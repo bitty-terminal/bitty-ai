@@ -22,7 +22,7 @@ A clear and concise description of what you expected to happen.
 
 - OS: [e.g. CachyOS, Arch Linux, macOS 15]
 - Bitty AI version or commit: [e.g. 0.0.0 or commit SHA]
-- Rust toolchain: [e.g. 1.97.1]
+- Rust toolchain: [e.g. 1.98.1]
 
 **Additional context**
 Add any other context about the problem here.
