@@ -6,15 +6,20 @@
 - The umbrella directory is not a Git repository and sibling repositories own
   their own Git, CarryCtx, CI, releases, and agent guidance.
 - All formal Bitty repositories belong under <https://github.com/bitty-terminal>.
-- `bitty-docs` is the canonical source for AI architecture, security,
-  configuration, interface, and project decisions. All AI-specific documentation
-  lives in `bitty-docs/docs/ai/` to prevent duplication.
+- `bitty-ai-docs` is the canonical source for AI-core architecture,
+  specifications, and design documentation. It is mounted at `docs/` as a Git
+  submodule pinned to a commit; initialize it with
+  `git submodule update --init`.
+- `bitty-docs` owns shared governance (decisions, security corpus, reviews,
+  project state); `bitty-terminal-docs` and `bitty-plugins-docs` own the
+  sibling corpora and are linked by absolute URL.
 
 ## Current phase
 
 - The repository is newly initialized and pre-implementation.
 - Documentation-first: architecture, security requirements, and design decisions
-  must be captured in `bitty-docs/docs/ai/` before implementation.
+  must be captured in the `docs/` submodule (bitty-ai-docs) before
+  implementation.
 - Do not add product code unless a later task authorizes it and its architecture
   and security gates are accepted.
 - Rust components use edition 2024. Dependencies, workspace layout, MSRV,
@@ -28,7 +33,8 @@
 1. Read this guide and the applicable files in `.carryctx/rules/`.
 2. Adopt the assigned persona in `.carryctx/personas/`.
 3. Read the task, team context, exact scopes, dependencies, and relevant
-   canonical contracts in `bitty-docs/docs/ai/`.
+   canonical contracts in the `docs/` submodule (bitty-ai-docs); run
+   `git submodule update --init` first when `docs/` is empty.
 4. Use `ctxctl outline` before targeted `symbol`, `read`, or `deps` inspection.
 
 ## CarryCtx workflow
@@ -95,19 +101,24 @@
 ## Documentation contract
 
 - Repository-owned documentation is English-only.
-- **All AI architecture, security, and design documentation lives in
-  `bitty-docs/docs/ai/` to prevent duplication and drift.** This repository
+- **All AI architecture and design documentation lives in `bitty-ai-docs`,
+  mounted at `docs/`, to prevent duplication and drift.** This repository
   contains only implementation-specific API docs and crate README files.
-- Synchronize affected canonical material in `bitty-docs/docs/ai/` when
-  architecture, security, public behavior, configuration, compatibility, or
-  developer workflows change.
+- Initialize/refresh the submodule with `git submodule update --init`; bump the
+  pin with `git submodule update --remote docs` followed by `git add docs` and
+  a `docs:` commit. `docs/` is external content: `just check` excludes it from
+  markdownlint, so gates behave identically with and without the submodule
+  initialized. Security and governance documents stay in `bitty-docs`.
+- Synchronize affected canonical material in `bitty-ai-docs` (via the `docs/`
+  submodule pointer) when architecture, security, public behavior,
+  configuration, compatibility, or developer workflows change.
 - Documentation synchronization is part of definition of done, not deferred
   cleanup.
 
 ## Architecture and security
 
 - ModelProvider, ContextProvider, Agent, and Tool Bus boundaries are defined in
-  `bitty-docs/docs/ai/`.
+  `docs/specifications/ai-architecture.md` (bitty-ai-docs).
 - Treat terminal content, plugin data, IPC/MCP clients, and model responses as
   untrusted across every boundary.
 - P0 security controls are release blockers. Never add ambient authority,

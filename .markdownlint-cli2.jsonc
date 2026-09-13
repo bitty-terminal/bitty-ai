@@ -13,6 +13,7 @@
     "dist",
     "build",
     "site",
-    ".worktrees"
+    ".worktrees",
+    "docs"
   ]
 }

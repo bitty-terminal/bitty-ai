@@ -16,8 +16,8 @@
 /// 3. **Agent** - Multi-level agent runtime (inspect/self/workspace/all)
 /// 4. **Tool Bus** - MCP adapter, tool registry, capability gating
 ///
-/// Architecture documentation will be maintained in `bitty-docs/docs/ai/`
-/// once the documentation structure is finalized.
+/// Architecture documentation is maintained in
+/// `docs/specifications/ai-architecture.md` (bitty-ai-docs).
 pub mod placeholder {
     /// Placeholder function to allow workspace checks to pass.
     ///
