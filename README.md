@@ -35,7 +35,7 @@ crates/
 ## Development
 
 - Rust edition 2024, resolver 3, MSRV 1.85
-- Toolchain: 1.97.1 (pinned in `rust-toolchain.toml`)
+- Toolchain: 1.98.1 (pinned in `rust-toolchain.toml`)
 - Quality gates: `just check` (fmt, clippy, tests, actionlint, markdownlint)
 - Git hooks: managed by lefthook (`lefthook install`)
 - Lifecycle: managed by CarryCtx (state in `.git/carryctx/`)

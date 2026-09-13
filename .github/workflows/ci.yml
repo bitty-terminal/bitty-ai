@@ -24,7 +24,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: >-
-          rustup toolchain install 1.97.1
+          rustup toolchain install 1.98.1
           --profile minimal
           --component rustfmt
           --component clippy
@@ -73,7 +73,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: >-
-          rustup toolchain install 1.97.1
+          rustup toolchain install 1.98.1
           --profile minimal
           --component clippy
 
@@ -90,7 +90,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: >-
-          rustup toolchain install 1.97.1
+          rustup toolchain install 1.98.1
           --profile minimal
           --component clippy
 
@@ -107,7 +107,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: >-
-          rustup toolchain install 1.97.1
+          rustup toolchain install 1.98.1
           --profile minimal
           --component clippy
 
@@ -124,7 +124,7 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: >-
-          rustup toolchain install 1.97.1
+          rustup toolchain install 1.98.1
           --profile minimal
 
       - name: Install cargo-deny
