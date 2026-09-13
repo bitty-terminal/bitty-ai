@@ -5,10 +5,11 @@ contains the ModelProvider, ContextProvider, Agent runtime, and Tool Bus
 components that enable terminal-native AI assistance.
 
 **Status**: Pre-implementation. This repository is currently in the
-documentation-first phase. Canonical architecture, security requirements, and
-design decisions are maintained in
-[bitty-docs](https://github.com/bitty-terminal/bitty-docs) under the `ai/`
-directory to ensure cross-repository consistency.
+documentation-first phase. Canonical architecture and design decisions are
+maintained in
+[bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs), mounted at
+`docs/` as a Git submodule; shared governance and the security corpus live in
+[bitty-docs](https://github.com/bitty-terminal/bitty-docs).
 
 ## Architecture
 
@@ -39,16 +40,26 @@ crates/
 - Quality gates: `just check` (fmt, clippy, tests, actionlint, markdownlint)
 - Git hooks: managed by lefthook (`lefthook install`)
 - Lifecycle: managed by CarryCtx (state in `.git/carryctx/`)
+- Docs submodule: `git submodule update --init` (or clone with
+  `--recurse-submodules`); bump with `git submodule update --remote docs`
 
 ## Documentation
 
-All architectural decisions, security requirements, and cross-cutting design
-documentation live in the
-[bitty-docs repository](https://github.com/bitty-terminal/bitty-docs) under
-`docs/ai/` to prevent duplication and drift across repositories.
+Canonical architecture, specifications, and cross-cutting design documentation
+live in the [bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs)
+repository, mounted at `docs/` as a Git submodule pinned by commit:
 
-This repository contains only implementation-specific documentation (API docs,
-crate README files, and inline code documentation).
+- New clone: `git clone --recurse-submodules …` (or
+  `git submodule update --init` in an existing checkout).
+- Bump the pin: `git submodule update --remote docs`, then `git add docs` and
+  commit the pointer change.
+- Read: [`docs/README.md`](https://github.com/bitty-terminal/bitty-ai-docs/blob/main/docs/README.md)
+  is the documentation map.
+
+Shared governance and the security corpus live in
+[bitty-docs](https://github.com/bitty-terminal/bitty-docs). This repository
+contains only implementation-specific documentation (API docs, crate README
+files, and inline code documentation).
 
 ## License
 

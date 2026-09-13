@@ -3,8 +3,10 @@
 Thank you for your interest in contributing to Bitty AI. This repository is in
 a pre-implementation bootstrap phase: it contains a placeholder Rust workspace
 scaffold and quality gates, not product behavior. Canonical product,
-architecture, security, and project documentation lives in the
-[bitty-docs](https://github.com/bitty-terminal/bitty-docs) repository.
+architecture, and design documentation lives in
+[bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs), mounted at
+`docs/` as a Git submodule; shared governance and the security corpus live in
+[bitty-docs](https://github.com/bitty-terminal/bitty-docs).
 
 Start by reading [AGENTS.md](AGENTS.md). It defines the governance model,
 CarryCtx workflow, delivery lifecycle, and constraints that every contributor
@@ -23,10 +25,18 @@ and agent must follow.
 
 ## Setup
 
-Clone the repository and run:
+Clone with the canonical docs submodule and run:
 
 ```bash
+git clone --recurse-submodules https://github.com/bitty-terminal/bitty-ai.git
+cd bitty-ai
 just setup
+```
+
+Existing checkouts initialize the submodule separately:
+
+```bash
+git submodule update --init
 ```
 
 This fetches Cargo dependencies, installs the Lefthook Git hooks
@@ -88,7 +98,8 @@ gates as `just check`.
 
 - Do not add product code, dependencies, or configuration unless an explicitly
   scoped task authorizes it.
-- Documentation synchronization in `bitty-docs` is part of definition of done.
+- Documentation synchronization in `bitty-ai-docs` (via the `docs/` submodule
+  pointer) and `bitty-docs` (governance) is part of definition of done.
 - Never describe scaffolding or plans as implemented behavior.
 
 ## Reporting issues
