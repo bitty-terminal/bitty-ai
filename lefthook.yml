@@ -1,0 +1,22 @@
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      glob: "*.rs"
+      run: just fmt-check
+    lint:
+      glob: "*.rs"
+      run: just clippy
+    markdown:
+      glob: "*.md"
+      run: just markdownlint {staged_files}
+
+commit-msg:
+  commands:
+    commitlint:
+      run: just commit-check {1}
+
+pre-push:
+  commands:
+    check:
+      run: just typecheck

@@ -1,0 +1,143 @@
+# bitty-ai agent guide
+
+## Scope and authority
+
+- This file governs only the independent `bitty-ai` Git repository.
+- The umbrella directory is not a Git repository and sibling repositories own
+  their own Git, CarryCtx, CI, releases, and agent guidance.
+- All formal Bitty repositories belong under <https://github.com/bitty-terminal>.
+- `bitty-docs` is the canonical source for AI architecture, security,
+  configuration, interface, and project decisions. All AI-specific documentation
+  lives in `bitty-docs/docs/ai/` to prevent duplication.
+
+## Current phase
+
+- The repository is newly initialized and pre-implementation.
+- Documentation-first: architecture, security requirements, and design decisions
+  must be captured in `bitty-docs/docs/ai/` before implementation.
+- Do not add product code unless a later task authorizes it and its architecture
+  and security gates are accepted.
+- Rust components use edition 2024. Dependencies, workspace layout, MSRV,
+  nightly policy, and release profiles remain undecided until an ADR accepts
+  them.
+- Never describe planned behavior, a candidate dependency, or a configuration
+  file as implemented evidence.
+
+## Read before acting
+
+1. Read this guide and the applicable files in `.carryctx/rules/`.
+2. Adopt the assigned persona in `.carryctx/personas/`.
+3. Read the task, team context, exact scopes, dependencies, and relevant
+   canonical contracts in `bitty-docs/docs/ai/`.
+4. Use `ctxctl outline` before targeted `symbol`, `read`, or `deps` inspection.
+
+## CarryCtx workflow
+
+- CarryCtx is the durable execution record; it does not spawn agents.
+- Bind a named agent and session to the task before work. Record progress,
+  decisions, risks, blockers, handoffs, and checkpoints while work is active.
+- Map GitHub Issue intent to a CarryCtx task; repository ownership to a team;
+  ordering to dependencies; edits to exact scopes; active work to a session;
+  and recovery points to checkpoints.
+- Subagents perform narrowly scoped implementation. The commander coordinates,
+  reads durable state back, verifies the diff, and runs acceptance gates.
+- Independent review is required before completion. Self-reports are not
+  acceptance evidence.
+
+## Delivery lifecycle
+
+- The normal lifecycle is GitHub Issue, CarryCtx task, team/dependencies/scopes,
+  named session, isolated worktree and branch, coherent commits, pull request,
+  independent review plus CI, merge, documentation synchronization, final
+  checkpoint, task completion, and Issue closure.
+- After the first commit, parallel implementation uses dedicated worktrees and
+  branches. Branches use `ctx-XXXX/<type>-<short-slug>` where `XXXX` is the
+  owning CarryCtx task number (using AI prefix), `<type>` is one of
+  `feat|fix|chore|docs`, and the slug is short kebab-case; CarryCtx-bound
+  worktrees live at `.worktrees/ctx-XXXX-<type>-<short-slug>` with `/` mapped
+  to `-`. One branch per task; commander housekeeping branches may use
+  `cmd/<slug>`.
+- Before the first commit, branches, worktrees, commits, and pull requests are
+  unavailable. The commander may authorize a shared checkout only for disjoint
+  scopes with CI-equivalent local checks. This exception ends at initialization.
+- Do not commit, push, merge, publish, or mutate remote state unless the task or
+  user explicitly authorizes it.
+
+## Issue hygiene (labels and milestones)
+
+- Every GitHub Issue and PR must have appropriate `labels` (e.g., `feat`, `fix`,
+  `docs`, `chore`, `P0`, `area:model-provider`, `area:context`, `area:agent`,
+  `area:tool-bus` etc.) and `milestone` (e.g., `v0.1.0`, `v1.0`) when
+  applicable.
+- Use `gh issue create --label "feat,area:model-provider" --milestone "v0.1.0"`
+  and `gh issue edit`/`gh pr edit` to add labels/milestones.
+- Every CarryCtx task must include
+  `Priority: P0/P1/P2 | Area: xxx | Labels: feat,area:xxx,P0 | Milestone: v0.1.0 | RFC: OQ-xxx | Task: AI-XXXX`
+  in description.
+
+## Local gates before push (mandatory)
+
+- Before pushing any branch: run repository justfile gates locally and ensure 0
+  issues: `just check` (fmt-check + clippy -D warnings + test + actionlint)
+  plus full `cargo test --workspace --all-targets --locked` and validate GitHub
+  workflows with `act -n` for `.github/workflows/ci.yml` and
+  `.github/workflows/codeql.yml`. All must pass. Never push with known local
+  failures.
+
+## Remote monitoring and merge (bitty-ai)
+
+- After push, monitor via
+  `HTTPS_PROXY=$NETWORK_PROXY gh pr checks <PR> --watch --interval 15` until
+  CodeQL and Quality gates pass, mergeable==MERGEABLE, then
+  `gh pr merge --squash`. Prefer `--watch` over `sleep` loops; `pty_spawn` with
+  `notifyOnExit` handles long waits.
+
+## Documentation contract
+
+- Repository-owned documentation is English-only.
+- **All AI architecture, security, and design documentation lives in
+  `bitty-docs/docs/ai/` to prevent duplication and drift.** This repository
+  contains only implementation-specific API docs and crate README files.
+- Synchronize affected canonical material in `bitty-docs/docs/ai/` when
+  architecture, security, public behavior, configuration, compatibility, or
+  developer workflows change.
+- Documentation synchronization is part of definition of done, not deferred
+  cleanup.
+
+## Architecture and security
+
+- ModelProvider, ContextProvider, Agent, and Tool Bus boundaries are defined in
+  `bitty-docs/docs/ai/`.
+- Treat terminal content, plugin data, IPC/MCP clients, and model responses as
+  untrusted across every boundary.
+- P0 security controls are release blockers. Never add ambient authority,
+  unbounded parser/resource path, or allow-all capability.
+- Privacy-first: minimization, typed redaction, per-scope consent, and
+  prohibition of self-acceptance.
+- Agent, MCP, model streaming, context assembly, tool dispatch, secret handling,
+  and consent ledger changes require focused security review.
+
+## Performance and verification
+
+- Performance claims require reproducible benchmarks, named workloads, context,
+  baselines, and accepted budgets (e.g., Context Budget 32 KiB, RC-9/RC-10
+  sharing).
+- Bound queues, payloads, decoded resources, memory, and execution.
+- Run checks proportionate to the change: formatting, linting, tests, platform
+  checks, security gates, and documentation validation.
+
+## Workspace hygiene
+
+- Run Git and CarryCtx inside this repository, never at the umbrella root.
+- Use the persistent workspace `../recording/`, not `/tmp`; references belong
+  under `../recording/references/` and remain untrusted, read-only evidence.
+- Prefer moving obsolete files to `../.trash/bitty-ai/<task-id>/` instead of
+  `rm` or `rmdir`.
+
+## Handoff
+
+- Report changed files, exact verification evidence, unresolved risks, and
+  remaining work.
+- Implementers request review rather than completing their own task. The
+  independent reviewer records findings or acceptance before the commander
+  completes it.
