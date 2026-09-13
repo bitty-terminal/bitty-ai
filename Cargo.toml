@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    # AI core crates will be added here
-    # Future structure:
+    "crates/bitty-ai-core",
+    # Future crates:
     # - crates/bitty-ai-model-provider
     # - crates/bitty-ai-context-provider
     # - crates/bitty-ai-agent
