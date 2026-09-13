@@ -122,10 +122,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install cargo-deny
+      - name: Install pinned Rust toolchain
         run: >-
-          cargo install cargo-deny@0.17.1
-          --locked
+          rustup toolchain install 1.97.1
+          --profile minimal
 
-      - name: Run cargo-deny
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Check dependencies (licenses, bans, sources)
         run: cargo deny check
+
+      # cargo-deny and cargo-audit share ~/.cargo/advisory-db; deny populates it
+      # so clear before audit to avoid "Refusing to initialize non-empty directory" failure.
+      - name: Audit advisories
+        run: rm -rf ~/.cargo/advisory-db && cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192

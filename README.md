@@ -23,7 +23,7 @@ The AI subsystem is organized into four core components:
 
 This workspace will contain:
 
-```
+```text
 crates/
   bitty-ai-model-provider/     # Model abstraction and registry
   bitty-ai-context-provider/   # Context system and providers
