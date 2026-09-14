@@ -52,7 +52,7 @@ pub use context::{
 };
 pub use provider::{
     FakeProvider, ModelCapability, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
-    Role, ToolCallRequest, TurnRequest, validate_provider_id,
+    Role, TerminalModelMetadata, ToolCallRequest, TurnRequest, validate_provider_id,
 };
 pub use session::{
     AgentInstanceId, AgentLevel, AgentSession, DenyAllElevations, ElevationGrant, ExecutionId,
