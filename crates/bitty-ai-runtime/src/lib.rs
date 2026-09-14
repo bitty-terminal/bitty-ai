@@ -7,11 +7,14 @@
 //! with a scripted [`provider::FakeProvider`], fail-closed authorization
 //! hooks, and structured execution outcomes including `Unknown`.
 //!
-//! The crate tracks the unmerged draft `implementation-profile-v0.1.md`
-//! content; that profile is **not** an accepted contract, so nothing here
-//! claims conformance to it. Normative architecture stays in the canonical
-//! `docs/specifications/` corpus (`ai-architecture.md`, `context-management.md`,
-//! `command-tool-architecture.md`, `agent-coordination.md`); bound values are
+//! The crate tracks the draft `implementation-profile-v0.1.md` (status:
+//! draft, not an accepted contract; a draft disposition proposes no accepted
+//! architecture), so nothing here claims conformance to it. Normative
+//! architecture stays in the canonical `docs/specifications/` corpus
+//! (`ai-architecture.md`, `context-management.md`,
+//! `command-tool-architecture.md`, `agent-coordination.md`,
+//! `implementation-profile-v0.1.md` plus the `R1`..`R6` draft dispositions);
+//! bound values are
 //! annotated with the draft rule they mirror (`MP-*`, `CP-*`, `TB-*`, `RS-*`,
 //! `AG-*`, `FS-AI*`) and remain skeleton defaults until an accepted profile
 //! says otherwise.

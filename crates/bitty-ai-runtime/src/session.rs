@@ -1,6 +1,7 @@
 //! Session identity, agent levels, and lifecycle.
 //!
-//! Mirrors the `AG-1`..`AG-4` and `AW-1` shape: a fresh session starts at the
+//! Mirrors the draft `AG-1`..`AG-4` and `AW-1` shape (draft disposition,
+//! not an accepted contract): a fresh session starts at the
 //! `inspect` read tier, elevation requires an explicit grant hook (denied by
 //! default), level checks are server-side state (never client claims), and
 //! cancellation is idempotent (`MP-7`). Identity separates the runtime-local
@@ -133,8 +134,10 @@ impl IdIssuer {
     }
 }
 
-/// Attenuated authority tier (`AG` levels). `Own` is the spec `self` tier,
-/// renamed because `self` is a Rust keyword.
+/// Attenuated authority tier (draft `AG` levels in `ai-architecture.md`).
+/// `Own` is the spec `self` tier, renamed because `self` is a Rust keyword.
+/// This tier is distinct from the ephemeral `AgentWorkspace` (`AW-1`) and
+/// from context levels `L0`/`L1`; the `AgentInstanceId` split stays per AI-0013.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentLevel {
     /// Read workspace/project/git/diagnostics/zone-scoped snapshots, list

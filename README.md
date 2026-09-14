@@ -4,10 +4,11 @@ Bitty AI is the AI subsystem for the Bitty terminal platform. This repository
 contains the ModelProvider, ContextProvider, Agent runtime, and Tool Bus
 components that enable terminal-native AI assistance.
 
-**Status**: Experimental / pre-alpha. Architecture work is
-documentation-first, while an experimental vertical slice
-(`crates/bitty-ai-slice`) is implemented to validate runtime and host
-boundaries. Production runtime implementation has not started. Canonical
+**Status**: Experimental / pre-alpha, draft scope. Architecture work is
+documentation-first. A deterministic single-agent runtime skeleton
+(`crates/bitty-ai-runtime`, AI-0009, draft scope) is implemented alongside
+the experimental vertical slice (`crates/bitty-ai-slice`) that validates
+runtime and host boundaries. No production runtime exists. Canonical
 architecture and design decisions are maintained in
 [bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs), mounted at
 `docs/` as a Git submodule; shared governance and the security corpus live in
@@ -19,13 +20,16 @@ The AI subsystem is organized into four core components:
 
 - **ModelProvider**: Model registry, capability negotiation, streaming inference, and budget tracking
 - **ContextProvider**: Stable ID system, semantic zones, budget assembly, and provider implementations
-- **Agent**: Multi-level agent runtime (AgentWorkspace L0/L1/L2), sessions, and consent ledger
+- **Agent**: Single-agent turn loop with authority tiers (`Inspect`/`Own` for
+  spec `self`/`Workspace`/`All`), sessions, ephemeral-workspace stub, and
+  consent-ledger seam (host-owned, stubbed)
 - **Tool Bus**: MCP adapter, tool registry, capability gating, and secure dispatch
 
 ## Repository structure
 
 ```text
 crates/
+  bitty-ai-runtime/            # Deterministic single-agent skeleton (AI-0009, draft scope)
   bitty-ai-slice/              # Experimental pressure test, not shipped
 ```
 
