@@ -18,12 +18,16 @@ architecture and design decisions are maintained in
 
 The AI subsystem is organized into four core components:
 
-- **ModelProvider**: Model registry, capability negotiation, streaming inference, and budget tracking
-- **ContextProvider**: Stable ID system, semantic zones, budget assembly, and provider implementations
+- **ModelProvider**: Skeleton subset — model registry, capability negotiation,
+  scripted streaming inference, and budget tracking (network providers stubbed,
+  host-owned)
+- **ContextProvider**: Skeleton subset — Stable ID system, semantic zones,
+  budget assembly, and provider implementations (L2+ compaction stubbed)
 - **Agent**: Single-agent turn loop with authority tiers (`Inspect`/`Own` for
   spec `self`/`Workspace`/`All`), sessions, ephemeral-workspace stub, and
   consent-ledger seam (host-owned, stubbed)
-- **Tool Bus**: MCP adapter, tool registry, capability gating, and secure dispatch
+- **Tool Bus**: Skeleton subset — tool registry, capability gating, and secure
+  dispatch with MCP-transport seam (host-owned, stubbed)
 
 ## Repository structure
 
