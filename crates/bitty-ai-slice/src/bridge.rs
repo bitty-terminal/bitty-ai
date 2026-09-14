@@ -9,7 +9,7 @@
 //! - [`ConsentLedger`] for per-client, per-scope, time-bounded grants,
 //! - [`IpcEndpoint`] for the bounded request/response channel and correlation,
 //! - [`validate_request_envelope`] / [`validate_response_envelope`] for the
-//!   accepted wire bounds.
+//!   bounded wire-envelope checks.
 //!
 //! When the registry does not know a method, the bridge fails closed with
 //! [`SliceError::UnsupportedHostMethod`] instead of inventing a new Core API.
@@ -25,7 +25,7 @@ use crate::error::SliceError;
 
 /// Host-side peer that serves bounded IPC requests.
 ///
-/// In a real deployment this is the Bitty host over the accepted scoped IPC
+/// In a real deployment this is the Bitty host over the scoped IPC
 /// transport. In tests it is a deterministic loopback peer; the slice never
 /// treats a missing handler as success.
 pub trait HostPeer {
