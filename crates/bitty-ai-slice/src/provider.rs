@@ -1,6 +1,6 @@
 //! ModelProvider boundary for the slice.
 //!
-//! Mirrors the accepted `MP-1`/`MP-5`/`MP-7` shape at the smallest useful size:
+//! Mirrors the draft `MP-1`/`MP-5`/`MP-7` shape at the smallest useful size:
 //! a host-owned provider identity, a bounded `complete` turn, and a typed tool
 //! request. The only implementation here is deterministic and local; it never
 //! performs network I/O and holds no credential, matching `MP-3` (local-first
@@ -8,7 +8,8 @@
 
 use crate::error::SliceError;
 
-/// Combined bound for `messages`, mirroring `MP-5` (`<= 32 KiB` combined).
+/// Candidate combined bound for `messages` (`MP-5`, pending `OQ-066`):
+/// `32 KiB`. A candidate profile, not an accepted core bound.
 pub const MAX_MESSAGE_BYTES: usize = 32 * 1024;
 
 /// Bound for a single tool-call argument payload, mirroring `TB-3` (`16 KiB`).

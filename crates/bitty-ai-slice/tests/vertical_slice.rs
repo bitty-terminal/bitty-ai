@@ -276,6 +276,10 @@ fn tool_call_limit_is_enforced() {
 
 #[test]
 fn oversized_stream_chunk_fails_closed() {
+    // Exercises the slice-local `MAX_FRAGMENT_BYTES` (64 KiB) gate, not
+    // RC-10's larger 256 KiB `CHUNK_CEILING`: 70 KiB passes `validate_chunk`
+    // and is rejected by the slice-local fragment bound.
+    // `chunk_over_rc10_ceiling_fails_closed` below covers the RC-10 gate.
     let mut sink = PanelStreamSink::new();
     let bytes = vec![b'x'; 70 * 1024];
     let error = sink
@@ -292,6 +296,32 @@ fn oversized_stream_chunk_fails_closed() {
     assert!(
         matches!(error, SliceError::StreamViolation { .. }),
         "got {error:?}"
+    );
+    assert!(sink.chunks().is_empty());
+}
+
+#[test]
+fn chunk_over_rc10_ceiling_fails_closed() {
+    let mut sink = PanelStreamSink::new();
+    let bytes = vec![b'x'; bitty_ipc::wire::CHUNK_CEILING + 1];
+    let error = sink
+        .emit(StreamChunk {
+            seq: 0,
+            total: 1,
+            is_final: true,
+            fragment: bitty_ai_slice::Fragment {
+                kind: FragmentKind::Markdown,
+                bytes: bytes.clone(),
+            },
+        })
+        .expect_err("a chunk over the RC-10 ceiling must fail closed");
+    assert_eq!(
+        error,
+        SliceError::Ipc(bitty_ipc::error::IpcError::PayloadTooLarge {
+            field: "chunk.bytes".to_owned(),
+            limit: bitty_ipc::wire::CHUNK_CEILING,
+            actual: bytes.len(),
+        })
     );
     assert!(sink.chunks().is_empty());
 }

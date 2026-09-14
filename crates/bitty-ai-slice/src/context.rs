@@ -14,7 +14,8 @@
 use crate::bridge::{HostPeer, IpcBridge};
 use crate::error::SliceError;
 
-/// The accepted Context Budget (`CP-5`): 32 KiB combined per turn.
+/// Candidate Context Budget profile (`CP-5`, pending `OQ-066`): 32 KiB combined
+/// per turn. This is a candidate profile, not an accepted core bound.
 pub const CONTEXT_BUDGET_BYTES: usize = 32 * 1024;
 
 /// Semantic-zone selector derived from OSC 7/133 boundaries (`CP-8`/`CP-9`).

@@ -12,10 +12,14 @@ use bitty_ipc::wire::{CHUNK_CEILING, validate_chunk};
 
 use crate::error::SliceError;
 
-/// RC-10 decoded-byte ceiling per streamed chunk.
+/// RC-10 decoded-byte ceiling per streamed chunk (`CHUNK_CEILING`, 256 KiB).
+/// This mirrors the generic RC-10 gate; the slice-local bound that rejects an
+/// oversized fragment is [`MAX_FRAGMENT_BYTES`] (64 KiB).
 pub const MAX_STREAM_CHUNK_BYTES: usize = CHUNK_CEILING;
 
-/// Per-fragment bound used by the slice (one rich block per chunk, `RS-3`).
+/// Slice-local per-fragment bound (`RS-3`, one rich block per chunk, 64 KiB).
+/// This is the bound that rejects an oversized slice fragment; RC-10's larger
+/// [`CHUNK_CEILING`] (256 KiB) is enforced separately by `validate_chunk`.
 pub const MAX_FRAGMENT_BYTES: usize = 64 * 1024;
 
 /// Rich fragment kind (`RS-1`).
