@@ -1,0 +1,111 @@
+name: Snapshot source
+
+# Verifies that the CarryCtx publication at refs/heads/carryctx-snapshots is
+# current with respect to main. In-repo publication retired the separate
+# *-workflow mirror: the commander's merge closeout runs `just workflow-publish`
+# (native `carryctx export --publication` + `git push` of the snapshot branch).
+#
+# The gate tolerates the two legitimate cases that are not "stale": no snapshot
+# branch exists yet, and the snapshot was republished from a newer main than the
+# one this run saw (a closeout race). It fails only when main has advanced past
+# the publication, or when the recorded revision is not related to main (a
+# publication taken from a feature branch, which can never match main).
+#
+# Triggers:
+#   - push to main: fails while a newer main HEAD is unpublished, so a red run
+#     is the closeout signal to publish.
+#   - push to carryctx-snapshots: intended to re-check and turn green once the
+#     closeout publishes the snapshot for the pending main HEAD. The snapshot
+#     ref tree carries no workflow files, so GitHub never starts this workflow
+#     for that push; the schedule below is what actually re-checks. Kept for the
+#     eventual case where the ref carries workflow files.
+#   - schedule: daily staleness check so a missed closeout is caught even when
+#     main stays idle, and a delayed publish turns the check green.
+#   - workflow_dispatch: manual re-run during merge closeout.
+# Pull requests are unaffected: none of the triggers is a pull_request event, so
+# PR builds and their required checks are untouched. Before the first
+# publication the branch does not exist yet; the check then passes with a notice
+# so main is not blocked while in-repo publication rolls out.
+
+on:
+  push:
+    branches:
+      - main
+      - carryctx-snapshots
+  schedule:
+    # Daily at 06:17 UTC (off the hour to avoid top-of-hour scheduler load).
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapshot-source-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot-source:
+    name: Snapshot source matches main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history lets the gate compare publication ancestry instead of a
+          # string prefix (a republished snapshot may be newer than main).
+          fetch-depth: 0
+
+      - name: Fetch main and snapshot refs
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags origin +refs/heads/carryctx-snapshots:refs/remotes/origin/carryctx-snapshots || true
+
+      - name: Verify CarryCtx-Source trailer matches or leads main HEAD
+        run: |
+          set -euo pipefail
+          snapshot_ref=refs/remotes/origin/carryctx-snapshots
+          if ! git rev-parse --verify -q "$snapshot_ref" >/dev/null; then
+            echo "::notice title=CarryCtx snapshot::refs/heads/carryctx-snapshots is not published yet; skipping source check."
+            exit 0
+          fi
+          main_sha="$(git rev-parse refs/remotes/origin/main)"
+          source_line="$(git log -1 --format=%B "$snapshot_ref" | sed -n 's/^CarryCtx-Source: //p' | head -n1)"
+          if [ -z "$source_line" ]; then
+            echo "::error::snapshot tip has no CarryCtx-Source trailer"
+            exit 1
+          fi
+          # Trailer shape: `<project>@<rev> (<branch>)`; take everything after the
+          # last '@' so a project token never leaks into the revision.
+          rev="${source_line##*@}"
+          rev="${rev%% *}"
+          if [ -z "$rev" ] || [ "$rev" = "$source_line" ]; then
+            echo "::error::cannot parse CarryCtx-Source trailer: $source_line"
+            exit 1
+          fi
+          if [ "$main_sha" = "$rev" ]; then
+            echo "snapshot source $rev matches main HEAD $main_sha"
+            exit 0
+          fi
+          # Resolve the recorded revision. A publication taken from main records
+          # a main commit, which is present once full history is fetched.
+          if ! git rev-parse --verify -q "${rev}^{commit}" >/dev/null 2>&1; then
+            echo "::error::snapshot source revision $rev is absent from this checkout; the publication was not taken from main. Run 'just workflow-publish' from the primary checkout on main."
+            exit 1
+          fi
+          rev_sha="$(git rev-parse "${rev}^{commit}")"
+          # Legitimate case: the snapshot was republished from a newer main than
+          # the one this run checked out (a merge-closeout race). It is current,
+          # not stale, so accept it.
+          if git merge-base --is-ancestor "$main_sha" "$rev_sha"; then
+            echo "snapshot source $rev_sha is at or ahead of main HEAD $main_sha; accepting"
+            exit 0
+          fi
+          if git merge-base --is-ancestor "$rev_sha" "$main_sha"; then
+            echo "::error::snapshot refs/heads/carryctx-snapshots source ($rev_sha) is behind main HEAD ($main_sha); run 'just workflow-publish' during merge closeout"
+            exit 1
+          fi
+          echo "::error::snapshot source $rev_sha is not an ancestor of main HEAD $main_sha; republish from the primary checkout on main"
+          exit 1

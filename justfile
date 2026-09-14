@@ -44,3 +44,26 @@ commit-check message:
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
 check: fmt-check clippy test actionlint markdownlint
+
+# Publish a redacted CarryCtx snapshot inside this repo (commander merge
+# closeout only; never a git hook). `carryctx export --publication` redacts the
+# bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref
+# `refs/heads/carryctx-snapshots`; the target pushes that branch only when the
+# local ref advanced. Canonical closeout runs from the primary checkout on
+# branch main (`cd "$BITTY_WORKSPACE/bitty-ai" && just workflow-publish`); a
+# detached or feature worktree records that branch as the snapshot source. Dry
+# run validates the export and writes neither the ref nor the remote.
+workflow-publish *args:
+    bash scripts/workflow-publish.sh {{args}}
+
+workflow-publish-dry *args:
+    bash scripts/workflow-publish.sh --dry-run {{args}}
+
+# Restore the local CarryCtx DB from the in-repo snapshot branch
+# `refs/heads/carryctx-snapshots` (fresh-clone recipe). Refuses to replace a
+# non-empty local DB without --force, e.g. `just workflow-import --force`.
+workflow-import *args:
+    bash scripts/workflow-import.sh {{args}}
+
+workflow-import-dry *args:
+    bash scripts/workflow-import.sh --dry-run {{args}}
