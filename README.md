@@ -4,9 +4,11 @@ Bitty AI is the AI subsystem for the Bitty terminal platform. This repository
 contains the ModelProvider, ContextProvider, Agent runtime, and Tool Bus
 components that enable terminal-native AI assistance.
 
-**Status**: Pre-implementation. This repository is currently in the
-documentation-first phase. Canonical architecture and design decisions are
-maintained in
+**Status**: Experimental / pre-alpha. Architecture work is
+documentation-first, while an experimental vertical slice
+(`crates/bitty-ai-slice`) is implemented to validate runtime and host
+boundaries. Production runtime implementation has not started. Canonical
+architecture and design decisions are maintained in
 [bitty-ai-docs](https://github.com/bitty-terminal/bitty-ai-docs), mounted at
 `docs/` as a Git submodule; shared governance and the security corpus live in
 [bitty-docs](https://github.com/bitty-terminal/bitty-docs).
@@ -22,16 +24,16 @@ The AI subsystem is organized into four core components:
 
 ## Repository structure
 
-This workspace will contain:
-
 ```text
 crates/
-  bitty-ai-model-provider/     # Model abstraction and registry
-  bitty-ai-context-provider/   # Context system and providers
-  bitty-ai-agent/              # Agent runtime and levels
-  bitty-ai-tool-bus/           # Tool discovery and execution
-  bitty-ai-workspace/          # AgentWorkspace and coordination
+  bitty-ai-core/               # Placeholder shared kernel (under review)
+  bitty-ai-slice/              # Experimental pressure test, not shipped
 ```
+
+The v0.1 direction (see `docs/specifications/implementation-profile-v0.1.md`)
+starts from a single `bitty-ai-runtime` crate instead of splitting
+model/context/agent/tool-bus/workspace crates up front; the split happens only
+once implementation evidence demands it.
 
 ## Development
 
