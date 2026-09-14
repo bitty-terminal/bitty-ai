@@ -5,3 +5,15 @@ version = 4
 [[package]]
 name = "bitty-ai-core"
 version = "0.0.1"
+
+[[package]]
+name = "bitty-ai-slice"
+version = "0.0.1"
+dependencies = [
+ "bitty-ipc",
+]
+
+[[package]]
+name = "bitty-ipc"
+version = "0.0.20"
+source = "git+https://github.com/bitty-terminal/bitty?rev=3c9cfea6f9481aac32cbf5b657043f94d3fe273b#3c9cfea6f9481aac32cbf5b657043f94d3fe273b"
