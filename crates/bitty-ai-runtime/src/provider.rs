@@ -5,6 +5,24 @@
 //! and idempotent cancellation. There are no network providers here: the only
 //! implementation is the scripted [`FakeProvider`], which replays
 //! caller-supplied turns so tests run offline with no secrets.
+//!
+//! ## Ownership (R1 draft disposition)
+//!
+//! Provider registry implementation and all model I/O belong on the AI helper
+//! side (this crate, staging toward a `bitty-ai-host` helper behind scoped
+//! IPC), per the draft disposition of `MP-1` versus `BA-2`/`BA-3` in
+//! `docs/specifications/execution-ownership-r1.md`: `BA-2` (Agent versus AI
+//! split) and `BA-3` (bridge process model) win on placement.
+//!
+//! Red line: `bitty-agent` performs no model selection, no model I/O, and no
+//! API-key handling. A terminal-side registry, if retained, validates generic
+//! service metadata and mediates authorized requests only (see
+//! [`TerminalModelMetadata`]): it is not a provider implementation and holds
+//! no credentials.
+//!
+//! [`FakeProvider`] is the only provider here: deterministic, scripted,
+//! offline. Network providers, TLS, credentials, and real model calls are out
+//! of scope by design, not deferred work.
 
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -39,6 +57,37 @@ pub struct ModelDescriptor {
     pub name: String,
     /// Capability flags for this model.
     pub capabilities: Vec<ModelCapability>,
+}
+
+/// Terminal-side generic model metadata mediation placeholder (R1 draft
+/// disposition).
+///
+/// When a terminal-side registry is retained, it validates generic service
+/// metadata and mediates authorized requests only: it is not a provider
+/// implementation, performs no model I/O, and holds no credentials. This
+/// struct is that boundary expressed in code: a model name plus a capability
+/// snapshot, derivable from a [`ModelDescriptor`], with no I/O methods, no
+/// secret fields, and no clock. Real provider I/O stays on the AI helper side
+/// behind [`ModelProvider`]; `bitty-agent` performs no model selection, no
+/// model I/O, and no API-key handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalModelMetadata {
+    /// Registry-known model name (mirrors [`ModelDescriptor::name`]).
+    pub name: String,
+    /// Capability snapshot (mirrors [`ModelDescriptor::capabilities`]).
+    pub capabilities: Vec<ModelCapability>,
+}
+
+impl TerminalModelMetadata {
+    /// Snapshot generic metadata from a helper-side registry descriptor. No
+    /// credentials are read (there are none to read) and no I/O happens.
+    #[must_use]
+    pub fn from_descriptor(descriptor: &ModelDescriptor) -> Self {
+        Self {
+            name: descriptor.name.clone(),
+            capabilities: descriptor.capabilities.clone(),
+        }
+    }
 }
 
 /// Conversation role for one message.
@@ -392,6 +441,44 @@ mod tests {
         // never validates: the `MP-2` shape allows only `[a-z0-9_-]`.
         assert!(validate_provider_id("local.deterministic").is_err());
         assert!(validate_provider_id("a".repeat(65).as_str()).is_err());
+    }
+
+    #[test]
+    fn terminal_metadata_mirrors_descriptor_only() {
+        // R1 disposition: the terminal-side mediation placeholder carries a
+        // generic name-plus-capabilities snapshot and nothing else.
+        let descriptor = ModelDescriptor {
+            name: "fake-chat".to_owned(),
+            capabilities: vec![ModelCapability::Text, ModelCapability::ToolUse],
+        };
+        let mediated = TerminalModelMetadata::from_descriptor(&descriptor);
+        assert_eq!(
+            mediated,
+            TerminalModelMetadata {
+                name: "fake-chat".to_owned(),
+                capabilities: vec![ModelCapability::Text, ModelCapability::ToolUse],
+            }
+        );
+        // The snapshot is detached: later helper-side changes do not leak
+        // through the mediation view.
+        let mut changed = descriptor.clone();
+        changed.capabilities.push(ModelCapability::Streaming);
+        assert_ne!(TerminalModelMetadata::from_descriptor(&changed), mediated);
+    }
+
+    #[test]
+    fn mediation_view_derives_from_helper_registry() {
+        // Mediation flows one way: helper-side `list_models` snapshots feed
+        // the terminal-side view; the view never drives provider behavior.
+        let provider = FakeProvider::new("bitty-fake").expect("valid id");
+        let mediated: Vec<TerminalModelMetadata> = provider
+            .list_models()
+            .iter()
+            .map(TerminalModelMetadata::from_descriptor)
+            .collect();
+        assert_eq!(mediated.len(), 1);
+        assert_eq!(mediated[0].name, "fake-chat");
+        assert!(mediated[0].capabilities.contains(&ModelCapability::Text));
     }
 
     #[test]
