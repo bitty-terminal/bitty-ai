@@ -7,21 +7,31 @@ name: Snapshot source
 #
 # The gate tolerates the two legitimate cases that are not "stale": no snapshot
 # branch exists yet, and the snapshot was republished from a newer main than the
-# one this run saw (a closeout race). It fails only when main has advanced past
-# the publication, or when the recorded revision is not related to main (a
-# publication taken from a feature branch, which can never match main).
+# one this run saw (a closeout race). A present-but-malformed trailer (missing,
+# unparsable, or pointing at a revision absent from main) is real breakage and
+# always fails.
+#
+# Notification-noise fix: every merge to main creates a new HEAD while snapshot
+# publication is a separate later push, so a push-triggered run ALWAYS observes
+# "behind" in the post-merge window. Push runs are therefore informational for
+# the behind case (notice + exit 0); enforcement lives in the scheduled
+# staleness gate, which fails on behind, plus workflow_dispatch, which also
+# fails so a manual re-run during closeout gives a true signal.
 #
 # Triggers:
-#   - push to main: fails while a newer main HEAD is unpublished, so a red run
-#     is the closeout signal to publish.
+#   - push to main: informational while a newer main HEAD is unpublished, so no
+#     red run or notification per merge; the notice still names the closeout
+#     publish step.
 #   - push to carryctx-snapshots: intended to re-check and turn green once the
 #     closeout publishes the snapshot for the pending main HEAD. The snapshot
 #     ref tree carries no workflow files, so GitHub never starts this workflow
 #     for that push; the schedule below is what actually re-checks. Kept for the
 #     eventual case where the ref carries workflow files.
 #   - schedule: daily staleness check so a missed closeout is caught even when
-#     main stays idle, and a delayed publish turns the check green.
-#   - workflow_dispatch: manual re-run during merge closeout.
+#     main stays idle, and a delayed publish turns the check green. Enforcing:
+#     fails while behind (detection latency ~24h via the daily cron).
+#   - workflow_dispatch: manual re-run during merge closeout. Enforcing, so the
+#     signal is trustworthy.
 # Pull requests are unaffected: none of the triggers is a pull_request event, so
 # PR builds and their required checks are untouched. Before the first
 # publication the branch does not exist yet; the check then passes with a notice
@@ -68,7 +78,7 @@ jobs:
           set -euo pipefail
           snapshot_ref=refs/remotes/origin/carryctx-snapshots
           if ! git rev-parse --verify -q "$snapshot_ref" >/dev/null; then
-            echo "::notice title=CarryCtx snapshot::refs/heads/carryctx-snapshots is not published yet; skipping source check."
+            echo "::notice title=CarryCtx snapshot::refs/heads/carryctx-snapshots is not published yet; run 'just workflow-publish' during merge closeout (informational; the scheduled staleness check enforces)."
             exit 0
           fi
           main_sha="$(git rev-parse refs/remotes/origin/main)"
@@ -104,8 +114,17 @@ jobs:
             exit 0
           fi
           if git merge-base --is-ancestor "$rev_sha" "$main_sha"; then
-            echo "::error::snapshot refs/heads/carryctx-snapshots source ($rev_sha) is behind main HEAD ($main_sha); run 'just workflow-publish' during merge closeout"
-            exit 1
+            msg="snapshot refs/heads/carryctx-snapshots source ($rev_sha) is behind main HEAD ($main_sha); run 'just workflow-publish' during merge closeout"
+            case "${GITHUB_EVENT_NAME:-push}" in
+              schedule|workflow_dispatch)
+                echo "::error::$msg (enforcing ${GITHUB_EVENT_NAME} run)"
+                exit 1
+                ;;
+              *)
+                echo "::notice title=CarryCtx snapshot::$msg (informational push run; the scheduled staleness check enforces)"
+                exit 0
+                ;;
+            esac
           fi
           echo "::error::snapshot source $rev_sha is not an ancestor of main HEAD $main_sha; republish from the primary checkout on main"
           exit 1
