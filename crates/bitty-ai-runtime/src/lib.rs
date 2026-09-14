@@ -55,8 +55,8 @@ pub use provider::{
     Role, ToolCallRequest, TurnRequest, validate_provider_id,
 };
 pub use session::{
-    AgentId, AgentLevel, AgentSession, DenyAllElevations, ElevationGrant, ExecutionId, IdIssuer,
-    RunId, SessionError, SessionId, SessionState,
+    AgentInstanceId, AgentLevel, AgentSession, DenyAllElevations, ElevationGrant, ExecutionId,
+    IdIssuer, RunId, SessionError, SessionId, SessionState,
 };
 pub use stream::{
     Fragment, FragmentKind, StreamChunk, StreamError, StreamSink, VecSink, emit_fragments,

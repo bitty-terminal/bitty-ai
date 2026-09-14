@@ -292,7 +292,7 @@ impl<P: ModelProvider> Agent<P> {
 
         self.tools.begin_turn();
         let base = AuthBase {
-            agent_id: self.session.agent_id(),
+            agent_instance_id: self.session.agent_instance_id(),
             session_id: self.session.session_id(),
             level: self.session.level(),
         };

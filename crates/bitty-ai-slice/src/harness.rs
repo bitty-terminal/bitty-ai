@@ -204,7 +204,7 @@ pub fn scripted_provider(
 #[must_use]
 pub fn test_session() -> AgentSession {
     let mut ids = IdIssuer::default();
-    AgentSession::new(ids.agent(), ids.run(), ids.session())
+    AgentSession::new(ids.agent_instance(), ids.run(), ids.session())
 }
 
 /// Wire a deterministic single-agent runtime: `provider` plus the harness

@@ -25,12 +25,12 @@ impl ToolAuthorizer for AllowAll {
 }
 
 fn ids() -> (
-    bitty_ai_runtime::AgentId,
+    bitty_ai_runtime::AgentInstanceId,
     bitty_ai_runtime::RunId,
     bitty_ai_runtime::SessionId,
 ) {
     let mut issuer = bitty_ai_runtime::IdIssuer::default();
-    (issuer.agent(), issuer.run(), issuer.session())
+    (issuer.agent_instance(), issuer.run(), issuer.session())
 }
 
 fn session() -> bitty_ai_runtime::AgentSession {

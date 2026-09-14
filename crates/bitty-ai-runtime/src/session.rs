@@ -3,10 +3,57 @@
 //! Mirrors the `AG-1`..`AG-4` and `AW-1` shape: a fresh session starts at the
 //! `inspect` read tier, elevation requires an explicit grant hook (denied by
 //! default), level checks are server-side state (never client claims), and
-//! cancellation is idempotent (`MP-7`). Identity separates the logical agent,
-//! the run, the session, and each execution, following the ownership split in
-//! `agent-coordination.md` (agent/run owned by the AI runtime; executions are
-//! attributed records reconciled by the supervising backend, stubbed here).
+//! cancellation is idempotent (`MP-7`). Identity separates the runtime-local
+//! agent instance, the run, the session, and each execution, following the
+//! ownership split in `agent-coordination.md` (agent/run owned by the AI
+//! runtime; executions are attributed records reconciled by the supervising
+//! backend, stubbed here).
+//!
+//! ## Runtime identity hierarchy (v0.1, single agent)
+//!
+//! ```text
+//! AgentInstanceId (one runtime-local agent object)
+//! ├── RunId (one turn-loop invocation)
+//! ├── SessionId (one context/history scope)
+//! └── ExecutionId (one side-effect attempt)
+//! ```
+//!
+//! - [`AgentInstanceId`] names the runtime-local agent object owned by this
+//!   crate. v0.1 runs a single agent, so there is no orchestration,
+//!   scheduling, or multi-agent routing on top of it.
+//! - [`RunId`] names the turn-loop invocation that created the session. v0.1
+//!   binds one [`RunId`] per [`AgentSession`] at construction.
+//! - [`SessionId`] names the context/history scope (fact store scope) carried
+//!   by the [`AgentSession`] handle.
+//! - [`ExecutionId`] names one dispatched tool execution. It is issued per
+//!   dispatch (see [`IdIssuer::execution`]) and recorded on
+//!   [`crate::agent::ExecutionRecord`] and [`crate::tool::ToolExecution`].
+//!
+//! ## Protocol identity vs runtime identity
+//!
+//! This crate is `std`-only and does not depend on the generic `bitty-agent`
+//! protocol crate. The names below are deliberately distinct so a future
+//! bridge can map them without a collision:
+//!
+//! | Identity | Owner | Shape (today) | Meaning |
+//! | --- | --- | --- | --- |
+//! | Protocol `AgentId` | `bitty-agent` (external) | `owner.name` principal, e.g. `"owner.name"` | External principal on the generic wire protocol |
+//! | [`AgentInstanceId`] | `bitty-ai-runtime` (this crate) | `u64` handle | Runtime-local agent object |
+//! | [`RunId`] | `bitty-ai-runtime` | `u64` handle | One invocation |
+//! | [`SessionId`] | `bitty-ai-runtime` | `u64` handle | One context/history scope |
+//! | [`ExecutionId`] | `bitty-ai-runtime` | `u64` handle | One side-effect attempt |
+//!
+//! Bridge mapping (later P1 work, not implemented here):
+//!
+//! ```text
+//! protocol AgentId (owner.name)
+//!       │ authorization / mapping (future bridge crate)
+//!       ▼
+//! AgentInstanceId
+//!       ├── RunId
+//!       ├── SessionId
+//!       └── ExecutionId
+//! ```
 //!
 //! Sessions are shared handles: cancelling through any clone is visible to
 //! all holders, so a tool host or test peer can cancel a turn mid-dispatch
@@ -16,33 +63,55 @@ use std::cell::Cell;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::rc::Rc;
 
-/// Logical agent handle.
+/// Runtime-local agent object handle.
+///
+/// This is **not** the generic `bitty-agent` protocol `AgentId`
+/// (`owner.name`, the external principal). It names the single agent object
+/// owned by this runtime crate; the protocol-to-instance mapping lives in a
+/// future bridge crate (P1) and is intentionally absent here so this crate
+/// stays `std`-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AgentId(pub u64);
+pub struct AgentInstanceId(pub u64);
 
 /// One agent turn-loop invocation.
+///
+/// v0.1 binds one [`RunId`] per [`AgentSession`] at construction; there is
+/// no run scheduler or multi-run orchestration in this skeleton phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(pub u64);
 
 /// One agent session (fact store scope).
+///
+/// Names the context/history scope carried by [`AgentSession`]. Distinct
+/// from [`RunId`] (the invocation) and [`ExecutionId`] (one dispatch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
 /// One dispatched tool execution (attribution handle).
+///
+/// Issued per dispatch via [`IdIssuer::execution`] and recorded on
+/// [`crate::agent::ExecutionRecord`] and [`crate::tool::ToolExecution`].
+/// An `Unknown` status on this id requires reconciliation before retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExecutionId(pub u64);
 
 /// Deterministic id issuer. Values start at 1; 0 is reserved as "none".
+///
+/// The counter is shared across all four id spaces, so every issued value
+/// is globally unique and strictly increasing regardless of kind. There are
+/// no per-kind sequences: future persistence or bridge code must store the
+/// `(kind, value)` pair rather than assuming e.g. run 1 pairs with
+/// session 1.
 #[derive(Debug, Default)]
 pub struct IdIssuer {
     next: u64,
 }
 
 impl IdIssuer {
-    /// Issue the next agent id.
-    pub fn agent(&mut self) -> AgentId {
+    /// Issue the next agent-instance id.
+    pub fn agent_instance(&mut self) -> AgentInstanceId {
         self.next += 1;
-        AgentId(self.next)
+        AgentInstanceId(self.next)
     }
 
     /// Issue the next run id.
@@ -163,7 +232,7 @@ impl ElevationGrant for DenyAllElevations {
 
 #[derive(Debug)]
 struct SessionInner {
-    agent_id: AgentId,
+    agent_instance_id: AgentInstanceId,
     run_id: RunId,
     session_id: SessionId,
     level: Cell<AgentLevel>,
@@ -180,9 +249,9 @@ pub struct AgentSession(Rc<SessionInner>);
 impl AgentSession {
     /// Start a session at `inspect`/`Active`, generation 1 (`AG-1`).
     #[must_use]
-    pub fn new(agent_id: AgentId, run_id: RunId, session_id: SessionId) -> Self {
+    pub fn new(agent_instance_id: AgentInstanceId, run_id: RunId, session_id: SessionId) -> Self {
         Self(Rc::new(SessionInner {
-            agent_id,
+            agent_instance_id,
             run_id,
             session_id,
             level: Cell::new(AgentLevel::Inspect),
@@ -191,10 +260,10 @@ impl AgentSession {
         }))
     }
 
-    /// Bound agent id.
+    /// Bound runtime-local agent instance id.
     #[must_use]
-    pub fn agent_id(&self) -> AgentId {
-        self.0.agent_id
+    pub fn agent_instance_id(&self) -> AgentInstanceId {
+        self.0.agent_instance_id
     }
 
     /// Bound run id.
@@ -300,7 +369,38 @@ mod tests {
 
     fn session() -> AgentSession {
         let mut ids = IdIssuer::default();
-        AgentSession::new(ids.agent(), ids.run(), ids.session())
+        AgentSession::new(ids.agent_instance(), ids.run(), ids.session())
+    }
+
+    #[test]
+    fn id_issuer_starts_at_one_and_increases_monotonically() {
+        let mut ids = IdIssuer::default();
+        let instance = ids.agent_instance();
+        let run = ids.run();
+        let session_id = ids.session();
+        let execution = ids.execution();
+        assert_eq!(instance.0, 1);
+        assert_eq!(run.0, 2);
+        assert_eq!(session_id.0, 3);
+        assert_eq!(execution.0, 4);
+        // 0 stays reserved as "none": no issued id may be zero.
+        for value in [instance.0, run.0, session_id.0, execution.0] {
+            assert_ne!(value, 0);
+        }
+        let next = ids.execution();
+        assert!(next.0 > execution.0);
+    }
+
+    #[test]
+    fn session_preserves_bound_identity() {
+        let mut ids = IdIssuer::default();
+        let instance = ids.agent_instance();
+        let run = ids.run();
+        let session_id = ids.session();
+        let session = AgentSession::new(instance, run, session_id);
+        assert_eq!(session.agent_instance_id(), instance);
+        assert_eq!(session.run_id(), run);
+        assert_eq!(session.session_id(), session_id);
     }
 
     #[test]

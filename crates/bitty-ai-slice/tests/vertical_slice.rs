@@ -234,7 +234,7 @@ fn host_without_snapshot_handler_fails_closed() {
 fn auth_base() -> AuthBase {
     let mut ids = IdIssuer::default();
     AuthBase {
-        agent_id: ids.agent(),
+        agent_instance_id: ids.agent_instance(),
         session_id: ids.session(),
         level: AgentLevel::Inspect,
     }
