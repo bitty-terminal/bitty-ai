@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use crate::context::MAX_SUMMARY_BYTES;
-use crate::session::{AgentId, AgentLevel, AgentSession, SessionId};
+use crate::session::{AgentInstanceId, AgentLevel, AgentSession, SessionId};
 
 /// Maximum tool name length in bytes (`TB-2`).
 pub const MAX_TOOL_NAME_LEN: usize = 64;
@@ -285,8 +285,8 @@ impl ToolRegistry {
 /// Caller identity presented to the authorization hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthBase {
-    /// Calling agent.
-    pub agent_id: AgentId,
+    /// Calling runtime-local agent instance.
+    pub agent_instance_id: AgentInstanceId,
     /// Calling session.
     pub session_id: SessionId,
     /// Server-side authority tier of the session.
@@ -726,7 +726,7 @@ mod tests {
     fn base() -> AuthBase {
         let mut ids = crate::session::IdIssuer::default();
         AuthBase {
-            agent_id: ids.agent(),
+            agent_instance_id: ids.agent_instance(),
             session_id: ids.session(),
             level: AgentLevel::Inspect,
         }

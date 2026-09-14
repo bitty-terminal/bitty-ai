@@ -15,7 +15,7 @@ canonical `docs/specifications/` corpus (`ai-architecture.md`,
 ```text
 provider  ModelProvider trait, deterministic FakeProvider (scripted turns)
 context   Stable Ids, token-first budget, L0 structured results, L1 prune
-session   AgentId/RunId/SessionId/ExecutionId, tiers, idempotent cancel
+session   AgentInstanceId/RunId/SessionId/ExecutionId, tiers, idempotent cancel
 tool      Bounded registry, deny-by-default hooks, host executor seam
 agent     Single-agent turn loop with structured outcomes incl. Unknown
 stream    Markdown/Diff/ToolCard fragments, seq/total/final chunks
