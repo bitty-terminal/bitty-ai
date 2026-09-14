@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Experimental AI vertical slice on generic bitty-ipc primitives (pressure test, CTX-0407)"
+description = "Integration harness: real bitty-ai-runtime x real bitty-ipc (pressure test, CTX-0407)"
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -14,4 +14,5 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+bitty-ai-runtime = { path = "../bitty-ai-runtime" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "3c9cfea6f9481aac32cbf5b657043f94d3fe273b" }
