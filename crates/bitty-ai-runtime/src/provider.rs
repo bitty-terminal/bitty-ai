@@ -388,6 +388,9 @@ mod tests {
         assert!(validate_provider_id("").is_err());
         assert!(validate_provider_id("1abc").is_err());
         assert!(validate_provider_id("ABC").is_err());
+        // Legacy dotted vocabulary (`local.deterministic`, pre-AI-0012 slice)
+        // never validates: the `MP-2` shape allows only `[a-z0-9_-]`.
+        assert!(validate_provider_id("local.deterministic").is_err());
         assert!(validate_provider_id("a".repeat(65).as_str()).is_err());
     }
 

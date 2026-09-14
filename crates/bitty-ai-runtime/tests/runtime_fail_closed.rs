@@ -498,6 +498,74 @@ fn l1_assembly_prunes_and_externalizes_inside_turn() {
 }
 
 #[test]
+fn legacy_dotted_tool_name_from_model_fails_as_invalid() {
+    // The model is untrusted: a legacy dotted name (`terminal.read_zone`,
+    // pre-AI-0012 slice vocabulary) must surface as `InvalidName` (`TB-2`),
+    // never as a dispatch or a silent unknown-tool substitute.
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "calling legacy".to_owned(),
+        tool_calls: vec![ToolCallRequest {
+            name: "terminal.read_zone".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        }],
+        latency_ms: 0,
+    });
+    let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
+    let mut executor = FakeToolExecutor::new();
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::InvalidName { .. })
+            }
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(executor.calls().is_empty());
+    assert!(agent.executions().is_empty());
+}
+
+#[test]
+fn tool_call_burst_fails_before_any_dispatch() {
+    // Nine calls in one assistant turn exceed the `TB-6` per-turn cap: the
+    // turn fails with `CallLimitExceeded` and dispatches nothing.
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "burst".to_owned(),
+        tool_calls: (0..9)
+            .map(|_| ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{}"#.to_vec(),
+            })
+            .collect(),
+        latency_ms: 0,
+    });
+    let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
+    let mut executor = FakeToolExecutor::new();
+    executor.push_success("read ok", b"data".to_vec());
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::CallLimitExceeded { .. })
+            }
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(executor.calls().is_empty());
+    assert!(agent.executions().is_empty());
+}
+
+#[test]
 fn context_request_resolves_token_first_budget() {
     let request = bitty_ai_runtime::ContextRequest {
         max_tokens: Some(64),

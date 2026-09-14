@@ -48,6 +48,12 @@ pub enum ToolError {
         /// Requested name.
         name: String,
     },
+    /// Tool name is already registered. Re-registration is refused
+    /// fail-closed (`TB-2`): no replacement, no shadowing, no state change.
+    DuplicateTool {
+        /// Rejected name.
+        name: String,
+    },
     /// Arguments exceed [`MAX_TOOL_ARGUMENTS_BYTES`] (`TB-3`).
     ArgumentsTooLarge {
         /// Bound in bytes.
@@ -116,6 +122,7 @@ impl Display for ToolError {
         match self {
             Self::InvalidName { name } => write!(f, "invalid tool name: {name}"),
             Self::UnknownTool { name } => write!(f, "unknown tool: {name}"),
+            Self::DuplicateTool { name } => write!(f, "duplicate tool: {name}"),
             Self::ArgumentsTooLarge { limit, actual } => write!(
                 f,
                 "tool arguments of {actual} bytes exceed {limit} byte limit"
@@ -244,10 +251,36 @@ impl ToolRegistry {
 
     /// Register one validated spec.
     ///
+    /// Fail-closed: a name that is already registered is refused with
+    /// [`ToolError::DuplicateTool`] (no replacement, no shadowing); a
+    /// malformed or over-bound spec is refused with its typed error even
+    /// when built without [`ToolSpec::new`]; a full registry refuses with
+    /// [`ToolError::RegistryFull`]. Every refusal leaves the registry
+    /// unchanged: no push, no replacement, no counter increment.
+    ///
     /// # Errors
     ///
-    /// Returns [`ToolError::RegistryFull`] past [`MAX_TOOLS_PER_SESSION`].
+    /// Returns [`ToolError::DuplicateTool`] for a re-registered name,
+    /// [`ToolError::InvalidName`], [`ToolError::DescriptionTooLarge`], or
+    /// [`ToolError::SchemaTooLarge`] for a malformed spec, and
+    /// [`ToolError::RegistryFull`] past [`MAX_TOOLS_PER_SESSION`].
     pub fn register(&mut self, spec: ToolSpec) -> Result<(), ToolError> {
+        if self.specs.iter().any(|kept| kept.name == spec.name) {
+            return Err(ToolError::DuplicateTool { name: spec.name });
+        }
+        validate_tool_name(&spec.name)?;
+        if spec.description.len() > MAX_TOOL_DESCRIPTION_LEN {
+            return Err(ToolError::DescriptionTooLarge {
+                limit: MAX_TOOL_DESCRIPTION_LEN,
+                actual: spec.description.len(),
+            });
+        }
+        if spec.schema_json.len() > MAX_TOOL_SCHEMA_BYTES {
+            return Err(ToolError::SchemaTooLarge {
+                limit: MAX_TOOL_SCHEMA_BYTES,
+                actual: spec.schema_json.len(),
+            });
+        }
         if self.specs.len() >= MAX_TOOLS_PER_SESSION {
             return Err(ToolError::RegistryFull {
                 limit: MAX_TOOLS_PER_SESSION,
@@ -764,6 +797,154 @@ mod tests {
             registry.register(overflow),
             Err(ToolError::RegistryFull { .. })
         ));
+    }
+
+    #[test]
+    fn duplicate_registration_is_fail_closed() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "workspace_read",
+                    "Read a bounded workspace path",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "workspace.read",
+                    true,
+                )
+                .expect("valid spec"),
+            )
+            .expect("capacity");
+        let retry = ToolSpec::new(
+            "workspace_read",
+            "Shadow description with wider scope",
+            br#"{"type":"object"}"#.to_vec(),
+            "workspace.write",
+            false,
+        )
+        .expect("valid spec");
+        let error = registry.register(retry).expect_err("duplicate must fail");
+        assert_eq!(
+            error,
+            ToolError::DuplicateTool {
+                name: "workspace_read".to_owned(),
+            }
+        );
+        // No partial state: no push, no replacement, lookup keeps the first.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.names(), vec!["workspace_read".to_owned()]);
+        let kept = registry.lookup("workspace_read").expect("original kept");
+        assert_eq!(kept.description, "Read a bounded workspace path");
+        assert_eq!(kept.required_scope, "workspace.read");
+        assert!(kept.read_only);
+    }
+
+    #[test]
+    fn duplicate_reports_even_when_registry_is_full() {
+        let mut registry = ToolRegistry::new();
+        for index in 0..MAX_TOOLS_PER_SESSION {
+            registry
+                .register(
+                    ToolSpec::new(
+                        format!("tool_{index}"),
+                        "test tool",
+                        Vec::new(),
+                        "test.scope",
+                        true,
+                    )
+                    .expect("valid spec"),
+                )
+                .expect("capacity");
+        }
+        let retry = ToolSpec::new("tool_0", "test tool", Vec::new(), "test.scope", true)
+            .expect("valid spec");
+        let error = registry.register(retry).expect_err("duplicate must fail");
+        assert_eq!(
+            error,
+            ToolError::DuplicateTool {
+                name: "tool_0".to_owned(),
+            }
+        );
+        assert_eq!(registry.len(), MAX_TOOLS_PER_SESSION);
+    }
+
+    #[test]
+    fn register_revalidates_specs_built_without_new() {
+        let mut registry = ToolRegistry::new();
+        // Legacy dotted vocabulary (`terminal.read_zone`) never enters the
+        // registry, even when the spec bypasses `ToolSpec::new`.
+        let dotted = ToolSpec {
+            name: "terminal.read_zone".to_owned(),
+            description: "legacy dotted name".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+        };
+        assert_eq!(
+            registry
+                .register(dotted)
+                .expect_err("dotted name must fail"),
+            ToolError::InvalidName {
+                name: "terminal.read_zone".to_owned(),
+            }
+        );
+        let oversized = ToolSpec {
+            name: "workspace_read".to_owned(),
+            description: "x".repeat(MAX_TOOL_DESCRIPTION_LEN + 1),
+            schema_json: Vec::new(),
+            required_scope: "workspace.read".to_owned(),
+            read_only: true,
+        };
+        assert!(matches!(
+            registry.register(oversized),
+            Err(ToolError::DescriptionTooLarge { .. })
+        ));
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn legacy_dotted_tool_call_fails_as_invalid_name() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let call = ToolCall {
+            name: "terminal.read_zone".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        assert_eq!(
+            bus.precheck(std::slice::from_ref(&call), &base())
+                .expect_err("dotted name must fail"),
+            ToolError::InvalidName {
+                name: "terminal.read_zone".to_owned(),
+            }
+        );
+        assert_eq!(bus.calls_this_turn(), 0);
+    }
+
+    #[test]
+    fn precheck_over_limit_leaves_no_partial_state() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let burst = vec![call; MAX_TOOL_CALLS_PER_TURN + 1];
+        assert_eq!(
+            bus.precheck(&burst, &base()).expect_err("burst must fail"),
+            ToolError::CallLimitExceeded {
+                limit: MAX_TOOL_CALLS_PER_TURN,
+            }
+        );
+        assert_eq!(bus.calls_this_turn(), 0);
     }
 
     #[test]
