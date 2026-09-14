@@ -674,6 +674,9 @@ mod tests {
         assert!(validate_stable_id("").is_err());
         assert!(validate_stable_id("Term").is_err());
         assert!(validate_stable_id("a b").is_err());
+        // Legacy multi-level path (`inst-1/term-1`, pre-AI-0012 slice) never
+        // validates: a `StableId` is one hierarchy level (`CP-1`).
+        assert!(validate_stable_id("inst-1/term-1").is_err());
         assert!(validate_stable_id("a".repeat(65).as_str()).is_err());
     }
 
