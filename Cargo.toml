@@ -4,6 +4,8 @@ members = [
     # Experimental pressure-test slice (CTX-0407 / AI-0005). Not a shipped
     # component; see crates/bitty-ai-slice/src/lib.rs.
     "crates/bitty-ai-slice",
+    # Deterministic single-agent runtime skeleton (AI-0009). Std only.
+    "crates/bitty-ai-runtime",
     # Future crates:
     # - crates/bitty-ai-model-provider
     # - crates/bitty-ai-context-provider

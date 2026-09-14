@@ -1,0 +1,17 @@
+[package]
+name = "bitty-ai-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Deterministic single-agent runtime skeleton (AI-0009, draft scope)"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No dependencies: std only. No network providers, no TLS, no async runtime.
