@@ -1,20 +1,40 @@
-//! Deterministic end-to-end and fail-closed proof for the vertical slice.
+//! Deterministic end-to-end and fail-closed proof for the harness.
 //!
-//! No network, no secrets, no wall-clock: the host peer is a bounded loopback
-//! implementation and every timestamp is caller-supplied. The loopback peer is
-//! a test double for the Bitty host, not a claim about live data; the product
-//! path fails closed when the real host does not implement a method.
+//! The real `bitty-ai-runtime` (`Agent` / `AgentSession` / `FakeProvider` /
+//! context assembly / `ToolBus` / `VecSink`) is driven through the real
+//! `bitty-ipc` bridge (`IpcBridge` + consent ledger + scoped method
+//! registry). No network, no secrets, no wall-clock: the host peer is a
+//! bounded loopback implementation and every timestamp is caller-supplied.
+//! The loopback peer is a test double for the Bitty host, not a claim about
+//! live data; the product path fails closed when the real host does not
+//! implement a method.
+//!
+//! Vocabulary deltas vs the pre-AI-0012 slice (all forced by runtime
+//! validated shapes; the `bitty-agent` mapping is later P1 work):
+//!
+//! - tool `terminal_read_zone` (was `terminal.read_zone`: runtime `TB-2`
+//!   names reject `.`),
+//! - provider id `local-deterministic` (was `local.deterministic`: runtime
+//!   `MP-2` ids reject `.`),
+//! - record owner `term-1` (was `inst-1/term-1`: a runtime `StableId` is one
+//!   hierarchy level).
 
+use bitty_ai_runtime::{
+    AgentError, AgentLevel, AuthBase, ContextError, ExecOutcome, FakeToolExecutor, Fragment,
+    FragmentKind, IdIssuer, ModelProvider, ProviderTurn, RecordBody, StreamChunk, StreamError,
+    StreamSink, ToolBus, ToolCall, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, VecSink,
+};
 use bitty_ai_slice::{
-    ContextRequest, DeterministicLocalProvider, FragmentKind, HostPeer, HostToolBus, IpcBridge,
-    Message, PanelStreamSink, Role, SemanticZone, SliceError, StreamChunk, StreamSink, ToolBus,
-    ToolDecl, ToolHost, ToolInvocation, VerticalSlice,
+    AllowReadOnly, HARNESS_MODEL, HARNESS_PROVIDER_ID, HARNESS_TOOL, HostPeer, IpcBridge,
+    SliceError, SnapshotRequest, collect_terminal_context, harness_agent, scripted_provider,
+    terminal_record, test_tool_registry,
 };
 use bitty_ipc::channel::{IpcRequest, IpcResponse};
 use bitty_ipc::scope::{Scope, ScopeSet};
 
 const NOW_MS: u64 = 1_000;
 const TTL_MS: u64 = 60_000;
+const ANSWER: &str = "The last command printed `hello` with a zero exit status.";
 
 struct LoopbackHost {
     snapshot: Vec<u8>,
@@ -49,34 +69,12 @@ impl HostPeer for LoopbackHost {
     }
 }
 
-impl ToolHost for LoopbackHost {
-    fn call_tool(
-        &mut self,
-        tool: &str,
-        _arguments: &[u8],
-        _now_ms: u64,
-    ) -> Result<Vec<u8>, SliceError> {
-        if tool == "terminal.read_zone" {
-            Ok(self.snapshot.clone())
-        } else {
-            Err(SliceError::ToolDenied {
-                name: tool.to_owned(),
-            })
-        }
-    }
-}
-
 fn snapshot() -> Vec<u8> {
     b"$ echo hello\nhello\n".to_vec()
 }
 
-fn request(max_bytes: usize) -> ContextRequest {
-    ContextRequest {
-        instance_id: "inst-1".to_owned(),
-        terminal_id: "term-1".to_owned(),
-        zone: SemanticZone::Output,
-        max_bytes,
-    }
+fn request(max_bytes: usize) -> SnapshotRequest {
+    SnapshotRequest::new("inst-1", "term-1", "output", "term-1", max_bytes)
 }
 
 fn bridge(granted: ScopeSet, consent: bool) -> IpcBridge {
@@ -89,60 +87,96 @@ fn bridge(granted: ScopeSet, consent: bool) -> IpcBridge {
     bridge
 }
 
-fn messages() -> Vec<Message> {
-    vec![Message::new(Role::User, "what did my last command print?")]
+fn tool_args() -> Vec<u8> {
+    br#"{"zone":"output"}"#.to_vec()
+}
+
+/// One full deterministic turn: scripted provider round (answer draft + one
+/// tool call), real tool dispatch of the harness tool, then a scripted final
+/// round with the terminal answer and no further tool calls.
+fn run_harness(context_budget_bytes: usize) -> (ExecOutcome, Vec<StreamChunk>, String, usize) {
+    let mut bridge = bridge(ScopeSet::single(Scope::TerminalInspect), true);
+    let mut peer = LoopbackHost::serving(snapshot());
+    let seed = collect_terminal_context(&mut bridge, &mut peer, &request(4096), 1, NOW_MS)
+        .expect("context collected");
+    let mut provider =
+        scripted_provider("Checking the terminal output.", Some(tool_args())).expect("provider");
+    provider.push_turn(ProviderTurn {
+        text: ANSWER.to_owned(),
+        tool_calls: Vec::new(),
+        latency_ms: 0,
+    });
+    let provider_id = provider.provider_id().to_owned();
+    let mut agent = harness_agent(provider, context_budget_bytes).expect("agent");
+    let mut executor = FakeToolExecutor::new();
+    executor.push_success("terminal snapshot", snapshot());
+    let mut sink = VecSink::new();
+    let outcome = agent.run_turn(
+        &mut executor,
+        HARNESS_MODEL,
+        "what did my last command print?",
+        &[seed],
+        &mut sink,
+        NOW_MS,
+    );
+    (
+        outcome,
+        sink.chunks().to_vec(),
+        provider_id,
+        executor.calls().len(),
+    )
 }
 
 #[test]
 fn end_to_end_loop_is_deterministic() {
-    let run = || {
-        let mut slice = VerticalSlice::new(
-            DeterministicLocalProvider::default_slice(),
-            bridge(ScopeSet::single(Scope::TerminalInspect), true),
-            HostToolBus::new(HostToolBus::read_only_registry()).expect("tool bus"),
-            PanelStreamSink::new(),
-        );
-        let mut ipc_host = LoopbackHost::serving(snapshot());
-        let mut tool_host = LoopbackHost::serving(snapshot());
-        slice
-            .run_turn(
-                &mut ipc_host,
-                &mut tool_host,
-                &messages(),
-                &request(4096),
-                NOW_MS,
-            )
-            .expect("turn succeeds")
+    let (first, first_chunks, first_provider, first_calls) = run_harness(32 * 1024);
+    let (second, second_chunks, second_provider, second_calls) = run_harness(32 * 1024);
+    assert_eq!(first, second, "the runtime must be deterministic");
+    assert_eq!(first_chunks, second_chunks, "streamed chunks must match");
+    assert_eq!(first_provider, HARNESS_PROVIDER_ID);
+    assert_eq!(second_provider, HARNESS_PROVIDER_ID);
+    assert_eq!(first_calls, 1, "exactly one tool dispatch per turn");
+    assert_eq!(second_calls, 1, "exactly one tool dispatch per turn");
+
+    let text = match &first {
+        ExecOutcome::Completed { text } => text.clone(),
+        other => panic!("turn must complete, got {other:?}"),
     };
+    assert!(text.contains("hello"), "final answer mentions output");
 
-    let first = run();
-    let second = run();
-    assert_eq!(first, second, "the slice must be deterministic");
-
-    assert_eq!(first.provider_id, "local.deterministic");
-    assert!(first.answer.contains("hello"));
-
-    let context = first.context.as_ref().expect("context collected");
-    assert_eq!(context.provider, "terminal");
-    assert_eq!(context.owner, "inst-1/term-1");
-    assert_eq!(context.generation, 1);
-    assert_eq!(context.collected_at_ms, NOW_MS);
-    assert!(context.is_untrusted_surface);
-    assert_eq!(context.bytes, snapshot());
-
-    let tool = first.tool.as_ref().expect("tool dispatched");
-    assert_eq!(tool.name, "terminal.read_zone");
-    assert!(tool.is_untrusted_surface);
-    assert!(tool.result.len() <= 16 * 1024);
-
-    assert_eq!(first.chunks.len(), 2);
-    assert_eq!(first.chunks[0].fragment.kind, FragmentKind::Markdown);
-    assert_eq!(first.chunks[1].fragment.kind, FragmentKind::ToolCard);
-    for (index, chunk) in first.chunks.iter().enumerate() {
-        assert_eq!(chunk.seq, index as u32);
-        assert_eq!(chunk.total, first.chunks.len() as u32);
-        assert_eq!(chunk.is_final, index + 1 == first.chunks.len());
+    // Seed context record collected through the real bridge.
+    let seed = terminal_record("term-1", 1, NOW_MS, snapshot()).expect("record");
+    assert_eq!(seed.provider, "terminal");
+    assert_eq!(seed.owner.as_str(), "term-1");
+    assert_eq!(seed.generation, 1);
+    assert_eq!(seed.collected_at_ms, NOW_MS);
+    assert!(seed.is_untrusted_surface);
+    match &seed.body {
+        RecordBody::Inline(bytes) => assert_eq!(*bytes, snapshot()),
+        RecordBody::Artifact(_) => panic!("small body stays inline"),
     }
+
+    // Two provider rounds stream three single-fragment batches: draft text,
+    // then the tool card, then final text. Unlike the old slice (which
+    // numbered one global fragment list), the real runtime numbers each
+    // emission batch independently, so every chunk here is seq 0 / total 1.
+    assert_eq!(first_chunks.len(), 3);
+    assert_eq!(first_chunks[0].fragment.kind, FragmentKind::Markdown);
+    assert_eq!(first_chunks[1].fragment.kind, FragmentKind::ToolCard);
+    assert_eq!(first_chunks[2].fragment.kind, FragmentKind::Markdown);
+    for chunk in &first_chunks {
+        bitty_ai_runtime::validate_chunk(chunk).expect("runtime framing valid");
+        assert_eq!((chunk.seq, chunk.total, chunk.is_final), (0, 1, true));
+    }
+    assert_eq!(
+        first_chunks[0].fragment.bytes,
+        b"Checking the terminal output.".to_vec()
+    );
+    let card = String::from_utf8_lossy(&first_chunks[1].fragment.bytes);
+    assert!(card.contains(HARNESS_TOOL), "card names the tool");
+    assert!(card.contains("status=ok"), "card records success");
+    assert_eq!(first_chunks[2].fragment.bytes, ANSWER.as_bytes());
+    assert!(first_chunks[1].fragment.bytes.len() <= 16 * 1024);
 }
 
 #[test]
@@ -187,22 +221,9 @@ fn missing_scope_fails_closed() {
 
 #[test]
 fn host_without_snapshot_handler_fails_closed() {
-    let mut slice = VerticalSlice::new(
-        DeterministicLocalProvider::default_slice(),
-        bridge(ScopeSet::single(Scope::TerminalInspect), true),
-        HostToolBus::new(HostToolBus::read_only_registry()).expect("tool bus"),
-        PanelStreamSink::new(),
-    );
-    let mut ipc_host = LoopbackHost::delegated();
-    let mut tool_host = LoopbackHost::serving(snapshot());
-    let error = slice
-        .run_turn(
-            &mut ipc_host,
-            &mut tool_host,
-            &messages(),
-            &request(4096),
-            NOW_MS,
-        )
+    let mut bridge = bridge(ScopeSet::single(Scope::TerminalInspect), true);
+    let mut host = LoopbackHost::delegated();
+    let error = collect_terminal_context(&mut bridge, &mut host, &request(4096), 1, NOW_MS)
         .expect_err("missing host handler must fail closed");
     assert!(
         matches!(error, SliceError::ContextUnavailable { .. }),
@@ -210,24 +231,29 @@ fn host_without_snapshot_handler_fails_closed() {
     );
 }
 
+fn auth_base() -> AuthBase {
+    let mut ids = IdIssuer::default();
+    AuthBase {
+        agent_id: ids.agent(),
+        session_id: ids.session(),
+        level: AgentLevel::Inspect,
+    }
+}
+
 #[test]
 fn unknown_tool_fails_closed_before_dispatch() {
-    let mut bus = HostToolBus::new(HostToolBus::read_only_registry()).expect("tool bus");
-    let mut host = LoopbackHost::serving(snapshot());
+    let bus = ToolBus::new(test_tool_registry().expect("registry")).with_authorizer(AllowReadOnly);
+    let call = ToolCall {
+        name: "terminal_destroy".to_owned(),
+        arguments: br#"{}"#.to_vec(),
+    };
     let error = bus
-        .dispatch(
-            &mut host,
-            &ToolInvocation {
-                name: "terminal.destroy".to_owned(),
-                arguments: "{}".to_owned(),
-            },
-            NOW_MS,
-        )
+        .precheck(std::slice::from_ref(&call), &auth_base())
         .expect_err("unknown tool must fail closed");
     assert_eq!(
         error,
-        SliceError::ToolNotRegistered {
-            name: "terminal.destroy".to_owned(),
+        ToolError::UnknownTool {
+            name: "terminal_destroy".to_owned(),
         }
     );
     assert_eq!(bus.calls_this_turn(), 0);
@@ -235,121 +261,139 @@ fn unknown_tool_fails_closed_before_dispatch() {
 
 #[test]
 fn write_tool_is_denied_by_default() {
-    let mut bus = HostToolBus::new(vec![ToolDecl::new("workspace.write", "write files", false)])
-        .expect("tool bus");
-    let mut host = LoopbackHost::serving(snapshot());
-    let error = bus
-        .dispatch(
-            &mut host,
-            &ToolInvocation {
-                name: "workspace.write".to_owned(),
-                arguments: "{}".to_owned(),
-            },
-            NOW_MS,
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(
+            ToolSpec::new(
+                "workspace_write",
+                "write files",
+                br#"{"type":"object"}"#.to_vec(),
+                "workspace.write",
+                false,
+            )
+            .expect("spec"),
         )
+        .expect("capacity");
+    let bus = ToolBus::new(registry).with_authorizer(AllowReadOnly);
+    let call = ToolCall {
+        name: "workspace_write".to_owned(),
+        arguments: br#"{}"#.to_vec(),
+    };
+    let error = bus
+        .precheck(std::slice::from_ref(&call), &auth_base())
         .expect_err("write tool must be denied by default");
-    assert_eq!(
-        error,
-        SliceError::ToolDenied {
-            name: "workspace.write".to_owned(),
-        }
-    );
+    assert!(matches!(error, ToolError::Denied { .. }), "got {error:?}");
 }
 
 #[test]
 fn tool_call_limit_is_enforced() {
-    let mut bus = HostToolBus::new(HostToolBus::read_only_registry()).expect("tool bus");
-    let mut host = LoopbackHost::serving(snapshot());
-    let call = ToolInvocation {
-        name: "terminal.read_zone".to_owned(),
-        arguments: "{}".to_owned(),
+    let mut bus =
+        ToolBus::new(test_tool_registry().expect("registry")).with_authorizer(AllowReadOnly);
+    let mut executor = FakeToolExecutor::new();
+    for _ in 0..8 {
+        executor.push_success("ok", b"data".to_vec());
+    }
+    let mut ids = IdIssuer::default();
+    let base = auth_base();
+    let call = ToolCall {
+        name: HARNESS_TOOL.to_owned(),
+        arguments: br#"{}"#.to_vec(),
     };
     for _ in 0..8 {
-        bus.dispatch(&mut host, &call, NOW_MS)
+        bus.dispatch(&mut executor, &call, &base, ids.execution(), NOW_MS)
             .expect("within limit");
     }
     let error = bus
-        .dispatch(&mut host, &call, NOW_MS)
+        .dispatch(&mut executor, &call, &base, ids.execution(), NOW_MS)
         .expect_err("ninth call must fail");
-    assert_eq!(error, SliceError::ToolCallLimitExceeded { limit: 8 });
+    assert_eq!(error, ToolError::CallLimitExceeded { limit: 8 });
 }
 
 #[test]
 fn oversized_stream_chunk_fails_closed() {
-    // Exercises the slice-local `MAX_FRAGMENT_BYTES` (64 KiB) gate, not
-    // RC-10's larger 256 KiB `CHUNK_CEILING`: 70 KiB passes `validate_chunk`
-    // and is rejected by the slice-local fragment bound.
-    // `chunk_over_rc10_ceiling_fails_closed` below covers the RC-10 gate.
-    let mut sink = PanelStreamSink::new();
+    // Exercises the runtime `MAX_FRAGMENT_BYTES` (64 KiB) gate: 70 KiB is
+    // rejected before reaching the sink.
+    let mut sink = VecSink::new();
     let bytes = vec![b'x'; 70 * 1024];
     let error = sink
         .emit(StreamChunk {
             seq: 0,
             total: 1,
             is_final: true,
-            fragment: bitty_ai_slice::Fragment {
-                kind: FragmentKind::Markdown,
-                bytes,
-            },
+            fragment: Fragment::markdown(bytes),
         })
         .expect_err("oversized fragment must fail closed");
     assert!(
-        matches!(error, SliceError::StreamViolation { .. }),
+        matches!(error, StreamError::OversizedFragment { .. }),
         "got {error:?}"
     );
-    assert!(sink.chunks().is_empty());
+    assert!(sink.is_empty());
 }
 
 #[test]
 fn chunk_over_rc10_ceiling_fails_closed() {
-    let mut sink = PanelStreamSink::new();
+    // The runtime is std-only, so the RC-10 ceiling is mirrored as
+    // `MAX_STREAM_CHUNK_BYTES` and checked after the tighter
+    // `MAX_FRAGMENT_BYTES` bound: a chunk over the 256 KiB ceiling surfaces
+    // as `OversizedFragment`, not as a `bitty-ipc` wire error. The wire gate
+    // itself stays covered by the bridge path (`validate_chunk` on send).
+    let mut sink = VecSink::new();
     let bytes = vec![b'x'; bitty_ipc::wire::CHUNK_CEILING + 1];
+    let actual = bytes.len();
     let error = sink
         .emit(StreamChunk {
             seq: 0,
             total: 1,
             is_final: true,
-            fragment: bitty_ai_slice::Fragment {
-                kind: FragmentKind::Markdown,
-                bytes: bytes.clone(),
-            },
+            fragment: Fragment::markdown(bytes),
         })
         .expect_err("a chunk over the RC-10 ceiling must fail closed");
     assert_eq!(
         error,
-        SliceError::Ipc(bitty_ipc::error::IpcError::PayloadTooLarge {
-            field: "chunk.bytes".to_owned(),
-            limit: bitty_ipc::wire::CHUNK_CEILING,
-            actual: bytes.len(),
-        })
+        StreamError::OversizedFragment {
+            limit: 64 * 1024,
+            actual,
+        }
     );
-    assert!(sink.chunks().is_empty());
+    assert!(sink.is_empty());
 }
 
 #[test]
 fn context_budget_exceeded_fails_closed() {
-    let mut slice = VerticalSlice::new(
-        DeterministicLocalProvider::default_slice(),
-        bridge(ScopeSet::single(Scope::TerminalInspect), true),
-        HostToolBus::new(HostToolBus::read_only_registry()).expect("tool bus"),
-        PanelStreamSink::new(),
+    let mut provider = scripted_provider(ANSWER, Some(tool_args())).expect("provider");
+    provider.push_turn(ProviderTurn {
+        text: ANSWER.to_owned(),
+        tool_calls: vec![ToolCallRequest {
+            name: HARNESS_TOOL.to_owned(),
+            arguments: tool_args(),
+        }],
+        latency_ms: 0,
+    });
+    let mut agent = harness_agent(provider, 4).expect("agent");
+    let seed = terminal_record("term-1", 1, NOW_MS, snapshot()).expect("record");
+    let mut executor = FakeToolExecutor::new();
+    let mut sink = VecSink::new();
+    let outcome = agent.run_turn(
+        &mut executor,
+        HARNESS_MODEL,
+        "what did my last command print?",
+        &[seed],
+        &mut sink,
+        NOW_MS,
     );
-    let mut ipc_host = LoopbackHost::serving(snapshot());
-    let mut tool_host = LoopbackHost::serving(snapshot());
-    let error = slice
-        .run_turn(
-            &mut ipc_host,
-            &mut tool_host,
-            &messages(),
-            &request(4),
-            NOW_MS,
-        )
-        .expect_err("over-budget context must fail closed");
-    assert_eq!(
-        error,
-        SliceError::ContextBudgetExceeded {
-            limit: 4,
-            actual: snapshot().len(),
-        }
-    );
+    match outcome {
+        ExecOutcome::Failed { error } => assert!(
+            matches!(
+                error,
+                AgentError::Context(ContextError::BudgetExceeded { limit: 4, .. })
+            ),
+            "got {error:?}"
+        ),
+        other => panic!("over-budget context must fail closed, got {other:?}"),
+    }
+    // Budget fails before provider I/O: the script is unconsumed.
+    assert_eq!(agent.provider_mut().scripted_turns_remaining(), 2);
+    // The denied-by-status tool path stays typed: no dispatch happened.
+    assert!(agent.executions().is_empty());
+    assert!(sink.is_empty());
 }

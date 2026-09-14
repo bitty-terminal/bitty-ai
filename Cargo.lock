@@ -10,6 +10,7 @@ version = "0.0.1"
 name = "bitty-ai-slice"
 version = "0.0.1"
 dependencies = [
+ "bitty-ai-runtime",
  "bitty-ipc",
 ]
 
