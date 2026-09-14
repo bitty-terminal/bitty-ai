@@ -26,7 +26,6 @@ The AI subsystem is organized into four core components:
 
 ```text
 crates/
-  bitty-ai-core/               # Placeholder shared kernel (under review)
   bitty-ai-slice/              # Experimental pressure test, not shipped
 ```
 
