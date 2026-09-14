@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "crates/bitty-ai-core",
+    # Experimental pressure-test slice (CTX-0407 / AI-0005). Not a shipped
+    # component; see crates/bitty-ai-slice/src/lib.rs.
+    "crates/bitty-ai-slice",
     # Future crates:
     # - crates/bitty-ai-model-provider
     # - crates/bitty-ai-context-provider
