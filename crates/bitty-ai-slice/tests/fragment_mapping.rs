@@ -21,11 +21,17 @@
 //!   `is_final` closes each emission batch. The runtime bound is
 //!   `MAX_FRAGMENT_BYTES` (64 KiB); the transport bound is
 //!   `MAX_FRAGMENT_TEXT_BYTES` (16 KiB).
-//! - Mapping under test is test-only: validated runtime bytes that are valid
-//!   UTF-8 become `FragmentData{text,zone}` with the caller-supplied
+//! - Mapping under test: validated runtime bytes that are valid UTF-8 become
+//!   `FragmentData{text,zone}` with the caller-supplied
 //!   `(terminal_id,generation,seq)` key and a reused snapshot `ZoneKind`
 //!   (`None` leaves zoning to projection). `FragmentIngestService::ingest` is
 //!   the end-to-end proof that the real service accepts our fragments.
+//!   Since AI-0066 the pre-split rule lives in production slice code
+//!   (`bitty_ai_slice::fragment_transport`): a fragment larger than the 16 KiB
+//!   transport ceiling is cut at code-point boundaries into parts with a
+//!   continuation marker and dense `seq`, so a full 64 KiB block reassembles
+//!   byte-identically instead of truncating. The counterfactual direct
+//!   projection (no pre-split) still loses bytes and is asserted as such.
 //! - Headless mapping proof only: no socket, process, PTY, network, wall
 //!   clock, secret, or render/projection step. Drained `RichFragment`s are
 //!   asserted as DTOs; no test claims pixels, `RichBlock`s, or live display.
@@ -40,6 +46,9 @@
 use bitty_ai_runtime::{
     Fragment, FragmentKind, StreamChunk, StreamSink, VecSink, emit_fragments, fragment_text,
     validate_chunk,
+};
+use bitty_ai_slice::fragment_transport::{
+    FragmentTransportCursor, FragmentTransportError, pre_split_chunk, reassemble,
 };
 use bitty_ipc::error::IpcError;
 use bitty_ipc::rich_fragment::{
@@ -208,11 +217,11 @@ fn over_budget_text_truncates_at_char_boundary_with_flag() {
 
 #[test]
 fn runtime_64kib_fragment_does_not_fit_verbatim() {
-    // Bound mismatch input for the `bitty` track: a full-size runtime
-    // fragment (64 KiB) truncates to the 16 KiB transport ceiling with
-    // `truncated = true`. Verbatim carriage requires re-splitting runtime
-    // output to the transport ceiling before ingest; truncation alone loses
-    // bytes by construction.
+    // Bound mismatch input: a full-size runtime fragment (64 KiB) truncates to
+    // the 16 KiB transport ceiling with `truncated = true` when projected
+    // verbatim. AI-0066 removes the loss with the `fragment_transport`
+    // pre-split rule (proven below); this test keeps the unsplit counterfactual
+    // so the byte loss stays visible.
     let bytes = vec![b'x'; bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES];
     assert!(bytes.len() > MAX_FRAGMENT_TEXT_BYTES);
     let chunk = chunk(0, 1, Fragment::markdown(bytes));
@@ -480,4 +489,172 @@ fn ingest_takes_no_consent_or_scope_proof_by_construction() {
         .ingest(data)
         .expect("headless ingest needs no consent");
     assert!(stored.is_untrusted_surface);
+}
+
+// ── AI-0066 pre-split: no byte loss across the 16 KiB ceiling ────────────────
+
+/// A multi-byte block just under the 64 KiB runtime fragment bound: 21845
+/// three-byte code points = 65535 bytes. The 16 KiB cut falls mid-code-point
+/// (16384 is not a multiple of 3), so a byte-wise split would corrupt UTF-8;
+/// the pre-split rule must back off to a code-point boundary.
+fn euro_block() -> String {
+    "€".repeat(21845)
+}
+
+#[test]
+fn pre_split_64kib_multibyte_reassembles_byte_identical() {
+    let text = euro_block();
+    let bytes = text.as_bytes();
+    assert!(bytes.len() <= bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES);
+    assert!(bytes.len() > MAX_FRAGMENT_TEXT_BYTES);
+    let chunk = chunk(0, 1, Fragment::markdown(bytes.to_vec()));
+    validate_chunk(&chunk).expect("the runtime accepts a full 64 KiB-scale fragment");
+
+    let mut cursor = FragmentTransportCursor::new(TERMINAL_ID, GENERATION, 0);
+    let parts = cursor
+        .map_chunk(&chunk, Some(ZoneKind::Output))
+        .expect("pre-split maps UTF-8 without loss");
+    assert!(parts.len() > 1, "a 64 KiB fragment must split");
+    assert_eq!(
+        cursor.next_seq(),
+        parts.len() as u64,
+        "the cursor advances by the part count"
+    );
+
+    let mut offset = 0_usize;
+    for (index, part) in parts.iter().enumerate() {
+        assert!(
+            part.data.text.len() <= MAX_FRAGMENT_TEXT_BYTES,
+            "every part fits the 16 KiB transport ceiling"
+        );
+        offset += part.data.text.len();
+        assert!(
+            text.is_char_boundary(offset),
+            "part {index} must not split a code point"
+        );
+        assert_eq!(part.part_index, index as u32);
+        assert_eq!(part.part_count, parts.len() as u32);
+        assert_eq!(part.is_continuation, index > 0);
+        assert_eq!(part.data.seq, index as u64);
+        assert_eq!(part.source_seq, 0);
+    }
+    assert_eq!(offset, text.len(), "the parts cover every source byte");
+
+    // The real ingest service accepts every part without truncating, and the
+    // ordered concatenation is byte-identical to the source.
+    let mut service = FragmentIngestService::new();
+    let mut stored_texts = Vec::new();
+    for part in &parts {
+        let stored = service
+            .ingest(part.data.clone())
+            .expect("a pre-split part ingests");
+        assert!(!stored.truncated, "a pre-split part must never truncate");
+        stored.validate().expect("stored DTO validates");
+        stored_texts.push(stored.text);
+    }
+    assert_eq!(stored_texts.concat(), text);
+    let reassembled = reassemble(&parts).expect("well-formed parts reassemble");
+    assert_eq!(reassembled, text);
+    assert_eq!(reassembled.as_bytes(), bytes);
+}
+
+#[test]
+fn direct_projection_of_a_full_fragment_loses_bytes() {
+    // Counterfactual: with no pre-split, the same 64 KiB multi-byte block
+    // truncates at the 16 KiB ceiling and every trailing byte is lost. This is
+    // the byte loss `pre_split_64kib_multibyte_reassembles_byte_identical`
+    // removes.
+    let text = euro_block();
+    let chunk = chunk(0, 1, Fragment::markdown(text.as_bytes().to_vec()));
+    let data = map_chunk_to_fragment_data(&chunk, TERMINAL_ID, GENERATION, Some(ZoneKind::Output))
+        .expect("maps; the service bounds it");
+    let mut service = FragmentIngestService::new();
+    let stored = service.ingest(data).expect("over-budget text truncates");
+    assert!(stored.truncated);
+    assert!(stored.text.len() <= MAX_FRAGMENT_TEXT_BYTES);
+    assert!(stored.text.len() < text.len());
+    assert!(text.starts_with(&stored.text));
+    assert_ne!(stored.text, text, "direct projection loses trailing bytes");
+}
+
+#[test]
+fn cursor_assigns_dense_seq_across_a_turn() {
+    // A split fragment followed by another fragment must not collide under the
+    // transport dedup key: the cursor advances by the part count, and a new
+    // source fragment is not a continuation.
+    let text = euro_block();
+    let fragments = vec![
+        Fragment::markdown(text.as_bytes().to_vec()),
+        Fragment::markdown(b"tail".to_vec()),
+    ];
+    let mut sink = VecSink::new();
+    let done = emit_fragments(&mut sink, &fragments, 0, &|| false).expect("turn emits cleanly");
+    assert!(done.is_some());
+    assert_eq!(sink.len(), 2);
+
+    let mut cursor = FragmentTransportCursor::new(TERMINAL_ID, GENERATION, 0);
+    let first = cursor
+        .map_chunk(&sink.chunks()[0], Some(ZoneKind::Output))
+        .expect("first chunk maps");
+    let second = cursor
+        .map_chunk(&sink.chunks()[1], Some(ZoneKind::Output))
+        .expect("second chunk maps");
+    assert!(first.len() > 1);
+    let seqs: Vec<u64> = first
+        .iter()
+        .chain(second.iter())
+        .map(|part| part.data.seq)
+        .collect();
+    let expected: Vec<u64> = (0..seqs.len() as u64).collect();
+    assert_eq!(seqs, expected, "transport seq stays dense across the turn");
+    assert!(
+        !second[0].is_continuation,
+        "a new source fragment starts fresh"
+    );
+    assert_eq!(second[0].part_count, 1);
+
+    let mut service = FragmentIngestService::new();
+    for part in first.iter().chain(second.iter()) {
+        service
+            .ingest(part.data.clone())
+            .expect("dense keys avoid the duplicate-key refusal");
+    }
+    assert_eq!(service.len(), seqs.len());
+}
+
+#[test]
+fn reassembly_rejects_misordered_parts() {
+    let chunk = markdown_chunk(0, 1, &"é".repeat(20 * 1024));
+    let parts = pre_split_chunk(&chunk, TERMINAL_ID, GENERATION, None, 0).expect("split");
+    assert!(parts.len() > 1);
+    let mut swapped = parts.clone();
+    swapped.swap(0, 1);
+    assert!(matches!(
+        reassemble(&swapped),
+        Err(FragmentTransportError::PartOrder { .. })
+    ));
+}
+
+#[test]
+fn pre_split_does_not_bypass_the_runtime_fragment_bound() {
+    // The pre-split runs after `validate_chunk`: an over-64 KiB runtime
+    // fragment is rejected, never silently accepted as many small parts.
+    let oversized = chunk(
+        0,
+        1,
+        Fragment::markdown(vec![b'x'; bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES + 1]),
+    );
+    assert!(matches!(
+        pre_split_chunk(&oversized, TERMINAL_ID, GENERATION, None, 0),
+        Err(FragmentTransportError::Runtime(_))
+    ));
+}
+
+#[test]
+fn pre_split_fails_closed_on_non_utf8() {
+    let chunk = chunk(0, 1, Fragment::markdown(vec![0xff, 0xfe, b'a']));
+    assert!(matches!(
+        pre_split_chunk(&chunk, TERMINAL_ID, GENERATION, None, 0),
+        Err(FragmentTransportError::NonUtf8)
+    ));
 }
