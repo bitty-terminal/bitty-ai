@@ -32,7 +32,12 @@ a new Core API.
 
 The harness is deterministic: every operation takes a caller-supplied
 `now_ms`, there is no wall-clock, thread, async runtime, network, or secret,
-and the model provider is the runtime's scripted `FakeProvider`.
+and the model provider is the runtime's scripted `FakeProvider` — except the
+`journal_prototype` experiment (AI-0049), which persists an append-ordered
+single-writer journal through SQLite in a caller-supplied database file. That
+module is a prototype for the draft R6 persistence profile
+(`docs/specifications/persistence-profile-r6.md`); it is evidence only and
+decides no open register entry.
 
 ## Modules
 
@@ -43,6 +48,7 @@ fake_host  Deterministic FakeHost double mirroring bitty dispatch, consent, and 
 harness    Fixtures adapting real IPC snapshots to real runtime inputs with scripted provider
 live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via an injectable seam (BII-09)
 local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, and bounded fail-closed JSON
+journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite journal with deletion tombstones, bounded fields, and fail-closed corruption handling (no FTS5, no scheduler, caller-supplied timestamps)
 ```
 
 ## Dependencies
@@ -50,6 +56,11 @@ local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a
 - `bitty-ai-runtime` via local path.
 - `bitty-ipc` via pinned Git revision (`2cbb1fbed82814c157359b71dd8efbb4be0c36e7`
   in `Cargo.toml`).
+- `rusqlite` `=0.40.2`, `default-features = false`, `features = ["bundled"]`,
+  for the `journal_prototype` experiment only. The dependency review (AI-0049
+  PX-0298) covers supply-chain breadth, MIT licensing, Rust 1.85 fit, and
+  ambient authority; `bundled` compiles vendored SQLite 3.53.2 and requires a
+  C toolchain. `bitty-ai-runtime` stays std-only and untouched.
 
 ## FakeHost and the live host
 
@@ -62,11 +73,13 @@ keep calling the same trait methods.
 
 Live wiring is explicitly out of scope here: this crate contains no code that
 connects to a real terminal, process, PTY, socket, or network peer (no
-`std::net`, `std::process`, `std::fs`, async runtime, or IPC transport).
-`LiveBittyHost` carries only an injectable provider seam (`fn` pointers),
-server-evaluated scopes, and the real consent ledger; tests use canned
-providers as mapping proof and claim no live data. Every operation takes
-caller-supplied `now_ms`, and there are no secret or credential fields —
+`std::net`, `std::process`, async runtime, or IPC transport). Filesystem
+access appears only in the `journal_prototype` experiment (the caller-supplied
+database path and SQLite's own sidecar files in that directory) and its test
+scratch directories. `LiveBittyHost` carries only an injectable provider seam
+(`fn` pointers), server-evaluated scopes, and the real consent ledger; tests
+use canned providers as mapping proof and claim no live data. Every operation
+takes caller-supplied `now_ms`, and there are no secret or credential fields —
 except the `local_provider` experiment, which opens loopback-only TCP with
 mandatory timeouts and a caller-supplied, redacted key.
 
@@ -96,3 +109,9 @@ cargo test -p bitty-ai-slice
   reconcile semantics against the real `bitty-ipc` shapes.
 - `src/live_host.rs` inline tests (4 tests): live delegation for snapshot,
   tool dispatch, `Unknown` reconcile, and missing-handler fail-closed.
+- `src/journal_prototype.rs` inline tests (8 tests): append/read-back order
+  across reopen, tombstone visibility without history rewrite, tombstone
+  idempotency and unknown-id no-op, duplicate-id rejection, bounded-field
+  fail-closed, garbage-file corruption fail-closed (file untouched),
+  incompatible-schema fail-closed (rows preserved), and single-writer
+  rejection until the first writer closes.
