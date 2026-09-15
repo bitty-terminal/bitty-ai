@@ -15,4 +15,4 @@ workspace = true
 
 [dependencies]
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "eef983ec5d72ca9ad6c3bc2c62d1ba3c9bc85360" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "64e17095ee2f54b3482807cd133fadb9af949925" }

@@ -12,8 +12,12 @@
 //! ## Read-only mirror of merged `bitty` shapes
 //!
 //! No file in the `bitty` repository is modified by this task. Shapes below
-//! mirror `bitty` `main` at `eef983e` (the inspection point in
-//! `bitty-side-delivery-verification.md`), read-only:
+//! mirror `bitty` `main` at `64e1709` (the inspection point in
+//! `bitty-side-delivery-verification.md`), read-only. The `eef983e..64e1709`
+//! window adds the `[tools.*]` fail-closed enforcement (#716) and the bounded
+//! consent-gated `process.spawn` surface (#717) in `bitty-runtime` /
+//! `bitty-plugin-host` only; `crates/bitty-ipc` is byte-identical across the
+//! window, so the mirror needs no shape change beyond this pin reference:
 //!
 //! - Dispatch prefix + per-tool consent: `crates/bitty-ipc/src/tool_dispatch.rs`
 //!   `ToolSpec` (`L197`), `ToolRequest` (`L271`, `validate` `L316`),
