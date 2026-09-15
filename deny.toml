@@ -6,10 +6,7 @@ no-default-features = false
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = [
-  "RUSTSEC-2026-0192",
-  "RUSTSEC-2024-0436",
-]
+ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436"]
 
 [bans]
 multiple-versions = "warn"
