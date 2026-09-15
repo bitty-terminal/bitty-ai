@@ -137,6 +137,24 @@ pub enum ContextError {
         /// Smallest record footprint in bytes.
         actual: usize,
     },
+    /// Two records share one turn-scoped id. Omission and pruning reports
+    /// key on id, so a collision would make them unattributable (AI-0061).
+    DuplicateRecordId {
+        /// Colliding id.
+        id: String,
+    },
+    /// Record generation differs from the request generation. Only
+    /// current-generation records assemble: rotation invalidates
+    /// prior-generation context (`AG-2`), and future generations indicate
+    /// crossed sessions or forged input (AI-0061).
+    StaleGeneration {
+        /// Offending record id.
+        id: String,
+        /// Generation carried by the record.
+        actual: u64,
+        /// Generation required by the request.
+        current: u64,
+    },
 }
 
 impl Display for ContextError {
@@ -167,6 +185,15 @@ impl Display for ContextError {
             Self::BudgetExceeded { limit, actual } => write!(
                 f,
                 "context budget exceeded: smallest record {actual} bytes over {limit} byte budget"
+            ),
+            Self::DuplicateRecordId { id } => write!(f, "duplicate context record id: {id}"),
+            Self::StaleGeneration {
+                id,
+                actual,
+                current,
+            } => write!(
+                f,
+                "context record {id} generation {actual} does not match request generation {current}"
             ),
         }
     }
@@ -231,7 +258,13 @@ pub enum ContextPriority {
     Critical,
 }
 
-/// Requested detail depth (`CP-5`).
+/// Requested detail depth (`CP-5` vocabulary, reserved).
+///
+/// No assembly reader exists yet: [`assemble`] always carries bounded inline
+/// bodies plus summaries and externalizes only by byte size, never by this
+/// level. Retained (rather than removed with the former request fields,
+/// AI-0061) as the spec-reserved signal for the planned retrieval/ranking
+/// level, which is explicitly out of scope here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailLevel {
     /// Summaries and references only.
@@ -249,11 +282,11 @@ pub struct ContextRequest {
     pub max_tokens: Option<u32>,
     /// Byte ceiling; defaults to the candidate 32 KiB profile.
     pub max_bytes: Option<u64>,
-    /// Caller priority hint (kept for the host contract; assembly truncates
-    /// per-record priority, not this field).
-    pub priority: ContextPriority,
-    /// Requested detail depth.
-    pub detail: DetailLevel,
+    /// Generation the caller is assembling for. Only records carrying this
+    /// generation assemble; expired or future generations fail closed
+    /// ([`ContextError::StaleGeneration`]) so rotated-out context never
+    /// leaks into a new turn (`AG-2`).
+    pub current_generation: u64,
 }
 
 impl ContextRequest {
@@ -570,8 +603,11 @@ pub struct AssembledContext {
 /// Assemble `records` under `request` (L0 + L1, deterministic).
 ///
 /// Policy, in order: validate all records (fail closed, no partial output);
-/// drop records superseded by trusted host-policy links (untrusted-surface
-/// `supersedes` links are ignored as inert data); collapse full-content
+/// reject duplicate turn-scoped ids (fail closed, reports key on id);
+/// reject records outside the request generation (fail closed, rotation
+/// invalidates prior generations); drop records superseded by trusted
+/// host-policy links (untrusted-surface `supersedes` links are ignored as
+/// inert data); collapse full-content
 /// `(provider, owner, summary, canonical body)` duplicates with a
 /// deny-by-default survivor rule (untrusted duplicates never displace a
 /// trusted original); externalize inline bodies over
@@ -593,7 +629,8 @@ pub struct AssembledContext {
 /// # Errors
 ///
 /// Returns [`ContextError`] for invalid records, record-count overflow,
-/// artifact failures, or when even the smallest record exceeds the budget.
+/// duplicate record ids, stale (or future) record generations, artifact
+/// failures, or when even the smallest record exceeds the budget.
 /// The store is unchanged on error.
 pub fn assemble(
     records: &[ContextRecord],
@@ -607,6 +644,32 @@ pub fn assemble(
     }
     for record in records {
         record.validate()?;
+    }
+    // AI-0061: turn-scoped ids must be unique. Omission and pruning reports
+    // key on id, so a collision would make them unattributable. Fail closed
+    // rather than admitting ambiguous records.
+    {
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(records.len());
+        for record in records {
+            if !seen.insert(record.id.as_str()) {
+                return Err(ContextError::DuplicateRecordId {
+                    id: record.id.clone(),
+                });
+            }
+        }
+    }
+    // AI-0061: only the request generation assembles. Expired records (or
+    // future/forged ones from crossed sessions) never reach the model:
+    // rotation invalidates prior-generation context (AG-2). Fail closed.
+    for record in records {
+        if record.generation != request.current_generation {
+            return Err(ContextError::StaleGeneration {
+                id: record.id.clone(),
+                actual: record.generation,
+                current: request.current_generation,
+            });
+        }
     }
 
     let mut pruned_ids: Vec<String> = Vec::new();
@@ -838,8 +901,7 @@ mod tests {
         ContextRequest {
             max_tokens: None,
             max_bytes: Some(bytes as u64),
-            priority: ContextPriority::Normal,
-            detail: DetailLevel::Standard,
+            current_generation: 1,
         }
     }
 
@@ -868,8 +930,7 @@ mod tests {
         let request = ContextRequest {
             max_tokens: Some(100),
             max_bytes: Some(1_000_000),
-            priority: ContextPriority::Normal,
-            detail: DetailLevel::Standard,
+            current_generation: 1,
         };
         assert_eq!(request.effective_budget_bytes(), 400);
         assert_eq!(ContextRequest::estimate_tokens(9), 3);
@@ -1321,5 +1382,83 @@ mod tests {
         assert_eq!(budgeted.len(), budgeted_len);
         assert_eq!(budgeted.total_bytes(), budgeted_bytes);
         assert_eq!(budgeted.next_id(), budgeted_next);
+    }
+
+    #[test]
+    fn duplicate_record_ids_fail_closed() {
+        // Same turn-scoped id on two otherwise-admissible records (distinct
+        // bodies, so dedupe would admit both) must fail: omission and
+        // pruning reports key on id and a collision would make them
+        // unattributable. The store stays untouched.
+        let first = record("dup", "workspace", "outline of foo", 10);
+        let mut second = record("dup", "terminal", "zone dump", 12);
+        second.is_untrusted_surface = true;
+        let mut store = ArtifactStore::new();
+        let err = assemble(&[first, second], &mut store, &budget(8_192))
+            .expect_err("duplicate ids must fail");
+        assert!(
+            matches!(err, ContextError::DuplicateRecordId { ref id } if id == "dup"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+        assert_eq!(store.next_id(), 0);
+    }
+
+    #[test]
+    fn stale_and_future_generations_fail_closed() {
+        // Only the request generation assembles. An expired record (older
+        // than the request) and a future one (crossed session or forged
+        // input) both fail rather than leaking rotated-out context into a
+        // new turn. The store stays untouched either way.
+        let mut expired = record("old", "workspace", "outline of foo", 10);
+        expired.generation = 0;
+        let mut future = record("new", "workspace", "outline of foo", 10);
+        future.generation = 2;
+        let request = ContextRequest {
+            max_tokens: None,
+            max_bytes: Some(8_192),
+            current_generation: 1,
+        };
+        let mut store = ArtifactStore::new();
+        let err =
+            assemble(&[expired], &mut store, &request).expect_err("expired generation must fail");
+        assert!(
+            matches!(
+                err,
+                ContextError::StaleGeneration {
+                    ref id,
+                    actual: 0,
+                    current: 1
+                } if id == "old"
+            ),
+            "unexpected error: {err:?}"
+        );
+        let err =
+            assemble(&[future], &mut store, &request).expect_err("future generation must fail");
+        assert!(
+            matches!(
+                err,
+                ContextError::StaleGeneration {
+                    ref id,
+                    actual: 2,
+                    current: 1
+                } if id == "new"
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.total_bytes(), 0);
+        assert_eq!(store.next_id(), 0);
+    }
+
+    #[test]
+    fn current_generation_assembles() {
+        // Records carrying exactly the request generation still assemble:
+        // the new gate rejects skew, not fresh input.
+        let fresh = record("fresh", "workspace", "outline of foo", 10);
+        let mut store = ArtifactStore::new();
+        let assembled = assemble(&[fresh], &mut store, &budget(8_192)).expect("fresh assembles");
+        assert_eq!(assembled.context_refs, vec!["fresh".to_owned()]);
     }
 }

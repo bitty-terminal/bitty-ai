@@ -434,8 +434,7 @@ impl<P: ModelProvider> Agent<P> {
         let request = ContextRequest {
             max_tokens: None,
             max_bytes: Some(self.config.context_budget_bytes as u64),
-            priority: crate::context::ContextPriority::Normal,
-            detail: crate::context::DetailLevel::Standard,
+            current_generation: self.session.generation(),
         };
         let assembled = match assemble(seed_records, &mut self.artifacts, &request) {
             Ok(assembled) => assembled,

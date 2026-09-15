@@ -6,10 +6,10 @@
 
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AgentLevel, AuthContext, AuthDecision, ContextError,
-    ContextPriority, ContextRecord, DetailLevel, ElevationGrant, ExecOutcome, FakeProvider,
-    FakeToolExecutor, FragmentKind, ModelProvider, ProviderError, ProviderTurn, ProviderUsage,
-    RecordBody, SessionState, StableId, StreamSink, ToolAuthorizer, ToolBus, ToolCallRequest,
-    ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, VecSink,
+    ContextPriority, ContextRecord, ElevationGrant, ExecOutcome, FakeProvider, FakeToolExecutor,
+    FragmentKind, ModelProvider, ProviderError, ProviderTurn, ProviderUsage, RecordBody,
+    SessionState, StableId, StreamSink, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError,
+    ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, VecSink,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -779,8 +779,7 @@ fn context_request_resolves_token_first_budget() {
     let request = bitty_ai_runtime::ContextRequest {
         max_tokens: Some(64),
         max_bytes: Some(1_000_000),
-        priority: ContextPriority::Normal,
-        detail: DetailLevel::Standard,
+        current_generation: 1,
     };
     assert_eq!(request.effective_budget_bytes(), 256);
 }

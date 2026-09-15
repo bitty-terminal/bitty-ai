@@ -820,7 +820,7 @@ pub fn compress_records(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ArtifactStore, AssembledContext, DetailLevel, StableId, assemble};
+    use crate::context::{ArtifactStore, AssembledContext, StableId, assemble};
 
     fn record(id: &str, provider: &str, summary: &str, body_len: usize) -> ContextRecord {
         ContextRecord {
@@ -856,8 +856,7 @@ mod tests {
         crate::context::ContextRequest {
             max_tokens: None,
             max_bytes: Some(bytes as u64),
-            priority: ContextPriority::Normal,
-            detail: DetailLevel::Standard,
+            current_generation: 1,
         }
     }
 
