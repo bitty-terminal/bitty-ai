@@ -3,16 +3,16 @@
 ## Scope and authority
 
 - This file governs only the independent `bitty-ai` Git repository.
-- The umbrella directory is not a Git repository and sibling repositories own
+- The umbrella directory is not a Git repository and other Bitty repositories own
   their own Git, CarryCtx, CI, releases, and agent guidance.
 - All formal Bitty repositories belong under <https://github.com/bitty-terminal>.
-- `bitty-ai-docs` is the canonical source for AI-core architecture,
+- [`bitty-ai-docs`](https://github.com/bitty-terminal/bitty-ai-docs) is the canonical source for AI-core architecture,
   specifications, and design documentation. It is mounted at `docs/` as a Git
   submodule pinned to a commit; initialize it with
   `git submodule update --init`.
-- `bitty-docs` owns shared governance (decisions, security corpus, reviews,
-  project state); `bitty-terminal-docs` and `bitty-plugins-docs` own the
-  sibling corpora and are linked by absolute URL.
+- [`bitty-docs`](https://github.com/bitty-terminal/bitty-docs) owns shared governance (decisions, security corpus, reviews,
+  project state); [`bitty-terminal-docs`](https://github.com/bitty-terminal/bitty-terminal-docs) and [`bitty-plugins-docs`](https://github.com/bitty-terminal/bitty-plugins-docs) own the
+  respective corpora and are linked by absolute URL.
 
 ## Current phase
 
@@ -35,7 +35,6 @@
 3. Read the task, team context, exact scopes, dependencies, and relevant
    canonical contracts in the `docs/` submodule (bitty-ai-docs); run
    `git submodule update --init` first when `docs/` is empty.
-4. Use `ctxctl outline` before targeted `symbol`, `read`, or `deps` inspection.
 
 ## CarryCtx workflow
 
@@ -140,10 +139,9 @@
 ## Workspace hygiene
 
 - Run Git and CarryCtx inside this repository, never at the umbrella root.
-- Use the persistent workspace `../recording/`, not `/tmp`; references belong
-  under `../recording/references/` and remain untrusted, read-only evidence.
-- Prefer moving obsolete files to `../.trash/bitty-ai/<task-id>/` instead of
-  `rm` or `rmdir`.
+- Ephemeral scratch under `/tmp/bitty/`; durable material under this repository's
+  `recording/` (gitignored). References belong
+  under `recording/references/` and remain untrusted, read-only evidence.
 
 ## Handoff
 
