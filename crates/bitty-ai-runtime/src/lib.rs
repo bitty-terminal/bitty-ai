@@ -3,9 +3,9 @@
 //! **Status: skeleton, draft scope (AI-0009).** This crate implements the
 //! single-crate runtime skeleton authorized by `bitty-ai` Issue #11: a
 //! deterministic single-agent loop over the
-//! `provider` / `context` / `session` / `tool` / `agent` / `stream` modules
-//! with a scripted [`provider::FakeProvider`], fail-closed authorization
-//! hooks, and structured execution outcomes including `Unknown`.
+//! `provider` / `context` / `session` / `tool` / `agent` / `stream` / `bridge`
+//! modules with a scripted [`provider::FakeProvider`], fail-closed
+//! authorization hooks, and structured execution outcomes including `Unknown`.
 //!
 //! The crate tracks the draft `implementation-profile-v0.1.md` (status:
 //! draft, not an accepted contract; a draft disposition proposes no accepted
@@ -25,12 +25,17 @@
 //!   boundaries, two-phase tool validation (transactional denial per turn),
 //!   L0 structured results plus L1 dedupe/supersede/externalize assembly,
 //!   bounded budgets with counted truncation, sequenced stream fragments,
-//!   deny-by-default authorization hooks.
+//!   deny-by-default authorization hooks, P1 wire-level protocol-to-instance
+//!   bridge mapping plus consent-ledger seam with deny-by-default and test
+//!   double.
 //! - Stub (host-owned, deliberately absent): network model providers,
-//!   credential handling, consent ledger, capability enforcement, MCP
+//!   credential handling, real consent ledger, capability enforcement, MCP
 //!   transport, persistence, multi-agent/teams, L2+ compaction, LSP wiring.
 //!   [`tool::ToolExecutor`] and [`tool::ToolAuthorizer`] are the seams where
 //!   the host plugs those in; without them the crate refuses (`FS-AI7`).
+//!   [`bridge::ConsentLedger`] is the consent seam: [`bridge::DenyAllConsent`]
+//!   denies by default and [`bridge::FakeConsentLedger`] is the deterministic
+//!   test double; the real ledger lives host-side.
 //!
 //! ## Determinism rules
 //!
@@ -41,6 +46,7 @@
 #![deny(unsafe_code)]
 
 pub mod agent;
+pub mod bridge;
 pub mod context;
 pub mod provider;
 pub mod session;
@@ -48,6 +54,11 @@ pub mod stream;
 pub mod tool;
 
 pub use agent::{Agent, AgentConfig, AgentError, ExecOutcome, ExecutionRecord};
+pub use bridge::{
+    BridgeError, ConsentDecision, ConsentLedger, ConsentQuery, DenyAllConsent, FakeConsentLedger,
+    IdentityBridge, MAX_CONSENT_GRANTS, MAX_CONSENT_SCOPE_LEN, MAX_PROTOCOL_ID_LEN,
+    MAX_PROTOCOL_ID_SEGMENT_LEN, ProtocolAgentId, ensure_consented, validate_protocol_id,
+};
 pub use context::{
     ArtifactRef, ArtifactStore, AssembledContent, AssembledContext, AssembledRecord, ContextError,
     ContextPriority, ContextRecord, ContextRequest, DetailLevel, RecordBody, StableId, assemble,

@@ -21,6 +21,7 @@ session   AgentInstanceId/RunId/SessionId/ExecutionId, tiers, idempotent cancel
 tool      Bounded registry, deny-by-default hooks, host executor seam
 agent     Single-agent turn loop with structured outcomes incl. Unknown
 stream    Markdown/Diff/ToolCard fragments, seq/total/final chunks
+bridge    P1 wire owner.name <-> AgentInstanceId map + consent seam (deny + fake)
 ```
 
 ## Rules
@@ -29,6 +30,10 @@ stream    Markdown/Diff/ToolCard fragments, seq/total/final chunks
   async runtime, network, filesystem, or secrets.
 - Authorization hooks deny by default; without host wiring the crate refuses.
 - The runtime never executes a tool; the host plugs in `ToolExecutor`.
+- The real consent ledger lives host-side; this crate owns only the seam
+  (`ConsentLedger` trait, `DenyAllConsent`, `FakeConsentLedger` test double).
+- Protocol identity is a validated wire string (`owner.name`); this crate
+  never depends on the generic `bitty-agent` crate.
 - `Unknown` effects reconcile before retry; the loop never blindly retries.
 
 ## Tests
