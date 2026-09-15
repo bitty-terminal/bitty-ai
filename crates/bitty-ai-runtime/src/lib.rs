@@ -50,6 +50,7 @@ pub mod bridge;
 pub mod context;
 pub mod prompt;
 pub mod provider;
+pub mod reconcile;
 pub mod selection;
 pub mod session;
 pub mod stream;
@@ -83,6 +84,12 @@ pub use prompt::{
 pub use provider::{
     FakeProvider, ModelCapability, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
     ProviderUsage, Role, TerminalModelMetadata, ToolCallRequest, TurnRequest, validate_provider_id,
+};
+pub use reconcile::{
+    DEFAULT_MAX_UNKNOWN_RETRIES, DEFAULT_RECONCILE_BASE_DELAY_MS, DEFAULT_RECONCILE_MAX_DELAY_MS,
+    FakeReconciler, MAX_RECONCILE_ATTEMPTS, MAX_RECONCILE_DELAY_MS, MAX_RECONCILE_REASON_BYTES,
+    ReconcileConfig, ReconcileOutcome, ReconcileStatus, UnknownEscalation, UnknownReconciler,
+    reconcile_delay_ms,
 };
 pub use selection::{
     FallbackDirective, MAX_ALIAS_CANDIDATES, MAX_ALIASES, MAX_MODEL_NAME_LEN,

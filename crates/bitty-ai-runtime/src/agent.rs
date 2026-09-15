@@ -26,6 +26,11 @@ use crate::provider::{
     DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, Message, ModelProvider,
     ProviderError, ProviderTurn, TurnRequest,
 };
+use crate::reconcile::{
+    DEFAULT_MAX_UNKNOWN_RETRIES, DEFAULT_RECONCILE_BASE_DELAY_MS, DEFAULT_RECONCILE_MAX_DELAY_MS,
+    ReconcileConfig, ReconcileOutcome, ReconcileStatus, UnknownEscalation, UnknownReconciler,
+    bound_reason, reconcile_delay_ms,
+};
 use crate::selection::estimate_cost;
 use crate::session::{AgentSession, ExecutionId, IdIssuer, SessionError};
 use crate::stream::{FragmentKind, StreamError, StreamSink, emit_fragments, fragment_text};
@@ -66,6 +71,20 @@ pub struct AgentConfig {
     /// Relative output cost weight for the active model (same rule as
     /// [`AgentConfig::input_cost_weight`]).
     pub output_cost_weight: u32,
+    /// Reconcile query budget: maximum status queries per `Unknown`
+    /// execution before typed escalation (`MP-7`). Counts reconcile queries
+    /// only, never tool dispatches: this budget is separate from
+    /// [`AgentConfig::max_tool_calls_per_turn`] and [`AgentConfig::max_rounds`]
+    /// by construction (see [`ReconcileConfig`]).
+    pub max_unknown_retries: usize,
+    /// Base backoff delay in milliseconds for reconcile query attempt 0;
+    /// doubles per attempt up to
+    /// [`AgentConfig::unknown_reconcile_max_delay_ms`]. Deterministic: the
+    /// driver derives each `next_retry_ms` from caller-supplied `now_ms`
+    /// with saturating addition; no wall clock is read.
+    pub unknown_reconcile_base_delay_ms: u64,
+    /// Per-attempt backoff ceiling in milliseconds for reconcile queries.
+    pub unknown_reconcile_max_delay_ms: u64,
 }
 
 impl Default for AgentConfig {
@@ -78,6 +97,23 @@ impl Default for AgentConfig {
             max_turn_cost: None,
             input_cost_weight: 1,
             output_cost_weight: 1,
+            max_unknown_retries: DEFAULT_MAX_UNKNOWN_RETRIES,
+            unknown_reconcile_base_delay_ms: DEFAULT_RECONCILE_BASE_DELAY_MS,
+            unknown_reconcile_max_delay_ms: DEFAULT_RECONCILE_MAX_DELAY_MS,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Reconcile view of the `Unknown` query budget and backoff bounds.
+    /// Separate object from the tool-call budget, sharing only the source
+    /// values, so callers cannot mistake one budget for the other.
+    #[must_use]
+    pub fn reconcile_config(&self) -> ReconcileConfig {
+        ReconcileConfig {
+            max_unknown_retries: self.max_unknown_retries,
+            base_delay_ms: self.unknown_reconcile_base_delay_ms,
+            max_delay_ms: self.unknown_reconcile_max_delay_ms,
         }
     }
 }
@@ -113,6 +149,21 @@ pub enum AgentError {
         /// Accumulated estimated cost when the fuse tripped.
         actual: u64,
     },
+    /// An `Unknown` effect stayed unresolvable within the reconcile query
+    /// budget and escalated to this typed report (`MP-7`). Fail-closed: the
+    /// session is marked failed and no further retry is attempted under the
+    /// reconcile protocol. Retry budget and tool-call budget stay separate;
+    /// this variant carries only reconcile counts, never dispatch counts.
+    UnknownUnresolved {
+        /// Tool whose effect stayed uncertain.
+        tool: String,
+        /// Last observed pending reason (bounded).
+        reason: String,
+        /// Status queries performed (bounded by the effective budget).
+        attempts: usize,
+        /// Dispatched executions recorded when escalation fired.
+        dispatched: usize,
+    },
 }
 
 impl Display for AgentError {
@@ -129,6 +180,18 @@ impl Display for AgentError {
             Self::CostCeilingExceeded { limit, actual } => {
                 write!(f, "turn cost {actual} exceeded ceiling {limit}")
             }
+            Self::UnknownUnresolved {
+                tool,
+                reason,
+                attempts,
+                dispatched,
+            } => {
+                write!(
+                    f,
+                    "tool {tool} effect unreconciled after {attempts} queries \
+                     ({dispatched} dispatched): {reason}"
+                )
+            }
         }
     }
 }
@@ -141,7 +204,9 @@ impl std::error::Error for AgentError {
             Self::Tool(error) => Some(error),
             Self::Stream(error) => Some(error),
             Self::Session(error) => Some(error),
-            Self::RoundLimitExceeded { .. } | Self::CostCeilingExceeded { .. } => None,
+            Self::RoundLimitExceeded { .. }
+            | Self::CostCeilingExceeded { .. }
+            | Self::UnknownUnresolved { .. } => None,
         }
     }
 }
@@ -173,6 +238,17 @@ impl From<StreamError> for AgentError {
 impl From<SessionError> for AgentError {
     fn from(error: SessionError) -> Self {
         Self::Session(error)
+    }
+}
+
+impl From<UnknownEscalation> for AgentError {
+    fn from(report: UnknownEscalation) -> Self {
+        Self::UnknownUnresolved {
+            tool: report.tool,
+            reason: report.reason,
+            attempts: report.attempts,
+            dispatched: report.dispatched,
+        }
     }
 }
 
@@ -616,6 +692,104 @@ impl<P: ModelProvider> Agent<P> {
             reason: format!("{reason} (tool {tool})"),
             dispatched: self.executions.len(),
         }
+    }
+
+    /// Reconcile one `Unknown` execution: bounded status queries with
+    /// deterministic backoff ceilings, then typed escalation (`MP-7`).
+    ///
+    /// The driver queries `reconciler` for `execution_id` without executing
+    /// anything: no [`ToolExecutor`](crate::tool::ToolExecutor) call is made
+    /// here, and the tool-call budget
+    /// ([`AgentConfig::max_tool_calls_per_turn`], [`ToolBus::calls_this_turn`])
+    /// is neither read nor modified. Only the separate reconcile budget
+    /// ([`AgentConfig::max_unknown_retries`] plus backoff bounds) applies.
+    ///
+    /// - The target must be recorded on this agent with
+    ///   [`ToolStatus::Unknown`]; otherwise [`ReconcileOutcome::NoUnknown`]
+    ///   is returned and nothing runs.
+    /// - Each query computes `delays_ms[attempt]` via
+    ///   [`reconcile_delay_ms`] and derives `now_ms.saturating_add(delay)`
+    ///   as the caller-scheduled retry instant. The driver never sleeps and
+    ///   never reads a clock: pass the same deterministic `now_ms` used by
+    ///   the turn loop.
+    /// - A terminal reconciler answer updates the recorded status in place
+    ///   and returns [`ReconcileOutcome::Resolved`]; the session stays
+    ///   `Active`. A `Resolved(ToolStatus::Unknown)` answer is treated as
+    ///   still pending (fail closed).
+    /// - When the budget is exhausted the driver marks the session failed
+    ///   and returns [`ReconcileOutcome::Escalated`] with the typed
+    ///   [`UnknownEscalation`] report (convertible to
+    ///   [`AgentError::UnknownUnresolved`]). No further retry is attempted
+    ///   under this protocol.
+    pub fn reconcile_unknown(
+        &mut self,
+        reconciler: &mut dyn UnknownReconciler,
+        execution_id: ExecutionId,
+        now_ms: u64,
+    ) -> ReconcileOutcome {
+        let position = self.executions.iter().position(|record| {
+            record.execution_id == execution_id
+                && matches!(record.status, ToolStatus::Unknown { .. })
+        });
+        let Some(index) = position else {
+            return ReconcileOutcome::NoUnknown;
+        };
+        let tool = self.executions[index].tool.clone();
+        let dispatched = self.executions.len();
+        let config = self.config.reconcile_config();
+        let budget = config.effective_retries();
+        let ceiling = config.effective_max_delay_ms();
+        let base = config.base_delay_ms.min(ceiling);
+        let current_reason = match &self.executions[index].status {
+            ToolStatus::Unknown { reason } => bound_reason(reason),
+            _ => unreachable!("matched Unknown above"),
+        };
+        let mut delays_ms: Vec<u64> = Vec::new();
+        let mut last_reason = current_reason;
+        let mut attempt = 0;
+        while attempt < budget {
+            let delay = reconcile_delay_ms(attempt, base, ceiling);
+            delays_ms.push(delay);
+            let _next_retry_ms = now_ms.saturating_add(delay);
+            let answer = reconciler.reconcile(&tool, execution_id, now_ms);
+            match answer {
+                ReconcileStatus::Resolved(status) => {
+                    let terminal = match &status {
+                        ToolStatus::Success
+                        | ToolStatus::Failed { .. }
+                        | ToolStatus::Denied { .. } => true,
+                        ToolStatus::Unknown { .. } => false,
+                    };
+                    if terminal {
+                        self.executions[index].status = status.clone();
+                        return ReconcileOutcome::Resolved {
+                            status,
+                            attempts: attempt + 1,
+                            delays_ms,
+                        };
+                    }
+                    match status {
+                        ToolStatus::Unknown { reason } => {
+                            last_reason = bound_reason(&reason);
+                        }
+                        _ => unreachable!("non-terminal status is Unknown"),
+                    }
+                }
+                ReconcileStatus::Pending { reason } => {
+                    last_reason = bound_reason(&reason);
+                }
+            }
+            attempt += 1;
+        }
+        let report = UnknownEscalation {
+            tool,
+            reason: last_reason,
+            attempts: delays_ms.len(),
+            dispatched,
+            delays_ms,
+        };
+        self.session.finish(true);
+        ReconcileOutcome::Escalated(report)
     }
 
     /// Resolve the token pair used for cost accounting for one provider
