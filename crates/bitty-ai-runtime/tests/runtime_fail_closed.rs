@@ -825,3 +825,74 @@ fn relaxed_config_still_clamped_by_bus_constant() {
     assert!(executor.calls().is_empty());
     assert!(agent.executions().is_empty());
 }
+
+#[test]
+fn executor_denial_is_attributed_then_fails_the_turn() {
+    // A host-side refusal returned by the executor becomes an attributed
+    // `Denied` execution and then fails the turn (`TB-7`); the refusal is
+    // never retried and the follow-up round is not consumed.
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "reading".to_owned(),
+        tool_calls: vec![ToolCallRequest {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        }],
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    provider.push_turn(ProviderTurn {
+        text: "unreached".to_owned(),
+        tool_calls: Vec::new(),
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    let mut executor = FakeToolExecutor::new();
+    executor.push_error(ToolError::Denied {
+        name: "workspace_read".to_owned(),
+        reason: "host policy refused".to_owned(),
+    });
+    let session = session();
+    let mut agent = Agent::new(
+        provider,
+        read_tool_bus(),
+        session.clone(),
+        AgentConfig::default(),
+    );
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::Denied { .. })
+            }
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    // The refusal was attributed exactly once and never dispatched again.
+    assert_eq!(executor.calls().len(), 1);
+    assert_eq!(agent.executions().len(), 1);
+    assert!(matches!(
+        agent.executions()[0].status,
+        ToolStatus::Denied { .. }
+    ));
+    // The tool card carries the denial before the turn terminates.
+    let cards: Vec<&bitty_ai_runtime::StreamChunk> = sink
+        .chunks()
+        .iter()
+        .filter(|chunk| chunk.fragment.kind == FragmentKind::ToolCard)
+        .collect();
+    assert_eq!(cards.len(), 1);
+    assert!(
+        String::from_utf8_lossy(&cards[0].fragment.bytes).contains("status=denied"),
+        "card: {}",
+        String::from_utf8_lossy(&cards[0].fragment.bytes)
+    );
+    // No follow-up provider round ran; the session is terminally failed.
+    assert_eq!(agent.provider_mut().scripted_turns_remaining(), 1);
+    assert_eq!(agent.provider_mut().complete_calls(), 1);
+    assert_eq!(session.state(), SessionState::Failed);
+}

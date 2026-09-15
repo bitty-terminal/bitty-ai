@@ -31,6 +31,7 @@ use bitty_ai_slice::{
     terminal_record, test_tool_registry,
 };
 use bitty_ipc::channel::{IpcRequest, IpcResponse};
+use bitty_ipc::error::IpcError;
 use bitty_ipc::rich_fragment::{FragmentData, FragmentIngestService};
 use bitty_ipc::scope::{Scope, ScopeSet};
 
@@ -68,6 +69,25 @@ impl HostPeer for LoopbackHost {
             request.id,
             b"host does not implement this method".to_vec(),
         )?)
+    }
+}
+
+/// Peer that counts served requests, so a refused bridge call can be shown
+/// to have never reached the host.
+struct CountingHost {
+    served: usize,
+}
+
+impl CountingHost {
+    fn new() -> Self {
+        Self { served: 0 }
+    }
+}
+
+impl HostPeer for CountingHost {
+    fn serve(&mut self, request: &IpcRequest) -> Result<IpcResponse, SliceError> {
+        self.served += 1;
+        Ok(IpcResponse::success(request.id, b"served".to_vec())?)
     }
 }
 
@@ -291,6 +311,97 @@ fn missing_scope_fails_closed() {
         .call("terminal.snapshot", b"{}", NOW_MS, &mut host)
         .expect_err("missing scope must fail closed");
     assert!(matches!(error, SliceError::Ipc(_)), "got {error:?}");
+}
+
+#[test]
+fn live_consent_never_widens_the_server_evaluated_scope_set() {
+    // AIQ-22/42 negative evidence: the reader is granted only
+    // `terminal.inspect` server-side while its ledger carries a live grant
+    // for `process.spawn`. A live grant outside the granted set must not
+    // authorize the method, and the refusal must reach no host peer.
+    let mut bridge = IpcBridge::new("reader-inspect", ScopeSet::single(Scope::TerminalInspect));
+    bridge
+        .grant_consent(Scope::ProcessSpawn, NOW_MS, TTL_MS)
+        .expect("consent grant");
+    assert!(bridge.consent_active(Scope::ProcessSpawn, NOW_MS));
+    let mut peer = CountingHost::new();
+
+    let error = bridge
+        .call("process.spawn", br#"{}"#, NOW_MS, &mut peer)
+        .expect_err("consent must not widen the granted scope set");
+
+    match error {
+        SliceError::Ipc(IpcError::ScopeDenied { .. }) => {}
+        other => panic!("expected ScopeDenied, got {other:?}"),
+    }
+    assert_eq!(peer.served, 0, "refused call never reached the host peer");
+    assert_eq!(bridge.pending_count(), 0, "no request enqueued");
+}
+
+#[test]
+fn consent_grant_is_bound_to_the_reader_that_holds_it() {
+    // AIQ-58 negative evidence: two readers hold the same server-evaluated
+    // scope set, but only reader A holds a grant. Reader B must not inherit
+    // reader A's authorization, and only A reaches the host.
+    let mut reader_a = IpcBridge::new("reader-a", ScopeSet::single(Scope::TerminalInspect));
+    reader_a
+        .grant_consent(Scope::TerminalInspect, NOW_MS, TTL_MS)
+        .expect("grant");
+    let mut reader_b = IpcBridge::new("reader-b", ScopeSet::single(Scope::TerminalInspect));
+    let mut peer = CountingHost::new();
+
+    reader_a
+        .call("terminal.snapshot", b"{}", NOW_MS, &mut peer)
+        .expect("grant holder is served");
+    let error = reader_b
+        .call("terminal.snapshot", b"{}", NOW_MS, &mut peer)
+        .expect_err("second reader must not inherit the first reader's grant");
+
+    assert_eq!(
+        error,
+        SliceError::ConsentRequired {
+            scope: "terminal.inspect",
+        }
+    );
+    assert!(reader_a.consent_active(Scope::TerminalInspect, NOW_MS));
+    assert!(!reader_b.consent_active(Scope::TerminalInspect, NOW_MS));
+    assert_eq!(peer.served, 1, "only the grant holder reached the host");
+    assert_eq!(reader_b.pending_count(), 0, "no request enqueued");
+}
+
+#[test]
+fn per_reader_consent_expiry_does_not_authorize_another_reader() {
+    // AIQ-58 negative evidence: each reader's grant expires on its own
+    // schedule. At `later` reader A's grant is expired while reader B's is
+    // live; only B is served and A enqueues nothing.
+    let mut reader_a = IpcBridge::new("reader-a", ScopeSet::single(Scope::TerminalInspect));
+    reader_a
+        .grant_consent(Scope::TerminalInspect, NOW_MS, 100)
+        .expect("grant");
+    let mut reader_b = IpcBridge::new("reader-b", ScopeSet::single(Scope::TerminalInspect));
+    reader_b
+        .grant_consent(Scope::TerminalInspect, NOW_MS, TTL_MS)
+        .expect("grant");
+    let later = NOW_MS + 100;
+    assert!(!reader_a.consent_active(Scope::TerminalInspect, later));
+    assert!(reader_b.consent_active(Scope::TerminalInspect, later));
+    let mut peer = CountingHost::new();
+
+    let error = reader_a
+        .call("terminal.snapshot", b"{}", later, &mut peer)
+        .expect_err("expired reader grant must not serve");
+    assert_eq!(
+        error,
+        SliceError::ConsentRequired {
+            scope: "terminal.inspect",
+        }
+    );
+    reader_b
+        .call("terminal.snapshot", b"{}", later, &mut peer)
+        .expect("live reader grant serves");
+
+    assert_eq!(peer.served, 1, "only the live grant reached the host");
+    assert_eq!(reader_a.pending_count(), 0, "no request enqueued");
 }
 
 #[test]
