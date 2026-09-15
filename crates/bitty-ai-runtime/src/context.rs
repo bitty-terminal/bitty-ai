@@ -13,8 +13,11 @@
 //!   records collapse to the newest, and large inline bodies move to artifact
 //!   references.
 //!
-//! Explicitly out of scope: L2+ selective compression/compaction, provider
-//! summarization, retrieval/ranking, and durable retention. Missing, expired,
+//! Explicitly out of scope here: provider summarization, retrieval/ranking,
+//! and durable retention. L2 selective compression lives in
+//! [`crate::compression`] as a fake-verified prototype (host summarizer
+//! seam, deterministic breakpoints, in-memory retention policy); the durable
+//! store stays out of scope (AI-0049). Missing, expired,
 //! or deleted content resolves to typed [`ContextError::ArtifactUnavailable`],
 //! never to a silent substitute.
 //!
