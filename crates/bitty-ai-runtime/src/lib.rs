@@ -4,7 +4,7 @@
 //! single-crate runtime skeleton authorized by `bitty-ai` Issue #11: a
 //! deterministic single-agent loop over the
 //! `provider` / `context` / `session` / `tool` / `agent` / `stream` / `bridge`
-//! modules with a scripted [`provider::FakeProvider`], fail-closed
+//! / `prompt` modules with a scripted [`provider::FakeProvider`], fail-closed
 //! authorization hooks, and structured execution outcomes including `Unknown`.
 //!
 //! The crate tracks the draft `implementation-profile-v0.1.md` (status:
@@ -48,6 +48,7 @@
 pub mod agent;
 pub mod bridge;
 pub mod context;
+pub mod prompt;
 pub mod provider;
 pub mod session;
 pub mod stream;
@@ -63,6 +64,16 @@ pub use context::{
     ArtifactRef, ArtifactStore, AssembledContent, AssembledContext, AssembledRecord, ContextError,
     ContextPriority, ContextRecord, ContextRequest, DetailLevel, RecordBody, StableId, assemble,
     validate_stable_id,
+};
+pub use prompt::assemble as assemble_prompt;
+pub use prompt::{
+    AssembledPrompt, AssembledSection, Directive, LayerInput, MAX_BUDGET_CEILING_BYTES,
+    MAX_CANONICAL_BYTES, MAX_CORE_VERSION_LEN, MAX_DIRECTIVE_KEY_LEN, MAX_DIRECTIVE_VALUE_LEN,
+    MAX_DIRECTIVES_PER_LAYER, MAX_LAYER_TEXT_BYTES, MAX_SCOPE_LEN, MAX_SCOPES_PER_LAYER,
+    MAX_TOOL_ENTRIES_PER_LAYER, PromptError, PromptLayer, PromptSnapshot, check_dispatch,
+    common_prefix_len, is_dispatch_allowed, validate_budget_ceiling, validate_core_version,
+    validate_directive_key, validate_directive_value, validate_layer_text,
+    validate_prompt_tool_name, validate_scope,
 };
 pub use provider::{
     FakeProvider, ModelCapability, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
