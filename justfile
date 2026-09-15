@@ -18,7 +18,10 @@ typecheck:
 actionlint:
     actionlint -color
 
-# Scan the working tree and committed history for secrets (gitleaks).
+# Scan committed Git history for secrets (gitleaks v8.30.1; see
+# .gitleaks.toml). Uncommitted or untracked working-tree content is only
+# covered once it is staged and committed; `secrets` is deliberately not part
+# of `check` so contributors without gitleaks still pass the default gate.
 secrets:
     gitleaks detect --source . --no-banner
 
