@@ -132,6 +132,9 @@ use bitty_ipc::tool_dispatch::{
     ToolSpec,
 };
 
+use bitty_ai_runtime::bridge::IdentityBridge;
+
+use crate::bridge::wire_client_id;
 use crate::error::SliceError;
 use crate::fake_host::BittyHost;
 
@@ -157,6 +160,10 @@ impl LiveBittyHost {
     /// scopes, an optional snapshot provider (`None` leaves the snapshot
     /// table empty so the missing-handler path stays fail-closed and
     /// observable), and the supervised-execution provider.
+    ///
+    /// This is the raw seam: `client_id` is taken verbatim and only
+    /// length-bounded. Product callers must use [`Self::from_binding`] so the
+    /// id is derived from a bound protocol principal (`AI-0065`).
     ///
     /// Tool providers are registered per tool via [`Self::register_tool`];
     /// the tool table starts empty (unknown tools fail closed).
@@ -198,6 +205,28 @@ impl LiveBittyHost {
             tools: ToolDispatchService::new(),
             executions: ExecutionService::with_provider(execution_provider),
         })
+    }
+
+    /// Construct a live host whose client identity is derived from the bound
+    /// protocol principal of `identity` (`AI-0065`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures of [`wire_client_id`]: an unbound identity or an
+    /// over-long derived id is refused before any host state exists (no
+    /// consent ledger, snapshot table, tool registry, or execution store).
+    pub fn from_binding(
+        identity: &IdentityBridge,
+        granted: ScopeSet,
+        snapshot_provider: Option<SnapshotProvider>,
+        execution_provider: ExecutionProvider,
+    ) -> Result<Self, SliceError> {
+        Self::new(
+            wire_client_id(identity)?,
+            granted,
+            snapshot_provider,
+            execution_provider,
+        )
     }
 
     /// Construct a live host wired to the real live snapshot provider
