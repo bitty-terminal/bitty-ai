@@ -18,6 +18,10 @@ typecheck:
 actionlint:
     actionlint -color
 
+# Scan the working tree and committed history for secrets (gitleaks).
+secrets:
+    gitleaks detect --source . --no-banner
+
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}
 
