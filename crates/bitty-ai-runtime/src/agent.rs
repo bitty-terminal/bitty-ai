@@ -33,7 +33,9 @@ use crate::reconcile::{
 };
 use crate::selection::estimate_cost;
 use crate::session::{AgentSession, ExecutionId, IdIssuer, SessionError, SessionState};
-use crate::stream::{FragmentKind, StreamError, StreamSink, emit_fragments, fragment_text};
+use crate::stream::{
+    Fragment, FragmentKind, StreamError, StreamSink, emit_fragments, fragment_text,
+};
 use crate::tool::{
     AuthBase, MAX_TOOL_CALLS_PER_TURN, ToolBus, ToolError, ToolExecution, ToolExecutor, ToolStatus,
 };
@@ -314,6 +316,10 @@ pub struct Agent<P: ModelProvider> {
     executions: Vec<ExecutionRecord>,
     tool_history: Vec<ContextRecord>,
     turn_cost: u64,
+    /// Next unused stream sequence number of the logical turn (`S-8` scheme
+    /// A); reset at every [`Agent::run_turn`] entry, advanced by every
+    /// completed emission batch.
+    next_seq: u32,
 }
 
 impl<P: ModelProvider> Agent<P> {
@@ -329,6 +335,7 @@ impl<P: ModelProvider> Agent<P> {
             executions: Vec::new(),
             tool_history: Vec::new(),
             turn_cost: 0,
+            next_seq: 0,
         }
     }
 
@@ -409,7 +416,10 @@ impl<P: ModelProvider> Agent<P> {
     /// after reconcile) to continue. Per-turn state (`executions`,
     /// `tool_history`, `turn_cost`) resets after the gate, so counts never
     /// mix history; `executions` is additionally bounded by
-    /// [`MAX_EXECUTIONS_PER_AGENT`].
+    /// [`MAX_EXECUTIONS_PER_AGENT`]. Streamed chunks are numbered continuously
+    /// across the turn's emission batches (`S-8` scheme A) so transport dedup
+    /// keys stay unique; `total`/`is_final` close each emission batch, while
+    /// turn completion is this method's [`ExecOutcome`].
     pub fn run_turn(
         &mut self,
         executor: &mut dyn ToolExecutor,
@@ -463,6 +473,7 @@ impl<P: ModelProvider> Agent<P> {
         self.executions.clear();
         self.tool_history.clear();
         self.turn_cost = 0;
+        self.next_seq = 0;
         loop {
             if self.session.is_cancelled() {
                 return self.reconcile_cancel();
@@ -614,8 +625,9 @@ impl<P: ModelProvider> Agent<P> {
         }
     }
 
-    /// Stream assistant text. Returns `Ok(false)` when cancellation stopped
-    /// emission (caller reconciles).
+    /// Stream assistant text for one provider round, continuing the turn's
+    /// sequence after any earlier batch. Returns `Ok(false)` when
+    /// cancellation stopped emission (caller reconciles).
     ///
     /// # Errors
     ///
@@ -629,11 +641,11 @@ impl<P: ModelProvider> Agent<P> {
             return Ok(!self.session.is_cancelled());
         }
         let fragments = fragment_text(FragmentKind::Markdown, &turn.text);
-        let session = &self.session;
-        emit_fragments(sink, &fragments, &|| session.is_cancelled())
+        self.emit_batch(sink, &fragments)
     }
 
-    /// Stream one ToolCard fragment for a recorded execution.
+    /// Stream one ToolCard fragment for a recorded execution, continuing the
+    /// turn's sequence after the assistant text and any earlier cards.
     ///
     /// # Errors
     ///
@@ -654,8 +666,36 @@ impl<P: ModelProvider> Agent<P> {
             execution.tool, status, execution.summary
         );
         let fragments = fragment_text(FragmentKind::ToolCard, &card);
+        self.emit_batch(sink, &fragments)
+    }
+
+    /// Emit one fragment batch into the turn's continuous sequence and
+    /// advance [`Agent::next_seq`] on completion (`S-8` scheme A).
+    ///
+    /// Returns `Ok(true)` when every fragment was emitted, `Ok(false)` when
+    /// cancellation stopped emission early (already-emitted chunks stay
+    /// emitted; the caller reconciles).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamError`] for oversized or misframed chunks or an
+    /// exhausted sequence space; chunks emitted before the failure stay
+    /// emitted.
+    fn emit_batch(
+        &mut self,
+        sink: &mut dyn StreamSink,
+        fragments: &[Fragment],
+    ) -> Result<bool, StreamError> {
+        let start_seq = self.next_seq;
         let session = &self.session;
-        emit_fragments(sink, &fragments, &|| session.is_cancelled())
+        let next_seq = emit_fragments(sink, fragments, start_seq, &|| session.is_cancelled())?;
+        match next_seq {
+            Some(next_seq) => {
+                self.next_seq = next_seq;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Record one execution as an attributed record plus an L0
