@@ -998,4 +998,78 @@ mod tests {
             Err(ToolError::Denied { .. })
         ));
     }
+
+    #[test]
+    fn dispatch_records_executor_denial_as_status_without_data() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_error(ToolError::Denied {
+            name: "workspace_read".to_owned(),
+            reason: "host policy refused".to_owned(),
+        });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("host denial is a recorded status, not a bus error");
+        // A host-side refusal is attributed as `Denied` with no payload and
+        // the dispatch is still counted against the per-turn cap.
+        assert!(matches!(execution.status, ToolStatus::Denied { .. }));
+        assert!(execution.data.is_empty());
+        assert!(execution.is_untrusted_surface);
+        assert_eq!(execution.tool, "workspace_read");
+        assert_eq!(bus.calls_this_turn(), 1);
+    }
+
+    #[test]
+    fn dispatch_rechecks_the_hook_at_the_boundary_after_precheck() {
+        use std::cell::Cell;
+
+        // Revocation between the transactional gate and the next dispatch
+        // boundary must take effect: the hook allows the validation pass and
+        // denies every later check (`PP-6`). The call is refused before the
+        // executor with no partial state.
+        struct RevokeAfterPrecheck {
+            checks: Cell<usize>,
+        }
+        impl ToolAuthorizer for RevokeAfterPrecheck {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                let seen = self.checks.get();
+                self.checks.set(seen + 1);
+                if seen == 0 {
+                    AuthDecision::Allow
+                } else {
+                    AuthDecision::Deny {
+                        reason: "grant revoked".to_owned(),
+                    }
+                }
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(RevokeAfterPrecheck {
+            checks: Cell::new(0),
+        });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        bus.precheck(std::slice::from_ref(&call), &base())
+            .expect("validation pass allows");
+        let mut executor = FakeToolExecutor::new();
+        let mut ids = crate::session::IdIssuer::default();
+        let error = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect_err("dispatch boundary must re-check the hook");
+        assert!(matches!(error, ToolError::Denied { .. }));
+        assert!(executor.calls().is_empty(), "revoked call never dispatched");
+        assert_eq!(bus.calls_this_turn(), 0);
+    }
 }

@@ -369,6 +369,35 @@ fn dispatch_effect_requires_explicit_opt_in() {
 }
 
 #[test]
+fn dispatch_refuses_scope_with_only_unrelated_grant_and_live_consent() {
+    // AIQ-22/42 negative evidence: the host's server-evaluated grant holds
+    // only `terminal.inspect` while the ledger carries a live grant for
+    // `terminal.input`. Consent for the tool's scope must not widen the
+    // grant, and a refusal must consume no script and store no execution.
+    let mut host = inspect_host();
+    host.grant_consent(Scope::TerminalInput, NOW_MS, TTL_MS)
+        .expect("consent grant");
+    host.register_tool(effect_spec()).expect("register");
+    host.push_tool_output(ToolOutput {
+        target_id: None,
+        data: b"sent".to_vec(),
+        summary: "sent".to_owned(),
+    });
+    let request = ToolRequest::new("terminal_send", br#"{}"#.to_vec()).with_allow_effects(true);
+
+    let error = host
+        .dispatch_tool(&request, NOW_MS, 1)
+        .expect_err("scope gate must ignore consent for another scope");
+
+    assert!(
+        matches!(ipc_error(&error), IpcError::ScopeDenied { .. }),
+        "got {error:?}"
+    );
+    assert_eq!(host.pending_tool_scripts(), 1, "no script consumed");
+    assert_eq!(host.execution_count(), 0, "no execution stored");
+}
+
+#[test]
 fn dispatch_consent_is_per_scope_not_per_tool() {
     let mut host = inspect_host();
     for name in ["terminal_read_zone", "terminal_read_zone_b"] {
