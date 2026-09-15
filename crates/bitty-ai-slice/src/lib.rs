@@ -37,6 +37,7 @@ pub mod bridge;
 pub mod error;
 pub mod fake_host;
 pub mod harness;
+pub mod live_host;
 
 pub use bridge::{HostPeer, IpcBridge};
 pub use error::SliceError;
@@ -46,3 +47,4 @@ pub use harness::{
     collect_terminal_context, harness_agent, scripted_provider, terminal_record, test_session,
     test_tool_registry,
 };
+pub use live_host::LiveBittyHost;
