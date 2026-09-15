@@ -140,6 +140,13 @@ part_index > 0`.
 4. Concatenating the parts in order reproduces the source bytes exactly and
    every part stays under the 16 KiB ceiling, so the ingest service never
    truncates a pre-split part.
+5. Both entry points enforce the 64 KiB runtime bound: `pre_split_chunk` through
+   `validate_chunk`, and the fragment-level `pre_split_fragment` directly, so a
+   raw `Fragment` larger than one runtime fragment is refused rather than split.
+6. `reassemble` refuses parts that do not share one source identity: every part
+   must carry the first part's `(terminal_id, generation, source_seq)` and a
+   transport `seq` of `first_seq + part_index`, so a foreign or reordered part
+   fails closed instead of being concatenated.
 
 This module is the runtime-to-transport mapping layer, not a shipped
 transport. `bitty-ai-runtime` stays std-only with zero dependencies and cannot
@@ -170,7 +177,10 @@ cargo test -p bitty-ai-slice
 - `tests/fragment_mapping.rs`: runtime fragment -> transport `FragmentData`
   mapping, including the AI-0066 pre-split proof that a 64 KiB multi-byte
   UTF-8 block reassembles byte-identically through the real ingest service
-  (the counterfactual direct projection truncates).
+  (the counterfactual direct projection truncates), plus the AI-0069 negatives:
+  a foreign `terminal_id`/`generation`/`source_seq` part, a non-contiguous
+  transport `seq`, a mismatched later-part `part_count`, and an oversized raw
+  fragment at the fragment-level entry point are all refused.
 - `src/live_host.rs` inline tests (4 tests): live delegation for snapshot,
   tool dispatch, `Unknown` reconcile, and missing-handler fail-closed.
 - `src/journal_prototype.rs` inline tests (8 tests): append/read-back order

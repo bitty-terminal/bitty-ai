@@ -43,12 +43,14 @@
 //!   provider-echo) are asserted as absence where checkable and otherwise
 //!   recorded as gap input for the `bitty` track; there is no bypass path.
 
+use bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES;
 use bitty_ai_runtime::{
     Fragment, FragmentKind, StreamChunk, StreamSink, VecSink, emit_fragments, fragment_text,
     validate_chunk,
 };
 use bitty_ai_slice::fragment_transport::{
-    FragmentTransportCursor, FragmentTransportError, pre_split_chunk, reassemble,
+    FragmentTransportCursor, FragmentTransportError, TransportPart, pre_split_chunk,
+    pre_split_fragment, reassemble,
 };
 use bitty_ipc::error::IpcError;
 use bitty_ipc::rich_fragment::{
@@ -657,4 +659,108 @@ fn pre_split_fails_closed_on_non_utf8() {
         pre_split_chunk(&chunk, TERMINAL_ID, GENERATION, None, 0),
         Err(FragmentTransportError::NonUtf8)
     ));
+}
+
+// ── AI-0069 reassembly identity + fragment-level split bound ─────────────────
+
+/// A multi-part split used by the identity negatives below: the 16 KiB cut
+/// lands on a code-point boundary and yields more than one part, so mutating
+/// one part is a real cross-part disagreement.
+fn split_parts() -> Vec<TransportPart> {
+    let chunk = markdown_chunk(0, 1, &"é".repeat(20 * 1024));
+    let parts = pre_split_chunk(&chunk, TERMINAL_ID, GENERATION, None, 0).expect("split");
+    assert!(parts.len() > 1, "the fixture must yield several parts");
+    parts
+}
+
+#[test]
+fn reassemble_refuses_a_foreign_terminal_part() {
+    // A part from a different terminal with a matching index/count must not be
+    // silently reassembled into this fragment's bytes.
+    let mut parts = split_parts();
+    parts[1].data.terminal_id = "t:2".to_owned();
+    assert!(matches!(
+        reassemble(&parts),
+        Err(FragmentTransportError::TerminalMismatch { index: 1, .. })
+    ));
+}
+
+#[test]
+fn reassemble_refuses_a_foreign_generation_part() {
+    let mut parts = split_parts();
+    parts[1].data.generation = GENERATION + 1;
+    assert!(matches!(
+        reassemble(&parts),
+        Err(FragmentTransportError::GenerationMismatch { index: 1, .. })
+    ));
+}
+
+#[test]
+fn reassemble_refuses_a_foreign_source_seq_part() {
+    // `source_seq` is the split-time identity of the source fragment: a part
+    // that disagrees cannot belong to this reassembly even if its index/count
+    // and transport key line up.
+    let mut parts = split_parts();
+    parts[1].source_seq += 1;
+    assert!(matches!(
+        reassemble(&parts),
+        Err(FragmentTransportError::SourceSeqMismatch { index: 1, .. })
+    ));
+}
+
+#[test]
+fn reassemble_refuses_a_noncontiguous_part_seq() {
+    // `data.seq` must be `first_seq + part_index`; a gapped transport seq is a
+    // reordered or truncated part, not a contiguous split.
+    let mut parts = split_parts();
+    parts[1].data.seq += 100;
+    assert!(matches!(
+        reassemble(&parts),
+        Err(FragmentTransportError::SequenceGap { index: 1, .. })
+    ));
+}
+
+#[test]
+fn reassemble_refuses_a_mismatched_part_count_on_a_later_part() {
+    // The first part's `part_count` is checked against the input length; a later
+    // part disagreeing is still an inconsistent split and must fail closed.
+    let mut parts = split_parts();
+    let first_count = parts[0].part_count;
+    let mutated_count = first_count + 1;
+    parts[1].part_count = mutated_count;
+    assert!(matches!(
+        reassemble(&parts),
+        Err(FragmentTransportError::PartCountMismatch { expected, actual })
+            if expected == first_count && actual == mutated_count as usize
+    ));
+}
+
+#[test]
+fn pre_split_fragment_refuses_an_oversized_raw_fragment() {
+    // The fragment-level entry point must enforce the 64 KiB runtime bound
+    // itself so a raw `Fragment` caller cannot split an oversized fragment.
+    let fragment = Fragment::markdown(vec![b'x'; MAX_FRAGMENT_BYTES + 1]);
+    let err = pre_split_fragment(&fragment, 0, TERMINAL_ID, GENERATION, None, 0)
+        .expect_err("an over-64 KiB fragment must be refused, not split");
+    assert_eq!(
+        err,
+        FragmentTransportError::OversizedFragment {
+            actual: MAX_FRAGMENT_BYTES + 1,
+            limit: MAX_FRAGMENT_BYTES,
+        }
+    );
+}
+
+#[test]
+fn pre_split_fragment_accepts_exactly_the_runtime_bound() {
+    // The bound is a ceiling, not a strict inequality: exactly one runtime
+    // fragment (64 KiB) still splits and reassembles byte-identically.
+    let fragment = Fragment::markdown(vec![b'x'; MAX_FRAGMENT_BYTES]);
+    let parts = pre_split_fragment(&fragment, 0, TERMINAL_ID, GENERATION, None, 0)
+        .expect("the exact runtime bound is admitted");
+    assert!(parts.len() > 1, "64 KiB exceeds the 16 KiB part ceiling");
+    assert_eq!(
+        reassemble(&parts).expect("the split parts reassemble"),
+        "x".repeat(MAX_FRAGMENT_BYTES)
+    );
 }
