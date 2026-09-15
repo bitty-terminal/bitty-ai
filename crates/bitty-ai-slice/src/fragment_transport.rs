@@ -41,6 +41,15 @@
 //! 7. [`reassemble`] refuses parts that do not share one source identity: every
 //!    part must carry the first part's `(terminal_id, generation, source_seq)`
 //!    and a transport `seq` of `first_seq + part_index`.
+//! 8. [`reassemble_expected`] additionally binds the whole part set to a
+//!    caller-supplied [`FragmentIdentity`]. A foreign but internally consistent
+//!    part set, which rule 7 alone would reassemble silently, fails closed with
+//!    [`FragmentTransportError::IdentityMismatch`] unless its identity matches
+//!    the caller's expectation. A later part whose recorded `part_count`
+//!    disagrees with the first is reported as
+//!    [`FragmentTransportError::InconsistentPartCount`], kept distinct from the
+//!    whole-input [`FragmentTransportError::PartCountMismatch`] so both
+//!    failure modes stay unambiguous.
 //!
 //! # Why this lives in the slice, not in the runtime
 //!
@@ -81,6 +90,46 @@ pub struct TransportPart {
     pub is_continuation: bool,
 }
 
+/// The `(terminal_id, generation, source_seq)` identity of one source fragment.
+///
+/// [`pre_split_fragment`] stamps this identity onto every part of a split, and
+/// [`reassemble_expected`] requires the parts to match a caller-supplied value.
+/// Binding the first part absolutely and every later part relatively to the
+/// first constrains the whole set without re-checking each part against the
+/// expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentIdentity {
+    /// Transport identity of the source terminal.
+    pub terminal_id: String,
+    /// Runtime generation the source fragment belongs to.
+    pub generation: u64,
+    /// Runtime `seq` of the source fragment at split time.
+    pub source_seq: u32,
+}
+
+impl FragmentIdentity {
+    /// Construct the expected identity that [`reassemble_expected`] binds
+    /// against.
+    #[must_use]
+    pub fn new(terminal_id: &str, generation: u64, source_seq: u32) -> Self {
+        Self {
+            terminal_id: terminal_id.to_owned(),
+            generation,
+            source_seq,
+        }
+    }
+}
+
+impl From<&TransportPart> for FragmentIdentity {
+    fn from(part: &TransportPart) -> Self {
+        Self {
+            terminal_id: part.data.terminal_id.clone(),
+            generation: part.data.generation,
+            source_seq: part.source_seq,
+        }
+    }
+}
+
 /// Fail-closed mapping errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FragmentTransportError {
@@ -104,12 +153,33 @@ pub enum FragmentTransportError {
     SequenceExhausted,
     /// Reassembly was called with no parts.
     EmptyParts,
-    /// Reassembly input disagrees with the recorded `part_count`.
+    /// The number of supplied parts disagrees with the recorded `part_count`.
     PartCountMismatch {
         /// `part_count` recorded on the first part.
         expected: u32,
         /// Number of parts actually supplied.
         actual: usize,
+    },
+    /// A later part records a different `part_count` than the first part.
+    ///
+    /// Distinct from [`FragmentTransportError::PartCountMismatch`], which
+    /// compares the recorded count with the number of supplied parts: this
+    /// variant compares two parts' recorded counts, so the two failure paths
+    /// stay distinguishable.
+    InconsistentPartCount {
+        /// Zero-based index of the offending part.
+        index: u32,
+        /// `part_count` recorded on the first part.
+        expected: u32,
+        /// `part_count` recorded on the offending part.
+        found: u32,
+    },
+    /// The parts do not belong to the caller-supplied expected identity.
+    IdentityMismatch {
+        /// Identity the caller required via [`reassemble_expected`].
+        expected: FragmentIdentity,
+        /// Identity carried by the parts (taken from the first part).
+        found: FragmentIdentity,
     },
     /// Reassembly input is out of order or mislabels its continuation flag.
     PartOrder {
@@ -192,6 +262,24 @@ impl Display for FragmentTransportError {
             Self::PartCountMismatch { expected, actual } => {
                 write!(f, "expected {expected} parts, got {actual}")
             }
+            Self::InconsistentPartCount {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "part {index} records part_count {found}, expected {expected} from the first part"
+            ),
+            Self::IdentityMismatch { expected, found } => write!(
+                f,
+                "parts belong to (terminal_id {:?}, generation {}, source_seq {}), expected (terminal_id {:?}, generation {}, source_seq {})",
+                found.terminal_id,
+                found.generation,
+                found.source_seq,
+                expected.terminal_id,
+                expected.generation,
+                expected.source_seq
+            ),
             Self::PartOrder {
                 expected_index,
                 found,
@@ -344,18 +432,63 @@ pub fn pre_split_chunk(
 /// 0`, and every part must carry the first part's
 /// `(terminal_id, generation, source_seq)` identity with a transport `seq`
 /// equal to `first_seq + part_index`. Every part must also fit the transport
-/// ceiling. A foreign or reordered part is refused instead of silently
-/// reassembled. Successful output is byte-identical to the source fragment when
-/// the parts came from [`pre_split_fragment`].
+/// ceiling. A reordered part is refused instead of silently reassembled.
+/// Successful output is byte-identical to the source fragment when the parts
+/// came from [`pre_split_fragment`].
+///
+/// This entry point anchors identity on the first part, so a wholly foreign but
+/// internally consistent part set is still accepted. Callers that already know
+/// which source fragment they asked for must use [`reassemble_expected`], which
+/// takes the expected [`FragmentIdentity`] from the caller instead. This
+/// function is exactly [`reassemble_expected`] with the first part's identity as
+/// the expectation.
 ///
 /// # Errors
 ///
-/// Returns a [`FragmentTransportError`] for empty, mismatched, out-of-order,
-/// foreign-identity, non-contiguous-`seq`, or over-ceiling input.
+/// Returns every error [`reassemble_expected`] documents for the first part's
+/// own identity, including variants that name both the first part and the
+/// offending part.
 pub fn reassemble(parts: &[TransportPart]) -> Result<String, FragmentTransportError> {
     let Some(first) = parts.first() else {
         return Err(FragmentTransportError::EmptyParts);
     };
+    reassemble_expected(parts, &FragmentIdentity::from(first))
+}
+
+/// Reassemble pre-split parts, binding the whole set to a caller-supplied
+/// expected identity.
+///
+/// Performs every check [`reassemble`] performs, and additionally requires the
+/// parts to carry `expected`. The first part is compared absolutely against
+/// `expected` and every later part is compared against the first part, so a
+/// wholly foreign but internally consistent part set fails closed with
+/// [`FragmentTransportError::IdentityMismatch`] instead of reassembling
+/// silently. `part_count` disagreements keep two distinct typed errors: a
+/// supplied-length disagreement is
+/// [`FragmentTransportError::PartCountMismatch`] and a later part that records a
+/// different `part_count` than the first is
+/// [`FragmentTransportError::InconsistentPartCount`].
+///
+/// # Errors
+///
+/// Returns a [`FragmentTransportError`] for empty, mismatched, out-of-order,
+/// foreign-identity, non-contiguous-`seq`, or over-ceiling input. A part set
+/// that does not match `expected` returns
+/// [`FragmentTransportError::IdentityMismatch`].
+pub fn reassemble_expected(
+    parts: &[TransportPart],
+    expected: &FragmentIdentity,
+) -> Result<String, FragmentTransportError> {
+    let Some(first) = parts.first() else {
+        return Err(FragmentTransportError::EmptyParts);
+    };
+    let found = FragmentIdentity::from(first);
+    if &found != expected {
+        return Err(FragmentTransportError::IdentityMismatch {
+            expected: expected.clone(),
+            found,
+        });
+    }
     if usize::try_from(first.part_count).ok() != Some(parts.len()) {
         return Err(FragmentTransportError::PartCountMismatch {
             expected: first.part_count,
@@ -373,9 +506,10 @@ pub fn reassemble(parts: &[TransportPart]) -> Result<String, FragmentTransportEr
             });
         }
         if part.part_count != first.part_count {
-            return Err(FragmentTransportError::PartCountMismatch {
+            return Err(FragmentTransportError::InconsistentPartCount {
+                index: expected_index,
                 expected: first.part_count,
-                actual: part.part_count as usize,
+                found: part.part_count,
             });
         }
         if part.data.terminal_id != first.data.terminal_id {

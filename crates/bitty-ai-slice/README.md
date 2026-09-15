@@ -49,7 +49,7 @@ harness    Fixtures adapting real IPC snapshots to real runtime inputs with scri
 live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via an injectable seam (BII-09)
 local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, and bounded fail-closed JSON
 journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite journal with deletion tombstones, bounded fields, and fail-closed corruption handling (no FTS5, no scheduler, caller-supplied timestamps)
-fragment_transport  Runtime-to-transport pre-split (AI-0066): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker and dense seq
+fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker, dense seq, and a caller-bindable reassembly identity
 ```
 
 ## Dependencies
@@ -147,6 +147,15 @@ part_index > 0`.
    must carry the first part's `(terminal_id, generation, source_seq)` and a
    transport `seq` of `first_seq + part_index`, so a foreign or reordered part
    fails closed instead of being concatenated.
+7. `reassemble_expected` binds the whole part set to a caller-supplied
+   `FragmentIdentity` (AI-0070). Because rule 6 only checks the parts against
+   each other, a wholly foreign but internally consistent set reassembles
+   silently; binding the first part absolutely to the caller's expectation and
+   every later part to the first rejects it with
+   `FragmentTransportError::IdentityMismatch`. A later part whose recorded
+   `part_count` disagrees with the first reports
+   `FragmentTransportError::InconsistentPartCount`, kept distinct from the
+   supplied-length `FragmentTransportError::PartCountMismatch`.
 
 This module is the runtime-to-transport mapping layer, not a shipped
 transport. `bitty-ai-runtime` stays std-only with zero dependencies and cannot
@@ -180,7 +189,11 @@ cargo test -p bitty-ai-slice
   (the counterfactual direct projection truncates), plus the AI-0069 negatives:
   a foreign `terminal_id`/`generation`/`source_seq` part, a non-contiguous
   transport `seq`, a mismatched later-part `part_count`, and an oversized raw
-  fragment at the fragment-level entry point are all refused.
+  fragment at the fragment-level entry point are all refused. The AI-0070
+  additions prove `reassemble_expected` rejects a foreign but internally
+  consistent part set (`IdentityMismatch`) that `reassemble` alone accepts, and
+  that the two `part_count` failure modes stay distinguishable
+  (`PartCountMismatch` vs `InconsistentPartCount`).
 - `src/live_host.rs` inline tests (4 tests): live delegation for snapshot,
   tool dispatch, `Unknown` reconcile, and missing-handler fail-closed.
 - `src/journal_prototype.rs` inline tests (8 tests): append/read-back order
