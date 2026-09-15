@@ -128,6 +128,13 @@ impl SnapshotRequest {
 ///
 /// The record is always an untrusted observation surface: terminal output is
 /// attacker-controlled data, never instructions.
+///
+/// The turn-scoped id names the source terminal and its generation
+/// (`terminal-{owner}-{generation}`): distinct terminals sampled in one
+/// generation never share an id, which assembly would reject as
+/// [`ContextError::DuplicateRecordId`]. Re-sampling one terminal within the
+/// same generation reuses its id, so callers advance the generation per
+/// sample instead of assembling two same-id records.
 pub fn terminal_record(
     owner: &str,
     generation: u64,
@@ -135,7 +142,7 @@ pub fn terminal_record(
     bytes: Vec<u8>,
 ) -> Result<ContextRecord, ContextError> {
     Ok(ContextRecord {
-        id: format!("terminal-{generation}"),
+        id: format!("terminal-{owner}-{generation}"),
         provider: "terminal".to_owned(),
         owner: StableId::new(owner)?,
         generation,
@@ -408,5 +415,21 @@ mod tests {
             json,
             r#"{"instance":"inst-1","terminal":"term-1","zone":"output","max_bytes":4096}"#
         );
+    }
+
+    #[test]
+    fn terminal_record_ids_distinguish_sources_per_generation() {
+        // P2-2 (AI-0061): turn-scoped ids must be unique or assembly
+        // rejects them as DuplicateRecordId. Distinct terminals sampled in
+        // one generation get distinct ids; re-sampling one terminal in the
+        // same generation reuses its id, so callers advance the generation
+        // per sample instead of assembling same-id pairs.
+        let first = terminal_record("term-1", 1, 0, b"a".to_vec()).expect("record");
+        let second = terminal_record("term-2", 1, 0, b"b".to_vec()).expect("record");
+        assert_ne!(first.id, second.id);
+        let resample = terminal_record("term-1", 1, 1, b"c".to_vec()).expect("record");
+        assert_eq!(first.id, resample.id);
+        let next_gen = terminal_record("term-1", 2, 2, b"d".to_vec()).expect("record");
+        assert_ne!(first.id, next_gen.id);
     }
 }
