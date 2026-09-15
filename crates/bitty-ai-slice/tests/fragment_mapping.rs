@@ -11,10 +11,14 @@
 //!   (`FragmentData`/`RichFragment`/`FragmentIngestService`, 16 KiB text bound,
 //!   64-deep queue, always-`true` untrusted label) and `scope.rs` (no
 //!   `rich.*` wire method registered).
-//! - Runtime side is `bitty-ai-runtime/src/stream.rs` (untouched by this
-//!   task): `FragmentKind::{Markdown,Diff,ToolCard}`, `Fragment{kind,bytes}`,
+//! - Runtime side is `bitty-ai-runtime/src/stream.rs` (AI-0058): `FragmentKind`
+//!   `{Markdown,Diff,ToolCard}`, `Fragment{kind,bytes}`,
 //!   `StreamChunk{seq: u32,total,is_final,fragment}`, `validate_chunk`,
-//!   `fragment_text`, `emit_fragments`, `VecSink`. The runtime bound is
+//!   `fragment_text`, `emit_fragments`, `VecSink`. The runtime numbers `seq`
+//!   continuously across the emission batches of one logical turn (`S-8`
+//!   scheme A, `P1-5`), so the transport `seq` is the runtime `seq` projected
+//!   directly and needs no renumbering; `total` is the running water mark and
+//!   `is_final` closes each emission batch. The runtime bound is
 //!   `MAX_FRAGMENT_BYTES` (64 KiB); the transport bound is
 //!   `MAX_FRAGMENT_TEXT_BYTES` (16 KiB).
 //! - Mapping under test is test-only: validated runtime bytes that are valid
@@ -324,8 +328,8 @@ fn streamed_turn_ingests_end_to_end_through_real_service() {
     assert!(!fragments.is_empty());
     let mut sink = VecSink::new();
     let done =
-        emit_fragments(&mut sink, &fragments, &|| false).expect("in-budget turn emits cleanly");
-    assert!(done);
+        emit_fragments(&mut sink, &fragments, 0, &|| false).expect("in-budget turn emits cleanly");
+    assert!(done.is_some());
     assert_eq!(sink.len(), fragments.len());
 
     let mut service = FragmentIngestService::new();
@@ -350,6 +354,62 @@ fn streamed_turn_ingests_end_to_end_through_real_service() {
         assert!(!fragment.truncated);
         fragment.validate().expect("each DTO validates");
     }
+}
+
+#[test]
+fn continuous_turn_seq_yields_distinct_transport_keys() {
+    // P1-5 / S-8 scheme A: three emission batches of one logical turn
+    // (draft text, tool card, final text) number continuously, so the direct
+    // projection keeps the transport dedup key unique without renumbering.
+    // The pre-fix runtime restarted at `seq 0` per batch and the second
+    // ingest failed as a duplicate key.
+    let mut sink = VecSink::new();
+    let draft = fragment_text(FragmentKind::Markdown, "checking");
+    let after_draft = emit_fragments(&mut sink, &draft, 0, &|| false)
+        .expect("draft batch emits")
+        .expect("draft batch completes");
+    let card = fragment_text(FragmentKind::ToolCard, "tool=terminal_read_zone status=ok");
+    let after_card = emit_fragments(&mut sink, &card, after_draft, &|| false)
+        .expect("card batch emits")
+        .expect("card batch completes");
+    let answer = fragment_text(FragmentKind::Markdown, "the output was hello");
+    let after_answer = emit_fragments(&mut sink, &answer, after_card, &|| false)
+        .expect("answer batch emits")
+        .expect("answer batch completes");
+    assert_eq!((after_draft, after_card, after_answer), (1, 2, 3));
+    assert_eq!(sink.len(), 3);
+    // Single-fragment batches: seq/total advance as a running water mark and
+    // every batch-closing chunk carries `is_final`.
+    let framing: Vec<(u32, u32, bool)> = sink
+        .chunks()
+        .iter()
+        .map(|chunk| (chunk.seq, chunk.total, chunk.is_final))
+        .collect();
+    assert_eq!(framing, vec![(0, 1, true), (1, 2, true), (2, 3, true)]);
+
+    let mut service = FragmentIngestService::new();
+    for chunk in sink.chunks() {
+        let data =
+            map_chunk_to_fragment_data(chunk, TERMINAL_ID, GENERATION, Some(ZoneKind::Output))
+                .expect("continuous chunk maps");
+        service
+            .ingest(data)
+            .expect("unique transport key across emission batches");
+    }
+    assert_eq!(service.len(), 3);
+    assert!(service.contains(TERMINAL_ID, GENERATION, 0));
+    assert!(service.contains(TERMINAL_ID, GENERATION, 1));
+    assert!(service.contains(TERMINAL_ID, GENERATION, 2));
+    let drained = service.drain_bounded(8);
+    assert_eq!(
+        drained
+            .iter()
+            .map(|fragment| fragment.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(drained[2].text, "the output was hello");
+    assert!(drained.iter().all(|fragment| !fragment.truncated));
 }
 
 // ── fail-closed mapping edges ────────────────────────────────────────────────
