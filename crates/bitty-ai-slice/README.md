@@ -42,6 +42,7 @@ error      Typed fail-closed slice errors (unsupported method, consent, budget a
 fake_host  Deterministic FakeHost double mirroring bitty dispatch, consent, and result shapes (BII-09)
 harness    Fixtures adapting real IPC snapshots to real runtime inputs with scripted provider
 live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via an injectable seam (BII-09)
+local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, and bounded fail-closed JSON
 ```
 
 ## Dependencies
@@ -65,7 +66,9 @@ connects to a real terminal, process, PTY, socket, or network peer (no
 `LiveBittyHost` carries only an injectable provider seam (`fn` pointers),
 server-evaluated scopes, and the real consent ledger; tests use canned
 providers as mapping proof and claim no live data. Every operation takes
-caller-supplied `now_ms`, and there are no secret or credential fields.
+caller-supplied `now_ms`, and there are no secret or credential fields —
+except the `local_provider` experiment, which opens loopback-only TCP with
+mandatory timeouts and a caller-supplied, redacted key.
 
 `FakeHost` is std-only and deterministic: no network, no threads, no
 filesystem, no wall clock. Every method takes caller-supplied `now_ms`;
