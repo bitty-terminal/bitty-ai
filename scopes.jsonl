@@ -2,3 +2,4 @@
 {"created_at":"2026-09-15T03:18:16.988600545+00:00","id":"01M2HH534WAFZVFGM7DHTS7NH5","kind":"include","pattern":"crates/bitty-ai-slice/src/fake_host.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
 {"created_at":"2026-09-15T03:18:17.023600297+00:00","id":"01M2HH535ZARZTQ26R1K0ZVRCW","kind":"include","pattern":"crates/bitty-ai-slice/src/lib.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
 {"created_at":"2026-09-15T03:18:17.053972292+00:00","id":"01M2HH536YGE6T8MSC5D8TWZWF","kind":"include","pattern":"crates/bitty-ai-slice/tests/fake_host.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
+{"created_at":"2026-09-15T03:49:51.645853375+00:00","id":"01M2HJYXCX8VM3MQ7MKSVDNXAH","kind":"include","pattern":"docs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HJYF3P4KZJ4YDF0ES4RBW1"}
