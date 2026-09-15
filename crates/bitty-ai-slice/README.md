@@ -56,7 +56,10 @@ fragment_transport  Runtime-to-transport pre-split (AI-0066): 64 KiB runtime fra
 
 - `bitty-ai-runtime` via local path.
 - `bitty-ipc` via pinned Git revision (`2cbb1fbed82814c157359b71dd8efbb4be0c36e7`
-  in `Cargo.toml`).
+  in `Cargo.toml`). Detect drift between this pin and the local `bitty`
+  checkout with `just pin-drift` (`scripts/pin-drift.sh`); it is local-only by
+  default and documents the bump checklist in its header. It is intentionally
+  excluded from `just check`, which must not require network access.
 - `rusqlite` `=0.40.2`, `default-features = false`, `features = ["bundled"]`,
   for the `journal_prototype` experiment only. The dependency review (AI-0049
   PX-0298) covers supply-chain breadth, MIT licensing, Rust 1.85 fit, and

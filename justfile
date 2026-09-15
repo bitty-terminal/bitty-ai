@@ -67,3 +67,10 @@ workflow-import *args:
 
 workflow-import-dry *args:
     bash scripts/workflow-import.sh --dry-run {{args}}
+
+# Detect `bitty-ipc` pin drift against the mirrored FakeHost surface.
+# Local-only by default (no network); `--remote` opts into fetching
+# `origin/main` from the `bitty` checkout. Deliberately NOT part of
+# `just check`, which must keep zero network dependency.
+pin-drift *args:
+    bash scripts/pin-drift.sh {{args}}
