@@ -23,6 +23,7 @@ agent     Single-agent turn loop with structured outcomes incl. Unknown
 stream    Markdown/Diff/ToolCard fragments, seq/total/final chunks
 bridge    P1 wire owner.name <-> AgentInstanceId map + consent seam (deny + fake)
 prompt    Five-layer deterministic assembly, narrowing-only, canonical bytes
+selection Deterministic registry, capability-subset matching, data-held aliases, ordered fallback
 ```
 
 ## Rules
