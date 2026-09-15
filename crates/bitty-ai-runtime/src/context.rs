@@ -333,6 +333,14 @@ impl ArtifactStore {
         self.total_bytes
     }
 
+    /// Last assigned artifact id (`artifact://<next_id>` is the most recent
+    /// reference). Exposed so callers can snapshot store identity across
+    /// failed calls; [`assemble`] leaves it unchanged on error.
+    #[must_use]
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Retain `bytes` and return its reference.
     ///
     /// # Errors
@@ -572,6 +580,11 @@ pub struct AssembledContext {
 /// [`ContextPriority::Normal`]) while the budget holds, omitting the rest
 /// with counted truncation. Output order follows the caller order.
 ///
+/// Atomicity: externalization is a two-phase commit. Large bodies stage into
+/// a local buffer first with predicted references; the caller `store` is
+/// appended only after store-cap and budget checks pass. Any error leaves
+/// the store unchanged (`len`, `total_bytes`, and `next_id` identical).
+///
 /// Record content (`summary` text, body bytes) is never interpreted: no
 /// directive scan runs, and content influences maintenance only through
 /// bounded byte lengths feeding the same footprint accounting as benign
@@ -581,6 +594,7 @@ pub struct AssembledContext {
 ///
 /// Returns [`ContextError`] for invalid records, record-count overflow,
 /// artifact failures, or when even the smallest record exceeds the budget.
+/// The store is unchanged on error.
 pub fn assemble(
     records: &[ContextRecord],
     store: &mut ArtifactStore,
@@ -642,9 +656,14 @@ pub fn assemble(
         }
     }
 
-    // L1 externalize: large inline bodies become artifact references.
-    let mut externalized = 0usize;
+    // L1 externalize, phase 1 (stage only, zero store mutation): large inline
+    // bodies move into `pending` with predicted `artifact://<id>` references
+    // so budget footprints match the post-commit shape without touching
+    // `store`. Phase 2 commits only after store-cap and budget checks pass.
+    let base_next_id = store.next_id();
+    let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut staged: Vec<(usize, ContextRecord)> = Vec::with_capacity(deduped.len());
+    let mut staged_is_pending: Vec<bool> = Vec::with_capacity(deduped.len());
     for (index, mut record) in deduped {
         let externalize = matches!(&record.body, RecordBody::Inline(bytes) if bytes.len() > EXTERNALIZE_THRESHOLD_BYTES);
         if externalize {
@@ -653,11 +672,42 @@ pub fn assemble(
                 RecordBody::Inline(bytes) => std::mem::take(bytes),
                 RecordBody::Artifact(_) => Vec::new(),
             };
-            let reference = store.store(bytes)?;
-            record.body = RecordBody::Artifact(reference);
-            externalized += 1;
+            // Per-artifact bound checked before any mutation (validate()
+            // already caps inline bodies below this; defense in depth for
+            // future bound changes).
+            if bytes.len() > MAX_ARTIFACT_BYTES {
+                return Err(ContextError::ArtifactTooLarge {
+                    limit: MAX_ARTIFACT_BYTES,
+                    actual: bytes.len(),
+                });
+            }
+            pending.push(bytes);
+            let predicted = format!("artifact://{}", base_next_id + pending.len() as u64);
+            record.body = RecordBody::Artifact(ArtifactRef(predicted));
+            staged.push((index, record));
+            staged_is_pending.push(true);
+        } else {
+            staged.push((index, record));
+            staged_is_pending.push(false);
         }
-        staged.push((index, record));
+    }
+    let externalized = pending.len();
+
+    // Phase 1 validation: store caps against staged bytes, still zero
+    // mutation. Replicates `ArtifactStore::store` bounds for the batch so a
+    // later item failing cannot leave an earlier one retained (quota stolen,
+    // `next_id` advanced). Count first to preserve single-store error
+    // precedence, then total bytes.
+    if store.len() + pending.len() > MAX_ARTIFACTS {
+        return Err(ContextError::ArtifactStoreFull {
+            reason: format!("at most {MAX_ARTIFACTS} artifacts"),
+        });
+    }
+    let pending_bytes: usize = pending.iter().map(Vec::len).sum();
+    if store.total_bytes() + pending_bytes > MAX_ARTIFACT_STORE_BYTES {
+        return Err(ContextError::ArtifactStoreFull {
+            reason: format!("at most {MAX_ARTIFACT_STORE_BYTES} retained bytes"),
+        });
     }
 
     // Greedy include, highest effective priority first (AIQ-11: untrusted
@@ -701,6 +751,31 @@ pub fn assemble(
             actual: smallest,
         });
     }
+
+    // L1 externalize, phase 2 (atomic commit): all budgets and validations
+    // passed, so retain staged bytes. Pre-validation makes each `store`
+    // infallible here; the `?` is defense in depth for future bound changes.
+    // Commit order matches prediction order, so assigned references equal the
+    // predicted ones used for budget accounting.
+    let mut pending_drain = pending.into_iter();
+    for (position, (_, record)) in staged.iter_mut().enumerate() {
+        if staged_is_pending[position] {
+            let bytes = pending_drain
+                .next()
+                .expect("pending aligns with staged flags");
+            let committed = store.store(bytes)?;
+            debug_assert_eq!(
+                record.body,
+                RecordBody::Artifact(committed.clone()),
+                "predicted reference must equal committed reference"
+            );
+            record.body = RecordBody::Artifact(committed);
+        }
+    }
+    debug_assert!(
+        pending_drain.next().is_none(),
+        "all pending bytes must commit"
+    );
 
     let mut selected: Vec<(usize, ContextRecord)> = staged
         .into_iter()
@@ -1182,13 +1257,17 @@ mod tests {
         // Fill the store to its byte cap with maximum-size artifacts, then
         // show a further externalization fails closed with the store
         // unchanged: no silent substitution, no cap override via content.
+        // Atomicity covers the full store identity: count, bytes, and id
+        // sequence (two-phase commit, zero mutation on failure).
         let mut store = ArtifactStore::new();
         for _ in 0..(MAX_ARTIFACT_STORE_BYTES / MAX_ARTIFACT_BYTES) {
             store
                 .store(vec![b'a'; MAX_ARTIFACT_BYTES])
                 .expect("fill fits");
         }
-        let before = store.len();
+        let before_len = store.len();
+        let before_bytes = store.total_bytes();
+        let before_next = store.next_id();
         let err = assemble(
             &[untrusted(
                 "evil",
@@ -1201,6 +1280,46 @@ mod tests {
         )
         .expect_err("exhausted store must fail");
         assert!(matches!(err, ContextError::ArtifactStoreFull { .. }));
-        assert_eq!(store.len(), before);
+        assert_eq!(store.len(), before_len);
+        assert_eq!(store.total_bytes(), before_bytes);
+        assert_eq!(store.next_id(), before_next);
+
+        // Partial batch: room for one more artifact but not two. A naive
+        // direct-write loop would retain the first before failing on the
+        // second (quota stolen, `next_id` advanced); two-phase commit leaves
+        // the store identical.
+        let mut partial = ArtifactStore::new();
+        for _ in 0..(MAX_ARTIFACTS - 1) {
+            partial
+                .store(vec![b'p'; 16])
+                .expect("fill to one below count cap");
+        }
+        let partial_len = partial.len();
+        let partial_bytes = partial.total_bytes();
+        let partial_next = partial.next_id();
+        let two_large = vec![
+            record("big-one", "terminal", "zone dump one", 8_192),
+            record("big-two", "terminal", "zone dump two", 8_192),
+        ];
+        let err = assemble(&two_large, &mut partial, &budget(32_768))
+            .expect_err("second externalization must exhaust the count cap");
+        assert!(matches!(err, ContextError::ArtifactStoreFull { .. }));
+        assert_eq!(partial.len(), partial_len);
+        assert_eq!(partial.total_bytes(), partial_bytes);
+        assert_eq!(partial.next_id(), partial_next);
+
+        // Budget failure after staging: externalization footprints still
+        // resolve, then the greedy budget finds no room. The store must be
+        // untouched even though staging succeeded.
+        let mut budgeted = ArtifactStore::new();
+        let budgeted_len = budgeted.len();
+        let budgeted_bytes = budgeted.total_bytes();
+        let budgeted_next = budgeted.next_id();
+        let err = assemble(&two_large, &mut budgeted, &budget(1))
+            .expect_err("tiny budget must fail after staging");
+        assert!(matches!(err, ContextError::BudgetExceeded { .. }));
+        assert_eq!(budgeted.len(), budgeted_len);
+        assert_eq!(budgeted.total_bytes(), budgeted_bytes);
+        assert_eq!(budgeted.next_id(), budgeted_next);
     }
 }
