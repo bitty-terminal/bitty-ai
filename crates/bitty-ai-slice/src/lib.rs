@@ -31,7 +31,9 @@
 //! `now_ms`, there is no wall-clock, thread, async runtime, network, or secret,
 //! and the model provider is the runtime's scripted `FakeProvider` — except the
 //! `local_provider` experiment, which opens loopback-only TCP with mandatory
-//! timeouts and a caller-supplied key.
+//! timeouts and a caller-supplied key, and the [`journal_prototype`]
+//! experiment (AI-0049), which persists an append-ordered single-writer
+//! journal through SQLite in a caller-supplied file.
 
 #![deny(unsafe_code)]
 
@@ -39,6 +41,7 @@ pub mod bridge;
 pub mod error;
 pub mod fake_host;
 pub mod harness;
+pub mod journal_prototype;
 pub mod live_host;
 pub mod local_provider;
 
