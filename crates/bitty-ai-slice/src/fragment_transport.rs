@@ -34,6 +34,13 @@
 //!    `(terminal_id, generation, seq)`.
 //! 5. Every part fits `MAX_FRAGMENT_TEXT_BYTES`, so the ingest service never
 //!    truncates a pre-split part and its `truncated` flag stays `false`.
+//! 6. Both entry points enforce the 64 KiB runtime bound: [`pre_split_chunk`]
+//!    through `validate_chunk`, and the fragment-level [`pre_split_fragment`]
+//!    directly, so a raw [`Fragment`] larger than one runtime fragment is
+//!    refused instead of split.
+//! 7. [`reassemble`] refuses parts that do not share one source identity: every
+//!    part must carry the first part's `(terminal_id, generation, source_seq)`
+//!    and a transport `seq` of `first_seq + part_index`.
 //!
 //! # Why this lives in the slice, not in the runtime
 //!
@@ -50,6 +57,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
+use bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES;
 use bitty_ai_runtime::{Fragment, StreamChunk, validate_chunk};
 use bitty_ipc::rich_fragment::{FragmentData, MAX_FRAGMENT_TEXT_BYTES};
 use bitty_ipc::snapshot::ZoneKind;
@@ -80,6 +88,13 @@ pub enum FragmentTransportError {
     Runtime(String),
     /// Fragment bytes are not valid UTF-8 and cannot map to transport text.
     NonUtf8,
+    /// A raw fragment exceeds the runtime [`MAX_FRAGMENT_BYTES`] bound.
+    OversizedFragment {
+        /// Observed bytes.
+        actual: usize,
+        /// Runtime fragment bound in bytes.
+        limit: usize,
+    },
     /// The fragment would need more parts than a `u32` can index.
     TooManyParts {
         /// Number of parts the split produced.
@@ -103,6 +118,42 @@ pub enum FragmentTransportError {
         /// Index actually found.
         found: u32,
     },
+    /// A part carries a different source `terminal_id` than the first part.
+    TerminalMismatch {
+        /// Zero-based index of the offending part.
+        index: u32,
+        /// `terminal_id` carried by the first part.
+        expected: String,
+        /// `terminal_id` carried by the offending part.
+        found: String,
+    },
+    /// A part carries a different `generation` than the first part.
+    GenerationMismatch {
+        /// Zero-based index of the offending part.
+        index: u32,
+        /// `generation` carried by the first part.
+        expected: u64,
+        /// `generation` carried by the offending part.
+        found: u64,
+    },
+    /// A part carries a different source `seq` than the first part.
+    SourceSeqMismatch {
+        /// Zero-based index of the offending part.
+        index: u32,
+        /// `source_seq` carried by the first part.
+        expected: u32,
+        /// `source_seq` carried by the offending part.
+        found: u32,
+    },
+    /// A part's transport `seq` is not contiguous from the first part.
+    SequenceGap {
+        /// Zero-based index of the offending part.
+        index: u32,
+        /// Expected transport `seq` (`first.data.seq + index`).
+        expected: u64,
+        /// Transport `seq` found on the offending part.
+        found: u64,
+    },
     /// A reassembled part exceeds the transport ceiling.
     PartTooLarge {
         /// Zero-based index of the offending part.
@@ -124,6 +175,12 @@ impl Display for FragmentTransportError {
                     "fragment bytes are not valid UTF-8: cannot map without loss"
                 )
             }
+            Self::OversizedFragment { actual, limit } => {
+                write!(
+                    f,
+                    "fragment of {actual} bytes exceeds the {limit} byte runtime bound"
+                )
+            }
             Self::TooManyParts { parts } => {
                 write!(
                     f,
@@ -141,6 +198,38 @@ impl Display for FragmentTransportError {
             } => write!(
                 f,
                 "expected part index {expected_index} with matching continuation flag, got {found}"
+            ),
+            Self::TerminalMismatch {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "part {index} carries terminal_id {found:?}, expected {expected:?} from the first part"
+            ),
+            Self::GenerationMismatch {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "part {index} carries generation {found}, expected {expected} from the first part"
+            ),
+            Self::SourceSeqMismatch {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "part {index} carries source_seq {found}, expected {expected} from the first part"
+            ),
+            Self::SequenceGap {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "part {index} carries transport seq {found}, expected contiguous {expected}"
             ),
             Self::PartTooLarge {
                 index,
@@ -163,12 +252,19 @@ impl Error for FragmentTransportError {}
 /// `first_seq`. An empty fragment yields exactly one empty part so every source
 /// fragment keeps a `part_count >= 1` projection.
 ///
+/// This is the fragment-level entry point, so it enforces the runtime
+/// [`MAX_FRAGMENT_BYTES`] bound itself: a raw fragment larger than one runtime
+/// fragment is refused instead of being split, matching [`pre_split_chunk`]
+/// (which reaches the same refusal through `validate_chunk`).
+///
 /// # Errors
 ///
-/// Returns [`FragmentTransportError::NonUtf8`] when the bytes are not valid
-/// UTF-8, [`FragmentTransportError::TooManyParts`] when the part count exceeds
-/// the `u32` index space, or [`FragmentTransportError::SequenceExhausted`] when
-/// the transport `seq` range would overflow.
+/// Returns [`FragmentTransportError::OversizedFragment`] when the fragment
+/// exceeds [`MAX_FRAGMENT_BYTES`], [`FragmentTransportError::NonUtf8`] when the
+/// bytes are not valid UTF-8, [`FragmentTransportError::TooManyParts`] when the
+/// part count exceeds the `u32` index space, or
+/// [`FragmentTransportError::SequenceExhausted`] when the transport `seq` range
+/// would overflow.
 pub fn pre_split_fragment(
     fragment: &Fragment,
     source_seq: u32,
@@ -177,6 +273,12 @@ pub fn pre_split_fragment(
     zone: Option<ZoneKind>,
     first_seq: u64,
 ) -> Result<Vec<TransportPart>, FragmentTransportError> {
+    if fragment.bytes.len() > MAX_FRAGMENT_BYTES {
+        return Err(FragmentTransportError::OversizedFragment {
+            actual: fragment.bytes.len(),
+            limit: MAX_FRAGMENT_BYTES,
+        });
+    }
     let text = std::str::from_utf8(&fragment.bytes).map_err(|_| FragmentTransportError::NonUtf8)?;
     let ends = part_ends(text);
     let total = ends.len();
@@ -236,16 +338,20 @@ pub fn pre_split_chunk(
 
 /// Reassemble pre-split parts into the source text.
 ///
-/// Verifies the continuation marker before concatenating: `part_count` must
-/// match the supplied length, indices must be dense and in order, each part's
-/// `is_continuation` must equal `part_index > 0`, and every part must fit the
-/// transport ceiling. Successful output is byte-identical to the source
-/// fragment when the parts came from [`pre_split_fragment`].
+/// Every part must belong to the same source fragment before anything is
+/// concatenated: `part_count` must match the supplied length, indices must be
+/// dense and in order, each part's `is_continuation` must equal `part_index >
+/// 0`, and every part must carry the first part's
+/// `(terminal_id, generation, source_seq)` identity with a transport `seq`
+/// equal to `first_seq + part_index`. Every part must also fit the transport
+/// ceiling. A foreign or reordered part is refused instead of silently
+/// reassembled. Successful output is byte-identical to the source fragment when
+/// the parts came from [`pre_split_fragment`].
 ///
 /// # Errors
 ///
 /// Returns a [`FragmentTransportError`] for empty, mismatched, out-of-order,
-/// or over-ceiling input.
+/// foreign-identity, non-contiguous-`seq`, or over-ceiling input.
 pub fn reassemble(parts: &[TransportPart]) -> Result<String, FragmentTransportError> {
     let Some(first) = parts.first() else {
         return Err(FragmentTransportError::EmptyParts);
@@ -264,6 +370,43 @@ pub fn reassemble(parts: &[TransportPart]) -> Result<String, FragmentTransportEr
             return Err(FragmentTransportError::PartOrder {
                 expected_index,
                 found: part.part_index,
+            });
+        }
+        if part.part_count != first.part_count {
+            return Err(FragmentTransportError::PartCountMismatch {
+                expected: first.part_count,
+                actual: part.part_count as usize,
+            });
+        }
+        if part.data.terminal_id != first.data.terminal_id {
+            return Err(FragmentTransportError::TerminalMismatch {
+                index: expected_index,
+                expected: first.data.terminal_id.clone(),
+                found: part.data.terminal_id.clone(),
+            });
+        }
+        if part.data.generation != first.data.generation {
+            return Err(FragmentTransportError::GenerationMismatch {
+                index: expected_index,
+                expected: first.data.generation,
+                found: part.data.generation,
+            });
+        }
+        if part.source_seq != first.source_seq {
+            return Err(FragmentTransportError::SourceSeqMismatch {
+                index: expected_index,
+                expected: first.source_seq,
+                found: part.source_seq,
+            });
+        }
+        let Some(expected_seq) = first.data.seq.checked_add(u64::from(expected_index)) else {
+            return Err(FragmentTransportError::SequenceExhausted);
+        };
+        if part.data.seq != expected_seq {
+            return Err(FragmentTransportError::SequenceGap {
+                index: expected_index,
+                expected: expected_seq,
+                found: part.data.seq,
             });
         }
         if part.data.text.len() > MAX_FRAGMENT_TEXT_BYTES {
