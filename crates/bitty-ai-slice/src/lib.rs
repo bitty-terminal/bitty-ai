@@ -29,7 +29,9 @@
 //!
 //! The harness is deterministic: every operation takes a caller-supplied
 //! `now_ms`, there is no wall-clock, thread, async runtime, network, or secret,
-//! and the model provider is the runtime's scripted `FakeProvider`.
+//! and the model provider is the runtime's scripted `FakeProvider` — except the
+//! `local_provider` experiment, which opens loopback-only TCP with mandatory
+//! timeouts and a caller-supplied key.
 
 #![deny(unsafe_code)]
 
@@ -38,6 +40,7 @@ pub mod error;
 pub mod fake_host;
 pub mod harness;
 pub mod live_host;
+pub mod local_provider;
 
 pub use bridge::{HostPeer, IpcBridge};
 pub use error::SliceError;
@@ -48,3 +51,4 @@ pub use harness::{
     test_tool_registry,
 };
 pub use live_host::LiveBittyHost;
+pub use local_provider::{LocalEndpoint, LocalProvider};
