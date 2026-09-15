@@ -138,6 +138,9 @@ impl IdIssuer {
 /// `Own` is the spec `self` tier, renamed because `self` is a Rust keyword.
 /// This tier is distinct from the ephemeral `AgentWorkspace` (`AW-1`) and
 /// from context levels `L0`/`L1`; the `AgentInstanceId` split stays per AI-0013.
+/// This is only a policy-profile label, not a capability proof: holding a tier
+/// grants nothing by itself; every dispatch still passes the `AG-1`..`AG-4`
+/// checks and the `R2` unified authorization backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentLevel {
     /// Read workspace/project/git/diagnostics/zone-scoped snapshots, list
