@@ -1,0 +1,29 @@
+# AI-0068: secret-scan configuration for gitleaks.
+#
+# `gitleaks detect` scans git history, so the AI-0043 wire-probe fixture is
+# reported from commit 1e926a4 and cannot be covered by an inline
+# `#gitleaks:allow` comment (that would require rewriting history). A
+# rule-scoped allowlist is used instead.
+#
+# The allowlist is intentionally minimal:
+#   * scoped to the single `generic-api-key` rule (`[[rules.allowlists]]`);
+#   * used from `[[rules.allowlists]]`, not a global `[[allowlists]]`, because
+#     in the available gitleaks build a global entry with `paths` + `regexes`
+#     under `condition = "AND"` degenerates to a path-only allowlist that would
+#     ignore every finding in the file;
+#   * `condition = "AND"` requires BOTH the exact fixture path AND the exact
+#     fixture value to match, so no other path, value, or rule is weakened;
+#   * `generic-api-key` itself stays enabled.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "AI-0068: synthetic wire-probe API key unit-test fixture (local_provider.rs, AI-0043)"
+paths = ['''crates/bitty-ai-slice/src/local_provider\.rs''']
+regexTarget = "secret"
+regexes = ['''Ak3y-Wire-Probe-9z8y7x6w5v-0043a''']
+condition = "AND"
