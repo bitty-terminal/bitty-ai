@@ -30,9 +30,10 @@
 //! ## Read-only mirror pin
 //!
 //! No file in the `bitty` repository is modified by this task. The services
-//! used here are read through the pinned `bitty-ipc` revision `64e1709`
-//! (verified byte-identical `src/` against `bitty` `main` at `789b6b2` by
-//! AI-0034; only a crate-local `README.md` differs, no wire/transport change):
+//! used here are read through the pinned `bitty-ipc` revision `2cbb1fb`
+//! (AI-0039 verified `64e1709..2cbb1fb` additive: new `src/host_bridge.rs`
+//! plus `lib.rs` export plus crate `README.md`; existing DTO/validate/bounds
+//! shapes byte-identical):
 //!
 //! - Snapshot DTO/service: `crates/bitty-ipc/src/snapshot.rs` `SNAPSHOT_METHOD`
 //!   (`L64`), `SnapshotRequest` (`L235`, `validate` `L288`), `SnapshotData`

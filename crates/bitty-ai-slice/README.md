@@ -47,7 +47,7 @@ live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via a
 ## Dependencies
 
 - `bitty-ai-runtime` via local path.
-- `bitty-ipc` via pinned Git revision (`64e17095ee2f54b3482807cd133fadb9af949925`
+- `bitty-ipc` via pinned Git revision (`2cbb1fbed82814c157359b71dd8efbb4be0c36e7`
   in `Cargo.toml`).
 
 ## FakeHost and the live host
