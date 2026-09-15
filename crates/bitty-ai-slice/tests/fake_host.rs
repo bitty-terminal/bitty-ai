@@ -3,8 +3,11 @@
 //!
 //! Every test is deterministic (`now_ms` caller-supplied, no wall clock,
 //! no threads, no network, no filesystem) and single-agent (one `FakeHost`
-//! per `client_id`). Shapes mirror `bitty` `main` at `eef983e` read-only;
-//! live wiring is out of scope and no test connects to a real host.
+//! per `client_id`). Shapes mirror `bitty` `main` at `64e1709` read-only
+//! (`eef983e..64e1709` adds #716/#717 in `bitty-runtime` /
+//! `bitty-plugin-host` only; `crates/bitty-ipc` is byte-identical, so no
+//! mirror change); live wiring is out of scope and no test connects to a
+//! real host.
 
 use bitty_ai_slice::{BittyHost, FakeHost, SliceError};
 use bitty_ipc::error::IpcError;
@@ -12,7 +15,7 @@ use bitty_ipc::execution::{
     EXECUTION_SCOPE, EffectState, ExecutionRequest, ExecutionResult, ExecutionStatus,
     RawExecutionOutput,
 };
-use bitty_ipc::scope::{Scope, ScopeSet};
+use bitty_ipc::scope::{Scope, ScopeSet, required_scope_for_method};
 use bitty_ipc::snapshot::{
     DetailLevel, SNAPSHOT_METHOD, SemanticZone, SnapshotData, SnapshotRequest, ZoneKind,
 };
@@ -714,6 +717,77 @@ fn execution_truncates_streams_at_caller_budget() {
     assert!(result.truncated);
     assert_eq!(result.stdout_summary.len(), 64);
     assert_eq!(result.stderr_summary.len(), 64);
+}
+
+// ── process.spawn mapping (AI-0027) ─────────────────────────────────────────
+
+// bitty `main` at `64e1709` adds the bounded consent-gated `process.spawn`
+// surface (#717) behind the `[tools.*]` fail-closed allowlist (#716) in
+// `bitty-runtime` / `bitty-plugin-host` only; `crates/bitty-ipc` is
+// byte-identical to `eef983e`, so `FakeHost` needs no mirror change. This
+// test pins the mapping the new surface relies on: `SpawnService::dispatch`
+// resolves `SpawnRequest(tool + args)` via the host `SpawnAuthorizer`, then
+// runs the resolved executable under the real `ExecutionService` — the exact
+// prefix `FakeHost::execute` mirrors (scope `process.spawn`, effect opt-in,
+// per-spawn consent, stream budget, `Unknown` agreement, attributed store,
+// `reconcile`/`resolve` without retry). The allowlist itself stays host-side
+// (like the runtime `ToolRegistry` + `ToolAuthorizer` seam) and is correctly
+// absent here: `FakeHost` takes the already-resolved `ExecutionRequest`.
+#[test]
+fn spawn_surface_maps_onto_execute_reconcile_resolve() {
+    // One scope guards the whole path: the wire method, the spawn surface,
+    // and the execution backend agree.
+    assert_eq!(
+        required_scope_for_method("process.spawn"),
+        Some(Scope::ProcessSpawn)
+    );
+    assert_eq!(EXECUTION_SCOPE, Scope::ProcessSpawn);
+
+    // Spawn-shaped allowlisted request (`git status` is an accepted Layer-2
+    // verb) serves through `execute` with scope + opt-in + consent.
+    let mut host = spawn_host();
+    host.push_execution_output(RawExecutionOutput {
+        target_id: None,
+        status: ExecutionStatus::Completed,
+        exit_code: Some(0),
+        stdout: "ok".to_owned(),
+        stderr: String::new(),
+        evidence_refs: Vec::new(),
+        effect_state: EffectState::Completed,
+    });
+    let request = ExecutionRequest::new("git", vec!["status".to_owned()]).with_allow_effects(true);
+    let result = host
+        .execute(&request, NOW_MS, 61)
+        .expect("spawn-shaped execution serves");
+    assert_eq!(result.status, ExecutionStatus::Completed);
+    assert!(result.is_untrusted_surface);
+    assert_eq!(host.reconcile(61).expect("reconcile queries"), result);
+
+    // Timeout-shaped outcome (`Unknown`/`Unknown` with no exit code: spawn
+    // reports a killed child as `Unknown`, never as failure) reconciles and
+    // resolves without retry — the same path the runtime maps as
+    // `EffectUnknown` → `ToolStatus::Unknown` → `ExecOutcome::Unknown`.
+    host.push_execution_output(exec_unknown_output());
+    let unknown = host
+        .execute(&exec_request(), NOW_MS, 62)
+        .expect("unknown stores");
+    assert!(unknown.needs_reconciliation());
+    let terminal = ExecutionResult::new(
+        62,
+        CLIENT.to_owned(),
+        None,
+        ExecutionStatus::Completed,
+        Some(0),
+        "done".to_owned(),
+        String::new(),
+        false,
+        Vec::new(),
+        EffectState::Completed,
+    )
+    .expect("terminal result validates");
+    host.resolve(62, terminal.clone())
+        .expect("resolve closes unknown");
+    assert_eq!(host.reconcile(62).expect("reconciled"), terminal);
 }
 
 // ── consent ledger seam ─────────────────────────────────────────────────────
