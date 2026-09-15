@@ -5,10 +5,11 @@
 //! network, no secrets, no wall clock.
 
 use bitty_ai_runtime::{
-    Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ContextPriority, ContextRecord,
-    DetailLevel, ExecOutcome, FakeProvider, FakeToolExecutor, FragmentKind, ModelProvider,
-    ProviderError, ProviderTurn, ProviderUsage, RecordBody, StableId, StreamSink, ToolAuthorizer,
-    ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, VecSink,
+    Agent, AgentConfig, AgentError, AgentLevel, AuthContext, AuthDecision, ContextError,
+    ContextPriority, ContextRecord, DetailLevel, ElevationGrant, ExecOutcome, FakeProvider,
+    FakeToolExecutor, FragmentKind, ModelProvider, ProviderError, ProviderTurn, ProviderUsage,
+    RecordBody, SessionState, StableId, StreamSink, ToolAuthorizer, ToolBus, ToolCallRequest,
+    ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, VecSink,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -55,6 +56,35 @@ fn read_tool_bus() -> ToolBus {
     ToolBus::new(registry).with_authorizer(AllowAll)
 }
 
+fn read_write_tool_bus() -> ToolBus {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(
+            ToolSpec::new(
+                "workspace_read",
+                "Read a bounded workspace path",
+                br#"{"type":"object"}"#.to_vec(),
+                "workspace.read",
+                true,
+            )
+            .expect("valid spec"),
+        )
+        .expect("capacity");
+    registry
+        .register(
+            ToolSpec::new(
+                "workspace_write",
+                "Write a bounded workspace path",
+                br#"{"type":"object"}"#.to_vec(),
+                "workspace.write",
+                false,
+            )
+            .expect("valid spec"),
+        )
+        .expect("capacity");
+    ToolBus::new(registry).with_authorizer(AllowAll)
+}
+
 fn seed_record(id: &str, summary: &str, body_len: usize) -> ContextRecord {
     ContextRecord {
         id: id.to_owned(),
@@ -72,7 +102,7 @@ fn seed_record(id: &str, summary: &str, body_len: usize) -> ContextRecord {
 
 fn run(
     agent: &mut Agent<FakeProvider>,
-    executor: &mut FakeToolExecutor,
+    executor: &mut dyn ToolExecutor,
     prompt: &str,
     seeds: &[ContextRecord],
     sink: &mut VecSink,
@@ -355,6 +385,104 @@ fn deny_by_default_without_authorizer() {
 }
 
 #[test]
+fn mid_turn_generation_rotation_downgrades_remaining_writes() {
+    // P0-1 (S-1): per-call JIT `AuthBase`. A `Workspace` turn with two
+    // writes rotates to `Inspect` during the first dispatch; the second
+    // write must be denied at the fresh tier while the first stays recorded.
+    struct AllowElevation;
+    impl ElevationGrant for AllowElevation {
+        fn elevation_granted(&self, _current: AgentLevel, _requested: AgentLevel) -> bool {
+            true
+        }
+    }
+    struct RotatingExecutor {
+        session: bitty_ai_runtime::AgentSession,
+        rotate_on_call: usize,
+        calls: Vec<(String, Vec<u8>)>,
+    }
+    impl ToolExecutor for RotatingExecutor {
+        fn execute(
+            &mut self,
+            tool: &str,
+            arguments: &[u8],
+            _now_ms: u64,
+        ) -> Result<ToolSuccess, ToolError> {
+            self.calls.push((tool.to_owned(), arguments.to_vec()));
+            if self.calls.len() == self.rotate_on_call {
+                self.session.rotate_generation();
+            }
+            ToolSuccess::new("write ok".to_owned(), b"ok".to_vec())
+        }
+    }
+    let session = session();
+    session
+        .elevate(AgentLevel::Workspace, &AllowElevation)
+        .expect("grant allows elevation");
+    assert_eq!(session.generation(), 1);
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "two writes".to_owned(),
+        tool_calls: vec![
+            ToolCallRequest {
+                name: "workspace_write".to_owned(),
+                arguments: br#"{"path":"a"}"#.to_vec(),
+            },
+            ToolCallRequest {
+                name: "workspace_write".to_owned(),
+                arguments: br#"{"path":"b"}"#.to_vec(),
+            },
+        ],
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    provider.push_turn(ProviderTurn {
+        text: "unreached".to_owned(),
+        tool_calls: Vec::new(),
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    let mut agent = Agent::new(
+        provider,
+        read_write_tool_bus(),
+        session.clone(),
+        AgentConfig::default(),
+    );
+    let mut executor = RotatingExecutor {
+        session: session.clone(),
+        rotate_on_call: 1,
+        calls: Vec::new(),
+    };
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::Denied { .. })
+            }
+        ),
+        "remaining write after rotation must be denied, got: {outcome:?}"
+    );
+    // Rotation happened mid-turn through the shared handle.
+    assert_eq!(session.level(), AgentLevel::Inspect);
+    assert_eq!(session.generation(), 2);
+    // Second dispatch never reached the host: fail closed before execute.
+    assert_eq!(executor.calls.len(), 1);
+    // Already-dispatched effect is kept, never rolled back; the denied
+    // remainder is recorded as a failed attribution.
+    assert_eq!(agent.executions().len(), 2);
+    assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
+    assert!(matches!(
+        agent.executions()[1].status,
+        ToolStatus::Failed { .. }
+    ));
+    assert_eq!(agent.provider_mut().complete_calls(), 1);
+    assert_eq!(session.state(), SessionState::Failed);
+}
+
+#[test]
 fn oversized_arguments_fail_with_no_dispatch() {
     let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
     provider.push_turn(ProviderTurn {
@@ -419,6 +547,72 @@ fn oversized_result_fails_after_single_dispatch() {
         agent.executions()[0].status,
         ToolStatus::Failed { .. }
     ));
+}
+
+#[test]
+fn full_artifact_store_fails_turn_instead_of_empty_inline() {
+    // P0-2 (S-2): 63 large seeds externalize during assembly (each 4100 B
+    // over the 4 KiB threshold with distinct summaries so L1 dedupe keeps
+    // all 63; 63 * 4100 = 258_300 retained bytes under the 256 KiB cap), so
+    // the following 5120 B tool result cannot externalize. The turn must
+    // fail as `Context(ArtifactStoreFull)` with the session marked failed,
+    // never `Completed` with an empty inline substitute.
+    let seeds: Vec<ContextRecord> = (0..63)
+        .map(|index| seed_record(&format!("seed-{index}"), &format!("summary-{index}"), 4100))
+        .collect();
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "reading".to_owned(),
+        tool_calls: vec![ToolCallRequest {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        }],
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    provider.push_turn(ProviderTurn {
+        text: "unreached".to_owned(),
+        tool_calls: Vec::new(),
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    let session = session();
+    let mut agent = Agent::new(
+        provider,
+        read_tool_bus(),
+        session.clone(),
+        AgentConfig {
+            context_budget_bytes: 64 * 1024,
+            ..AgentConfig::default()
+        },
+    );
+    let mut executor = FakeToolExecutor::new();
+    executor.push_success("large read", vec![b'y'; 5120]);
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "go", &seeds, &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Context(ContextError::ArtifactStoreFull { .. })
+            }
+        ),
+        "store-full externalization must fail the turn, got: {outcome:?}"
+    );
+    // The host dispatch happened (effect attributed), but no empty inline
+    // record was substituted for the lost bytes.
+    assert_eq!(executor.calls().len(), 1);
+    assert_eq!(agent.executions().len(), 1);
+    assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
+    assert!(
+        agent.tool_records().is_empty(),
+        "no Inline(empty) substitute may be recorded, got: {:?}",
+        agent.tool_records()
+    );
+    assert_eq!(session.state(), SessionState::Failed);
+    assert_eq!(agent.provider_mut().complete_calls(), 1);
 }
 
 #[test]

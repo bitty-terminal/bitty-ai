@@ -361,6 +361,22 @@ impl<P: ModelProvider> Agent<P> {
         self.turn_cost
     }
 
+    /// Fresh authorization base from server-side session state.
+    ///
+    /// Re-read before every `precheck`/`dispatch` so a mid-turn
+    /// [`AgentSession::rotate_generation`] downgrade to `Inspect` takes
+    /// effect for the remaining calls in the turn (S-1). The generation is
+    /// observed alongside the tier because rotation bumps the generation and
+    /// resets the tier together; the tier drives the [`AuthBase`] decision.
+    fn auth_base(&self) -> AuthBase {
+        let _generation = self.session.generation();
+        AuthBase {
+            agent_instance_id: self.session.agent_instance_id(),
+            session_id: self.session.session_id(),
+            level: self.session.level(),
+        }
+    }
+
     /// Run one turn: assemble seed context, loop provider rounds with tool
     /// dispatch, and stream fragments into `sink`.
     ///
@@ -416,11 +432,6 @@ impl<P: ModelProvider> Agent<P> {
         let context_refs = assembled.context_refs.clone();
 
         self.tools.begin_turn();
-        let base = AuthBase {
-            agent_instance_id: self.session.agent_instance_id(),
-            session_id: self.session.session_id(),
-            level: self.session.level(),
-        };
         let tool_names = self.tools.tool_names();
         let mut round = 0;
         self.tool_history.clear();
@@ -498,8 +509,10 @@ impl<P: ModelProvider> Agent<P> {
                 })
                 .collect();
             // Transactional gate: authorize everything before dispatching
-            // anything (FS-AI1).
-            if let Err(error) = self.tools.precheck(&calls, &base) {
+            // anything (FS-AI1). Fresh base per round so a rotation that
+            // landed between rounds is already visible here.
+            let precheck_base = self.auth_base();
+            if let Err(error) = self.tools.precheck(&calls, &precheck_base) {
                 return self.fail(error.into());
             }
             messages.push(Message::assistant(turn.text.clone()));
@@ -508,6 +521,11 @@ impl<P: ModelProvider> Agent<P> {
                     return self.reconcile_cancel();
                 }
                 let execution_id = self.ids.execution();
+                // S-1: per-call JIT authorization base. A mid-turn
+                // `rotate_generation()` (shared session handle) downgrades
+                // the remaining dispatches to `Inspect`; already-dispatched
+                // effects are kept, never rolled back.
+                let base = self.auth_base();
                 match self
                     .tools
                     .dispatch(executor, call, &base, execution_id, now_ms)
@@ -515,7 +533,11 @@ impl<P: ModelProvider> Agent<P> {
                     Ok(execution) => {
                         let unknown = matches!(execution.status, ToolStatus::Unknown { .. });
                         let denied = matches!(execution.status, ToolStatus::Denied { .. });
-                        self.record_execution(&execution, now_ms);
+                        // S-2: externalization failure fails the turn; never
+                        // substitute empty bytes for lost tool output.
+                        if let Err(error) = self.record_execution(&execution, now_ms) {
+                            return self.fail(error.into());
+                        }
                         messages.push(self.execution_message(&execution));
                         match self.emit_tool_card(sink, &execution) {
                             Ok(true) => {}
@@ -603,17 +625,28 @@ impl<P: ModelProvider> Agent<P> {
 
     /// Record one execution as an attributed record plus an L0
     /// [`ContextRecord`] (large payloads externalize to the artifact store).
-    fn record_execution(&mut self, execution: &ToolExecution, now_ms: u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ContextError`] from [`ArtifactStore::store`] (for
+    /// example [`ContextError::ArtifactStoreFull`]) when a large payload
+    /// cannot be externalized. The attributed [`ExecutionRecord`] is already
+    /// pushed (the effect happened), but no [`ContextRecord`] is appended:
+    /// callers must `fail()` the turn rather than substitute empty bytes
+    /// (S-2). Small payloads never fail here.
+    fn record_execution(
+        &mut self,
+        execution: &ToolExecution,
+        now_ms: u64,
+    ) -> Result<(), ContextError> {
         self.executions.push(ExecutionRecord {
             execution_id: execution.execution_id,
             tool: execution.tool.clone(),
             status: execution.status.clone(),
         });
         let body = if execution.data.len() > crate::context::EXTERNALIZE_THRESHOLD_BYTES {
-            match self.artifacts.store(execution.data.clone()) {
-                Ok(reference) => RecordBody::Artifact(reference),
-                Err(_) => RecordBody::Inline(Vec::new()),
-            }
+            let reference = self.artifacts.store(execution.data.clone())?;
+            RecordBody::Artifact(reference)
         } else {
             RecordBody::Inline(execution.data.clone())
         };
@@ -633,6 +666,7 @@ impl<P: ModelProvider> Agent<P> {
                 is_untrusted_surface: true,
             });
         }
+        Ok(())
     }
 
     /// Render one execution as a tool message for the next provider round.
