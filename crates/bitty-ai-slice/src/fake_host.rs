@@ -85,6 +85,9 @@ use bitty_ipc::tool_dispatch::{
     MAX_TOOL_CLIENT_ID_BYTES, MAX_TOOLS_PER_HOST, ToolExecution, ToolOutput, ToolRequest, ToolSpec,
 };
 
+use bitty_ai_runtime::bridge::IdentityBridge;
+
+use crate::bridge::wire_client_id;
 use crate::error::SliceError;
 
 /// Host capability surface shared by [`FakeHost`] and the live host.
@@ -191,6 +194,10 @@ impl FakeHost {
     /// Construct a host for `client_id` with server-evaluated `granted`
     /// scopes and empty scripts, ledger, registry, and execution store.
     ///
+    /// This is the raw seam: `client_id` is taken verbatim and only
+    /// length-bounded. Product callers must use [`Self::from_binding`] so the
+    /// id is derived from a bound protocol principal (`AI-0065`).
+    ///
     /// # Errors
     ///
     /// Returns [`SliceError::Ipc`] when `client_id` is empty or exceeds the
@@ -220,6 +227,18 @@ impl FakeHost {
             exec_scripts: VecDeque::new(),
             executions: BTreeMap::new(),
         })
+    }
+
+    /// Construct a host whose client identity is derived from the bound
+    /// protocol principal of `identity` (`AI-0065`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures of [`wire_client_id`]: an unbound identity or an
+    /// over-long derived id is refused before any host state exists (no
+    /// registry, ledger, script, or execution store).
+    pub fn from_binding(identity: &IdentityBridge, granted: ScopeSet) -> Result<Self, SliceError> {
+        Self::new(wire_client_id(identity)?, granted)
     }
 
     /// Authenticated client identity served by this host.

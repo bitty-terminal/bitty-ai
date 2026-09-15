@@ -42,7 +42,7 @@ decides no open register entry.
 ## Modules
 
 ```text
-bridge     Generic host boundary composing real bitty-ipc primitives; unknown methods fail closed
+bridge     Generic host boundary composing real bitty-ipc primitives; protocol-identity -> client_id binding rule; unknown methods fail closed
 error      Typed fail-closed slice errors (unsupported method, consent, budget and bound violations)
 fake_host  Deterministic FakeHost double mirroring bitty dispatch, consent, and result shapes (BII-09)
 harness    Fixtures adapting real IPC snapshots to real runtime inputs with scripted provider
@@ -91,6 +91,30 @@ consent ledger. It reuses the real `bitty-ipc` DTOs, bounds, and `validate()`
 methods directly; only the dispatch order is mirrored as explicit steps with
 the same denial classes and no-partial-state guarantee.
 
+## Protocol identity to wire `client_id` binding (AI-0065)
+
+The host keys its consent ledger and execution store by a wire `client_id`
+string, while `bitty-ai-runtime`'s `IdentityBridge` owns the protocol principal
+`ProtocolAgentId(owner.name)`. `bridge::wire_client_id` defines the one
+deterministic rule that binds them: `client_id` is exactly the validated
+`owner.name` wire principal of the bound identity (matching the upstream
+`ConsentGrant.client_id` contract). The rule fails closed:
+
+- an unbound identity is refused, so a caller cannot substitute an arbitrary
+  id for a missing binding, and
+- a bound principal longer than the upstream `client_id` bound
+  (`bridge::MAX_WIRE_CLIENT_ID_BYTES`, re-derived from the pinned `bitty-ipc`
+  `auth::MAX_SCOPED_ID_BYTES` value `64`, pinned revision
+  `2cbb1fbed82814c157359b71dd8efbb4be0c36e7`) is refused, because the runtime
+  protocol bound (128 bytes) is wider than the host wire bound.
+
+`bridge::verify_wire_client_id` refuses a caller-supplied id that disagrees
+with the bound principal. `IpcBridge::from_binding`, `FakeHost::from_binding`,
+and `LiveBittyHost::from_binding` are the sanctioned construction paths; the
+raw `new(client_id, ..)` constructors remain the explicit test/host seam.
+Every refusal is total: no host is constructed, nothing is dispatched, and no
+store entry is written.
+
 ## Tests
 
 ```text
@@ -100,6 +124,10 @@ cargo test -p bitty-ai-slice
 - `tests/vertical_slice.rs` (11 tests): full loop (prompt -> provider ->
   context -> tool -> streamed result) and fail-closed paths against the real
   runtime.
+- `tests/client_id_binding.rs` (8 tests): protocol identity -> wire
+  `client_id` binding rule (deterministic derivation, single upstream length
+  bound, and the unbound / over-long / disagreeing negatives with no dispatch
+  or store entry).
 - `tests/fake_host.rs` (27 tests) plus `src/fake_host.rs` inline tests
   (4 tests): snapshot, tool dispatch, supervised execution
   (`execute`/`reconcile`/`resolve` including `Unknown`), consent
