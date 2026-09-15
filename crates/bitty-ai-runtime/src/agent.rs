@@ -92,10 +92,16 @@ pub struct AgentConfig {
     /// Base backoff delay in milliseconds for reconcile query attempt 0;
     /// doubles per attempt up to
     /// [`AgentConfig::unknown_reconcile_max_delay_ms`]. Deterministic: the
-    /// driver derives each `next_retry_ms` from caller-supplied `now_ms`
-    /// with saturating addition; no wall clock is read.
+    /// driver derives each query attempt's retry instant from
+    /// caller-supplied `now_ms` with saturating addition; no wall clock is
+    /// read. See
+    /// [`Agent::reconcile_unknown`](crate::agent::Agent::reconcile_unknown)
+    /// for the full clock-advance contract (the driver never advances
+    /// `now_ms`; callers do).
     pub unknown_reconcile_base_delay_ms: u64,
     /// Per-attempt backoff ceiling in milliseconds for reconcile queries.
+    /// Bounds each entry of the reported `delays_ms`; the driver still never
+    /// sleeps or advances the clock itself.
     pub unknown_reconcile_max_delay_ms: u64,
 }
 
@@ -845,11 +851,12 @@ impl<P: ModelProvider> Agent<P> {
     /// - The target must be recorded on this agent with
     ///   [`ToolStatus::Unknown`]; otherwise [`ReconcileOutcome::NoUnknown`]
     ///   is returned and nothing runs.
-    /// - Each query computes `delays_ms[attempt]` via
-    ///   [`reconcile_delay_ms`] and derives `now_ms.saturating_add(delay)`
-    ///   as the caller-scheduled retry instant. The driver never sleeps and
-    ///   never reads a clock: pass the same deterministic `now_ms` used by
-    ///   the turn loop.
+    /// - Each query attempt `attempt` (0-based) reports
+    ///   `delays_ms[attempt] = reconcile_delay_ms(attempt, base, ceiling)`
+    ///   via [`reconcile_delay_ms`], with `base`/`ceiling` from
+    ///   [`AgentConfig::reconcile_config`] (already bounded by
+    ///   [`ReconcileConfig`] and the hard caps). The driver never sleeps and
+    ///   never reads a clock.
     /// - A terminal reconciler answer updates the recorded status in place
     ///   and returns [`ReconcileOutcome::Resolved`]; the session stays
     ///   `Active`. A `Resolved(ToolStatus::Unknown)` answer is treated as
@@ -859,6 +866,36 @@ impl<P: ModelProvider> Agent<P> {
     ///   [`UnknownEscalation`] report (convertible to
     ///   [`AgentError::UnknownUnresolved`]). No further retry is attempted
     ///   under this protocol.
+    ///
+    /// # Clock-advance contract
+    ///
+    /// `reconcile_unknown` is a single synchronous evaluation of the whole
+    /// bounded schedule and does **not** advance the clock: every query in one
+    /// invocation is issued at the same caller-supplied `now_ms`, and the
+    /// retry instant the driver computes for attempt `attempt`,
+    ///
+    /// ```text
+    /// next_retry_ms(attempt) = now_ms.saturating_add(delays_ms[attempt])
+    /// ```
+    ///
+    /// is reported, not waited on. `delays_ms` is therefore a *schedule*, not
+    /// observed elapsed time. Callers that need real backoff advance their own
+    /// clock by the reported delays and re-invoke:
+    ///
+    /// - a full-budget invocation schedules attempts up to
+    ///   `next_retry_ms(delays_ms.len() - 1)`; advance to (or past) that last
+    ///   scheduled instant and re-invoke to let a time-dependent reconciler
+    ///   make progress;
+    /// - for exactly one query per invocation, configure
+    ///   [`AgentConfig::max_unknown_retries`] `= 1` and advance by the single
+    ///   reported delay, `now_ms.saturating_add(delays_ms[0])`.
+    ///
+    /// Re-invocation is defined for as long as the target stays recorded as
+    /// [`ToolStatus::Unknown`]: escalation fails the session but does not
+    /// rewrite that recorded status. Reusing the same `now_ms` on every
+    /// invocation is valid only when the caller deliberately freezes time
+    /// (deterministic replay); the recorded `delays_ms` never reflects real
+    /// time advancement on its own.
     pub fn reconcile_unknown(
         &mut self,
         reconciler: &mut dyn UnknownReconciler,

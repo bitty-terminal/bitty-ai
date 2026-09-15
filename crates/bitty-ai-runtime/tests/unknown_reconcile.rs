@@ -7,10 +7,10 @@
 //! no sleep, no network, no secrets.
 
 use bitty_ai_runtime::{
-    Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ExecOutcome, FakeProvider,
-    FakeReconciler, FakeToolExecutor, ModelProvider, ProviderTurn, ProviderUsage, ReconcileOutcome,
-    SessionState, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
-    ToolStatus, VecSink, reconcile_delay_ms,
+    Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ExecOutcome, ExecutionId,
+    FakeProvider, FakeReconciler, FakeToolExecutor, ModelProvider, ProviderTurn, ProviderUsage,
+    ReconcileOutcome, ReconcileStatus, SessionState, ToolAuthorizer, ToolBus, ToolCallRequest,
+    ToolError, ToolRegistry, ToolSpec, ToolStatus, UnknownReconciler, VecSink, reconcile_delay_ms,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -255,6 +255,104 @@ fn backoff_schedule_is_deterministic() {
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+/// Time-dependent reconciler: reports `Pending` until the caller-supplied
+/// `now_ms` reaches `deadline_ms`, then resolves. It records every observed
+/// instant so the test can assert exactly when the driver queried it.
+struct DeadlineReconciler {
+    deadline_ms: u64,
+    nows: Vec<u64>,
+}
+
+impl DeadlineReconciler {
+    fn new(deadline_ms: u64) -> Self {
+        Self {
+            deadline_ms,
+            nows: Vec::new(),
+        }
+    }
+}
+
+impl UnknownReconciler for DeadlineReconciler {
+    fn reconcile(
+        &mut self,
+        _tool: &str,
+        _execution_id: ExecutionId,
+        now_ms: u64,
+    ) -> ReconcileStatus {
+        self.nows.push(now_ms);
+        if now_ms >= self.deadline_ms {
+            ReconcileStatus::Resolved(ToolStatus::Success)
+        } else {
+            ReconcileStatus::Pending {
+                reason: "not durable yet".to_owned(),
+            }
+        }
+    }
+}
+
+/// Clock-advance contract: `reconcile_unknown` never advances the clock, so a
+/// time-dependent reconciler stays pending for the whole frozen-clock
+/// invocation; the caller must advance `now_ms` by the reported `delays_ms`
+/// and re-invoke. Deterministic: no wall clock, no sleep.
+#[test]
+fn caller_clock_advance_by_reported_delays_enables_resolution() {
+    let config = AgentConfig {
+        max_unknown_retries: 2,
+        unknown_reconcile_base_delay_ms: 100,
+        unknown_reconcile_max_delay_ms: 1_000,
+        ..AgentConfig::default()
+    };
+    let (mut agent, _executor) = drive_to_unknown(config);
+    let execution_id = agent.executions()[0].execution_id;
+
+    // Deadline equals the last scheduled retry instant (NOW_MS + 200): the
+    // reconciler cannot finish while the clock is frozen.
+    let mut reconciler = DeadlineReconciler::new(NOW_MS + 200);
+
+    let frozen = agent.reconcile_unknown(&mut reconciler, execution_id, NOW_MS);
+    let report = match &frozen {
+        ReconcileOutcome::Escalated(report) => report,
+        other => panic!("frozen clock must escalate, got: {other:?}"),
+    };
+    // Exact documented formula: attempt `k` is scheduled at
+    // `now_ms.saturating_add(delays_ms[k])`; the driver reports the schedule
+    // instead of waiting on it.
+    assert_eq!(report.delays_ms, vec![100, 200]);
+    assert_eq!(NOW_MS.saturating_add(report.delays_ms[0]), NOW_MS + 100);
+    assert_eq!(NOW_MS.saturating_add(report.delays_ms[1]), NOW_MS + 200);
+    // Observable sequence: both queries saw the same frozen instant.
+    assert_eq!(reconciler.nows, vec![NOW_MS, NOW_MS]);
+
+    // Caller role: advance to the last scheduled retry instant, then
+    // re-invoke. The execution stays recorded `Unknown`, so this is defined.
+    let advanced_now_ms = NOW_MS.saturating_add(
+        report
+            .delays_ms
+            .last()
+            .copied()
+            .expect("budget is non-zero"),
+    );
+    assert_eq!(advanced_now_ms, NOW_MS + 200);
+
+    let advanced = agent.reconcile_unknown(&mut reconciler, execution_id, advanced_now_ms);
+    match &advanced {
+        ReconcileOutcome::Resolved {
+            status,
+            attempts,
+            delays_ms,
+        } => {
+            assert_eq!(*status, ToolStatus::Success);
+            assert_eq!(*attempts, 1);
+            assert_eq!(*delays_ms, vec![100]);
+        }
+        other => panic!("advanced clock must resolve, got: {other:?}"),
+    }
+    // Observable sequence: NOW_MS twice under the frozen invocation, then the
+    // advanced instant once. Time advanced only because the caller did.
+    assert_eq!(reconciler.nows, vec![NOW_MS, NOW_MS, NOW_MS + 200]);
+    assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
 }
 
 #[test]
