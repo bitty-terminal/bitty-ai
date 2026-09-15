@@ -35,10 +35,12 @@
 
 pub mod bridge;
 pub mod error;
+pub mod fake_host;
 pub mod harness;
 
 pub use bridge::{HostPeer, IpcBridge};
 pub use error::SliceError;
+pub use fake_host::{BittyHost, FakeHost};
 pub use harness::{
     AllowReadOnly, HARNESS_MODEL, HARNESS_PROVIDER_ID, HARNESS_TOOL, SnapshotRequest,
     collect_terminal_context, harness_agent, scripted_provider, terminal_record, test_session,
