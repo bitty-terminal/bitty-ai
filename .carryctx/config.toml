@@ -38,7 +38,11 @@ verbose = false
 [agent]
 
 [verification]
-commands = ["just check", "cargo check --workspace --all-targets --locked", "act -n --workflows .github/workflows/ci.yml --workflows .github/workflows/codeql.yml"]
+commands = [
+  "just check",
+  "cargo check --workspace --all-targets --locked",
+  "act -n --workflows .github/workflows/ci.yml --workflows .github/workflows/codeql.yml",
+]
 
 [worktree]
 
