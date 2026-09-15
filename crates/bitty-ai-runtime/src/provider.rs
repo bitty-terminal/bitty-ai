@@ -39,7 +39,14 @@ pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 32 * 1024;
 /// Maximum provider id length in bytes (`MP-2`).
 pub const MAX_PROVIDER_ID_LEN: usize = 64;
 
-/// Model capability flags (`MP-2`, subset relevant to the skeleton).
+/// Model capability flags (`MP-2`, skeleton vocabulary).
+///
+/// Capabilities are routing data, never authority: selection matches on
+/// required capability sets (see `crate::selection`) and execution still goes
+/// through [`ModelProvider::complete`]. The multimodal flags (`ImageInput`,
+/// `AudioInput`, `AudioOutput`, `VideoInput`) extend the text baseline with
+/// the routing inputs AI-0030 requires; unknown transports or model cards
+/// never synthesize a capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelCapability {
     /// Plain text completion.
@@ -48,6 +55,14 @@ pub enum ModelCapability {
     Streaming,
     /// Model may request tool calls.
     ToolUse,
+    /// Image understanding (vision input alongside text).
+    ImageInput,
+    /// Audio understanding (speech/sound input alongside text).
+    AudioInput,
+    /// Audio generation (speech/sound output).
+    AudioOutput,
+    /// Video understanding (moving-image input alongside text).
+    VideoInput,
 }
 
 /// One registry-known model (`MP-2` descriptor, skeleton subset).
@@ -231,6 +246,65 @@ pub enum ProviderError {
         /// Rejected id.
         id: String,
     },
+    /// Transport failure before any model effect (connection reset, TLS
+    /// failure, malformed envelope). No request bytes are known to have been
+    /// applied; the fallback policy may advance to the next candidate.
+    Transport {
+        /// Owning provider id.
+        provider: String,
+        /// What failed (no secrets, no credentials, no key material).
+        reason: String,
+    },
+    /// Provider refused authorization (unknown key scope, expired grant,
+    /// disabled account). This variant reports the refusal only: no
+    /// credential is stored, logged, or carried here, and the fallback
+    /// policy stops so the operator reconciles credentials instead of
+    /// spraying retries across providers.
+    Auth {
+        /// Owning provider id.
+        provider: String,
+        /// Refusal detail (no secrets, no credentials, no key material).
+        reason: String,
+    },
+    /// Provider rate limit hit. The caller may back off for
+    /// `retry_after_ms` (when known) or the fallback policy may advance to
+    /// the next candidate.
+    RateLimited {
+        /// Owning provider id.
+        provider: String,
+        /// Advised wait in milliseconds; `None` when the provider gave none.
+        retry_after_ms: Option<u64>,
+    },
+    /// Selected model lacks capabilities the request required. Selection is
+    /// a routing bug or registry drift, never a reason to try another model
+    /// blindly: the fallback policy stops so the caller reconciles.
+    CapabilityMismatch {
+        /// Owning provider id.
+        provider: String,
+        /// Requested model name.
+        model: String,
+        /// Required capabilities the model does not advertise.
+        missing: Vec<ModelCapability>,
+    },
+    /// Model is known but unavailable (disabled deployment, region without
+    /// capacity, withdrawn version). The fallback policy may advance to the
+    /// next candidate.
+    ModelUnavailable {
+        /// Owning provider id.
+        provider: String,
+        /// Unavailable model name.
+        model: String,
+    },
+    /// The effect may have happened but acknowledgement was lost. Returned
+    /// by providers; the caller reconciles (status inspection or user
+    /// direction) before retry and never falls back blindly (`MP-7`
+    /// parity with [`crate::tool::ToolError::EffectUnknown`]).
+    Unknown {
+        /// Owning provider id.
+        provider: String,
+        /// What is uncertain.
+        reason: String,
+    },
 }
 
 impl Display for ProviderError {
@@ -252,6 +326,34 @@ impl Display for ProviderError {
                 write!(f, "timeout {actual}ms exceeds ceiling {max}ms")
             }
             Self::InvalidProviderId { id } => write!(f, "invalid provider id: {id}"),
+            Self::Transport { provider, reason } => {
+                write!(f, "provider {provider} transport failure: {reason}")
+            }
+            Self::Auth { provider, reason } => {
+                write!(f, "provider {provider} refused authorization: {reason}")
+            }
+            Self::RateLimited {
+                provider,
+                retry_after_ms,
+            } => match retry_after_ms {
+                Some(ms) => write!(f, "provider {provider} rate limited: retry after {ms}ms"),
+                None => write!(f, "provider {provider} rate limited"),
+            },
+            Self::CapabilityMismatch {
+                provider,
+                model,
+                missing,
+            } => write!(
+                f,
+                "provider {provider} model {model} lacks {} capabilities",
+                missing.len()
+            ),
+            Self::ModelUnavailable { provider, model } => {
+                write!(f, "provider {provider} model {model} unavailable")
+            }
+            Self::Unknown { provider, reason } => {
+                write!(f, "provider {provider} effect unknown: {reason}")
+            }
         }
     }
 }
