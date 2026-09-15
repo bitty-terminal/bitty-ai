@@ -280,6 +280,45 @@ struct SessionInner {
 /// One agent session. Clones share identity and lifecycle: `cancel`,
 /// `elevate`, `rotate_generation`, and `finish` are visible through every
 /// handle.
+///
+/// # Single-threaded contract (`!Send`)
+///
+/// A session is an `Rc`-shared handle over `Cell` state, so it is
+/// deliberately `!Send` and `!Sync`; the compile-time test
+/// `agent_session_is_not_send` fails the build if that ever changes. Create,
+/// use, and drop a session on one thread: never move it across a thread
+/// boundary, never hold it across an `.await` on a multi-threaded executor,
+/// and never share it between concurrent tasks.
+///
+/// This is a declared v0.1 contract, not an oversight (review 07 `P1-7`,
+/// suggestion `S-10`). Lock-free `Cell` state keeps cancellation, elevation,
+/// and generation rotation deterministic for a single driver; the trade-off
+/// is that a multi-threaded async host cannot own the session directly.
+///
+/// ## Host wiring: drive each turn on one thread
+///
+/// An async host (for example a Tokio multi-threaded runtime) keeps the
+/// contract by constructing and driving the session inside one blocking
+/// task, so the session never crosses an `await` and only `Send` values
+/// leave the task:
+///
+/// ```ignore
+/// // Host-side sketch. The async runtime (here `tokio`) and this wiring live
+/// // in the host crate; `bitty-ai-runtime` stays std-only and `!Send`.
+/// let summary = tokio::task::spawn_blocking(move || {
+///     let mut ids = IdIssuer::default();
+///     let session = AgentSession::new(ids.agent_instance(), ids.run(), ids.session());
+///     // Construction, the whole turn, and drop all happen on this one
+///     // blocking thread; nothing `!Send` crosses the spawn boundary.
+///     run_turn(&session, request) // returns a `Send` summary
+/// })
+/// .await??;
+/// ```
+///
+/// Migrating the session to `Arc<Mutex<SessionInner>>` or an atomic state
+/// machine so it can be `Send` is tracked as follow-up; it is intentionally
+/// out of scope here (`S-10`) and would need cancellation-visibility ordering
+/// re-proven across threads.
 #[derive(Debug, Clone)]
 pub struct AgentSession(Rc<SessionInner>);
 
@@ -506,5 +545,24 @@ mod tests {
             session.elevate(AgentLevel::Own, &DenyAllElevations),
             Err(SessionError::AlreadyTerminated { .. })
         ));
+    }
+
+    #[test]
+    fn agent_session_is_not_send() {
+        // Review 07 `P1-7` / `S-10`: `AgentSession` must stay `!Send` while it
+        // is an `Rc<Cell<..>>` handle. This is a compile-time assertion, not a
+        // runtime check, using the classic two-blanket-impl trick (the
+        // static_assertions `assert_not_impl_any` approach, hand-rolled here
+        // to keep the crate dependency-free): if `AgentSession` were `Send`,
+        // both `AmbiguousIfSend<()>` and `AmbiguousIfSend<[()]>` would apply
+        // and resolving `AmbiguousIfSend<_>` would fail with E0283, breaking
+        // the build. If this stops compiling, revisit the single-threaded
+        // contract documented on `AgentSession`.
+        trait AmbiguousIfSend<A: ?Sized> {
+            fn marker() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<[()]> for T {}
+        let _ = <AgentSession as AmbiguousIfSend<_>>::marker;
     }
 }
