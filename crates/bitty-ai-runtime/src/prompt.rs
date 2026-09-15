@@ -132,6 +132,17 @@ pub const SKILL_REGISTRY_VERSION_1: &str = "1";
 /// Supported skill/profile format versions (exactly one today).
 pub const SUPPORTED_SKILL_VERSIONS: &[&str] = &[SKILL_REGISTRY_VERSION_1];
 
+/// Sentinel tool name carried by [`PromptError::PromptNotAllowed`] when
+/// [`assemble`] itself observes an empty effective allow-set (`Some([])`).
+///
+/// Assembly-time empty intersection (an explicit empty list or disjoint
+/// per-layer allow-sets) has no single dispatched tool to name, while the
+/// existing `PromptNotAllowed` variant requires a `tool` field. This sentinel
+/// reuses that variant per S-13 without adding a new error variant: it
+/// contains `<`, space, and `>` so it can never collide with a `TB-2` tool
+/// name (`^[a-z][a-z0-9_]*$`), making the assembly-time origin unambiguous.
+pub const EMPTY_ALLOW_SET_SENTINEL: &str = "<empty allow-set>";
+
 /// Prompt layer from most stable (Core) to most dynamic (Runtime/Turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PromptLayer {
@@ -571,9 +582,14 @@ pub enum PromptError {
         /// Bound.
         limit: usize,
     },
-    /// Budget ceiling is zero or exceeds [`MAX_BUDGET_CEILING_BYTES`].
+    /// Budget ceiling is zero or exceeds [`MAX_BUDGET_CEILING_BYTES`], or the
+    /// assembled canonical bytes exceed the effective budget ceiling (the
+    /// minimum across layers). The second use reuses this variant per S-13
+    /// without adding a new one: `actual` then carries the observed canonical
+    /// length that overran the effective budget.
     InvalidBudget {
-        /// Rejected ceiling.
+        /// Rejected ceiling, or observed canonical length when the effective
+        /// budget is overrun at assembly.
         actual: usize,
     },
     /// The same directive key carries different values with no precedence
@@ -609,9 +625,13 @@ pub enum PromptError {
         tool: String,
     },
     /// Dispatch refused: the assembled prompt constrains dispatch to an
-    /// allow-set that omits this tool.
+    /// allow-set that omits this tool. When [`assemble`] itself observes an
+    /// empty effective allow-set (`Some([])` from an explicit empty list or
+    /// a disjoint intersection), it fails closed with this variant carrying
+    /// [`EMPTY_ALLOW_SET_SENTINEL`], which can never be a real tool name.
     PromptNotAllowed {
-        /// Requested tool.
+        /// Requested tool, or [`EMPTY_ALLOW_SET_SENTINEL`] for an
+        /// assembly-time empty allow-set with no single tool to name.
         tool: String,
     },
     /// Declarative project path rejected: not lexically under any
@@ -858,6 +878,36 @@ pub fn validate_prompt_tool_name(name: &str) -> Result<(), PromptError> {
     }
 }
 
+/// Validate a skill/profile entry name: non-empty, at most
+/// [`MAX_SKILL_NAME_LEN`] bytes, `^[a-z][a-z0-9_-]*$`.
+///
+/// Independent of the tool namespace ([`validate_prompt_tool_name`] / `TB-2`,
+/// which forbids `-`): skill names allow hyphen so conventional names like
+/// `my-skill` are accepted without widening the tool charset. Dots stay
+/// rejected in both namespaces. Invalid names reuse
+/// [`PromptError::InvalidToolName`] to avoid a new variant for the same shape
+/// failure; the charset difference lives in the validator, not the error
+/// type.
+///
+/// # Errors
+///
+/// Returns [`PromptError::InvalidToolName`] when the shape is violated.
+pub fn validate_skill_name(name: &str) -> Result<(), PromptError> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_SKILL_NAME_LEN
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(PromptError::InvalidToolName {
+            name: name.to_owned(),
+        })
+    }
+}
+
 /// Validate a scope string: non-empty, at most [`MAX_SCOPE_LEN`] bytes,
 /// `^[a-z][a-z0-9_.-]*$` (for example `workspace.read`).
 ///
@@ -959,7 +1009,9 @@ pub fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 /// minimum, and directives by key with precedence override (higher-precedence
 /// layer wins, one [`DirectiveOverride`] per overridden layer) except
 /// [`NEVER_MERGE_DIRECTIVE_KEYS`] and same-layer conflicts, which fail
-/// closed; then render the canonical byte form.
+/// closed; fail closed on an empty effective allow-set (`Some([])`) and on a
+/// canonical form that exceeds the effective budget; then render the
+/// canonical byte form.
 ///
 /// Content text is never interpreted: no keyword, directive, or instruction
 /// scan runs over layer text, and text bytes never select, widen, or
@@ -969,8 +1021,11 @@ pub fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 /// # Errors
 ///
 /// Returns [`PromptError`] for any validation failure, an unresolvable
-/// directive conflict, or an over-bound canonical form. No partial assembly
-/// is returned.
+/// directive conflict, an empty effective allow-set
+/// ([`PromptError::PromptNotAllowed`] with [`EMPTY_ALLOW_SET_SENTINEL`]), a
+/// canonical form that exceeds the effective budget
+/// ([`PromptError::InvalidBudget`]), or an over-bound canonical form. No
+/// partial assembly is returned.
 pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptError> {
     snapshot.validate()?;
 
@@ -998,6 +1053,10 @@ pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptErro
     denied.dedup();
 
     // Allowed: intersection over layers that constrain (None = skip).
+    // P2-3: an empty intersection (explicit `Some([])` or disjoint sets)
+    // fails closed here instead of returning `Ok(Some([]))` and deferring
+    // the refusal to `check_dispatch`. Reuses `PromptNotAllowed` per S-13
+    // with the non-colliding `EMPTY_ALLOW_SET_SENTINEL`; no new variant.
     let mut allowed: Option<Vec<String>> = None;
     for input in &ordered {
         if let Some(list) = &input.allowed_tools {
@@ -1010,6 +1069,13 @@ pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptErro
                     .into_iter()
                     .filter(|item| set.contains(item))
                     .collect(),
+            });
+        }
+    }
+    if let Some(list) = &allowed {
+        if list.is_empty() {
+            return Err(PromptError::PromptNotAllowed {
+                tool: EMPTY_ALLOW_SET_SENTINEL.to_owned(),
             });
         }
     }
@@ -1117,6 +1183,19 @@ pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptErro
         canonical_bytes: Vec::new(),
     };
     let bytes = render_canonical(&assembled)?;
+    // P2-3: enforce the effective budget minimum against the canonical bytes.
+    // Only the 96 KiB hard cap was checked before (`CanonicalTooLarge`);
+    // a policy ceiling like `budget=1000` with 10 KiB of text wrongly
+    // returned `Ok`. Reuses `InvalidBudget` per S-13 with `actual` carrying
+    // the observed canonical length; no new variant. `render_canonical`
+    // still reports `CanonicalTooLarge` first when both caps are exceeded.
+    if let Some(ceiling) = budget {
+        if bytes.len() > ceiling {
+            return Err(PromptError::InvalidBudget {
+                actual: bytes.len(),
+            });
+        }
+    }
     assembled.canonical_bytes = bytes;
     Ok(assembled)
 }
@@ -1902,7 +1981,8 @@ impl LayerInput {
 /// One parsed skill/profile registry entry.
 #[derive(Debug, Clone)]
 struct SkillEntry {
-    /// Entry name (`^[a-z][a-z0-9_]*$`, bounded).
+    /// Entry name (`^[a-z][a-z0-9_-]*$`, bounded; hyphen allowed independent
+    /// of the tool namespace).
     name: String,
     /// Literal fragment lines after `text:` (joined with `\n`).
     fragment: String,
@@ -1967,7 +2047,9 @@ fn parse_skill_chunk(chunk: &[(usize, &str)]) -> Result<Option<SkillEntry>, Prom
             if value.len() > MAX_SKILL_NAME_LEN {
                 return Err(malformed(*lineno, "skill name exceeds length bound"));
             }
-            validate_prompt_tool_name(value)?;
+            // Skill namespace is independent of the tool namespace: hyphens
+            // accepted here, still rejected by `validate_prompt_tool_name`.
+            validate_skill_name(value)?;
             match &name {
                 None => name = Some(value.to_owned()),
                 Some(first) if first == value => {}
@@ -2355,6 +2437,111 @@ mod tests {
         ]);
         let assembled = assemble(&snapshot).expect("assembles");
         assert_eq!(assembled.effective_budget_ceiling_bytes, Some(1000));
+    }
+
+    #[test]
+    fn disjoint_allowed_sets_fail_closed_at_assembly() {
+        // P2-3: disjoint per-layer allow-sets intersect to `Some([])` and
+        // must fail at assembly, not defer to `check_dispatch`. Reuses
+        // `PromptNotAllowed` per S-13 with the sentinel (no new variant:
+        // the empty set has no single tool to name, and the sentinel can
+        // never collide with a `TB-2` name).
+        let disjoint = snapshot_with(vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                Some(vec!["tool_a"]),
+                vec![],
+                None,
+                None,
+                vec![],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "project",
+                Some(vec!["tool_b"]),
+                vec![],
+                None,
+                None,
+                vec![],
+            ),
+        ]);
+        assert_eq!(
+            assemble(&disjoint).expect_err("disjoint allow-sets must fail"),
+            PromptError::PromptNotAllowed {
+                tool: EMPTY_ALLOW_SET_SENTINEL.to_owned(),
+            }
+        );
+        // An explicit empty list is the same configuration error.
+        let explicit_empty = snapshot_with(vec![full_layer(
+            PromptLayer::User,
+            "u",
+            Some(vec![]),
+            vec![],
+            None,
+            None,
+            vec![],
+        )]);
+        assert_eq!(
+            assemble(&explicit_empty).expect_err("explicit empty allow-set must fail"),
+            PromptError::PromptNotAllowed {
+                tool: EMPTY_ALLOW_SET_SENTINEL.to_owned(),
+            }
+        );
+        // The sentinel is unambiguous: it can never be a real tool name.
+        assert!(validate_prompt_tool_name(EMPTY_ALLOW_SET_SENTINEL).is_err());
+    }
+
+    #[test]
+    fn canonical_exceeding_effective_budget_fails_closed() {
+        // P2-3: the effective budget minimum is enforced against the
+        // canonical bytes, not just the 96 KiB hard cap. Reuses
+        // `InvalidBudget` per S-13 with `actual` carrying the observed
+        // canonical length; no new variant.
+        let tight = snapshot_with(vec![full_layer(
+            PromptLayer::CoreContract,
+            "core",
+            None,
+            vec![],
+            Some(100),
+            None,
+            vec![],
+        )]);
+        // Same text without a budget assembles, proving the fixture text
+        // alone already overruns the tight ceiling (the budgeted canonical
+        // form is 2 bytes longer via `budget:100` vs `budget:*`, so exact
+        // equality with the unbounded length would be off by the header).
+        let unbounded = snapshot_with(vec![text_layer(PromptLayer::CoreContract, "core")]);
+        let baseline = assemble(&unbounded).expect("unbounded assembles");
+        let observed = baseline.canonical_bytes.len();
+        assert!(
+            observed > 100,
+            "fixture must overrun the tight budget (got {observed} bytes)"
+        );
+        match assemble(&tight).expect_err("over-budget canonical must fail") {
+            PromptError::InvalidBudget { actual } => {
+                assert!(
+                    actual > 100,
+                    "over-budget actual must exceed the ceiling (got {actual})"
+                );
+                // Budgeted form differs from the unbounded baseline only in
+                // the `budget:` line (`budget:100` vs `budget:*`).
+                assert_eq!(actual, observed + "100".len() - "*".len());
+            }
+            other => panic!("expected InvalidBudget, got {other:?}"),
+        }
+        // A ceiling above the canonical length still assembles.
+        let roomy = snapshot_with(vec![full_layer(
+            PromptLayer::CoreContract,
+            "core",
+            None,
+            vec![],
+            Some(4096),
+            None,
+            vec![],
+        )]);
+        let assembled = assemble(&roomy).expect("roomy budget assembles");
+        assert_eq!(assembled.effective_budget_ceiling_bytes, Some(4096));
     }
 
     #[test]
@@ -3447,7 +3634,9 @@ mod tests {
             LayerInput::skills_from_str("version = 1\n---\nversion = 1\ntext:\nhi\n"),
             Err(PromptError::MalformedSkill { .. })
         ));
-        // Entry name runs the shared tool-name validator.
+        // Entry name runs the independent skill-name validator (hyphen
+        // allowed, dots still rejected); shape failures reuse
+        // `InvalidToolName` with no new variant.
         assert!(matches!(
             LayerInput::skills_from_str("version = 1\n---\nname = Bad!\nversion = 1\n"),
             Err(PromptError::InvalidToolName { .. })
@@ -3481,6 +3670,38 @@ mod tests {
             )),
             Err(PromptError::UnresolvableConflict { key, .. }) if key == "tone"
         ));
+    }
+
+    #[test]
+    fn hyphenated_skill_name_accepted_independent_of_tool_namespace() {
+        // P2-4: skill names allow `-` independent of the tool namespace
+        // (`TB-2` forbids it), so `my-skill` assembles while the tool
+        // validator still rejects it.
+        assert!(validate_skill_name("my-skill").is_ok());
+        assert!(validate_prompt_tool_name("my-skill").is_err());
+        // Dots stay rejected in both namespaces; bad shapes still reuse
+        // `InvalidToolName` with no new variant.
+        assert!(validate_skill_name("bad.name").is_err());
+        assert!(matches!(
+            validate_skill_name("Bad!"),
+            Err(PromptError::InvalidToolName { .. })
+        ));
+        let layer = LayerInput::skills_from_str(concat!(
+            "version = 1\n",
+            "---\n",
+            "name = my-skill\n",
+            "version = 1\n",
+            "text:\n",
+            "Hyphenated fragment.\n",
+        ))
+        .expect("hyphenated skill accepted");
+        assert_eq!(layer.layer, PromptLayer::SkillsProfile);
+        let assembled = assemble(&snapshot_with(vec![layer])).expect("assembles");
+        assert!(
+            assembled
+                .section_text(PromptLayer::SkillsProfile)
+                .contains("Hyphenated fragment.")
+        );
     }
 
     #[test]

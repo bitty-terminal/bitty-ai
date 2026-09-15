@@ -42,12 +42,21 @@
 //! (`POST {path}` with `{"model","messages","stream":false}`), which a local
 //! Ollama server also serves at `/v1/chat/completions`. Tool observations
 //! (`Role::Tool`) are folded into `user` messages with a `[tool] ` prefix so
-//! no OpenAI tool protocol is required. Responses extract the first
-//! `"content"` string (OpenAI chat / Ollama chat) with fallback to
-//! `"response"` (Ollama `/api/generate`); anything else (malformed JSON,
-//! missing field, over-large, non-2xx) fails closed. Chunked
+//! no OpenAI tool protocol is required. Responses look up
+//! `choices[0].message.content` by path (OpenAI chat / Ollama chat); a missing
+//! or malformed path fails closed with [`ProviderError::Transport`] and never
+//! falls back to a global substring search (so an `error` field carrying a
+//! `"content"` substring cannot masquerade as model output). The `"response"`
+//! fallback (Ollama `/api/generate`) applies only when the top-level `choices`
+//! key is absent and the response `Content-Type` is JSON
+//! (`application/json`, optionally with parameters); anything else (malformed
+//! JSON, missing field, over-large, non-2xx) fails closed. Chunked
 //! `Transfer-Encoding` is rejected (close-delimited or `Content-Length`
-//! only).
+//! only). Request targets use an allowlist: leading `/`, an explicit
+//! `/v1/` or `/api/` prefix, and only `A-Za-z0-9/_-.~` bytes (rejecting
+//! `tab`, C0 controls, `?#;:,@&%`, and non-ASCII). The `Host` header emits
+//! bracketed IPv6 (`[::1]:port`) and bracketed `localhost` is refused at
+//! construction (use bare `localhost`).
 //!
 //! ## Error mapping (existing variants only, `MP-7` parity)
 //!
@@ -276,6 +285,19 @@ impl LocalEndpoint {
                 reason: "host must be bare (no scheme); plain HTTP only".to_owned(),
             });
         }
+        // Bracketed `localhost` is never a valid IP literal: reject it at
+        // construction instead of failing later at connect time. Bare
+        // `localhost` (any ASCII case) stays accepted; `[::1]` stays accepted.
+        if self.host.len() >= 2
+            && self.host.starts_with('[')
+            && self.host.ends_with(']')
+            && self.host[1..self.host.len() - 1].eq_ignore_ascii_case("localhost")
+        {
+            return Err(ProviderError::Transport {
+                provider: self.provider_id.clone(),
+                reason: "bracketed localhost refused (use bare localhost)".to_owned(),
+            });
+        }
         if !is_loopback_host(&self.host) {
             return Err(ProviderError::Transport {
                 provider: self.provider_id.clone(),
@@ -300,23 +322,7 @@ impl LocalEndpoint {
                 reason: "model carries CR/LF".to_owned(),
             });
         }
-        if self.path.is_empty()
-            || self.path.len() > MAX_LOCAL_PATH_LEN
-            || !self.path.starts_with('/')
-            || self.path.bytes().any(|b| {
-                b == b'\r'
-                    || b == b'\n'
-                    || b == b' '
-                    || b == b'"'
-                    || b == b'<'
-                    || b == b'>'
-                    || b == b'\\'
-                    || b == b'^'
-                    || b == b'{'
-                    || b == b'|'
-                    || b == b'}'
-            })
-        {
+        if !is_valid_local_path(&self.path) {
             return Err(ProviderError::Transport {
                 provider: self.provider_id.clone(),
                 reason: "invalid request path".to_owned(),
@@ -388,7 +394,9 @@ impl fmt::Debug for LocalEndpoint {
 ///
 /// Accepts `localhost` (any ASCII case), `127.0.0.0/8`, and `::1` (with or
 /// without brackets). Everything else — including other DNS names,
-/// `0.0.0.0`, and non-loopback literals — is refused.
+/// `0.0.0.0`, and non-loopback literals — is refused. Bracketed
+/// `[localhost]` is rejected by [`LocalEndpoint::validate`] before this check
+/// (it would otherwise fail open at construction and only fail at connect).
 fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
@@ -401,6 +409,57 @@ fn is_loopback_host(host: &str) -> bool {
         return ip.is_loopback();
     }
     false
+}
+
+/// Whether `path` is an allowed localhost request target (AI-0054, P2-8).
+///
+/// Allowlist: non-empty, `<= MAX_LOCAL_PATH_LEN` bytes, leading `/`, an
+/// explicit `/v1/` or `/api/` family prefix (`/v1`, `/api`, `/v1/*`,
+/// `/api/*`), and only `A-Za-z0-9/_-.~` bytes. The charset implicitly rejects
+/// `tab`, C0 controls (`0x00-0x1F`), `DEL` (`0x7F`), non-ASCII, space, and
+/// `?#;:,@&%\"<>\\^_{|}`` — the old blocklist allowed
+/// `tab/?/#/;/:/@&/%/C0` through. The two families cover the localhost
+/// surface this client speaks: OpenAI-compatible chat (`/v1/*`, default
+/// `/v1/chat/completions`) and Ollama native (`/api/*`, e.g.
+/// `/api/generate` for the `response` fallback shape).
+fn is_valid_local_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_LOCAL_PATH_LEN {
+        return false;
+    }
+    if !path.starts_with('/') {
+        return false;
+    }
+    let prefixed =
+        path == "/v1" || path == "/api" || path.starts_with("/v1/") || path.starts_with("/api/");
+    if !prefixed {
+        return false;
+    }
+    for byte in path.bytes() {
+        let allowed = matches!(
+            byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'_' | b'-' | b'.' | b'~'
+        );
+        if !allowed {
+            return false;
+        }
+    }
+    true
+}
+
+/// Render `host` for the HTTP `Host` header (AI-0054, P2-8).
+///
+/// Unbracketed IPv6 literals (`::1`, which contain `:`) are emitted bracketed
+/// (`[::1]`); already-bracketed (`[::1]`) and bare names/IPv4 (`localhost`,
+/// `127.0.0.1`) pass through unchanged. Validation guarantees the input is a
+/// loopback literal, so this is pure formatting (no validation, no secrets).
+fn host_header_value(host: &str) -> String {
+    if host.starts_with('[') && host.ends_with(']') {
+        return host.to_owned();
+    }
+    if host.contains(':') {
+        return format!("[{host}]");
+    }
+    host.to_owned()
 }
 
 /// Experimental localhost-only [`ModelProvider`] over raw HTTP/1.1.
@@ -590,7 +649,7 @@ fn http_round_trip(
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         endpoint.path,
-        endpoint.host,
+        host_header_value(&endpoint.host),
         endpoint.port,
         body.len()
     );
@@ -616,7 +675,8 @@ fn http_round_trip(
             reason: format!("response over-large (max {MAX_LOCAL_RESPONSE_BYTES})"),
         });
     }
-    extract_assistant_text(response_body, &provider)
+    let content_type = response_content_type(&raw);
+    extract_assistant_text(response_body, content_type.as_deref(), &provider)
 }
 
 fn short_io_kind(error: &std::io::Error) -> String {
@@ -884,48 +944,308 @@ fn retry_after_ms(raw: &[u8]) -> Option<u64> {
     None
 }
 
-/// Extract the assistant text: first `"content"` (OpenAI chat / Ollama
-/// chat), else `"response"` (Ollama generate). Strictly fail-closed.
-fn extract_assistant_text(body: &[u8], provider: &str) -> Result<String, ProviderError> {
+/// Extract the assistant text by path (AI-0054, P1-4 SEC).
+///
+/// - `choices` present: look up `choices[0].message.content` and return it;
+///   any absence or shape mismatch is [`ProviderError::Transport`] with no
+///   fallback (an `error` field carrying a `"content"` substring must never
+///   masquerade as model output).
+/// - `choices` absent: allow the Ollama `/api/generate` `"response"` string
+///   fallback only when the response `Content-Type` is JSON
+///   (`application/json`, optionally with parameters); otherwise
+///   `Transport`. A `choices`-present body never falls back to `response`,
+///   even when `response` is present.
+///
+/// Strictly fail-closed; `std`-only with no new dependencies.
+fn extract_assistant_text(
+    body: &[u8],
+    content_type: Option<&str>,
+    provider: &str,
+) -> Result<String, ProviderError> {
+    let missing = || ProviderError::Transport {
+        provider: provider.to_owned(),
+        reason: "response missing content/response".to_owned(),
+    };
     let text = std::str::from_utf8(body).map_err(|_| ProviderError::Transport {
         provider: provider.to_owned(),
         reason: "response body is not UTF-8".to_owned(),
     })?;
-    if let Some(value) = find_key_string(text, "content") {
-        return Ok(value);
+    // The top level must be a single JSON object (trailing bytes rejected).
+    let obj_start = skip_ws(text, 0).ok_or_else(missing)?;
+    if text.as_bytes().get(obj_start) != Some(&b'{') {
+        return Err(missing());
     }
-    if let Some(value) = find_key_string(text, "response") {
-        return Ok(value);
+    let obj_end = skip_json_object(text, obj_start).ok_or_else(missing)?;
+    let trail = skip_ws(text, obj_end).ok_or_else(missing)?;
+    if trail != text.len() {
+        return Err(missing());
     }
-    Err(ProviderError::Transport {
-        provider: provider.to_owned(),
-        reason: "response missing content/response".to_owned(),
-    })
+    if let Some((choices_start, choices_end)) = find_field_in_object(text, obj_start, "choices") {
+        extract_choices_message_content(text, choices_start, choices_end).ok_or_else(missing)
+    } else {
+        if !is_json_content_type(content_type) {
+            return Err(missing());
+        }
+        let (resp_start, resp_end) =
+            find_field_in_object(text, obj_start, "response").ok_or_else(missing)?;
+        if text.as_bytes().get(resp_start) != Some(&b'"') {
+            return Err(missing());
+        }
+        match parse_json_string(text, resp_start) {
+            Some((value, end)) if end == resp_end => Ok(value),
+            _ => Err(missing()),
+        }
+    }
 }
 
-/// Find `"key": "string"` and parse the JSON string value.
-fn find_key_string(text: &str, key: &str) -> Option<String> {
-    let quoted = format!("\"{key}\"");
-    let mut search_from = 0;
-    while let Some(hit) = text[search_from..].find(&quoted) {
-        let mut cursor = search_from + hit + quoted.len();
-        cursor = skip_ws(text, cursor)?;
-        if text.as_bytes().get(cursor) != Some(&b':') {
-            search_from = cursor.min(text.len());
-            continue;
+/// Whether `content_type` authorizes the Ollama `response` fallback.
+///
+/// Accepts `application/json` (case-insensitive, optionally with `; ...`
+/// parameters, e.g. `application/json; charset=utf-8`), which is what Ollama
+/// `/api/generate` returns. Missing or non-JSON content types deny the
+/// fallback (fail-closed `Transport`).
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    match content_type {
+        Some(value) => value.to_ascii_lowercase().contains("application/json"),
+        None => false,
+    }
+}
+
+/// Extract the `Content-Type` header value from a raw HTTP response.
+///
+/// Scans the header block (up to `\r\n\r\n`), case-insensitive name match.
+/// Returns the trimmed value (`None` when absent or non-UTF-8).
+fn response_content_type(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let end = text.find("\r\n\r\n")?;
+    for line in text[..end].lines().skip(1) {
+        if let Some(value) = header_value(line, "content-type") {
+            return Some(value.trim().to_owned());
         }
-        cursor += 1;
-        cursor = skip_ws(text, cursor)?;
-        if text.as_bytes().get(cursor) != Some(&b'"') {
-            search_from = cursor.min(text.len());
-            continue;
-        }
-        // First well-formed occurrence wins; malformed JSON fails closed at
-        // the call site (the caller maps `None` to `Transport`).
-        let (value, _) = parse_json_string(text, cursor)?;
-        return Some(value);
     }
     None
+}
+
+/// Look up `choices[0].message.content` by path inside already-validated JSON.
+///
+/// `choices_start`/`choices_end` delimit the `choices` value. Returns the
+/// unescaped `content` string only for the exact path
+/// `choices(array)[0](object).message(object).content(string)`; any shape
+/// mismatch (non-array, empty array, non-object element/message, missing or
+/// non-string content) returns `None` (caller maps to `Transport`).
+fn extract_choices_message_content(
+    text: &str,
+    choices_start: usize,
+    choices_end: usize,
+) -> Option<String> {
+    if text.as_bytes().get(choices_start) != Some(&b'[') {
+        return None;
+    }
+    let _ = choices_end;
+    let mut cursor = skip_ws(text, choices_start + 1)?;
+    if text.as_bytes().get(cursor) == Some(&b']') {
+        return None;
+    }
+    let first_start = cursor;
+    if text.as_bytes().get(first_start) != Some(&b'{') {
+        return None;
+    }
+    let first_end = skip_json_object(text, first_start)?;
+    cursor = skip_ws(text, first_end)?;
+    // Only index 0 is honored; trailing elements are ignored but must not
+    // affect the path lookup (the top-level object was already validated).
+    let _ = cursor;
+    let (msg_start, _) = find_field_in_object(text, first_start, "message")?;
+    if text.as_bytes().get(msg_start) != Some(&b'{') {
+        return None;
+    }
+    let (content_start, content_end) = find_field_in_object(text, msg_start, "content")?;
+    if text.as_bytes().get(content_start) != Some(&b'"') {
+        return None;
+    }
+    let (value, end) = parse_json_string(text, content_start)?;
+    if end == content_end {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Find the value range for `want` inside the object at `obj_start`.
+///
+/// Returns `Some((value_start, value_end))` for the first matching field and
+/// `None` when absent or malformed (callers treat both as fail-closed; the
+/// top-level well-formedness check in [`extract_assistant_text`] already
+/// separates malformed bodies from well-formed-but-absent for the `choices`
+/// branch decision).
+fn find_field_in_object(text: &str, obj_start: usize, want: &str) -> Option<(usize, usize)> {
+    if text.as_bytes().get(obj_start) != Some(&b'{') {
+        return None;
+    }
+    let mut cursor = skip_ws(text, obj_start + 1)?;
+    if text.as_bytes().get(cursor) == Some(&b'}') {
+        return None;
+    }
+    loop {
+        if text.as_bytes().get(cursor) != Some(&b'"') {
+            return None;
+        }
+        let (key, key_end) = parse_json_string(text, cursor)?;
+        cursor = skip_ws(text, key_end)?;
+        if text.as_bytes().get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor = skip_ws(text, cursor + 1)?;
+        let value_start = cursor;
+        let value_end = skip_json_value(text, cursor)?;
+        if key == want {
+            return Some((value_start, value_end));
+        }
+        cursor = skip_ws(text, value_end)?;
+        match text.as_bytes().get(cursor) {
+            Some(b',') => {
+                cursor = skip_ws(text, cursor + 1)?;
+                continue;
+            }
+            Some(b'}') => return None,
+            _ => return None,
+        }
+    }
+}
+
+/// Skip one JSON value starting at `cursor` (after leading whitespace).
+///
+/// Returns the byte index just past the value, or `None` on malformed input.
+/// Objects/arrays recurse; strings reuse [`parse_json_string`]; numbers use
+/// strict JSON number syntax; literals are `true`/`false`/`null`.
+fn skip_json_value(text: &str, cursor: usize) -> Option<usize> {
+    let start = skip_ws(text, cursor)?;
+    match text.as_bytes().get(start) {
+        Some(b'"') => {
+            let (_, end) = parse_json_string(text, start)?;
+            Some(end)
+        }
+        Some(b'{') => skip_json_object(text, start),
+        Some(b'[') => skip_json_array(text, start),
+        Some(b't') => {
+            if text[start..].starts_with("true") {
+                Some(start + 4)
+            } else {
+                None
+            }
+        }
+        Some(b'f') => {
+            if text[start..].starts_with("false") {
+                Some(start + 5)
+            } else {
+                None
+            }
+        }
+        Some(b'n') => {
+            if text[start..].starts_with("null") {
+                Some(start + 4)
+            } else {
+                None
+            }
+        }
+        Some(b'-' | b'0'..=b'9') => skip_json_number(text, start),
+        _ => None,
+    }
+}
+
+/// Skip a JSON object starting at the opening `{`.
+fn skip_json_object(text: &str, cursor: usize) -> Option<usize> {
+    if text.as_bytes().get(cursor) != Some(&b'{') {
+        return None;
+    }
+    let mut index = skip_ws(text, cursor + 1)?;
+    if text.as_bytes().get(index) == Some(&b'}') {
+        return Some(index + 1);
+    }
+    loop {
+        if text.as_bytes().get(index) != Some(&b'"') {
+            return None;
+        }
+        let (_, key_end) = parse_json_string(text, index)?;
+        index = skip_ws(text, key_end)?;
+        if text.as_bytes().get(index) != Some(&b':') {
+            return None;
+        }
+        index = skip_ws(text, index + 1)?;
+        index = skip_json_value(text, index)?;
+        index = skip_ws(text, index)?;
+        match text.as_bytes().get(index) {
+            Some(b',') => {
+                index = skip_ws(text, index + 1)?;
+                continue;
+            }
+            Some(b'}') => return Some(index + 1),
+            _ => return None,
+        }
+    }
+}
+
+/// Skip a JSON array starting at the opening `[`.
+fn skip_json_array(text: &str, cursor: usize) -> Option<usize> {
+    if text.as_bytes().get(cursor) != Some(&b'[') {
+        return None;
+    }
+    let mut index = skip_ws(text, cursor + 1)?;
+    if text.as_bytes().get(index) == Some(&b']') {
+        return Some(index + 1);
+    }
+    loop {
+        index = skip_json_value(text, index)?;
+        index = skip_ws(text, index)?;
+        match text.as_bytes().get(index) {
+            Some(b',') => {
+                index = skip_ws(text, index + 1)?;
+                continue;
+            }
+            Some(b']') => return Some(index + 1),
+            _ => return None,
+        }
+    }
+}
+
+/// Skip a strict JSON number starting at `cursor`.
+fn skip_json_number(text: &str, cursor: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = cursor;
+    if bytes.get(index) == Some(&b'-') {
+        index += 1;
+    }
+    match bytes.get(index) {
+        Some(b'0') => index += 1,
+        Some(b'1'..=b'9') => {
+            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+                index += 1;
+            }
+        }
+        _ => return None,
+    }
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        if !matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            return None;
+        }
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            index += 1;
+        }
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        if !matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            return None;
+        }
+        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
+            index += 1;
+        }
+    }
+    Some(index)
 }
 
 fn skip_ws(text: &str, mut cursor: usize) -> Option<usize> {
@@ -1663,6 +1983,278 @@ mod tests {
             other => panic!("expected Completed, got: {other:?}"),
         }
         assert_eq!(agent.provider_mut().complete_calls(), 1);
+        handle.join().expect("stub");
+    }
+
+    fn http_ok_with_content_type(json: &str, content_type: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+            json.len()
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn error_field_first_empty_choices_fails_closed_ai0054_p1_4() {
+        // AI-0054 P1-4 SEC: an `error` object carrying a `"content"` substring
+        // first must not masquerade as model output. The old global
+        // `find_key_string` returned the error text; the path lookup must fail
+        // closed with `Transport` when `choices` is empty.
+        let json = r#"{"error":{"content":"evil-in-error"},"choices":[]}"#;
+        let (port, handle) = stub_once(http_ok(json), 0);
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let err = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect_err("error-field text must not extract");
+        assert!(
+            matches!(err, ProviderError::Transport { .. }),
+            "empty choices with error content must be Transport, got: {err}"
+        );
+        assert!(!err.to_string().contains("evil-in-error"));
+        assert_eq!(provider.complete_calls(), 0);
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn error_field_first_with_valid_choices_returns_choices_ai0054_p1_4() {
+        // AI-0054 P1-4 SEC: when a valid `choices[0].message.content` exists
+        // after an error field, the path lookup returns the choices text, not
+        // the earlier error text.
+        let json = r#"{"error":{"content":"evil-in-error"},"choices":[{"message":{"role":"assistant","content":"good-from-choices"}}]}"#;
+        let (port, handle) = stub_once(http_ok(json), 0);
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("valid choices must win over error field");
+        assert_eq!(turn.text, "good-from-choices");
+        assert_eq!(provider.complete_calls(), 1);
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn choices_present_without_content_never_falls_back_to_response_ai0054_p1_4() {
+        // AI-0054 P1-4: `response` fallback applies only when `choices` is
+        // absent. A `choices`-present body with a missing `content` field must
+        // fail closed even when a `response` string is present.
+        let json =
+            r#"{"choices":[{"message":{"role":"assistant"}}],"response":"fallback-must-not-win"}"#;
+        let (port, handle) = stub_once(http_ok(json), 0);
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let err = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect_err("choices-present without content must not fall back");
+        assert!(matches!(err, ProviderError::Transport { .. }), "got: {err}");
+        assert!(!err.to_string().contains("fallback-must-not-win"));
+        assert_eq!(provider.complete_calls(), 0);
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn choices_and_response_prefers_choices_ai0054_p1_4() {
+        // When both shapes are present and `choices` is valid, the choices
+        // path wins; `response` is ignored.
+        let json =
+            r#"{"choices":[{"message":{"content":"from-choices"}}],"response":"from-response"}"#;
+        let (port, handle) = stub_once(http_ok(json), 0);
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "from-choices");
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn response_fallback_requires_json_content_type_ai0054_p1_4() {
+        // AI-0054 P1-4: the Ollama `response` fallback applies only when
+        // `choices` is absent AND `Content-Type` is JSON. A `text/plain`
+        // envelope with a `response` string must fail closed.
+        let json = r#"{"model":"llama3.1:8b","response":"ollama text","done":true}"#;
+        let (port, handle) = stub_once(http_ok_with_content_type(json, "text/plain"), 0);
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let err = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect_err("non-JSON content-type must deny response fallback");
+        assert!(matches!(err, ProviderError::Transport { .. }), "got: {err}");
+        handle.join().expect("stub");
+
+        // The same body with a JSON content-type (including parameters)
+        // succeeds through the fallback.
+        let (port, handle) = stub_once(
+            http_ok_with_content_type(json, "application/json; charset=utf-8"),
+            0,
+        );
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("JSON content-type must allow response fallback");
+        assert_eq!(turn.text, "ollama text");
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn malformed_paths_rejected_at_construction_ai0054_p2_8() {
+        // AI-0054 P2-8: allowlist rejects `tab/?/#/;/:/@&/%/C0`, missing
+        // leading `/`, wrong families, over-long, and non-ASCII. No stub is
+        // bound, so zero sockets can open.
+        let mut bad: Vec<String> = vec![
+            "v1/chat".to_owned(),
+            "/v1/chat completions".to_owned(),
+            "/v1/chat\tcompletions".to_owned(),
+            "/v1/chat?x=1".to_owned(),
+            "/v1/chat#frag".to_owned(),
+            "/v1/chat;param".to_owned(),
+            "/v1/chat:8080".to_owned(),
+            "/v1/chat@host".to_owned(),
+            "/v1/chat&x".to_owned(),
+            "/v1/chat%20x".to_owned(),
+            "/v1/chat\n".to_owned(),
+            "/v1/chat\r".to_owned(),
+            "/v1/chat\"x".to_owned(),
+            "/v1/chat<x>".to_owned(),
+            "/v1/chat\\x".to_owned(),
+            "/v1/chat^x".to_owned(),
+            "/v1/chat{x}".to_owned(),
+            "/v1/chat|x}".to_owned(),
+            "/evil".to_owned(),
+            "/".to_owned(),
+            "/v1chat".to_owned(),
+            "/api".to_owned().replace("api", "ap?"),
+            String::from("/v1/chat\x00"),
+            String::from("/v1/chat\x01"),
+            String::from("/v1/chat\x1f"),
+            String::from("/v1/chat\x7f"),
+            "/v1/caf\u{e9}".to_owned(),
+        ];
+        bad.push(format!("/v1/{}", "a".repeat(125)));
+        assert!(bad.last().expect("over-long").len() > MAX_LOCAL_PATH_LEN);
+        for path in bad {
+            let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_path(path.clone())
+                .expect_err("malformed path must fail");
+            assert!(
+                matches!(err, ProviderError::Transport { .. }),
+                "path {path:?} must be Transport, got: {err}"
+            );
+        }
+        let probe = LocalProvider::new(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+        );
+        assert_eq!(probe.complete_calls(), 0);
+    }
+
+    #[test]
+    fn valid_paths_accepted_ai0054_p2_8() {
+        // AI-0054 P2-8: the explicit `/v1/` + `/api/` families with charset
+        // `A-Za-z0-9/_-.~` are accepted, including the 128-byte boundary.
+        let boundary = format!("/v1/{}", "a".repeat(124));
+        assert_eq!(boundary.len(), MAX_LOCAL_PATH_LEN);
+        for path in [
+            "/v1/chat/completions".to_owned(),
+            "/v1/completions".to_owned(),
+            "/v1/embeddings".to_owned(),
+            "/v1".to_owned(),
+            "/api/generate".to_owned(),
+            "/api/chat".to_owned(),
+            "/api".to_owned(),
+            "/v1/a-b_c.d~e/f".to_owned(),
+            "/v1/AZaz09".to_owned(),
+            boundary,
+        ] {
+            assert!(
+                LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                    .expect("endpoint")
+                    .with_path(path.clone())
+                    .is_ok(),
+                "valid path rejected: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracketed_localhost_refused_at_construction_ai0054_p2_8() {
+        // AI-0054 P2-8: `[localhost]` must fail at construction (explicit
+        // refusal) rather than failing later at connect time. Bare
+        // `localhost` in any ASCII case stays accepted.
+        for bad in ["[localhost]", "[LOCALHOST]", "[LocalHost]"] {
+            let err = LocalEndpoint::new(bad, 11_434, "llama3.1:8b").expect_err("must refuse");
+            assert!(
+                matches!(err, ProviderError::Transport { .. }),
+                "bracketed localhost must be Transport, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("bracketed localhost"),
+                "explicit reason required, got: {err}"
+            );
+        }
+        for good in ["localhost", "LOCALHOST", "LocalHost"] {
+            assert!(
+                LocalEndpoint::new(good, 11_434, "llama3.1:8b").is_ok(),
+                "bare localhost refused: {good}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_header_bracketing_ai0054_p2_8() {
+        // AI-0054 P2-8: unbracketed IPv6 normalizes to bracketed form for the
+        // `Host` header; bare names/IPv4 pass through; bracketed input is
+        // preserved. Construction + `socket_addr` accept both IPv6 forms.
+        assert_eq!(host_header_value("::1"), "[::1]");
+        assert_eq!(host_header_value("[::1]"), "[::1]");
+        assert_eq!(host_header_value("127.0.0.1"), "127.0.0.1");
+        assert_eq!(host_header_value("localhost"), "localhost");
+        assert!(LocalEndpoint::new("::1", 11_434, "llama3.1:8b").is_ok());
+        assert!(LocalEndpoint::new("[::1]", 11_434, "llama3.1:8b").is_ok());
+        let v6 = LocalEndpoint::new("::1", 11_434, "llama3.1:8b").expect("endpoint");
+        let addr = v6.socket_addr().expect("socket addr");
+        assert_eq!(addr.ip().to_string(), "::1");
+        let v6b = LocalEndpoint::new("[::1]", 11_434, "llama3.1:8b").expect("endpoint");
+        assert_eq!(
+            v6b.socket_addr().expect("socket addr").ip().to_string(),
+            "::1"
+        );
+    }
+
+    #[test]
+    fn host_header_on_wire_ai0054_p2_8() {
+        // AI-0054 P2-8: the wire `Host` header carries the normalized form.
+        // `127.0.0.1` stays bare; `localhost` resolves to loopback and stays
+        // bare (no `::1:port` malformation).
+        let json = r#"{"choices":[{"message":{"content":"host probe"}}]}"#;
+        let (port, handle, req_rx) = stub_capture_once(http_ok(json));
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "host probe");
+        let raw = req_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request bytes");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains(&format!("Host: 127.0.0.1:{port}\r\n")),
+            "wire Host must be bare IPv4, got: {text}"
+        );
+        assert!(!text.contains("::1:"), "must not emit unbracketed IPv6");
+        handle.join().expect("stub");
+
+        let (port, handle, req_rx) = stub_capture_once(http_ok(json));
+        let endpoint = LocalEndpoint::new("localhost", port, "llama3.1:8b").expect("endpoint");
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "host probe");
+        let raw = req_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request bytes");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains(&format!("Host: localhost:{port}\r\n")),
+            "wire Host must be bare localhost, got: {text}"
+        );
         handle.join().expect("stub");
     }
 
