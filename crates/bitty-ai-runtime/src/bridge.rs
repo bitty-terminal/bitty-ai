@@ -94,6 +94,57 @@ pub const MAX_CONSENT_GRANTS: usize = 64;
 /// Real scope validation stays host-side.
 pub const MAX_CONSENT_SCOPE_LEN: usize = 128;
 
+/// Maximum bytes kept for any reason string emitted across a runtime
+/// boundary (`AI-0059`).
+///
+/// Mirrors [`crate::reconcile::MAX_RECONCILE_REASON_BYTES`] so every
+/// runtime-owned reason surface shares one bound. Reasons are interpolated
+/// with wire or host-supplied strings (tool names, provider details), so
+/// they are truncated and scrubbed before they reach a caller-visible
+/// `Display` or log line.
+pub(crate) const MAX_REASON_BYTES: usize = 512;
+
+/// Bound an outbound reason string (`AI-0059`).
+///
+/// Every character outside printable ASCII (`0x20..=0x7E`, so spaces are
+/// kept) becomes `?`, which defuses CR/LF log injection, terminal escapes,
+/// and confusable non-ASCII bytes; the result is then truncated to
+/// [`MAX_REASON_BYTES`] bytes. The transformation is deterministic, silent
+/// (no ellipsis marker that could itself exceed the bound), and never
+/// splits a character, so callers can log the value directly.
+///
+/// [`crate::reconcile::bound_reason`] stays a separate truncate-only helper
+/// for retry bookkeeping; this function is the scrub-aware bound for values
+/// leaving the runtime through an error or decision surface.
+pub(crate) fn bound_reason(reason: &str) -> String {
+    let mut bounded = String::with_capacity(reason.len().min(MAX_REASON_BYTES));
+    for character in reason.chars() {
+        if bounded.len() >= MAX_REASON_BYTES {
+            break;
+        }
+        if character.is_ascii_graphic() || character == ' ' {
+            bounded.push(character);
+        } else {
+            bounded.push('?');
+        }
+    }
+    bounded
+}
+
+/// Allowed bytes in a [`FakeConsentLedger`] scope (`AI-0059`).
+///
+/// Scopes are lowercase dotted-underscore wire vocabulary today
+/// (`workspace.read`, `terminal.inspect`); the allowlist keeps the fake
+/// table free of whitespace, control bytes, quotes, and case-confusable
+/// variants. Real host ledgers still own their own scope validation.
+fn is_scope_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase()
+        || byte.is_ascii_digit()
+        || byte == b'_'
+        || byte == b'.'
+        || byte == b'-'
+}
+
 /// Bridge identity and consent-seam errors. Every variant fails closed with
 /// no partial state: no binding is stored, no grant is recorded, no dispatch
 /// is implied.
@@ -182,46 +233,46 @@ impl std::error::Error for BridgeError {}
 pub fn validate_protocol_id(raw: &str) -> Result<(), BridgeError> {
     if raw.is_empty() {
         return Err(BridgeError::InvalidProtocolId {
-            id: raw.to_owned(),
+            id: bound_reason(raw),
             reason: "protocol id must not be empty".to_owned(),
         });
     }
     if raw.len() > MAX_PROTOCOL_ID_LEN {
         return Err(BridgeError::InvalidProtocolId {
-            id: raw.to_owned(),
+            id: bound_reason(raw),
             reason: format!("protocol id too long (max {MAX_PROTOCOL_ID_LEN})"),
         });
     }
     if raw.chars().any(|c| c.is_whitespace()) {
         return Err(BridgeError::InvalidProtocolId {
-            id: raw.to_owned(),
+            id: bound_reason(raw),
             reason: "protocol id must not contain whitespace".to_owned(),
         });
     }
     let parts: Vec<&str> = raw.split('.').collect();
     if parts.len() != 2 {
         return Err(BridgeError::InvalidProtocolId {
-            id: raw.to_owned(),
+            id: bound_reason(raw),
             reason: "protocol id must be exactly owner.name (one dot)".to_owned(),
         });
     }
     for segment in &parts {
         if segment.is_empty() {
             return Err(BridgeError::InvalidProtocolId {
-                id: raw.to_owned(),
+                id: bound_reason(raw),
                 reason: "protocol id segment must not be empty".to_owned(),
             });
         }
         if segment.len() > MAX_PROTOCOL_ID_SEGMENT_LEN {
             return Err(BridgeError::InvalidProtocolId {
-                id: raw.to_owned(),
+                id: bound_reason(raw),
                 reason: format!("segment too long (max {MAX_PROTOCOL_ID_SEGMENT_LEN})"),
             });
         }
         let first = segment.as_bytes()[0];
         if !first.is_ascii_lowercase() {
             return Err(BridgeError::InvalidProtocolId {
-                id: raw.to_owned(),
+                id: bound_reason(raw),
                 reason: "segment must start with lowercase letter".to_owned(),
             });
         }
@@ -230,7 +281,7 @@ pub fn validate_protocol_id(raw: &str) -> Result<(), BridgeError> {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_';
             if !ok {
                 return Err(BridgeError::InvalidProtocolId {
-                    id: raw.to_owned(),
+                    id: bound_reason(raw),
                     reason: "segment must be [a-z0-9_-]".to_owned(),
                 });
             }
@@ -292,6 +343,22 @@ impl Display for ProtocolAgentId {
 /// [`BridgeError::AlreadyBound`], and lookups for unbound principals or
 /// instances fail with typed errors. Re-binding the identical pair is an
 /// idempotent success.
+///
+/// # When the single-agent exception ends (`AI-0059`)
+///
+/// The exception is "one bridge instance serves exactly one agent", not
+/// "instance ids may repeat". [`crate::session::IdIssuer`] now mints
+/// process-unique ids, so two co-located agents no longer collide; what
+/// remains single-agent is this type's routing shape, because one
+/// `(protocol, instance)` pair cannot describe two principals. The window
+/// therefore ends the moment a second [`crate::agent::Agent`] is constructed
+/// in the same process: the host must then own one `IdentityBridge` per
+/// agent instance, or the bridge must move to the composite
+/// `(ProtocolAgentId, AgentInstanceId, SessionId)` key sketched in review
+/// `S-9`. Until that migration, a second distinct pair is still refused
+/// rather than silently re-routed, and
+/// [`crate::session::SessionId`] adds no routing here; it is only available
+/// for a future composite key.
 #[derive(Debug, Default)]
 pub struct IdentityBridge {
     binding: Option<(ProtocolAgentId, AgentInstanceId)>,
@@ -445,7 +512,7 @@ pub struct DenyAllConsent;
 impl ConsentLedger for DenyAllConsent {
     fn check(&self, query: &ConsentQuery) -> ConsentDecision {
         ConsentDecision::Deny {
-            reason: format!("default-deny: no grant for {}", query.tool),
+            reason: bound_reason(&format!("default-deny: no grant for {}", query.tool)),
         }
     }
 }
@@ -494,7 +561,8 @@ impl FakeConsentLedger {
     /// - [`BridgeError::InvalidProtocolId`] when `protocol` violates the
     ///   `owner.name` shape.
     /// - [`BridgeError::InvalidGrant`] when `tool` or `scope` is empty,
-    ///   over-bound, or carries an interior NUL, or when `tool` violates the
+    ///   over-bound, or carries an interior NUL, when `scope` leaves the
+    ///   lowercase `[a-z0-9_.-]` allowlist, or when `tool` violates the
     ///   runtime `TB-2` name shape.
     /// - [`BridgeError::LedgerFull`] when a new triple would exceed
     ///   [`MAX_CONSENT_GRANTS`].
@@ -518,12 +586,17 @@ impl FakeConsentLedger {
         }
         if let Err(error) = crate::tool::validate_tool_name(tool) {
             return Err(BridgeError::InvalidGrant {
-                reason: error.to_string(),
+                reason: bound_reason(&error.to_string()),
             });
         }
         if scope.len() > MAX_CONSENT_SCOPE_LEN {
             return Err(BridgeError::InvalidGrant {
                 reason: format!("scope too long (max {MAX_CONSENT_SCOPE_LEN})"),
+            });
+        }
+        if !scope.bytes().all(is_scope_byte) {
+            return Err(BridgeError::InvalidGrant {
+                reason: "scope must be [a-z0-9_.-]".to_owned(),
             });
         }
         if let Some(existing) = self
@@ -601,10 +674,10 @@ impl ConsentLedger for FakeConsentLedger {
             ConsentDecision::Allow
         } else {
             ConsentDecision::Deny {
-                reason: format!(
+                reason: bound_reason(&format!(
                     "no live consent for '{}' on '{}' (tool {})",
                     query.protocol_id, query.scope, query.tool
-                ),
+                )),
             }
         }
     }
@@ -615,7 +688,10 @@ impl ConsentLedger for FakeConsentLedger {
 /// This is the fail-closed helper hosts call after [`IdentityBridge`]
 /// resolution and before [`crate::tool::ToolBus`] dispatch: allowed checks
 /// return `Ok(())`, denied checks return [`BridgeError::ConsentDenied`] with
-/// no partial state.
+/// no partial state. The denial is a runtime boundary (`AI-0059`): both the
+/// queried tool name and a host ledger's reason are truncated to the
+/// runtime reason bound and scrubbed to printable ASCII before they reach
+/// the error.
 ///
 /// # Errors
 ///
@@ -627,8 +703,8 @@ pub fn ensure_consented(
     match ledger.check(query) {
         ConsentDecision::Allow => Ok(()),
         ConsentDecision::Deny { reason } => Err(BridgeError::ConsentDenied {
-            tool: query.tool.to_owned(),
-            reason,
+            tool: bound_reason(query.tool),
+            reason: bound_reason(&reason),
         }),
     }
 }
@@ -837,6 +913,153 @@ mod tests {
         }
     }
 
+    /// Assert a reason is a bounded, printable-ASCII string (no CR/LF, no
+    /// escape bytes, no non-ASCII confusables).
+    fn assert_bounded_reason(value: &str) {
+        assert!(
+            value.len() <= MAX_REASON_BYTES,
+            "reason exceeds {MAX_REASON_BYTES} bytes: {}",
+            value.len()
+        );
+        assert!(
+            value.bytes().all(|byte| (0x20..=0x7E).contains(&byte)),
+            "reason is not printable ASCII: {value:?}"
+        );
+    }
+
+    #[test]
+    fn bound_reason_truncates_on_the_byte_bound_and_scrubs_controls() {
+        let long = "e".repeat(MAX_REASON_BYTES + 64);
+        let bounded = bound_reason(&long);
+        assert_eq!(bounded.len(), MAX_REASON_BYTES);
+        assert!(bounded.bytes().all(|byte| byte == b'e'));
+
+        // CR/LF, tab, ESC, and DEL all become `?`; printable text survives.
+        let hostile = "line1\r\nline2\ttab\u{1b}[31mred\u{7f}";
+        assert_eq!(bound_reason(hostile), "line1??line2?tab?[31mred?");
+
+        // Each multi-byte character collapses to one ASCII byte, so the byte
+        // bound holds for dense UTF-8 input too.
+        let unicode = "🦀".repeat(MAX_REASON_BYTES);
+        assert_eq!(bound_reason(&unicode).len(), MAX_REASON_BYTES);
+    }
+
+    #[test]
+    fn deny_all_consent_bounds_hostile_tool_reason() {
+        let ledger = DenyAllConsent;
+        let tool = format!("bad\n{}\u{7f}", "t".repeat(MAX_REASON_BYTES * 2));
+        match ledger.check(&query("local.assistant", &tool, "workspace.read", 1_000)) {
+            ConsentDecision::Deny { reason } => {
+                assert_bounded_reason(&reason);
+                assert!(reason.starts_with("default-deny: no grant for bad?"));
+            }
+            ConsentDecision::Allow => panic!("deny-all must deny"),
+        }
+    }
+
+    #[test]
+    fn fake_consent_denial_bounds_hostile_query_strings() {
+        let ledger = FakeConsentLedger::new();
+        let tool = format!("tool\n{}", "\r".repeat(64));
+        let scope = format!("scope\r{}", "\n".repeat(64));
+        match ledger.check(&query("local.assistant", &tool, &scope, 1_000)) {
+            ConsentDecision::Deny { reason } => assert_bounded_reason(&reason),
+            ConsentDecision::Allow => panic!("empty ledger must deny"),
+        }
+    }
+
+    #[test]
+    fn ensure_consented_bounds_host_ledger_reason() {
+        struct HostileLedger;
+        impl ConsentLedger for HostileLedger {
+            fn check(&self, _query: &ConsentQuery) -> ConsentDecision {
+                ConsentDecision::Deny {
+                    reason: format!("boom\n\u{1b}[2J{}", "x".repeat(MAX_REASON_BYTES * 2)),
+                }
+            }
+        }
+
+        let error = ensure_consented(
+            &HostileLedger,
+            &query("local.assistant", "workspace_read", "workspace.read", 1_000),
+        )
+        .expect_err("denying ledger must fail closed");
+        match error {
+            BridgeError::ConsentDenied { tool, reason } => {
+                assert_eq!(tool, "workspace_read");
+                assert_bounded_reason(&reason);
+                assert!(reason.starts_with("boom?"));
+            }
+            other => panic!("expected ConsentDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_consented_bounds_hostile_tool_echo() {
+        let hostile = format!("tool\n{}", "x".repeat(MAX_REASON_BYTES * 2));
+        let error = ensure_consented(
+            &DenyAllConsent,
+            &query("local.assistant", &hostile, "workspace.read", 1_000),
+        )
+        .expect_err("deny-all must fail closed");
+        match error {
+            BridgeError::ConsentDenied { tool, reason } => {
+                assert_bounded_reason(&tool);
+                assert_bounded_reason(&reason);
+                assert!(tool.starts_with("tool?"));
+            }
+            other => panic!("expected ConsentDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_protocol_id_echo_is_bounded_and_scrubbed() {
+        let hostile = format!("bad\n{}\u{7f}", "X".repeat(MAX_REASON_BYTES * 2));
+        match validate_protocol_id(&hostile) {
+            Err(BridgeError::InvalidProtocolId { id, .. }) => {
+                assert_bounded_reason(&id);
+                assert!(id.starts_with("bad?"));
+            }
+            other => panic!("expected InvalidProtocolId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fake_grant_scope_charset_rejects_hostile_bytes() {
+        let mut ledger = FakeConsentLedger::new();
+        for scope in [
+            "workspace read",
+            "workspace\tread",
+            "workspace\nread",
+            "workspace\rread",
+            "workspace\0read",
+            "Workspace.Read",
+            "workspace.read!",
+            "workspace.read\u{7f}",
+            "workspace.réad",
+            "workspace/read",
+            "workspace.read;drop",
+            "workspace.read\u{1b}[31m",
+        ] {
+            let error = ledger
+                .grant("local.assistant", "workspace_read", scope, 9)
+                .expect_err("hostile scope must be rejected");
+            assert!(
+                matches!(error, BridgeError::InvalidGrant { .. }),
+                "scope {scope:?} must fail as InvalidGrant"
+            );
+        }
+        assert!(ledger.is_empty());
+        // The documented lowercase dotted vocabulary still enters the table.
+        ledger
+            .grant("local.assistant", "workspace_read", "workspace.read", 9)
+            .expect("lowercase dotted scope");
+        ledger
+            .grant("local.assistant", "workspace_read", "scope.a_b-c9", 9)
+            .expect("allowlisted punctuation");
+        assert_eq!(ledger.len(), 2);
+    }
+
     #[test]
     fn fake_grant_allows_exact_triple_before_expiry() {
         let mut ledger = FakeConsentLedger::new();
@@ -979,6 +1202,22 @@ mod tests {
                 .grant("local.assistant", "terminal.read_zone", "s", 9)
                 .is_err()
         );
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn fake_grant_tool_error_reason_is_bounded_and_scrubbed() {
+        let mut ledger = FakeConsentLedger::new();
+        // The TB-2 rejection interpolates the raw tool string, so a hostile
+        // name must not reach the public `InvalidGrant.reason` unbounded.
+        let tool = format!("bad\n{}\u{7f}\u{1b}[2J", "N".repeat(MAX_REASON_BYTES * 2));
+        match ledger.grant("local.assistant", &tool, "workspace.read", 9) {
+            Err(BridgeError::InvalidGrant { reason }) => {
+                assert_bounded_reason(&reason);
+                assert!(reason.starts_with("invalid tool name: bad?"));
+            }
+            other => panic!("expected InvalidGrant, got {other:?}"),
+        }
         assert!(ledger.is_empty());
     }
 

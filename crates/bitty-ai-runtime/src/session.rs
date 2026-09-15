@@ -21,7 +21,9 @@
 //!
 //! - [`AgentInstanceId`] names the runtime-local agent object owned by this
 //!   crate. v0.1 runs a single agent, so there is no orchestration,
-//!   scheduling, or multi-agent routing on top of it.
+//!   scheduling, or multi-agent routing on top of it. Instance ids are
+//!   process-unique (`AI-0059`), so co-located agents never share a handle
+//!   even though routing still assumes one agent per process.
 //! - [`RunId`] names the turn-loop invocation that created the session. v0.1
 //!   binds one [`RunId`] per [`AgentSession`] at construction.
 //! - [`SessionId`] names the context/history scope (fact store scope) carried
@@ -63,6 +65,7 @@
 use std::cell::Cell;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Runtime-local agent object handle.
 ///
@@ -96,41 +99,69 @@ pub struct SessionId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExecutionId(pub u64);
 
-/// Deterministic id issuer. Values start at 1; 0 is reserved as "none".
+/// Process-wide id counter behind every [`IdIssuer`] (`AI-0059`).
 ///
-/// The counter is shared across all four id spaces, so every issued value
-/// is globally unique and strictly increasing regardless of kind. There are
-/// no per-kind sequences: future persistence or bridge code must store the
-/// `(kind, value)` pair rather than assuming e.g. run 1 pairs with
-/// session 1.
+/// Ids are identity handles, never protocol-visible facts, so one monotonic
+/// source per process is enough: it keeps two `Agent` instances from minting
+/// colliding [`AgentInstanceId`]s. `Relaxed` is sufficient: uniqueness comes
+/// from the atomic read-modify-write itself, and ids guard no other memory.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Process-level id issuer. Values start at 1; 0 is reserved as "none".
+///
+/// The counter is process-global (`AI-0059`): every issued value is unique
+/// and strictly increasing across all [`IdIssuer`] handles and all four id
+/// spaces in one process. This widens the `AI-0013` single-counter rule from
+/// one issuer to the process, so a second `Agent` constructed with its own
+/// `IdIssuer::default()` can no longer collide with the first one's
+/// [`AgentInstanceId`]. There are no per-kind sequences: future persistence
+/// or bridge code must store the `(kind, value)` pair rather than assuming
+/// e.g. run 1 pairs with session 1.
+///
+/// The issuer itself carries no state; the private marker keeps the type
+/// non-unit so [`IdIssuer::default`] stays the single construction seam
+/// every existing call site already uses. Values are reproducible only for
+/// the issue order inside one process run; they are local handles and must
+/// never be persisted as stable external ids.
 #[derive(Debug, Default)]
 pub struct IdIssuer {
-    next: u64,
+    /// Private marker: no state lives on the handle, the counter is
+    /// [`NEXT_ID`].
+    _private: (),
 }
 
 impl IdIssuer {
+    /// Claim the next process-global value.
+    ///
+    /// Panics only if the `u64` id space is exhausted (unreachable in
+    /// practice); ids never wrap back onto an already-issued value.
+    fn next(&mut self) -> u64 {
+        NEXT_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("id space exhausted")
+            + 1
+    }
+
     /// Issue the next agent-instance id.
     pub fn agent_instance(&mut self) -> AgentInstanceId {
-        self.next += 1;
-        AgentInstanceId(self.next)
+        AgentInstanceId(self.next())
     }
 
     /// Issue the next run id.
     pub fn run(&mut self) -> RunId {
-        self.next += 1;
-        RunId(self.next)
+        RunId(self.next())
     }
 
     /// Issue the next session id.
     pub fn session(&mut self) -> SessionId {
-        self.next += 1;
-        SessionId(self.next)
+        SessionId(self.next())
     }
 
     /// Issue the next execution id.
     pub fn execution(&mut self) -> ExecutionId {
-        self.next += 1;
-        ExecutionId(self.next)
+        ExecutionId(self.next())
     }
 }
 
@@ -379,22 +410,37 @@ mod tests {
     }
 
     #[test]
-    fn id_issuer_starts_at_one_and_increases_monotonically() {
+    fn id_issuer_increases_monotonically_across_kinds() {
         let mut ids = IdIssuer::default();
-        let instance = ids.agent_instance();
-        let run = ids.run();
-        let session_id = ids.session();
-        let execution = ids.execution();
-        assert_eq!(instance.0, 1);
-        assert_eq!(run.0, 2);
-        assert_eq!(session_id.0, 3);
-        assert_eq!(execution.0, 4);
+        let values = [
+            ids.agent_instance().0,
+            ids.run().0,
+            ids.session().0,
+            ids.execution().0,
+            ids.execution().0,
+        ];
         // 0 stays reserved as "none": no issued id may be zero.
-        for value in [instance.0, run.0, session_id.0, execution.0] {
+        for value in values {
             assert_ne!(value, 0);
         }
-        let next = ids.execution();
-        assert!(next.0 > execution.0);
+        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn id_issuer_is_process_shared_across_agents() {
+        // P1-6 regression: each `Agent` builds its own `IdIssuer::default()`;
+        // two co-located agents must never mint the same instance id.
+        let mut first_agent = IdIssuer::default();
+        let mut second_agent = IdIssuer::default();
+        assert_ne!(first_agent.agent_instance(), second_agent.agent_instance());
+        // Interleaved issuance is strictly increasing: one shared process
+        // counter, not two independent counters restarting at 1.
+        for _ in 0..16 {
+            let first = first_agent.agent_instance();
+            let second = second_agent.agent_instance();
+            assert_ne!(first, second);
+            assert!(first.0 < second.0);
+        }
     }
 
     #[test]

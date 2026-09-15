@@ -223,6 +223,35 @@ impl std::error::Error for AgentError {
 
 impl From<ProviderError> for AgentError {
     fn from(error: ProviderError) -> Self {
+        // Provider errors cross from host-owned implementations of
+        // `ModelProvider` into the runtime's typed error surface, carrying
+        // provider ids and transport reasons that may come from network or
+        // model-shaped input. Bound and scrub those strings here (`AI-0059`)
+        // so `Display`, logs, and reconcile reports never receive unbounded
+        // or newline-carrying text. Other variants carry already-validated
+        // registry names, not host reasons.
+        let error = match error {
+            ProviderError::Transport { provider, reason } => ProviderError::Transport {
+                provider: crate::bridge::bound_reason(&provider),
+                reason: crate::bridge::bound_reason(&reason),
+            },
+            ProviderError::Auth { provider, reason } => ProviderError::Auth {
+                provider: crate::bridge::bound_reason(&provider),
+                reason: crate::bridge::bound_reason(&reason),
+            },
+            ProviderError::RateLimited {
+                provider,
+                retry_after_ms,
+            } => ProviderError::RateLimited {
+                provider: crate::bridge::bound_reason(&provider),
+                retry_after_ms,
+            },
+            ProviderError::Unknown { provider, reason } => ProviderError::Unknown {
+                provider: crate::bridge::bound_reason(&provider),
+                reason: crate::bridge::bound_reason(&reason),
+            },
+            other => other,
+        };
         Self::Provider(error)
     }
 }
@@ -886,4 +915,67 @@ impl<P: ModelProvider> Agent<P> {
 /// applies only to the turn-loop multiplication.
 fn effective_cost_weight(weight: u32) -> u32 {
     if weight == 0 { 1 } else { weight }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::MAX_REASON_BYTES;
+
+    /// P2-7 (`AI-0059`): host-shaped provider reasons are bounded and
+    /// scrubbed when they enter the runtime's typed error surface.
+    #[test]
+    fn provider_reasons_are_bounded_at_the_agent_boundary() {
+        let hostile = format!("reset\n\u{1b}[2J{}", "x".repeat(MAX_REASON_BYTES * 2));
+        let long_provider = "p".repeat(MAX_REASON_BYTES * 3);
+        let cases = [
+            ProviderError::Transport {
+                provider: long_provider.clone(),
+                reason: hostile.clone(),
+            },
+            ProviderError::Auth {
+                provider: long_provider.clone(),
+                reason: hostile.clone(),
+            },
+            ProviderError::RateLimited {
+                provider: long_provider.clone(),
+                retry_after_ms: Some(250),
+            },
+            ProviderError::Unknown {
+                provider: long_provider.clone(),
+                reason: hostile.clone(),
+            },
+        ];
+        for error in cases {
+            let agent_error: AgentError = error.into();
+            match &agent_error {
+                AgentError::Provider(ProviderError::Transport { provider, reason })
+                | AgentError::Provider(ProviderError::Auth { provider, reason })
+                | AgentError::Provider(ProviderError::Unknown { provider, reason }) => {
+                    assert!(provider.len() <= MAX_REASON_BYTES);
+                    assert!(reason.len() <= MAX_REASON_BYTES);
+                    assert!(!reason.contains(['\n', '\r', '\t']));
+                }
+                AgentError::Provider(ProviderError::RateLimited { provider, .. }) => {
+                    assert!(provider.len() <= MAX_REASON_BYTES);
+                }
+                other => panic!("unexpected conversion: {other:?}"),
+            }
+            let display = agent_error.to_string();
+            assert!(
+                !display.contains('\n') && !display.contains('\r'),
+                "Display must not carry newlines: {display:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_provider_reasons_pass_through_unchanged() {
+        let error = ProviderError::Transport {
+            provider: "bitty-fake".to_owned(),
+            reason: "connection reset".to_owned(),
+        };
+        let agent_error: AgentError = error.clone().into();
+        assert_eq!(agent_error, AgentError::Provider(error));
+    }
 }
