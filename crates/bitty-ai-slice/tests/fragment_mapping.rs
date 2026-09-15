@@ -49,8 +49,8 @@ use bitty_ai_runtime::{
     validate_chunk,
 };
 use bitty_ai_slice::fragment_transport::{
-    FragmentTransportCursor, FragmentTransportError, TransportPart, pre_split_chunk,
-    pre_split_fragment, reassemble,
+    FragmentIdentity, FragmentTransportCursor, FragmentTransportError, TransportPart,
+    pre_split_chunk, pre_split_fragment, reassemble, reassemble_expected,
 };
 use bitty_ipc::error::IpcError;
 use bitty_ipc::rich_fragment::{
@@ -723,16 +723,108 @@ fn reassemble_refuses_a_noncontiguous_part_seq() {
 #[test]
 fn reassemble_refuses_a_mismatched_part_count_on_a_later_part() {
     // The first part's `part_count` is checked against the input length; a later
-    // part disagreeing is still an inconsistent split and must fail closed.
+    // part disagreeing is a different failure from that length check and must
+    // fail closed with the dedicated variant.
     let mut parts = split_parts();
     let first_count = parts[0].part_count;
     let mutated_count = first_count + 1;
     parts[1].part_count = mutated_count;
-    assert!(matches!(
-        reassemble(&parts),
-        Err(FragmentTransportError::PartCountMismatch { expected, actual })
-            if expected == first_count && actual == mutated_count as usize
-    ));
+    assert_eq!(
+        reassemble(&parts).expect_err("a later part with a foreign part_count is refused"),
+        FragmentTransportError::InconsistentPartCount {
+            index: 1,
+            expected: first_count,
+            found: mutated_count,
+        }
+    );
+}
+
+// ── AI-0070 absolute identity binding + precise part-count diagnostics ───────
+
+/// A second, internally consistent split built from a foreign source identity:
+/// the same text split with a different `(terminal_id, generation, source_seq)`.
+/// Every part agrees with the first, so the relative `reassemble` cannot tell it
+/// apart from the original; only a caller-supplied expectation can.
+fn foreign_split_parts() -> (Vec<TransportPart>, FragmentIdentity) {
+    let chunk = markdown_chunk(1, 2, &"é".repeat(20 * 1024));
+    let identity = FragmentIdentity::new("t:2", GENERATION + 1, 1);
+    let parts = pre_split_chunk(&chunk, &identity.terminal_id, identity.generation, None, 0)
+        .expect("the foreign fragment splits");
+    assert!(parts.len() > 1, "the fixture must yield several parts");
+    (parts, identity)
+}
+
+#[test]
+fn reassemble_expected_rejects_a_foreign_but_consistent_part_set() {
+    let (foreign, foreign_identity) = foreign_split_parts();
+    let foreign_text: String = foreign.iter().map(|part| part.data.text.as_str()).collect();
+
+    // The relative entry point accepts the internally consistent set, because
+    // every part agrees with the first: this is the silent gap AI-0070 closes.
+    assert_eq!(
+        reassemble(&foreign).expect("relative reassembly accepts a consistent set"),
+        foreign_text
+    );
+
+    // The absolute entry point refuses it: the set belongs to another source
+    // fragment than the caller asked for.
+    let expected = FragmentIdentity::new(TERMINAL_ID, GENERATION, 0);
+    assert_eq!(
+        reassemble_expected(&foreign, &expected)
+            .expect_err("a foreign but consistent part set must be refused"),
+        FragmentTransportError::IdentityMismatch {
+            expected: expected.clone(),
+            found: foreign_identity.clone(),
+        }
+    );
+    assert!(
+        reassemble_expected(&foreign, &expected)
+            .expect_err("still refused")
+            .to_string()
+            .contains(&foreign_identity.terminal_id)
+    );
+
+    // The caller can still accept the set it actually asked for.
+    assert_eq!(
+        reassemble_expected(&foreign, &foreign_identity)
+            .expect("the matching identity reassembles"),
+        foreign_text
+    );
+}
+
+#[test]
+fn part_count_failure_modes_are_distinguishable() {
+    let parts = split_parts();
+
+    // Whole-input disagreement: more parts are supplied than the split recorded.
+    let mut too_many = parts.clone();
+    too_many.push(parts[0].clone());
+    let length_error = reassemble(&too_many).expect_err("supplied length must match part_count");
+    assert_eq!(
+        length_error,
+        FragmentTransportError::PartCountMismatch {
+            expected: parts[0].part_count,
+            actual: parts.len() + 1,
+        }
+    );
+
+    // Later-part disagreement: one part records a different `part_count`.
+    let mut inconsistent = parts.clone();
+    let recorded = inconsistent[0].part_count;
+    inconsistent[1].part_count = recorded + 1;
+    let part_error = reassemble(&inconsistent).expect_err("later part_count must agree");
+    assert_eq!(
+        part_error,
+        FragmentTransportError::InconsistentPartCount {
+            index: 1,
+            expected: recorded,
+            found: recorded + 1,
+        }
+    );
+
+    // The two typed errors, and therefore their messages, are unambiguous.
+    assert_ne!(length_error, part_error);
+    assert_ne!(length_error.to_string(), part_error.to_string());
 }
 
 #[test]
