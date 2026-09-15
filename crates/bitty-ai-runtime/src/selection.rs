@@ -14,11 +14,13 @@
 //! fails closed with a typed [`SelectionError`] and no partial state:
 //!
 //! ```text
-//! alias resolution (unknown alias fails; stale candidates skipped in order)
+//! alias resolution (unknown alias fails; stale candidates skipped in declared
+//!   order; an alias is exclusive and a full alias miss fails closed)
 //!   -> capability-subset match (empty requirement set refused: never by name alone)
 //!   -> context-window minimum filter (unknown `0` satisfies no minimum)
-//!   -> cost-ceiling filter (both weights must fit; routing data only)
-//!   -> ordered fallback chain (alias order, then provider/model lexicographic)
+//!   -> cost-ceiling filter (effective weights must fit; `0` counts as baseline `1`)
+//!   -> ordered fallback chain (alias order with an alias, else provider/model
+//!      lexicographic; non-alias entries are never appended to an alias chain)
 //!   -> per-candidate execution via `ModelProvider` (unchanged trait)
 //!   -> typed-error fallback: advance on transport/rate-limit/unavailable/timeout,
 //!      stop on auth/capability/budget/caller errors, reconcile on Unknown
@@ -36,8 +38,9 @@
 //!   in [`ModelProvider::complete`](crate::provider::ModelProvider::complete)
 //!   via [`ProviderError::BudgetExceeded`](crate::provider::ProviderError::BudgetExceeded).
 //! - Alias tables are data, not authority: resolving an alias yields ordered
-//!   candidates that still pass every gate. An alias grants no execution
-//!   authority.
+//!   candidates that still pass every gate, the alias is exclusive (a full
+//!   miss is [`SelectionError::NoCandidate`], never a fall-through to
+//!   non-alias entries). An alias grants no execution authority.
 //! - [`ProviderError::Unknown`](crate::provider::ProviderError::Unknown) never
 //!   advances the chain. Reconcile (status inspection or user direction)
 //!   before retry, matching the `ToolStatus::Unknown` philosophy.
@@ -226,7 +229,8 @@ pub fn validate_model_name(name: &str) -> Result<(), SelectionError> {
 /// routing metadata. Context-window and cost fields are data for
 /// routing/budget decisions, not enforcement by themselves; a
 /// `context_window_tokens` of `0` means unknown and satisfies no minimum,
-/// and cost weights of `0` mean unset (smallest value, never a currency).
+/// and a cost weight of `0` means uncalibrated: it counts as the baseline
+/// weight `1` in [`estimate_cost`] and turn accounting (never a currency).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRegistration {
     /// Owning provider id (`MP-2` shape).
@@ -237,9 +241,9 @@ pub struct ModelRegistration {
     pub capabilities: Vec<ModelCapability>,
     /// Context window in tokens (`0` = unknown).
     pub context_window_tokens: u32,
-    /// Relative input cost weight (`0` = unset).
+    /// Relative input cost weight (`0` = uncalibrated, counts as baseline `1`).
     pub input_cost_weight: u32,
-    /// Relative output cost weight (`0` = unset).
+    /// Relative output cost weight (`0` = uncalibrated, counts as baseline `1`).
     pub output_cost_weight: u32,
 }
 
@@ -345,9 +349,9 @@ pub struct RegisteredModel {
     pub capabilities: Vec<ModelCapability>,
     /// Context window in tokens (`0` = unknown).
     pub context_window_tokens: u32,
-    /// Relative input cost weight (`0` = unset).
+    /// Relative input cost weight (`0` = uncalibrated, counts as baseline `1`).
     pub input_cost_weight: u32,
-    /// Relative output cost weight (`0` = unset).
+    /// Relative output cost weight (`0` = uncalibrated, counts as baseline `1`).
     pub output_cost_weight: u32,
 }
 
@@ -450,7 +454,9 @@ impl ProviderRegistry {
     /// table with [`SelectionError::AliasesFull`]. Candidates must be
     /// well-formed but need not be registered yet: unregistered candidates
     /// are skipped in declared order at selection time, so a stale entry
-    /// degrades to the next candidate instead of failing the request.
+    /// degrades to the next candidate; a fully missed alias fails closed
+    /// with [`SelectionError::NoCandidate`] instead of falling through to
+    /// non-alias entries.
     ///
     /// # Errors
     ///
@@ -541,19 +547,26 @@ impl ProviderRegistry {
 
     /// Select the ordered fallback chain for `request`.
     ///
-    /// Gate order: alias expansion (unknown alias fails; unregistered
-    /// candidates are skipped in declared order), capability-subset match,
-    /// context-window minimum, cost ceiling, then ordering (alias matches in
-    /// alias order first, remaining matches in provider/model lexicographic
-    /// order). The primary is element `0`; every element independently
-    /// satisfies the request, so advancing on a typed transient error never
-    /// weakens the requirement set.
+    /// Gate order: alias resolution (unknown alias fails), capability-subset
+    /// match, context-window minimum, cost ceiling, then ordering
+    /// (alias-declared order when an alias is requested, else provider/model
+    /// lexicographic). The primary is element `0`; every element
+    /// independently satisfies the request, so advancing on a typed
+    /// transient error never weakens the requirement set.
+    ///
+    /// An alias is exclusive: when [`SelectRequest::alias`] is set, only the
+    /// alias candidates are eligible (each still passing every gate;
+    /// unregistered candidates are skipped in declared order) and non-alias
+    /// entries are never appended, so a full alias miss fails closed with
+    /// [`SelectionError::NoCandidate`] instead of falling through to an
+    /// arbitrary capability match.
     ///
     /// # Errors
     ///
     /// Returns [`SelectionError::EmptyRequirement`] when no capability is
     /// required, [`SelectionError::UnknownAlias`] for an unregistered alias,
-    /// or [`SelectionError::NoCandidate`] when nothing satisfies the request.
+    /// or [`SelectionError::NoCandidate`] when nothing satisfies the request
+    /// (including a fully missed alias).
     pub fn select(&self, request: &SelectRequest) -> Result<Vec<SelectedModel>, SelectionError> {
         if request.required.is_empty() {
             return Err(SelectionError::EmptyRequirement);
@@ -569,16 +582,11 @@ impl ProviderRegistry {
                     Some(_) | None => {}
                 }
             }
-        }
-        for entry in self.entries() {
-            if chain
-                .iter()
-                .any(|kept| kept.provider_id == entry.provider_id && kept.name == entry.name)
-            {
-                continue;
-            }
-            if request.matches(entry) {
-                chain.push(SelectedModel::from_entry(entry));
+        } else {
+            for entry in self.entries() {
+                if request.matches(entry) {
+                    chain.push(SelectedModel::from_entry(entry));
+                }
             }
         }
         if chain.is_empty() {
@@ -597,14 +605,17 @@ pub struct SelectRequest {
     /// Required capabilities: every candidate must advertise all of them.
     /// Must be non-empty (selection never matches by name or alias alone).
     pub required: Vec<ModelCapability>,
-    /// Optional semantic alias: its candidates lead the chain in declared
-    /// order when they pass every other gate.
+    /// Optional semantic alias. When set it is exclusive: only the declared
+    /// candidates are eligible (each still passing every other gate, in
+    /// declared order) and a full alias miss is
+    /// [`SelectionError::NoCandidate`]; non-alias entries are never appended.
     pub alias: Option<String>,
     /// Optional minimum context window in tokens. Entries with an unknown
     /// (`0`) window never satisfy a minimum.
     pub min_context_window_tokens: Option<u32>,
-    /// Optional cost ceiling: both the input and output weights of a
-    /// candidate must fit. Routing data only, not enforcement.
+    /// Optional cost ceiling: both effective input and output weights of a
+    /// candidate must fit. An uncalibrated weight (`0`) counts as baseline
+    /// `1`, so `Some(0)` admits nothing. Routing data only, not enforcement.
     pub max_cost_weight: Option<u32>,
 }
 
@@ -636,7 +647,9 @@ impl SelectRequest {
             }
         }
         if let Some(max) = self.max_cost_weight {
-            if entry.input_cost_weight > max || entry.output_cost_weight > max {
+            if effective_cost_weight(entry.input_cost_weight) > max
+                || effective_cost_weight(entry.output_cost_weight) > max
+            {
                 return false;
             }
         }
@@ -675,9 +688,9 @@ pub struct SelectedModel {
     pub capabilities: Vec<ModelCapability>,
     /// Context window in tokens (`0` = unknown).
     pub context_window_tokens: u32,
-    /// Relative input cost weight (`0` = unset).
+    /// Relative input cost weight (`0` = uncalibrated, counts as baseline `1`).
     pub input_cost_weight: u32,
-    /// Relative output cost weight (`0` = unset).
+    /// Relative output cost weight (`0` = uncalibrated, counts as baseline `1`).
     pub output_cost_weight: u32,
 }
 
@@ -713,15 +726,19 @@ impl SelectedModel {
 /// token counts and per-model cost weights:
 ///
 /// ```text
-/// cost = input_tokens * input_weight + output_tokens * output_weight
+/// cost = input_tokens * effective(input_weight)
+///      + output_tokens * effective(output_weight)
+/// effective(weight) = if weight == 0 { 1 } else { weight }
 /// ```
 ///
 /// Both weights are routing data held on the model registration/selection
 /// ([`ModelRegistration`], [`RegisteredModel`], [`SelectedModel`]); a weight
-/// of `0` means unset and contributes `0`. Hosts calibrate by choosing
-/// weights (for example from a model card); the function itself performs no
-/// I/O, reads no clock, and authorizes nothing. Cost accounting never
-/// bypasses the byte budget
+/// of `0` means uncalibrated and counts as the baseline weight `1`, the same
+/// unified rule the turn loop applies in [`crate::agent`], so an unset weight
+/// is never free and cost accounting cannot under-count relative to routing.
+/// Hosts calibrate by choosing weights (for example from a model card); the
+/// function itself performs no I/O, reads no clock, and authorizes nothing.
+/// Cost accounting never bypasses the byte budget
 /// ([`ProviderError::BudgetExceeded`](crate::provider::ProviderError::BudgetExceeded))
 /// or authorization gates: selection filters may consider cost, enforcement
 /// stays in the existing gates plus the agent turn fuse (see
@@ -733,8 +750,17 @@ pub fn estimate_cost(
     input_weight: u32,
     output_weight: u32,
 ) -> u64 {
-    (input_tokens.saturating_mul(u64::from(input_weight)))
-        .saturating_add(output_tokens.saturating_mul(u64::from(output_weight)))
+    (input_tokens.saturating_mul(u64::from(effective_cost_weight(input_weight)))).saturating_add(
+        output_tokens.saturating_mul(u64::from(effective_cost_weight(output_weight))),
+    )
+}
+
+/// Effective cost weight shared by selection estimation/filtering and turn
+/// accounting: a configured `0` means uncalibrated and counts as the baseline
+/// weight `1` so an uncalibrated model is never free and accounting cannot
+/// under-count. Mirrors `crate::agent`'s `effective_cost_weight` (same rule).
+fn effective_cost_weight(weight: u32) -> u32 {
+    if weight == 0 { 1 } else { weight }
 }
 
 /// Fallback directive for one provider failure: advance to the next chain
@@ -1047,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn alias_resolution_leads_chain_in_declared_order() {
+    fn alias_chain_is_alias_candidates_in_declared_order() {
         let mut registry = registry_two();
         registry
             .register(text_model("bitty-c", "fast"))
@@ -1072,22 +1098,18 @@ mod tests {
             .iter()
             .map(|item| (item.provider_id.as_str(), item.name.as_str()))
             .collect();
-        // Alias candidates first in declared order, then the remaining
-        // capability match in lexicographic order.
-        assert_eq!(
-            order,
-            vec![
-                ("bitty-c", "fast"),
-                ("bitty-b", "chat"),
-                ("bitty-a", "vision"),
-            ]
-        );
+        // The alias is exclusive: only declared candidates, in declared
+        // order. The matching non-alias entry ("bitty-a", "vision") is never
+        // appended.
+        assert_eq!(order, vec![("bitty-c", "fast"), ("bitty-b", "chat")]);
     }
 
     #[test]
-    fn alias_still_requires_capabilities() {
-        // The alias resolves, but its candidates lack ImageInput: the alias
-        // narrows, it never waives the capability gate.
+    fn alias_candidates_still_require_capabilities() {
+        // The alias resolves, but its only candidate lacks ImageInput. The
+        // non-alias "vision" entry would satisfy the capability set, yet an
+        // alias is a hard filter: the request fails closed instead of
+        // falling through to a different model.
         let mut registry = registry_two();
         registry
             .register_alias(
@@ -1101,9 +1123,12 @@ mod tests {
             min_context_window_tokens: None,
             max_cost_weight: None,
         };
-        let chain = registry.select(&request).expect("non-alias match remains");
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].name, "vision");
+        match registry.select(&request) {
+            Err(SelectionError::NoCandidate { detail }) => {
+                assert!(detail.contains("alias=chat"), "unexpected detail: {detail}");
+            }
+            other => panic!("alias miss must not fall through: {other:?}"),
+        }
     }
 
     #[test]
@@ -1143,7 +1168,11 @@ mod tests {
             min_context_window_tokens: None,
             max_cost_weight: None,
         };
+        // The stale candidate is skipped in declared order and the chain
+        // stays alias-only, so the matching non-alias "bitty-a"/"vision"
+        // entry is not appended.
         let chain = registry.select(&request).expect("stale skipped");
+        assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name, "chat");
         assert_eq!(chain[0].provider_id, "bitty-b");
     }
@@ -1157,18 +1186,22 @@ mod tests {
                 vec![ModelRef::new("bitty-gone", "ghost").expect("valid ref")],
             )
             .expect("capacity");
-        // Alias candidates are stale, and the remaining entries cannot
-        // satisfy the capability set either.
+        // Every alias candidate is unregistered while the registry does hold
+        // entries satisfying the capability set. The alias is exclusive: a
+        // full miss is `NoCandidate`, never a silent fall-through to a
+        // non-alias model.
         let request = SelectRequest {
-            required: vec![Cap::VideoInput],
+            required: vec![Cap::Text],
             alias: Some("chat".to_owned()),
             min_context_window_tokens: None,
             max_cost_weight: None,
         };
-        assert!(matches!(
-            registry.select(&request),
-            Err(SelectionError::NoCandidate { .. })
-        ));
+        match registry.select(&request) {
+            Err(SelectionError::NoCandidate { detail }) => {
+                assert!(detail.contains("alias=chat"), "unexpected detail: {detail}");
+            }
+            other => panic!("fully stale alias must fail closed: {other:?}"),
+        }
     }
 
     #[test]
@@ -1279,6 +1312,54 @@ mod tests {
         let chain = registry.select(&request).expect("cheap fits");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].name, "cheap");
+    }
+
+    #[test]
+    fn cost_ceiling_filter_uses_effective_weight() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(registration(
+                "bitty-fake",
+                "uncalibrated",
+                vec![Cap::Text],
+                4_096,
+                0,
+                0,
+            ))
+            .expect("capacity");
+        registry
+            .register(registration(
+                "bitty-fake",
+                "calibrated",
+                vec![Cap::Text],
+                4_096,
+                2,
+                2,
+            ))
+            .expect("capacity");
+        // An uncalibrated weight (`0`) counts as baseline `1`, so a ceiling
+        // of `1` admits it and rejects the calibrated 2/2 entry.
+        let request = SelectRequest {
+            required: vec![Cap::Text],
+            alias: None,
+            min_context_window_tokens: None,
+            max_cost_weight: Some(1),
+        };
+        let chain = registry
+            .select(&request)
+            .expect("uncalibrated fits baseline");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name, "uncalibrated");
+        // A zero ceiling admits nothing: baseline `1` is the floor, `0` is
+        // never free anywhere in routing or accounting.
+        let request = SelectRequest {
+            max_cost_weight: Some(0),
+            ..request
+        };
+        assert!(matches!(
+            registry.select(&request),
+            Err(SelectionError::NoCandidate { .. })
+        ));
     }
 
     #[test]
@@ -1437,14 +1518,19 @@ mod tests {
     }
 
     #[test]
-    fn estimate_cost_is_tokens_times_weight() {
+    fn estimate_cost_treats_uncalibrated_weight_as_baseline_one() {
         // Relative routing units, never currency: exact on small values.
         assert_eq!(estimate_cost(10, 5, 2, 3), 35);
         assert_eq!(estimate_cost(0, 0, 2, 3), 0);
-        // Unset (`0`) weights contribute nothing; hosts calibrate by
-        // choosing explicit weights.
-        assert_eq!(estimate_cost(10, 5, 0, 0), 0);
-        assert_eq!(estimate_cost(10, 5, 0, 3), 15);
+        // A `0` weight means uncalibrated and counts as the baseline `1`,
+        // exactly like turn accounting
+        // (`cost_ceiling.rs::zero_configured_weights_count_as_baseline_one`):
+        // an unset weight is never free, so routing cannot estimate lower
+        // than accounting charges.
+        assert_eq!(estimate_cost(10, 5, 0, 0), 15);
+        assert_eq!(estimate_cost(10, 5, 0, 3), 25);
+        assert_eq!(estimate_cost(10, 5, 0, 0), estimate_cost(10, 5, 1, 1));
+        assert_eq!(estimate_cost(10, 5, 0, 3), estimate_cost(10, 5, 1, 3));
     }
 
     #[test]

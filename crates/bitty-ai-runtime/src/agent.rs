@@ -949,10 +949,12 @@ impl<P: ModelProvider> Agent<P> {
     }
 }
 
-/// Effective cost weight for turn accounting: a configured `0` (unset)
-/// counts as `1` so an uncalibrated host cannot bypass the ceiling with free
-/// rounds. Selection routing still treats `0` as smallest/unset; this mapping
-/// applies only to the turn-loop multiplication.
+/// Effective cost weight for turn accounting: a configured `0` means
+/// uncalibrated and counts as the baseline `1` so an uncalibrated host cannot
+/// bypass the ceiling with free rounds. This is the unified zero-weight rule:
+/// [`crate::selection::estimate_cost`] applies the same mapping to routing
+/// estimates and the selection cost-ceiling filter, so routing and accounting
+/// never disagree and accounting never under-counts.
 fn effective_cost_weight(weight: u32) -> u32 {
     if weight == 0 { 1 } else { weight }
 }

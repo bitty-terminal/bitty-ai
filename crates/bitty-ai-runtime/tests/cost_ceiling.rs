@@ -270,9 +270,13 @@ fn unreported_usage_falls_back_to_byte_estimate() {
 }
 
 #[test]
-fn zero_configured_weights_count_as_one() {
-    // A `0` (unset) configured weight counts as `1` in turn accounting so an
-    // uncalibrated host cannot bypass the ceiling with free rounds.
+fn zero_configured_weights_count_as_baseline_one() {
+    // A `0` (uncalibrated) configured weight counts as the baseline `1` in
+    // turn accounting so an uncalibrated host cannot bypass the ceiling with
+    // free rounds. Same unified rule as selection routing and its
+    // cost-ceiling filter (`selection.rs::
+    // estimate_cost_treats_uncalibrated_weight_as_baseline_one`): routing and
+    // accounting never disagree.
     let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
     provider.push_turn(final_turn("done", 5, 5));
     let mut agent = Agent::new(
