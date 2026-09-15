@@ -1013,7 +1013,7 @@ mod tests {
         // Seam composition smoke: resolve the wire principal, require live
         // consent, then run one deterministic FakeProvider turn. The bridge
         // never executes a tool; it only gates the turn that does.
-        use crate::provider::{FakeProvider, ModelProvider, ProviderTurn};
+        use crate::provider::{FakeProvider, ModelProvider, ProviderTurn, ProviderUsage};
         use crate::tool::{AuthBase, ToolBus, ToolRegistry, ToolSpec};
 
         let mut ids = crate::session::IdIssuer::default();
@@ -1058,6 +1058,7 @@ mod tests {
             text: "gated answer".to_owned(),
             tool_calls: Vec::new(),
             latency_ms: 0,
+            usage: ProviderUsage::default(),
         });
         let request = crate::provider::TurnRequest {
             model: "fake-chat".to_owned(),

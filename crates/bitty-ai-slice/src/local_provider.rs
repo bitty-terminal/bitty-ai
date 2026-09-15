@@ -82,7 +82,7 @@ use bitty_ai_runtime::bridge::MAX_CONSENT_SCOPE_LEN;
 use bitty_ai_runtime::prompt::MAX_CANONICAL_BYTES;
 use bitty_ai_runtime::provider::{
     MAX_REQUEST_TIMEOUT_MS, ModelCapability, ModelDescriptor, ModelProvider, ProviderError,
-    ProviderTurn, Role, TurnRequest, validate_provider_id,
+    ProviderTurn, ProviderUsage, Role, TurnRequest, validate_provider_id,
 };
 use bitty_ai_runtime::selection::validate_model_name;
 use bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES;
@@ -477,6 +477,7 @@ impl ModelProvider for LocalProvider {
             text,
             tool_calls: Vec::new(),
             latency_ms: 0,
+            usage: ProviderUsage::default(),
         })
     }
 

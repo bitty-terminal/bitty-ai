@@ -21,8 +21,9 @@
 
 use bitty_ai_runtime::{
     AgentError, AgentLevel, AuthBase, ContextError, ExecOutcome, FakeToolExecutor, Fragment,
-    FragmentKind, IdIssuer, ModelProvider, ProviderTurn, RecordBody, StreamChunk, StreamError,
-    StreamSink, ToolBus, ToolCall, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, VecSink,
+    FragmentKind, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage, RecordBody, StreamChunk,
+    StreamError, StreamSink, ToolBus, ToolCall, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
+    VecSink,
 };
 use bitty_ai_slice::{
     AllowReadOnly, HARNESS_MODEL, HARNESS_PROVIDER_ID, HARNESS_TOOL, HostPeer, IpcBridge,
@@ -105,6 +106,7 @@ fn run_harness(context_budget_bytes: usize) -> (ExecOutcome, Vec<StreamChunk>, S
         text: ANSWER.to_owned(),
         tool_calls: Vec::new(),
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let provider_id = provider.provider_id().to_owned();
     let mut agent = harness_agent(provider, context_budget_bytes).expect("agent");
@@ -368,6 +370,7 @@ fn context_budget_exceeded_fails_closed() {
             arguments: tool_args(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut agent = harness_agent(provider, 4).expect("agent");
     let seed = terminal_record("term-1", 1, NOW_MS, snapshot()).expect("record");

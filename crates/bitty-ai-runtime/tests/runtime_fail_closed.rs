@@ -7,8 +7,8 @@
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ContextPriority, ContextRecord,
     DetailLevel, ExecOutcome, FakeProvider, FakeToolExecutor, FragmentKind, ModelProvider,
-    ProviderError, ProviderTurn, RecordBody, StableId, StreamSink, ToolAuthorizer, ToolBus,
-    ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, VecSink,
+    ProviderError, ProviderTurn, ProviderUsage, RecordBody, StableId, StreamSink, ToolAuthorizer,
+    ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, VecSink,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -90,11 +90,13 @@ fn happy_path_streams_markdown_and_toolcard_then_completes() {
             arguments: br#"{"path":"a"}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     provider.push_turn(ProviderTurn {
         text: "done".to_owned(),
         tool_calls: Vec::new(),
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut executor = FakeToolExecutor::new();
     executor.push_success("read 12 bytes", b"hello world!".to_vec());
@@ -135,6 +137,7 @@ fn cancel_before_dispatch_touches_nothing() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let session = session();
     session.cancel();
@@ -169,11 +172,13 @@ fn cancel_after_dispatch_reports_reconciled_cancel() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     provider.push_turn(ProviderTurn {
         text: "unreached".to_owned(),
         tool_calls: Vec::new(),
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let session = session();
     let executor = FakeToolExecutor::new().with_cancel_on_call(session.clone(), 1);
@@ -206,6 +211,7 @@ fn cancel_after_dispatch_with_unknown_effect_needs_reconcile() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let session = session();
     let mut executor = FakeToolExecutor::new().with_cancel_on_call(session.clone(), 1);
@@ -235,6 +241,7 @@ fn budget_exceeded_fails_before_dispatch() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let config = AgentConfig {
         context_budget_bytes: 8,
@@ -277,6 +284,7 @@ fn unknown_tool_fails_with_no_dispatch() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
     let mut executor = FakeToolExecutor::new();
@@ -320,6 +328,7 @@ fn deny_by_default_without_authorizer() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     // No authorizer installed: fail closed (FS-AI7).
     let mut agent = Agent::new(
@@ -355,6 +364,7 @@ fn oversized_arguments_fail_with_no_dispatch() {
             arguments: vec![b'{'; 17 * 1024],
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
     let mut executor = FakeToolExecutor::new();
@@ -384,6 +394,7 @@ fn oversized_result_fails_after_single_dispatch() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
     let mut executor = FakeToolExecutor::new();
@@ -441,6 +452,7 @@ fn unknown_outcome_stops_turn_without_session_failure() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut executor = FakeToolExecutor::new();
     executor.push_error(ToolError::EffectUnknown {
@@ -474,6 +486,7 @@ fn l1_assembly_prunes_and_externalizes_inside_turn() {
         text: "final".to_owned(),
         tool_calls: Vec::new(),
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut new = seed_record("read-v2", "outline of foo", 10);
     new.supersedes = Some("read-v1".to_owned());
@@ -510,6 +523,7 @@ fn legacy_dotted_tool_name_from_model_fails_as_invalid() {
             arguments: br#"{}"#.to_vec(),
         }],
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
     let mut executor = FakeToolExecutor::new();
@@ -544,6 +558,7 @@ fn tool_call_burst_fails_before_any_dispatch() {
             })
             .collect(),
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
     let mut executor = FakeToolExecutor::new();

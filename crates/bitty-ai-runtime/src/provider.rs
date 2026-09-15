@@ -198,6 +198,23 @@ impl TurnRequest {
     }
 }
 
+/// Estimated token usage for one provider turn, in whole tokens.
+///
+/// Observed usage, not billed usage: the provider reports its best estimate
+/// (or the caller supplies a deterministic script value in tests) and the
+/// agent turn loop converts it to relative cost units via
+/// [`crate::selection::estimate_cost`]. No currency is implied. A zero pair
+/// means unreported: the turn loop falls back to a deterministic byte-based
+/// estimate so an uncalibrated provider cannot bypass a cost ceiling by
+/// reporting nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsage {
+    /// Estimated input tokens observed for this turn.
+    pub input_tokens: u32,
+    /// Estimated output tokens observed for this turn.
+    pub output_tokens: u32,
+}
+
 /// One scripted provider turn: assistant text plus follow-up tool calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderTurn {
@@ -209,6 +226,9 @@ pub struct ProviderTurn {
     /// Simulated provider latency in milliseconds, checked deterministically
     /// against [`TurnRequest::timeout_ms`].
     pub latency_ms: u64,
+    /// Estimated token usage observed for this turn (deterministic,
+    /// caller-supplied in scripts; zero means unreported).
+    pub usage: ProviderUsage,
 }
 
 /// Provider boundary errors. Every variant fails closed: no partial turn is
@@ -494,6 +514,7 @@ impl ModelProvider for FakeProvider {
             text: String::new(),
             tool_calls: Vec::new(),
             latency_ms: 0,
+            usage: ProviderUsage::default(),
         });
         if turn.latency_ms > request.timeout_ms {
             self.script.push_front(turn);
@@ -590,11 +611,13 @@ mod tests {
             text: "first".to_owned(),
             tool_calls: Vec::new(),
             latency_ms: 0,
+            usage: ProviderUsage::default(),
         });
         provider.push_turn(ProviderTurn {
             text: "second".to_owned(),
             tool_calls: Vec::new(),
             latency_ms: 0,
+            usage: ProviderUsage::default(),
         });
         let req = request("fake-chat", "hi", 4096, 5_000);
         assert_eq!(
@@ -621,6 +644,7 @@ mod tests {
             text: "kept".to_owned(),
             tool_calls: Vec::new(),
             latency_ms: 0,
+            usage: ProviderUsage::default(),
         });
         let over = request("fake-chat", "hi", 1, 5_000);
         assert!(matches!(
@@ -643,6 +667,7 @@ mod tests {
             text: "slow".to_owned(),
             tool_calls: Vec::new(),
             latency_ms: 6_000,
+            usage: ProviderUsage::default(),
         });
         let err = provider
             .complete(&request("fake-chat", "hi", 4096, 5_000))

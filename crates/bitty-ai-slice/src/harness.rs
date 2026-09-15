@@ -20,8 +20,8 @@
 
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentSession, AuthContext, AuthDecision, ContextError, ContextPriority,
-    ContextRecord, FakeProvider, IdIssuer, ProviderError, ProviderTurn, RecordBody, StableId,
-    ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
+    ContextRecord, FakeProvider, IdIssuer, ProviderError, ProviderTurn, ProviderUsage, RecordBody,
+    StableId, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
 };
 
 use crate::bridge::{HostPeer, IpcBridge};
@@ -196,6 +196,7 @@ pub fn scripted_provider(
         text: answer.to_owned(),
         tool_calls,
         latency_ms: 0,
+        usage: ProviderUsage::default(),
     });
     Ok(provider)
 }
