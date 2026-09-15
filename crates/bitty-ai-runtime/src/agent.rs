@@ -24,8 +24,9 @@ use crate::context::{
 };
 use crate::provider::{
     DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, Message, ModelProvider,
-    ProviderError, ProviderTurn,
+    ProviderError, ProviderTurn, TurnRequest,
 };
+use crate::selection::estimate_cost;
 use crate::session::{AgentSession, ExecutionId, IdIssuer, SessionError};
 use crate::stream::{FragmentKind, StreamError, StreamSink, emit_fragments, fragment_text};
 use crate::tool::{
@@ -49,6 +50,22 @@ pub struct AgentConfig {
     pub context_budget_bytes: usize,
     /// Provider timeout per round in milliseconds (`MP-8`).
     pub provider_timeout_ms: u64,
+    /// Per-turn cost ceiling in relative routing units (see
+    /// [`crate::selection::estimate_cost`); `None` disables the fuse and
+    /// preserves the pre-AI-0046 behavior. When set, the turn loop
+    /// accumulates estimated cost across provider rounds and stops with
+    /// [`AgentError::CostCeilingExceeded`] before dispatching further work.
+    /// Routing data only: never authorizes or bypasses the byte budget or
+    /// authorization gates.
+    pub max_turn_cost: Option<u64>,
+    /// Relative input cost weight for the active model (mirror the
+    /// [`crate::selection::SelectedModel`] weights at wiring time; `0`
+    /// counts as `1` in turn accounting so an uncalibrated host cannot
+    /// bypass the ceiling; never currency).
+    pub input_cost_weight: u32,
+    /// Relative output cost weight for the active model (same rule as
+    /// [`AgentConfig::input_cost_weight`]).
+    pub output_cost_weight: u32,
 }
 
 impl Default for AgentConfig {
@@ -58,6 +75,9 @@ impl Default for AgentConfig {
             max_tool_calls_per_turn: MAX_TOOL_CALLS_PER_TURN,
             context_budget_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
             provider_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            max_turn_cost: None,
+            input_cost_weight: 1,
+            output_cost_weight: 1,
         }
     }
 }
@@ -82,6 +102,17 @@ pub enum AgentError {
         /// Configured bound.
         limit: usize,
     },
+    /// Accumulated estimated turn cost exceeded the configured ceiling.
+    /// Fail-closed fuse: the turn stops before dispatching further work
+    /// (never mid-effect); the session stays `Active` for reconcile-and-retry,
+    /// same philosophy as `Unknown`/cancel, with no rollback of earlier
+    /// recorded rounds.
+    CostCeilingExceeded {
+        /// Configured ceiling in relative routing units.
+        limit: u64,
+        /// Accumulated estimated cost when the fuse tripped.
+        actual: u64,
+    },
 }
 
 impl Display for AgentError {
@@ -95,6 +126,9 @@ impl Display for AgentError {
             Self::RoundLimitExceeded { limit } => {
                 write!(f, "round limit of {limit} exceeded")
             }
+            Self::CostCeilingExceeded { limit, actual } => {
+                write!(f, "turn cost {actual} exceeded ceiling {limit}")
+            }
         }
     }
 }
@@ -107,7 +141,7 @@ impl std::error::Error for AgentError {
             Self::Tool(error) => Some(error),
             Self::Stream(error) => Some(error),
             Self::Session(error) => Some(error),
-            Self::RoundLimitExceeded { .. } => None,
+            Self::RoundLimitExceeded { .. } | Self::CostCeilingExceeded { .. } => None,
         }
     }
 }
@@ -193,6 +227,7 @@ pub struct Agent<P: ModelProvider> {
     config: AgentConfig,
     executions: Vec<ExecutionRecord>,
     tool_history: Vec<ContextRecord>,
+    turn_cost: u64,
 }
 
 impl<P: ModelProvider> Agent<P> {
@@ -207,6 +242,7 @@ impl<P: ModelProvider> Agent<P> {
             config,
             executions: Vec::new(),
             tool_history: Vec::new(),
+            turn_cost: 0,
         }
     }
 
@@ -241,13 +277,26 @@ impl<P: ModelProvider> Agent<P> {
         &self.tool_history
     }
 
+    /// Accumulated estimated turn cost in relative routing units for the
+    /// current (or most recent) turn. Reset to `0` at the start of every
+    /// [`Agent::run_turn`]; advanced once per successful provider round.
+    #[must_use]
+    pub fn turn_cost(&self) -> u64 {
+        self.turn_cost
+    }
+
     /// Run one turn: assemble seed context, loop provider rounds with tool
     /// dispatch, and stream fragments into `sink`.
     ///
     /// Cancellation returns [`ExecOutcome::Canceled`] (or
     /// [`ExecOutcome::Unknown`] when dispatched effects are unreconciled);
     /// budget, validation, and authorization failures return
-    /// [`ExecOutcome::Failed`] with no dispatch of their own.
+    /// [`ExecOutcome::Failed`] with no dispatch of their own. The cost fuse
+    /// ([`AgentError::CostCeilingExceeded`]) is the exception to the
+    /// `Failed`-means-terminal rule: it returns `Failed` with the session
+    /// left `Active` for reconcile-and-retry, like `Unknown`/cancel, with no
+    /// rollback of earlier recorded rounds. Cost accounting never authorizes
+    /// or bypasses the byte budget or authorization gates.
     pub fn run_turn(
         &mut self,
         executor: &mut dyn ToolExecutor,
@@ -299,6 +348,7 @@ impl<P: ModelProvider> Agent<P> {
         let tool_names = self.tools.tool_names();
         let mut round = 0;
         self.tool_history.clear();
+        self.turn_cost = 0;
         loop {
             if self.session.is_cancelled() {
                 return self.reconcile_cancel();
@@ -322,6 +372,30 @@ impl<P: ModelProvider> Agent<P> {
                 Ok(turn) => turn,
                 Err(error) => return self.fail(error.into()),
             };
+            // Cost fuse: accumulate estimated cost for this round, then stop
+            // before any further effect (no text emission, no tool dispatch
+            // for this round) when the ceiling is exceeded. The session stays
+            // `Active`: earlier recorded rounds are kept, nothing is rolled
+            // back, and the caller may reconcile (raise the ceiling, switch
+            // models) and retry.
+            let (input_tokens, output_tokens) = Self::round_usage(&turn_request, &turn);
+            let round_cost = estimate_cost(
+                input_tokens,
+                output_tokens,
+                effective_cost_weight(self.config.input_cost_weight),
+                effective_cost_weight(self.config.output_cost_weight),
+            );
+            self.turn_cost = self.turn_cost.saturating_add(round_cost);
+            if let Some(limit) = self.config.max_turn_cost {
+                if self.turn_cost > limit {
+                    return ExecOutcome::Failed {
+                        error: AgentError::CostCeilingExceeded {
+                            limit,
+                            actual: self.turn_cost,
+                        },
+                    };
+                }
+            }
             match self.emit_text(sink, &turn) {
                 Ok(true) => {}
                 Ok(false) => return self.reconcile_cancel(),
@@ -523,7 +597,14 @@ impl<P: ModelProvider> Agent<P> {
     }
 
     /// Fail the turn with a typed error and mark the session failed.
+    ///
+    /// The cost fuse ([`AgentError::CostCeilingExceeded`]) deliberately does
+    /// not use this path: it returns `Failed` with the session left `Active`.
     fn fail(&mut self, error: AgentError) -> ExecOutcome {
+        debug_assert!(
+            !matches!(error, AgentError::CostCeilingExceeded { .. }),
+            "cost fuse must leave the session Active; return Failed directly"
+        );
         self.session.finish(true);
         ExecOutcome::Failed { error }
     }
@@ -536,4 +617,30 @@ impl<P: ModelProvider> Agent<P> {
             dispatched: self.executions.len(),
         }
     }
+
+    /// Resolve the token pair used for cost accounting for one provider
+    /// round: the provider-reported [`crate::provider::ProviderUsage`] when
+    /// either count is non-zero, else a deterministic byte-based estimate
+    /// (input from the request bytes, output from the response text) so an
+    /// unreported usage cannot bypass the ceiling.
+    fn round_usage(request: &TurnRequest, turn: &ProviderTurn) -> (u64, u64) {
+        if turn.usage.input_tokens != 0 || turn.usage.output_tokens != 0 {
+            return (
+                u64::from(turn.usage.input_tokens),
+                u64::from(turn.usage.output_tokens),
+            );
+        }
+        (
+            ContextRequest::estimate_tokens(request.total_message_bytes()),
+            ContextRequest::estimate_tokens(turn.text.len()),
+        )
+    }
+}
+
+/// Effective cost weight for turn accounting: a configured `0` (unset)
+/// counts as `1` so an uncalibrated host cannot bypass the ceiling with free
+/// rounds. Selection routing still treats `0` as smallest/unset; this mapping
+/// applies only to the turn-loop multiplication.
+fn effective_cost_weight(weight: u32) -> u32 {
+    if weight == 0 { 1 } else { weight }
 }

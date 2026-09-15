@@ -82,13 +82,13 @@ pub use prompt::{
 };
 pub use provider::{
     FakeProvider, ModelCapability, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
-    Role, TerminalModelMetadata, ToolCallRequest, TurnRequest, validate_provider_id,
+    ProviderUsage, Role, TerminalModelMetadata, ToolCallRequest, TurnRequest, validate_provider_id,
 };
 pub use selection::{
     FallbackDirective, MAX_ALIAS_CANDIDATES, MAX_ALIASES, MAX_MODEL_NAME_LEN,
     MAX_REGISTERED_MODELS, ModelAlias, ModelRef, ModelRegistration, ProviderRegistry,
-    RegisteredModel, SelectRequest, SelectedModel, SelectionError, fallback_directive,
-    validate_model_name,
+    RegisteredModel, SelectRequest, SelectedModel, SelectionError, estimate_cost,
+    fallback_directive, validate_model_name,
 };
 pub use session::{
     AgentInstanceId, AgentLevel, AgentSession, DenyAllElevations, ElevationGrant, ExecutionId,

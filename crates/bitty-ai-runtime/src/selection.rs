@@ -695,6 +695,46 @@ impl SelectedModel {
             output_cost_weight: entry.output_cost_weight,
         }
     }
+
+    /// Estimated routing cost for an observed usage pair, in relative
+    /// routing units (never currency). Delegates to [`estimate_cost`].
+    #[must_use]
+    pub fn estimate_cost(&self, input_tokens: u64, output_tokens: u64) -> u64 {
+        estimate_cost(
+            input_tokens,
+            output_tokens,
+            self.input_cost_weight,
+            self.output_cost_weight,
+        )
+    }
+}
+
+/// Estimate routing cost in relative units (never currency) from observed
+/// token counts and per-model cost weights:
+///
+/// ```text
+/// cost = input_tokens * input_weight + output_tokens * output_weight
+/// ```
+///
+/// Both weights are routing data held on the model registration/selection
+/// ([`ModelRegistration`], [`RegisteredModel`], [`SelectedModel`]); a weight
+/// of `0` means unset and contributes `0`. Hosts calibrate by choosing
+/// weights (for example from a model card); the function itself performs no
+/// I/O, reads no clock, and authorizes nothing. Cost accounting never
+/// bypasses the byte budget
+/// ([`ProviderError::BudgetExceeded`](crate::provider::ProviderError::BudgetExceeded))
+/// or authorization gates: selection filters may consider cost, enforcement
+/// stays in the existing gates plus the agent turn fuse (see
+/// `crate::agent`). Saturates on overflow rather than wrapping.
+#[must_use]
+pub fn estimate_cost(
+    input_tokens: u64,
+    output_tokens: u64,
+    input_weight: u32,
+    output_weight: u32,
+) -> u64 {
+    (input_tokens.saturating_mul(u64::from(input_weight)))
+        .saturating_add(output_tokens.saturating_mul(u64::from(output_weight)))
 }
 
 /// Fallback directive for one provider failure: advance to the next chain
@@ -1394,5 +1434,39 @@ mod tests {
             mismatch.to_string(),
             "provider p model m lacks 2 capabilities"
         );
+    }
+
+    #[test]
+    fn estimate_cost_is_tokens_times_weight() {
+        // Relative routing units, never currency: exact on small values.
+        assert_eq!(estimate_cost(10, 5, 2, 3), 35);
+        assert_eq!(estimate_cost(0, 0, 2, 3), 0);
+        // Unset (`0`) weights contribute nothing; hosts calibrate by
+        // choosing explicit weights.
+        assert_eq!(estimate_cost(10, 5, 0, 0), 0);
+        assert_eq!(estimate_cost(10, 5, 0, 3), 15);
+    }
+
+    #[test]
+    fn estimate_cost_saturates_instead_of_wrapping() {
+        assert_eq!(estimate_cost(u64::MAX, 1, 2, u32::MAX), u64::MAX);
+        assert_eq!(
+            estimate_cost(u64::MAX, u64::MAX, u32::MAX, u32::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn selected_model_delegates_to_estimate_cost() {
+        let entry = RegisteredModel {
+            provider_id: "bitty-fake".to_owned(),
+            name: "m".to_owned(),
+            capabilities: vec![Cap::Text],
+            context_window_tokens: 4_096,
+            input_cost_weight: 2,
+            output_cost_weight: 4,
+        };
+        let selected = SelectedModel::from_entry(&entry);
+        assert_eq!(selected.estimate_cost(3, 7), 3 * 2 + 7 * 4);
     }
 }
