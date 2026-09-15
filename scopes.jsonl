@@ -1,1 +1,4 @@
 {"created_at":"2026-09-13T15:20:27.143030213+00:00","id":"01M2DNNZR7PBZ091DVJED0B93R","kind":"include","pattern":".github/ISSUE_TEMPLATE/bug_report.md","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2DNNN7616C7BZN385SP9TFZ"}
+{"created_at":"2026-09-15T03:18:16.988600545+00:00","id":"01M2HH534WAFZVFGM7DHTS7NH5","kind":"include","pattern":"crates/bitty-ai-slice/src/fake_host.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
+{"created_at":"2026-09-15T03:18:17.023600297+00:00","id":"01M2HH535ZARZTQ26R1K0ZVRCW","kind":"include","pattern":"crates/bitty-ai-slice/src/lib.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
+{"created_at":"2026-09-15T03:18:17.053972292+00:00","id":"01M2HH536YGE6T8MSC5D8TWZWF","kind":"include","pattern":"crates/bitty-ai-slice/tests/fake_host.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
