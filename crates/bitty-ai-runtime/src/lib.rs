@@ -70,12 +70,15 @@ pub use prompt::assemble as assemble_prompt;
 pub use prompt::{
     AssembledPrompt, AssembledSection, Directive, DirectiveOverride, LayerInput,
     MAX_BUDGET_CEILING_BYTES, MAX_CANONICAL_BYTES, MAX_CORE_VERSION_LEN, MAX_DIRECTIVE_KEY_LEN,
-    MAX_DIRECTIVE_VALUE_LEN, MAX_DIRECTIVES_PER_LAYER, MAX_LAYER_TEXT_BYTES, MAX_SCOPE_LEN,
-    MAX_SCOPES_PER_LAYER, MAX_TOOL_ENTRIES_PER_LAYER, NEVER_MERGE_DIRECTIVE_KEYS, PromptError,
-    PromptLayer, PromptSnapshot, check_dispatch, common_prefix_len, is_dispatch_allowed,
-    is_never_merge_directive_key, validate_budget_ceiling, validate_core_version,
-    validate_directive_key, validate_directive_value, validate_layer_text,
-    validate_prompt_tool_name, validate_scope,
+    MAX_DIRECTIVE_VALUE_LEN, MAX_DIRECTIVES_PER_LAYER, MAX_LAYER_TEXT_BYTES,
+    MAX_PROJECT_FILE_BYTES, MAX_PROJECT_FILES, MAX_PROJECT_PATH_LEN, MAX_SCOPE_LEN,
+    MAX_SCOPES_PER_LAYER, MAX_SKILL_ENTRIES, MAX_SKILL_ENTRY_BYTES, MAX_SKILL_NAME_LEN,
+    MAX_SKILL_REGISTRY_BYTES, MAX_SKILL_VERSION_LEN, MAX_TOOL_ENTRIES_PER_LAYER,
+    NEVER_MERGE_DIRECTIVE_KEYS, PromptError, PromptLayer, PromptSnapshot, SKILL_REGISTRY_VERSION_1,
+    SUPPORTED_SKILL_VERSIONS, admit_project_path, check_dispatch, common_prefix_len,
+    is_dispatch_allowed, is_never_merge_directive_key, is_supported_skill_version,
+    validate_budget_ceiling, validate_core_version, validate_directive_key,
+    validate_directive_value, validate_layer_text, validate_prompt_tool_name, validate_scope,
 };
 pub use provider::{
     FakeProvider, ModelCapability, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
