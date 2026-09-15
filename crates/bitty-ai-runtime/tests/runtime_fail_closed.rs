@@ -784,3 +784,45 @@ fn context_request_resolves_token_first_budget() {
     };
     assert_eq!(request.effective_budget_bytes(), 256);
 }
+
+#[test]
+fn relaxed_config_still_clamped_by_bus_constant() {
+    // P2-5 (AI-0056): effective cap = min(config, MAX_TOOL_CALLS_PER_TURN).
+    // A config of 16 does not relax the hard bus ceiling of 8: nine calls
+    // pass the agent-level config gate but still fail in `ToolBus::precheck`
+    // with limit 8 and dispatch nothing.
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "burst".to_owned(),
+        tool_calls: (0..9)
+            .map(|_| ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{}"#.to_vec(),
+            })
+            .collect(),
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    let config = AgentConfig {
+        max_tool_calls_per_turn: 16,
+        ..AgentConfig::default()
+    };
+    let mut agent = Agent::new(provider, read_tool_bus(), session(), config);
+    let mut executor = FakeToolExecutor::new();
+    executor.push_success("read ok", b"data".to_vec());
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::CallLimitExceeded { limit: 8 })
+            }
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(executor.calls().is_empty());
+    assert!(agent.executions().is_empty());
+}
