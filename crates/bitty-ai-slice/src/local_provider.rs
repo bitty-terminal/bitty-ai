@@ -1107,6 +1107,57 @@ mod tests {
         .into_bytes()
     }
 
+    /// Spawn a one-shot stub that captures the raw request bytes for header
+    /// assertions, then writes the scripted response and closes.
+    ///
+    /// Returns the bound port, the join handle, and the captured request
+    /// receiver. Read-only test helper; no product path uses it.
+    fn stub_capture_once(
+        response: Vec<u8>,
+    ) -> (u16, thread::JoinHandle<()>, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let port = listener.local_addr().expect("port").port();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (req_tx, req_rx) = mpsc::channel::<Vec<u8>>();
+        let handle = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(2_000)));
+            // Drain the request (bounded): read until end of headers plus
+            // any declared body so the client write never blocks.
+            let mut buf = [0_u8; 4096];
+            let mut seen = Vec::new();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        seen.extend_from_slice(&buf[..n]);
+                        if let Some(end) = find_headers_end(&seen) {
+                            let body_len =
+                                content_length_of(&seen[..end]).unwrap_or(0).min(96 * 1024);
+                            if seen.len() >= end + body_len {
+                                break;
+                            }
+                        }
+                        if seen.len() > 128 * 1024 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = req_tx.send(seen);
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stub ready");
+        (port, handle, req_rx)
+    }
+
     #[test]
     fn localhost_variants_accepted_elsewhere_refused_at_construction() {
         for host in [
@@ -1165,6 +1216,189 @@ mod tests {
         );
         assert!(rendered.contains("[redacted]"));
         assert!(endpoint.has_api_key());
+    }
+
+    #[test]
+    fn api_key_emits_exact_bearer_header_on_wire() {
+        // AI-0043 (1): a caller-supplied key must appear byte-exact as
+        // `Authorization: Bearer <key>` on the wire; the turn still completes.
+        let key = "Ak3y-Wire-Probe-9z8y7x6w5v-0043a";
+        let json = r#"{"choices":[{"message":{"content":"keyed stub"}}]}"#;
+        let (port, handle, req_rx) = stub_capture_once(http_ok(json));
+        let endpoint = LocalEndpoint::new("127.0.0.1", port, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key(key)
+            .expect("key");
+        assert!(endpoint.has_api_key());
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "keyed stub");
+        assert_eq!(provider.complete_calls(), 1);
+        let raw = req_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request bytes");
+        let text = String::from_utf8_lossy(&raw);
+        let expected = format!("Authorization: Bearer {key}\r\n");
+        assert!(
+            text.contains(&expected),
+            "wire bytes must carry exact Bearer line"
+        );
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn no_api_key_sends_no_authorization_header() {
+        // AI-0043 (2): without a key, no Authorization header may appear
+        // anywhere in the request bytes; the turn still completes.
+        let json = r#"{"choices":[{"message":{"content":"open stub"}}]}"#;
+        let (port, handle, req_rx) = stub_capture_once(http_ok(json));
+        let endpoint = endpoint_for(port);
+        assert!(!endpoint.has_api_key());
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "open stub");
+        assert_eq!(provider.complete_calls(), 1);
+        let raw = req_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request bytes");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            !text.to_ascii_lowercase().contains("authorization"),
+            "wire bytes must not carry Authorization without a key"
+        );
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn empty_api_key_refused_without_io() {
+        // AI-0043 (3a): an empty key fails closed at construction with a
+        // typed Transport error. No stub is bound in this test, so zero
+        // sockets can open; a fresh provider that never ran stays at zero
+        // calls.
+        let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key("")
+            .expect_err("empty key must fail");
+        assert!(
+            matches!(err, ProviderError::Transport { .. }),
+            "empty key must be Transport, got: {err}"
+        );
+        let probe = LocalProvider::new(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+        );
+        assert_eq!(probe.complete_calls(), 0);
+    }
+
+    #[test]
+    fn over_large_api_key_refused_without_io() {
+        // AI-0043 (3b): keys longer than 4 KiB fail closed at construction.
+        // The 4 KiB boundary itself still holds. No stub is bound, so zero
+        // sockets open.
+        let boundary = "Q".repeat(4 * 1024);
+        assert!(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_api_key(boundary)
+                .is_ok(),
+            "4 KiB key must be accepted"
+        );
+        let big = "Q".repeat(4 * 1024 + 1);
+        let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key(big.clone())
+            .expect_err("over-large key must fail");
+        assert!(
+            matches!(err, ProviderError::Transport { .. }),
+            "over-large key must be Transport, got: {err}"
+        );
+        // Redaction holds on this path too (full value and 8-byte prefix).
+        let rendered = err.to_string();
+        assert!(!rendered.contains(&big));
+        assert!(!rendered.contains(&big[..8]));
+        let probe = LocalProvider::new(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+        );
+        assert_eq!(probe.complete_calls(), 0);
+    }
+
+    #[test]
+    fn crlf_api_keys_refused_without_io() {
+        // AI-0043 (3c): CR- and LF-bearing keys fail closed at construction
+        // (header-injection refusal). No stub is bound, so zero sockets open.
+        for bad in [
+            "Ak3y-CR-Probe-0043\rx",
+            "Ak3y-LF-Probe-0043\nx",
+            "Ak3y-CRLF-Probe-0043\r\nx",
+        ] {
+            let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_api_key(bad)
+                .expect_err("CRLF key must fail");
+            assert!(
+                matches!(err, ProviderError::Transport { .. }),
+                "CRLF key must be Transport, got: {err}"
+            );
+            // The refusal reason must not echo the key material.
+            let rendered = err.to_string();
+            assert!(!rendered.contains(bad));
+        }
+        let probe = LocalProvider::new(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+        );
+        assert_eq!(probe.complete_calls(), 0);
+    }
+
+    #[test]
+    fn api_key_absent_from_debug_and_refusal_reasons_including_prefix() {
+        // AI-0043 (4): Debug and every new-path error reason carry neither
+        // the key nor a non-trivial prefix (first 8 / first 4 bytes) to catch
+        // truncation leaks. Single-char prefixes are not asserted: they occur
+        // naturally in unrelated fields.
+        let key = "Zk9q-Redact-Probe-7m6n5b4v-0043r";
+        let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key(key)
+            .expect("key");
+        let rendered = format!("{endpoint:?}");
+        assert!(!rendered.contains(key));
+        assert!(!rendered.contains(&key[..8]));
+        assert!(!rendered.contains(&key[..4]));
+        assert!(rendered.contains("[redacted]"));
+
+        // Refusal reasons from the new paths redact the same way.
+        let over = "Zk9q-".repeat(820);
+        let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key(over.clone())
+            .expect_err("over-large must fail");
+        let text = err.to_string();
+        assert!(!text.contains(&over));
+        assert!(!text.contains(&over[..8]));
+        assert!(!text.contains(&over[..4]));
+
+        for bad in ["Zk9q-CR-Probe-0043\rx", "Zk9q-LF-Probe-0043\nx"] {
+            let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_api_key(bad)
+                .expect_err("CRLF must fail");
+            let text = err.to_string();
+            assert!(!text.contains(bad));
+            assert!(!text.contains(&bad[..8]));
+            assert!(!text.contains(&bad[..4]));
+        }
+
+        // The empty-key refusal carries only a static reason.
+        let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key("")
+            .expect_err("empty must fail");
+        let text = err.to_string();
+        assert!(matches!(err, ProviderError::Transport { .. }));
+        assert!(text.contains("api key length out of bounds"));
     }
 
     #[test]
@@ -1437,6 +1671,26 @@ mod tests {
     #[ignore]
     fn live_ollama_probe() {
         let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint");
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "say ok"))
+            .expect("live turn");
+        assert!(!turn.text.is_empty());
+    }
+
+    /// Live key-protected probe (manual only, AI-0043): requires a local
+    /// key-bearing OpenAI-compatible server on loopback. Example server flags
+    /// (llama.cpp): `llama-server --host 127.0.0.1 --port 8080 --model <gguf>
+    /// --api-key test-live-key-0043`. The endpoint must use the same key via
+    /// `.with_api_key("test-live-key-0043")`. Without the key the server
+    /// answers 401 (mapped to `Auth`). Never runs in CI.
+    #[test]
+    #[ignore]
+    fn live_key_protected_probe() {
+        let endpoint = LocalEndpoint::new("127.0.0.1", 8080, "llama3.1:8b")
+            .expect("endpoint")
+            .with_api_key("test-live-key-0043")
+            .expect("key");
         let mut provider = LocalProvider::new(endpoint);
         let turn = provider
             .complete(&turn_request("llama3.1:8b", "say ok"))
