@@ -20,9 +20,12 @@
 //!   ceiling.
 //! - `allowed_scopes` (`None` = no constraint) intersect: a lower layer
 //!   cannot add a scope the upper set omits.
-//! - Generic `directives` with the same key but different values fail closed
-//!   with [`PromptError::UnresolvableConflict`]: the assembler refuses to
-//!   guess which instruction wins.
+//! - Generic `directives` with the same key but different values resolve by
+//!   precedence: the higher-precedence (lower-rank) layer wins, and every
+//!   override is recorded in [`AssembledPrompt::merge_overrides`] and in the
+//!   canonical bytes. Same-layer conflicts (no precedence difference) and
+//!   conflicts on [`NEVER_MERGE_DIRECTIVE_KEYS`] stay fail-closed with
+//!   [`PromptError::UnresolvableConflict`].
 //!
 //! > **A prompt never grants a capability.** Prompt text describes what should
 //! > be done; the dispatcher decides what can be done. Even when the prompt
@@ -31,6 +34,27 @@
 //! > or omits (under a constrained allow-set), dispatch is refused even when
 //! > the dispatcher would grant. All refusals are fail-closed with no partial
 //! > assembly or dispatch.
+//!
+//! # Directive precedence and the never-merge list
+//!
+//! When two layers set the same directive key to different values, the
+//! higher-precedence layer (smaller [`PromptLayer::rank`]) wins: Core
+//! overrides User, User overrides Project, and so on down to Runtime/Turn.
+//! Same-value duplicates merge silently with no record. Every cross-layer
+//! override appends one [`DirectiveOverride`] per overridden layer to
+//! [`AssembledPrompt::merge_overrides`] (sorted by key, overridden rank and
+//! value, then winning rank and value) and to the canonical bytes as a
+//! sorted `override:` line, so a reviewer can audit exactly which lower-layer value lost and to which
+//! upper-layer value.
+//!
+//! [`NEVER_MERGE_DIRECTIVE_KEYS`] names the minimal policy set of keys that
+//! never resolve by precedence: `agent.identity` (layer-asserted identity;
+//! a silent override would let a lower, less-trusted layer re-label the
+//! agent or mask which layer spoke) and `capability.grant` (grant-shaped
+//! advisory text; a silent merge would blur the prompt-never-grants
+//! boundary). Conflicts on those keys — and same-layer conflicts with no
+//! precedence difference — stay fail-closed with
+//! [`PromptError::UnresolvableConflict`].
 //!
 //! # Deterministic serialization (AIQ-12 mechanism evidence)
 //!
@@ -45,9 +69,9 @@
 //! This module provides enforcement evidence toward AIQ-12 ("Canonical
 //! serialization and stable-prefix ordering — Design: deterministic encoding
 //! is prerequisite for any prefix-cache claim") and toward the AIQ-31/AIQ-34
-//! merge-semantics facet (conflict diagnostics). It does not close any AIQ:
-//! canonical owner, digest algorithm, cache-key scope, epoch schema, and
-//! reviewer acceptance stay open in the register.
+//! merge-semantics facet (precedence-override + audit-record evidence). It
+//! does not close any AIQ: canonical owner, digest algorithm, cache-key
+//! scope, epoch schema, and reviewer acceptance stay open in the register.
 //!
 //! # Bounds and determinism rules
 //!
@@ -164,8 +188,11 @@ impl Display for PromptLayer {
 ///
 /// Directives carry advisory text policy (for example `tone = concise`).
 /// They never grant capability. The same key with the same value across
-/// layers merges to one entry; the same key with different values is an
-/// unresolvable conflict and fails closed at assembly.
+/// layers merges to one entry; the same key with different values resolves
+/// by layer precedence (higher-precedence layer wins, recorded in
+/// [`AssembledPrompt::merge_overrides`]), except keys in
+/// [`NEVER_MERGE_DIRECTIVE_KEYS`] and same-layer conflicts, which fail
+/// closed at assembly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Directive {
     /// Directive key (`^[a-z][a-z0-9_.-]*$`, bounded).
@@ -187,6 +214,54 @@ impl Directive {
         validate_directive_value(&key, &value)?;
         Ok(Self { key, value })
     }
+}
+
+/// Directive keys that never resolve by precedence (minimal policy set).
+///
+/// A same-key-different-value conflict on any of these keys stays
+/// fail-closed with [`PromptError::UnresolvableConflict`] even across
+/// layers with a clear precedence difference:
+///
+/// - `agent.identity`: layer-asserted identity. A silent override would let
+///   a lower (less trusted) layer re-label the agent or mask which layer
+///   spoke for a directive.
+/// - `capability.grant`: grant-shaped advisory text. A silent merge would
+///   blur the prompt-never-grants boundary by letting directive text look
+///   authoritative about capabilities.
+///
+/// Same-value duplicates on these keys still merge silently (no conflict,
+/// no audit record); only differing values fail closed. Keep this list
+/// minimal: every entry must be justified as identity- or
+/// capability-adjacent, and additions are a policy change requiring review.
+pub const NEVER_MERGE_DIRECTIVE_KEYS: &[&str] = &["agent.identity", "capability.grant"];
+
+/// Whether `key` is a never-merge directive key (see
+/// [`NEVER_MERGE_DIRECTIVE_KEYS`]).
+#[must_use]
+pub fn is_never_merge_directive_key(key: &str) -> bool {
+    NEVER_MERGE_DIRECTIVE_KEYS.contains(&key)
+}
+
+/// One recorded precedence override from directive merging.
+///
+/// When a higher-precedence layer and a lower-precedence layer set the same
+/// (mergeable) directive key to different values, the higher-precedence
+/// value wins and one record per overridden layer is stored on
+/// [`AssembledPrompt::merge_overrides`] and rendered into the canonical
+/// bytes. Records sort by (key, overridden-layer rank, overridden value,
+/// winning-layer rank, winning value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectiveOverride {
+    /// Conflicting directive key.
+    pub key: String,
+    /// Winning value (from the higher-precedence layer).
+    pub winning_value: String,
+    /// Layer that supplied the winning value.
+    pub winning_layer: PromptLayer,
+    /// Overridden value (from the lower-precedence layer).
+    pub overridden_value: String,
+    /// Layer that supplied the overridden value.
+    pub overridden_layer: PromptLayer,
 }
 
 /// One layer's contribution to a prompt snapshot.
@@ -365,6 +440,13 @@ pub struct AssembledPrompt {
     pub effective_scopes: Option<Vec<String>>,
     /// Effective directives sorted by key (deduped on equal values).
     pub effective_directives: Vec<Directive>,
+    /// Precedence override audit record, sorted by (key, overridden-layer
+    /// rank, overridden value, winning-layer rank, winning value). Empty
+    /// when no cross-layer directive value conflict occurred. Also rendered
+    /// into [`AssembledPrompt::canonical_bytes`] as sorted `override:` lines
+    /// (absent when empty, so override-free snapshots keep byte-identical
+    /// canonical forms).
+    pub merge_overrides: Vec<DirectiveOverride>,
     /// Canonical byte form (AIQ-12 mechanism evidence). See module docs.
     pub canonical_bytes: Vec<u8>,
 }
@@ -468,8 +550,12 @@ pub enum PromptError {
         /// Rejected ceiling.
         actual: usize,
     },
-    /// The same directive key carries different values: the assembler
-    /// refuses to guess and fails closed.
+    /// The same directive key carries different values with no precedence
+    /// resolution: either the key is in [`NEVER_MERGE_DIRECTIVE_KEYS`] or
+    /// both values come from the same layer (no precedence difference). The
+    /// assembler refuses to guess and fails closed. Cross-layer conflicts on
+    /// mergeable keys instead resolve by precedence and are recorded in
+    /// [`AssembledPrompt::merge_overrides`].
     UnresolvableConflict {
         /// Conflicting key.
         key: String,
@@ -742,8 +828,10 @@ pub fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
 /// rank (input order is insignificant); fill missing layers with empty text
 /// and no constraints; merge `denied_tools` by union, `allowed_tools` and
 /// `allowed_scopes` by intersection (`None` = no constraint), budgets by
-/// minimum, and directives by key with fail-closed conflict on differing
-/// values; then render the canonical byte form.
+/// minimum, and directives by key with precedence override (higher-precedence
+/// layer wins, one [`DirectiveOverride`] per overridden layer) except
+/// [`NEVER_MERGE_DIRECTIVE_KEYS`] and same-layer conflicts, which fail
+/// closed; then render the canonical byte form.
 ///
 /// Content text is never interpreted: no keyword, directive, or instruction
 /// scan runs over layer text, and text bytes never select, widen, or
@@ -826,30 +914,67 @@ pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptErro
         }
     }
 
-    // Directives: same key + same value merges; same key + different value
-    // fails closed (no precedence guess).
-    let mut by_key: BTreeMap<String, String> = BTreeMap::new();
+    // Directives: same key + same value merges silently; same key +
+    // different value resolves by precedence (higher-precedence layer wins,
+    // one audit record per overridden layer), except never-merge keys and
+    // same-layer conflicts, which fail closed.
+    let mut by_key: BTreeMap<String, (String, PromptLayer)> = BTreeMap::new();
+    let mut overrides: Vec<DirectiveOverride> = Vec::new();
     for input in &ordered {
         for directive in &input.directives {
             match by_key.get(&directive.key) {
                 None => {
-                    by_key.insert(directive.key.clone(), directive.value.clone());
+                    by_key.insert(
+                        directive.key.clone(),
+                        (directive.value.clone(), input.layer),
+                    );
                 }
-                Some(first) => {
-                    if first != &directive.value {
-                        return Err(PromptError::UnresolvableConflict {
+                Some((first_value, first_layer)) => {
+                    if first_value != &directive.value {
+                        if is_never_merge_directive_key(&directive.key)
+                            || *first_layer == input.layer
+                        {
+                            return Err(PromptError::UnresolvableConflict {
+                                key: directive.key.clone(),
+                                first: first_value.clone(),
+                                second: directive.value.clone(),
+                            });
+                        }
+                        // `ordered` is rank-ascending with duplicate layers
+                        // rejected, so the stored entry is always the
+                        // strictly higher-precedence winner.
+                        overrides.push(DirectiveOverride {
                             key: directive.key.clone(),
-                            first: first.clone(),
-                            second: directive.value.clone(),
+                            winning_value: first_value.clone(),
+                            winning_layer: *first_layer,
+                            overridden_value: directive.value.clone(),
+                            overridden_layer: input.layer,
                         });
                     }
                 }
             }
         }
     }
+    overrides.sort_by(|left, right| {
+        (
+            &left.key,
+            left.overridden_layer.rank(),
+            &left.overridden_value,
+            left.winning_layer.rank(),
+            &left.winning_value,
+        )
+            .cmp(&(
+                &right.key,
+                right.overridden_layer.rank(),
+                &right.overridden_value,
+                right.winning_layer.rank(),
+                &right.winning_value,
+            ))
+    });
+    overrides.dedup();
     let directives: Vec<Directive> = by_key
         .into_iter()
-        .map(|(key, value)| Directive { key, value })
+        .map(|(key, (value, _layer))| Directive { key, value })
         .collect();
 
     let mut assembled = AssembledPrompt {
@@ -860,6 +985,7 @@ pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptErro
         effective_budget_ceiling_bytes: budget,
         effective_scopes: scopes,
         effective_directives: directives,
+        merge_overrides: overrides,
         canonical_bytes: Vec::new(),
     };
     let bytes = render_canonical(&assembled)?;
@@ -885,12 +1011,19 @@ pub fn assemble(snapshot: &PromptSnapshot) -> Result<AssembledPrompt, PromptErro
 /// budget:<n>\n | budget:*\n
 /// scope:<s>\n | scope:*\n
 /// directive:<key>=<value>\n
+/// override:<key> winner:<layer> wlen=<n>:<value> overridden:<layer> olen=<m>:<value>\n
 /// end\n
 /// ```
 ///
 /// Text sections always appear in stable rank order with byte-length
 /// prefixes so embedded newlines or section-like text never shift parsing.
-/// Policy lists are lexicographically sorted. The trailing `[effective]`
+/// Policy lists are lexicographically sorted. Override lines are sorted by
+/// (key, overridden-layer rank, overridden value) and absent when no
+/// override occurred, so override-free snapshots keep byte-identical forms.
+/// Values are length-prefixed (`wlen`/`olen`) because directive values may
+/// contain spaces, `=`, or `:` (only `\n`, `\r`, NUL are forbidden); keys
+/// carry no spaces by construction and layer names come from a fixed set,
+/// so each line parses unambiguously. The trailing `[effective]`
 /// block keeps leading text bytes prefix-stable when only trailing layers
 /// change.
 ///
@@ -954,6 +1087,43 @@ fn render_canonical(prompt: &AssembledPrompt) -> Result<Vec<u8>, PromptError> {
         push(&directive.key);
         push("=");
         push(&directive.value);
+        push("\n");
+    }
+    // Override audit lines: sorted deterministically (defensive re-sort so
+    // even a hand-built `AssembledPrompt` renders canonically), absent when
+    // empty so override-free snapshots keep byte-identical forms.
+    let mut overrides: Vec<&DirectiveOverride> = prompt.merge_overrides.iter().collect();
+    overrides.sort_by(|left, right| {
+        (
+            &left.key,
+            left.overridden_layer.rank(),
+            &left.overridden_value,
+            left.winning_layer.rank(),
+            &left.winning_value,
+        )
+            .cmp(&(
+                &right.key,
+                right.overridden_layer.rank(),
+                &right.overridden_value,
+                right.winning_layer.rank(),
+                &right.winning_value,
+            ))
+    });
+    for item in overrides {
+        push("override:");
+        push(&item.key);
+        push(" winner:");
+        push(item.winning_layer.header());
+        push(" wlen=");
+        push(&item.winning_value.len().to_string());
+        push(":");
+        push(&item.winning_value);
+        push(" overridden:");
+        push(item.overridden_layer.header());
+        push(" olen=");
+        push(&item.overridden_value.len().to_string());
+        push(":");
+        push(&item.overridden_value);
         push("\n");
     }
     push("end\n");
@@ -1354,8 +1524,13 @@ mod tests {
         );
     }
 
+    // AI-0044 replaced the old fail-closed-on-any-difference rule with
+    // precedence override: the higher-precedence (lower-rank) layer wins and
+    // the override is audited. Only never-merge keys and same-layer
+    // conflicts still fail closed (see the `never_merge_*` and
+    // `same_layer_*` tests below).
     #[test]
-    fn conflicting_directives_fail_closed() {
+    fn higher_precedence_directive_overrides_lower() {
         let snapshot = snapshot_with(vec![
             full_layer(
                 PromptLayer::User,
@@ -1376,7 +1551,280 @@ mod tests {
                 vec![("tone", "casual")],
             ),
         ]);
-        let err = assemble(&snapshot).expect_err("conflict must fail");
+        let assembled = assemble(&snapshot).expect("precedence resolves");
+        assert_eq!(
+            assembled.effective_directives,
+            vec![Directive {
+                key: "tone".to_owned(),
+                value: "formal".to_owned()
+            }]
+        );
+        assert_eq!(
+            assembled.merge_overrides,
+            vec![DirectiveOverride {
+                key: "tone".to_owned(),
+                winning_value: "formal".to_owned(),
+                winning_layer: PromptLayer::User,
+                overridden_value: "casual".to_owned(),
+                overridden_layer: PromptLayer::Project,
+            }]
+        );
+    }
+
+    #[test]
+    fn lower_layer_cannot_override_upper() {
+        // Core (rank 0) beats RuntimeTurn (rank 4) even when the lower layer
+        // is listed first in the input: input order never affects output.
+        let snapshot = snapshot_with(vec![
+            full_layer(
+                PromptLayer::RuntimeTurn,
+                "turn",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "chatty")],
+            ),
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "formal")],
+            ),
+        ]);
+        let assembled = assemble(&snapshot).expect("precedence resolves");
+        assert_eq!(
+            assembled.effective_directives,
+            vec![Directive {
+                key: "tone".to_owned(),
+                value: "formal".to_owned()
+            }]
+        );
+        assert_eq!(
+            assembled.merge_overrides,
+            vec![DirectiveOverride {
+                key: "tone".to_owned(),
+                winning_value: "formal".to_owned(),
+                winning_layer: PromptLayer::CoreContract,
+                overridden_value: "chatty".to_owned(),
+                overridden_layer: PromptLayer::RuntimeTurn,
+            }]
+        );
+    }
+
+    #[test]
+    fn override_audit_record_exact_contents() {
+        let snapshot = snapshot_with(vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "formal"), ("style.mode", "terse")],
+            ),
+            full_layer(
+                PromptLayer::SkillsProfile,
+                "skills",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "casual"), ("style.mode", "terse")],
+            ),
+        ]);
+        let assembled = assemble(&snapshot).expect("precedence resolves");
+        // Same-value `style.mode` merges with no record; differing `tone`
+        // records exactly one override with winner + overridden value/layer.
+        assert_eq!(assembled.merge_overrides.len(), 1);
+        let record = &assembled.merge_overrides[0];
+        assert_eq!(record.key, "tone");
+        assert_eq!(record.winning_value, "formal");
+        assert_eq!(record.winning_layer, PromptLayer::CoreContract);
+        assert_eq!(record.overridden_value, "casual");
+        assert_eq!(record.overridden_layer, PromptLayer::SkillsProfile);
+        assert_eq!(
+            assembled.effective_directives,
+            vec![
+                Directive {
+                    key: "style.mode".to_owned(),
+                    value: "terse".to_owned()
+                },
+                Directive {
+                    key: "tone".to_owned(),
+                    value: "formal".to_owned()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_layer_conflict_records_each_overridden_layer() {
+        let snapshot = snapshot_with(vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "formal")],
+            ),
+            full_layer(
+                PromptLayer::User,
+                "user",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "brief")],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "project",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "casual")],
+            ),
+        ]);
+        let assembled = assemble(&snapshot).expect("precedence resolves");
+        // Core wins; both lower layers are audited, sorted by overridden
+        // rank (User before Project).
+        assert_eq!(
+            assembled.merge_overrides,
+            vec![
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "brief".to_owned(),
+                    overridden_layer: PromptLayer::User,
+                },
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "casual".to_owned(),
+                    overridden_layer: PromptLayer::Project,
+                },
+            ]
+        );
+        assert_eq!(
+            assembled.effective_directives,
+            vec![Directive {
+                key: "tone".to_owned(),
+                value: "formal".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn never_merge_keys_stay_fail_closed() {
+        assert_eq!(
+            NEVER_MERGE_DIRECTIVE_KEYS,
+            &["agent.identity", "capability.grant"]
+        );
+        assert!(is_never_merge_directive_key("agent.identity"));
+        assert!(is_never_merge_directive_key("capability.grant"));
+        assert!(!is_never_merge_directive_key("tone"));
+        for key in NEVER_MERGE_DIRECTIVE_KEYS {
+            let snapshot = snapshot_with(vec![
+                full_layer(
+                    PromptLayer::CoreContract,
+                    "core",
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    vec![(*key, "upper")],
+                ),
+                full_layer(
+                    PromptLayer::Project,
+                    "project",
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    vec![(*key, "lower")],
+                ),
+            ]);
+            let err = assemble(&snapshot).expect_err("never-merge must fail");
+            assert_eq!(
+                err,
+                PromptError::UnresolvableConflict {
+                    key: (*key).to_owned(),
+                    first: "upper".to_owned(),
+                    second: "lower".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn never_merge_keys_with_same_value_merge_silently() {
+        let snapshot = snapshot_with(vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("agent.identity", "bitty-core")],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "project",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("agent.identity", "bitty-core")],
+            ),
+        ]);
+        let assembled = assemble(&snapshot).expect("same value merges");
+        assert_eq!(
+            assembled.effective_directives,
+            vec![Directive {
+                key: "agent.identity".to_owned(),
+                value: "bitty-core".to_owned()
+            }]
+        );
+        assert!(assembled.merge_overrides.is_empty());
+    }
+
+    #[test]
+    fn same_layer_conflict_stays_fail_closed() {
+        // No precedence difference within one layer: the assembler refuses
+        // to guess which in-layer entry wins.
+        let snapshot = PromptSnapshot {
+            core_version: "bitty-core-prompt@1".to_owned(),
+            layers: vec![LayerInput {
+                layer: PromptLayer::User,
+                text: "user".to_owned(),
+                allowed_tools: None,
+                denied_tools: Vec::new(),
+                budget_ceiling_bytes: None,
+                allowed_scopes: None,
+                directives: vec![
+                    Directive {
+                        key: "tone".to_owned(),
+                        value: "formal".to_owned(),
+                    },
+                    Directive {
+                        key: "tone".to_owned(),
+                        value: "casual".to_owned(),
+                    },
+                ],
+            }],
+        };
+        let err = assemble(&snapshot).expect_err("same-layer conflict must fail");
         assert_eq!(
             err,
             PromptError::UnresolvableConflict {
@@ -1384,6 +1832,148 @@ mod tests {
                 first: "formal".to_owned(),
                 second: "casual".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn override_canonical_bytes_are_byte_exact() {
+        let snapshot = snapshot_with(vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "formal")],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "project",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "casual")],
+            ),
+        ]);
+        let assembled = assemble(&snapshot).expect("precedence resolves");
+        let text = String::from_utf8(assembled.canonical_bytes.clone()).expect("utf8");
+        let expected = concat!(
+            "prompt/1\n",
+            "core-version:bitty-core-prompt@1\n",
+            "[layer:core-contract len=4]\ncore\n",
+            "[layer:user len=0]\n\n",
+            "[layer:project len=7]\nproject\n",
+            "[layer:skills-profile len=0]\n\n",
+            "[layer:runtime-turn len=0]\n\n",
+            "[effective]\n",
+            "allowed:*\n",
+            "budget:*\n",
+            "scope:*\n",
+            "directive:tone=formal\n",
+            "override:tone winner:core-contract wlen=6:formal overridden:project olen=6:casual\n",
+            "end\n",
+        );
+        assert_eq!(text, expected);
+        assert!(!text.contains('\r'));
+    }
+
+    #[test]
+    fn override_free_canonical_has_no_override_lines() {
+        // Same-value directives merge with no audit record and no canonical
+        // change: existing override-free byte forms are preserved.
+        let snapshot = snapshot_with(vec![
+            full_layer(
+                PromptLayer::User,
+                "u",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "concise")],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "p",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "concise")],
+            ),
+        ]);
+        let assembled = assemble(&snapshot).expect("same value merges");
+        assert!(assembled.merge_overrides.is_empty());
+        let text = String::from_utf8(assembled.canonical_bytes.clone()).expect("utf8");
+        assert!(!text.contains("override:"));
+        assert!(text.contains("directive:tone=concise\n"));
+    }
+
+    #[test]
+    fn override_record_and_bytes_are_input_order_invariant() {
+        let layers_forward = vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "formal"), ("style.mode", "terse")],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "project",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "casual"), ("style.mode", "loose")],
+            ),
+            full_layer(
+                PromptLayer::RuntimeTurn,
+                "turn",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("style.mode", "chatty")],
+            ),
+        ];
+        let layers_reverse: Vec<LayerInput> = layers_forward.clone().into_iter().rev().collect();
+        let left = assemble(&snapshot_with(layers_forward)).expect("forward assembles");
+        let right = assemble(&snapshot_with(layers_reverse)).expect("reverse assembles");
+        assert_eq!(left.merge_overrides, right.merge_overrides);
+        assert_eq!(left.canonical_bytes, right.canonical_bytes);
+        assert_eq!(left, right);
+        // Two keys overridden: `tone` once (Project), `style.mode` twice
+        // (Project + RuntimeTurn), sorted by key then overridden rank.
+        assert_eq!(
+            left.merge_overrides,
+            vec![
+                DirectiveOverride {
+                    key: "style.mode".to_owned(),
+                    winning_value: "terse".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "loose".to_owned(),
+                    overridden_layer: PromptLayer::Project,
+                },
+                DirectiveOverride {
+                    key: "style.mode".to_owned(),
+                    winning_value: "terse".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "chatty".to_owned(),
+                    overridden_layer: PromptLayer::RuntimeTurn,
+                },
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "casual".to_owned(),
+                    overridden_layer: PromptLayer::Project,
+                },
+            ]
         );
     }
 
