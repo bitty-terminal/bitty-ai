@@ -49,6 +49,7 @@ harness    Fixtures adapting real IPC snapshots to real runtime inputs with scri
 live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via an injectable seam (BII-09)
 local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, and bounded fail-closed JSON
 journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite journal with deletion tombstones, bounded fields, and fail-closed corruption handling (no FTS5, no scheduler, caller-supplied timestamps)
+fragment_transport  Runtime-to-transport pre-split (AI-0066): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker and dense seq
 ```
 
 ## Dependencies
@@ -115,6 +116,34 @@ raw `new(client_id, ..)` constructors remain the explicit test/host seam.
 Every refusal is total: no host is constructed, nothing is dispatched, and no
 store entry is written.
 
+## Fragment pre-split (`fragment_transport`)
+
+The runtime bound `bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES` (64 KiB,
+reject) and the `bitty-ipc` ingest bound
+`rich_fragment::MAX_FRAGMENT_TEXT_BYTES` (16 KiB, truncate with
+`truncated = true`) disagree, so a full 64 KiB fragment projected verbatim into
+the ingest service loses bytes. `src/fragment_transport.rs` owns the
+deterministic pre-split rule that removes the loss:
+
+1. A validated runtime chunk whose fragment is valid UTF-8 is cut greedily
+   left to right into the longest prefixes that are `<= 16 KiB` and end on a
+   UTF-8 code-point boundary (a code point is never split).
+2. Parts of one source fragment carry a dense zero-based `part_index`
+   (`0..part_count`), `part_count >= 1`, and `is_continuation =
+part_index > 0`.
+3. Transport `seq` values are assigned contiguously from a cursor: part `i`
+   gets `first_seq + i`, and the cursor advances by `part_count`, so keys stay
+   unique under `(terminal_id, generation, seq)`.
+4. Concatenating the parts in order reproduces the source bytes exactly and
+   every part stays under the 16 KiB ceiling, so the ingest service never
+   truncates a pre-split part.
+
+This module is the runtime-to-transport mapping layer, not a shipped
+transport. `bitty-ai-runtime` stays std-only with zero dependencies and cannot
+name the transport ceiling; `bitty-ipc` is upstream and unchanged; no `rich.*`
+wire method is registered. The rule above is the contract the future
+production mapper must follow.
+
 ## Tests
 
 ```text
@@ -135,6 +164,10 @@ cargo test -p bitty-ai-slice
 - `tests/host_conformance.rs` (shared, FakeHost + LiveBittyHost): dispatch
   prefix order, consent attribution, and `ExecutionResult`/`Unknown`
   reconcile semantics against the real `bitty-ipc` shapes.
+- `tests/fragment_mapping.rs`: runtime fragment -> transport `FragmentData`
+  mapping, including the AI-0066 pre-split proof that a 64 KiB multi-byte
+  UTF-8 block reassembles byte-identically through the real ingest service
+  (the counterfactual direct projection truncates).
 - `src/live_host.rs` inline tests (4 tests): live delegation for snapshot,
   tool dispatch, `Unknown` reconcile, and missing-handler fail-closed.
 - `src/journal_prototype.rs` inline tests (8 tests): append/read-back order

@@ -34,12 +34,20 @@
 //! timeouts and a caller-supplied key, and the [`journal_prototype`]
 //! experiment (AI-0049), which persists an append-ordered single-writer
 //! journal through SQLite in a caller-supplied file.
+//!
+//! [`fragment_transport`] owns the runtime-to-transport pre-split rule
+//! (AI-0066) that reconciles the runtime 64 KiB fragment bound with the
+//! 16 KiB `bitty-ipc` ingest ceiling, so no fragment truncates across the
+//! boundary. It is the mapping layer, not a shipped transport: the runtime is
+//! std-only and cannot name the transport ceiling, and `bitty-ipc` is upstream
+//! and unchanged.
 
 #![deny(unsafe_code)]
 
 pub mod bridge;
 pub mod error;
 pub mod fake_host;
+pub mod fragment_transport;
 pub mod harness;
 pub mod journal_prototype;
 pub mod live_host;
