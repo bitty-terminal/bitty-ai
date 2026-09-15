@@ -31,6 +31,7 @@ use bitty_ai_slice::{
     terminal_record, test_tool_registry,
 };
 use bitty_ipc::channel::{IpcRequest, IpcResponse};
+use bitty_ipc::rich_fragment::{FragmentData, FragmentIngestService};
 use bitty_ipc::scope::{Scope, ScopeSet};
 
 const NOW_MS: u64 = 1_000;
@@ -129,6 +130,27 @@ fn run_harness(context_budget_bytes: usize) -> (ExecOutcome, Vec<StreamChunk>, S
     )
 }
 
+/// Direct runtime-to-transport projection used by the joint ingest proof: a
+/// validated chunk becomes `FragmentData` carrying the runtime's own
+/// continuous `seq` (`S-8` scheme A makes the runtime the turn's sequence
+/// authority, so no renumbering is needed). Mirrors the mapping helper in
+/// `fragment_mapping.rs` (test binaries cannot share it) minus the optional
+/// zone.
+fn map_chunk_to_fragment_data(
+    chunk: &StreamChunk,
+    terminal_id: &str,
+    generation: u64,
+) -> FragmentData {
+    bitty_ai_runtime::validate_chunk(chunk).expect("runtime framing valid");
+    FragmentData {
+        terminal_id: terminal_id.to_owned(),
+        generation,
+        seq: u64::from(chunk.seq),
+        zone: None,
+        text: String::from_utf8(chunk.fragment.bytes.clone()).expect("fragment text is UTF-8"),
+    }
+}
+
 #[test]
 fn end_to_end_loop_is_deterministic() {
     let (first, first_chunks, first_provider, first_calls) = run_harness(32 * 1024);
@@ -158,17 +180,21 @@ fn end_to_end_loop_is_deterministic() {
         RecordBody::Artifact(_) => panic!("small body stays inline"),
     }
 
-    // Two provider rounds stream three single-fragment batches: draft text,
-    // then the tool card, then final text. Unlike the old slice (which
-    // numbered one global fragment list), the real runtime numbers each
-    // emission batch independently, so every chunk here is seq 0 / total 1.
+    // Two provider rounds stream three single-fragment blocks: draft text,
+    // then the tool card, then final text. `seq` is continuous across the
+    // whole logical turn (S-8 scheme A) with a running water mark as `total`,
+    // so the three single-fragment batches frame as [0/1, 1/2, 2/3]; each
+    // block closes its own emission batch (`is_final`).
     assert_eq!(first_chunks.len(), 3);
     assert_eq!(first_chunks[0].fragment.kind, FragmentKind::Markdown);
     assert_eq!(first_chunks[1].fragment.kind, FragmentKind::ToolCard);
     assert_eq!(first_chunks[2].fragment.kind, FragmentKind::Markdown);
-    for chunk in &first_chunks {
+    for (index, chunk) in first_chunks.iter().enumerate() {
         bitty_ai_runtime::validate_chunk(chunk).expect("runtime framing valid");
-        assert_eq!((chunk.seq, chunk.total, chunk.is_final), (0, 1, true));
+        assert_eq!(
+            (chunk.seq, chunk.total, chunk.is_final),
+            (index as u32, index as u32 + 1, true)
+        );
     }
     assert_eq!(
         first_chunks[0].fragment.bytes,
@@ -179,6 +205,52 @@ fn end_to_end_loop_is_deterministic() {
     assert!(card.contains("status=ok"), "card records success");
     assert_eq!(first_chunks[2].fragment.bytes, ANSWER.as_bytes());
     assert!(first_chunks[1].fragment.bytes.len() <= 16 * 1024);
+}
+
+/// P1-5 joint proof: the three real blocks of one deterministic turn (draft
+/// text, tool card, final text) ingest into the real `bitty-ipc`
+/// `FragmentIngestService` through the direct `seq` projection. Before the
+/// fix every block restarted at `seq 0`, so the second ingest failed as a
+/// duplicate `(terminal_id, generation, seq)` key; the continuous runtime
+/// sequence now passes the transport's own dedup check.
+#[test]
+fn streamed_turn_blocks_ingest_into_real_fragment_service() {
+    let (outcome, chunks, _, _) = run_harness(32 * 1024);
+    assert!(
+        matches!(outcome, ExecOutcome::Completed { .. }),
+        "turn must complete, got {outcome:?}"
+    );
+    assert_eq!(chunks.len(), 3, "draft text, tool card, final text");
+
+    let mut service = FragmentIngestService::new();
+    for chunk in &chunks {
+        let data = map_chunk_to_fragment_data(chunk, "t:1", 1);
+        let stored = service
+            .ingest(data)
+            .expect("continuous turn seq must pass the transport dedup key");
+        assert!(stored.is_untrusted_surface);
+    }
+    assert_eq!(service.len(), 3);
+
+    let drained = service.drain_bounded(8);
+    assert_eq!(drained.len(), 3);
+    assert_eq!(
+        drained
+            .iter()
+            .map(|fragment| fragment.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    for fragment in &drained {
+        fragment.validate().expect("stored DTO validates");
+        assert!(!fragment.truncated, "in-budget blocks are not truncated");
+    }
+    let joined: String = drained
+        .iter()
+        .map(|fragment| fragment.text.clone())
+        .collect();
+    assert!(joined.contains("Checking the terminal output."));
+    assert!(joined.ends_with(ANSWER));
 }
 
 #[test]
@@ -335,10 +407,12 @@ fn oversized_stream_chunk_fails_closed() {
 #[test]
 fn chunk_over_rc10_ceiling_fails_closed() {
     // The runtime is std-only, so the RC-10 ceiling is mirrored as
-    // `MAX_STREAM_CHUNK_BYTES` and checked after the tighter
-    // `MAX_FRAGMENT_BYTES` bound: a chunk over the 256 KiB ceiling surfaces
-    // as `OversizedFragment`, not as a `bitty-ipc` wire error. The wire gate
-    // itself stays covered by the bridge path (`validate_chunk` on send).
+    // `MAX_STREAM_CHUNK_BYTES`. One fragment per chunk (`RS-3`) keeps the
+    // reachable bound at `MAX_FRAGMENT_BYTES` (64 KiB), so a chunk over the
+    // 256 KiB ceiling surfaces as `OversizedFragment` (P2-1: the unreachable
+    // chunk-layer variant was removed), not as a `bitty-ipc` wire error. The
+    // wire gate itself stays covered by the bridge path (`validate_chunk` on
+    // send).
     let mut sink = VecSink::new();
     let bytes = vec![b'x'; bitty_ipc::wire::CHUNK_CEILING + 1];
     let actual = bytes.len();
