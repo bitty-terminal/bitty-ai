@@ -1,4 +1,5 @@
-# AI-0068: secret-scan configuration for gitleaks.
+# AI-0068: secret-scan configuration for gitleaks (verified against v8.30.1,
+# the build `just secrets` targets; version pin tracked as risk PX-0320).
 #
 # `gitleaks detect` scans git history, so the AI-0043 wire-probe fixture is
 # reported from commit 1e926a4 and cannot be covered by an inline
@@ -6,14 +7,24 @@
 # rule-scoped allowlist is used instead.
 #
 # The allowlist is intentionally minimal:
-#   * scoped to the single `generic-api-key` rule (`[[rules.allowlists]]`);
-#   * used from `[[rules.allowlists]]`, not a global `[[allowlists]]`, because
-#     in the available gitleaks build a global entry with `paths` + `regexes`
-#     under `condition = "AND"` degenerates to a path-only allowlist that would
-#     ignore every finding in the file;
+#   * scoped to the single `generic-api-key` rule (`[[rules.allowlists]]`), so
+#     every other rule and every other file keeps full coverage;
 #   * `condition = "AND"` requires BOTH the exact fixture path AND the exact
 #     fixture value to match, so no other path, value, or rule is weakened;
+#   * the `paths` regex is anchored `^...$` because gitleaks matches `paths` as
+#     an *unanchored* regex: the bare `crates/.../local_provider\.rs` form also
+#     suppressed look-alike paths such as `local_provider.rs.bak` and
+#     `old/crates/.../local_provider.rs` (AI-0071). The anchor matches the
+#     repo-relative path form gitleaks emits when it scans from the repository
+#     root;
 #   * `generic-api-key` itself stays enabled.
+#
+# Mode note (AI-0071): rule-scoped AND allowlists are honoured both in the
+# git-history mode `just secrets` uses (default `gitleaks detect`) and under
+# `--no-git`. A *global* `[[allowlists]]` entry with `paths` + `regexes` under
+# `condition = "AND"` is honoured in git-history mode but degenerates to a
+# path-only allowlist under `--no-git`, where it would suppress every rule for a
+# matching path; the rule-scoped form avoids that mode-dependent weakening.
 
 [extend]
 useDefault = true
@@ -23,7 +34,7 @@ id = "generic-api-key"
 
 [[rules.allowlists]]
 description = "AI-0068: synthetic wire-probe API key unit-test fixture (local_provider.rs, AI-0043)"
-paths = ['''crates/bitty-ai-slice/src/local_provider\.rs''']
+paths = ['''^crates/bitty-ai-slice/src/local_provider\.rs$''']
 regexTarget = "secret"
 regexes = ['''Ak3y-Wire-Probe-9z8y7x6w5v-0043a''']
 condition = "AND"
