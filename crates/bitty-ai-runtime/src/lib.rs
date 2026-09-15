@@ -30,7 +30,10 @@
 //!   double.
 //! - Stub (host-owned, deliberately absent): network model providers,
 //!   credential handling, real consent ledger, capability enforcement, MCP
-//!   transport, persistence, multi-agent/teams, L2+ compaction, LSP wiring.
+//!   transport, persistence, multi-agent/teams, LSP wiring. L2+ compression
+//!   exists only as the fake-verified [`compression`] prototype (host
+//!   summarizer seam, deterministic breakpoints, in-memory retention); the
+//!   durable store stays out of scope (AI-0049) and AIQ-11 stays open.
 //!   [`tool::ToolExecutor`] and [`tool::ToolAuthorizer`] are the seams where
 //!   the host plugs those in; without them the crate refuses (`FS-AI7`).
 //!   [`bridge::ConsentLedger`] is the consent seam: [`bridge::DenyAllConsent`]
@@ -47,6 +50,7 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod compression;
 pub mod context;
 pub mod prompt;
 pub mod provider;
@@ -61,6 +65,11 @@ pub use bridge::{
     BridgeError, ConsentDecision, ConsentLedger, ConsentQuery, DenyAllConsent, FakeConsentLedger,
     IdentityBridge, MAX_CONSENT_GRANTS, MAX_CONSENT_SCOPE_LEN, MAX_PROTOCOL_ID_LEN,
     MAX_PROTOCOL_ID_SEGMENT_LEN, ProtocolAgentId, ensure_consented, validate_protocol_id,
+};
+pub use compression::{
+    CompressedSpan, CompressedView, CompressionConfig, CompressionError, DEFAULT_MAX_SPAN_BYTES,
+    FakeSummarizer, MAX_SPAN_ID_LEN, MAX_SPANS, RetentionClass, RetentionPolicy, RetentionTags,
+    SpanRange, SummarizeInput, Summarizer, compress_records, inherit_retention, select_breakpoints,
 };
 pub use context::{
     ArtifactRef, ArtifactStore, AssembledContent, AssembledContext, AssembledRecord, ContextError,
