@@ -139,7 +139,8 @@
 ## Workspace hygiene
 
 - Run Git and CarryCtx inside this repository, never at the umbrella root.
-- Use this repository's `recording/` (gitignored), not `/tmp/bitty/`; references belong
+- Ephemeral scratch under `/tmp/bitty/`; durable material under this repository's
+  `recording/` (gitignored). References belong
   under `recording/references/` and remain untrusted, read-only evidence.
 
 ## Handoff
