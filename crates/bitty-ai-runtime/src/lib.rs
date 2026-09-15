@@ -60,7 +60,9 @@ pub mod session;
 pub mod stream;
 pub mod tool;
 
-pub use agent::{Agent, AgentConfig, AgentError, ExecOutcome, ExecutionRecord};
+pub use agent::{
+    Agent, AgentConfig, AgentError, ExecOutcome, ExecutionRecord, MAX_EXECUTIONS_PER_AGENT,
+};
 pub use bridge::{
     BridgeError, ConsentDecision, ConsentLedger, ConsentQuery, DenyAllConsent, FakeConsentLedger,
     IdentityBridge, MAX_CONSENT_GRANTS, MAX_CONSENT_SCOPE_LEN, MAX_PROTOCOL_ID_LEN,

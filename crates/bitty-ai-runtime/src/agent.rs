@@ -32,7 +32,7 @@ use crate::reconcile::{
     bound_reason, reconcile_delay_ms,
 };
 use crate::selection::estimate_cost;
-use crate::session::{AgentSession, ExecutionId, IdIssuer, SessionError};
+use crate::session::{AgentSession, ExecutionId, IdIssuer, SessionError, SessionState};
 use crate::stream::{FragmentKind, StreamError, StreamSink, emit_fragments, fragment_text};
 use crate::tool::{
     AuthBase, MAX_TOOL_CALLS_PER_TURN, ToolBus, ToolError, ToolExecution, ToolExecutor, ToolStatus,
@@ -42,6 +42,16 @@ use crate::tool::{
 /// keeps requesting tools past this bound fails with
 /// [`AgentError::RoundLimitExceeded`] rather than looping forever.
 pub const DEFAULT_MAX_ROUNDS: usize = 4;
+
+/// Absolute ceiling on attributed executions retained per turn
+/// (`AI-0057/P1-1`). `executions` is cleared at every [`Agent::run_turn`]
+/// entry so cancel/reconcile counts never mix history; this cap bounds a
+/// single turn even when [`AgentConfig::max_rounds`] or
+/// [`AgentConfig::max_tool_calls_per_turn`] are raised above the defaults.
+/// The default `4` rounds `* 8` calls (`TB-6`) equals `32`, so default
+/// configurations never trip it. Exceeding it fails the turn with
+/// [`ToolError::CallLimitExceeded`].
+pub const MAX_EXECUTIONS_PER_AGENT: usize = 32;
 
 /// Turn-loop configuration. All values are skeleton defaults with documented
 /// provenance, not accepted contracts.
@@ -334,7 +344,9 @@ impl<P: ModelProvider> Agent<P> {
         &self.session
     }
 
-    /// Attributed executions recorded by this turn so far.
+    /// Attributed executions recorded by this turn so far. Cleared at every
+    /// [`Agent::run_turn`] entry (per-turn semantics) and bounded by
+    /// [`MAX_EXECUTIONS_PER_AGENT`].
     #[must_use]
     pub fn executions(&self) -> &[ExecutionRecord] {
         &self.executions
@@ -389,6 +401,15 @@ impl<P: ModelProvider> Agent<P> {
     /// left `Active` for reconcile-and-retry, like `Unknown`/cancel, with no
     /// rollback of earlier recorded rounds. Cost accounting never authorizes
     /// or bypasses the byte budget or authorization gates.
+    ///
+    /// Lifecycle: a `Canceled` session returns `Canceled` without I/O; a
+    /// `Completed`/`Failed` session returns
+    /// `Failed(Session(AlreadyTerminated))` without I/O, preserving the
+    /// terminal state for audit. Use an explicit new session (or host reset
+    /// after reconcile) to continue. Per-turn state (`executions`,
+    /// `tool_history`, `turn_cost`) resets after the gate, so counts never
+    /// mix history; `executions` is additionally bounded by
+    /// [`MAX_EXECUTIONS_PER_AGENT`].
     pub fn run_turn(
         &mut self,
         executor: &mut dyn ToolExecutor,
@@ -402,6 +423,12 @@ impl<P: ModelProvider> Agent<P> {
             return ExecOutcome::Canceled {
                 dispatched: 0,
                 unknown: 0,
+            };
+        }
+        let state = self.session.state();
+        if state != SessionState::Active {
+            return ExecOutcome::Failed {
+                error: AgentError::Session(SessionError::AlreadyTerminated { state }),
             };
         }
         let request = ContextRequest {
@@ -434,6 +461,7 @@ impl<P: ModelProvider> Agent<P> {
         self.tools.begin_turn();
         let tool_names = self.tools.tool_names();
         let mut round = 0;
+        self.executions.clear();
         self.tool_history.clear();
         self.turn_cost = 0;
         loop {
@@ -519,6 +547,14 @@ impl<P: ModelProvider> Agent<P> {
             for call in &calls {
                 if self.session.is_cancelled() {
                     return self.reconcile_cancel();
+                }
+                if self.executions.len() >= MAX_EXECUTIONS_PER_AGENT {
+                    return self.fail(
+                        ToolError::CallLimitExceeded {
+                            limit: MAX_EXECUTIONS_PER_AGENT,
+                        }
+                        .into(),
+                    );
                 }
                 let execution_id = self.ids.execution();
                 // S-1: per-call JIT authorization base. A mid-turn
