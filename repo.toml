@@ -1,0 +1,8 @@
+# bitty-ai: workspace identity descriptor (kind/lang/role mirror workspace.toml).
+[repo]
+name = "bitty-ai"
+kind = "core"
+lang = "rust"
+role = "AI runtime: inference sessions, context slices (2 crates)"
+owner = "TBD"
+docs = "bitty-ai-docs"
