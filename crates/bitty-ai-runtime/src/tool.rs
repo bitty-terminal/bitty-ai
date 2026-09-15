@@ -28,6 +28,14 @@ pub const MAX_TOOL_SCHEMA_BYTES: usize = 16 * 1024;
 /// Maximum registered tools per session (`TB-2`).
 pub const MAX_TOOLS_PER_SESSION: usize = 32;
 /// Maximum tool calls per assistant turn (`TB-6`).
+///
+/// Hard bus ceiling: the effective per-turn cap is
+/// `min(crate::agent::AgentConfig::max_tool_calls_per_turn,
+/// MAX_TOOL_CALLS_PER_TURN)`. Raising the config above this constant does
+/// not relax the bus: both [`ToolBus::precheck`] (batch gate) and
+/// [`ToolBus::dispatch`] (per-call counter) still clamp at this constant,
+/// so a config of 16 still fails past 8. Only tighter, never looser
+/// (fail-closed).
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 8;
 /// Maximum tool argument bytes (`TB-3`).
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 16 * 1024;
@@ -639,6 +647,12 @@ impl ToolBus {
     /// Validate and authorize every call without dispatching any
     /// (`FS-AI1` transactional denial: a refused turn dispatches nothing).
     ///
+    /// Enforces the constant side of the effective cap
+    /// `min(crate::agent::AgentConfig::max_tool_calls_per_turn,
+    /// MAX_TOOL_CALLS_PER_TURN)`: even when the host raises the config, a
+    /// batch larger than [`MAX_TOOL_CALLS_PER_TURN`] still fails here with
+    /// [`ToolError::CallLimitExceeded`].
+    ///
     /// # Errors
     ///
     /// Returns the first [`ToolError`] encountered; no call is dispatched.
@@ -656,6 +670,12 @@ impl ToolBus {
 
     /// Validate, re-authorize at this dispatch boundary (`PP-6`), and
     /// dispatch one call through `executor`.
+    ///
+    /// Enforces the constant side of the effective cap
+    /// `min(crate::agent::AgentConfig::max_tool_calls_per_turn,
+    /// MAX_TOOL_CALLS_PER_TURN)`: the per-turn counter still stops at
+    /// [`MAX_TOOL_CALLS_PER_TURN`] even when the host raises the config,
+    /// failing with [`ToolError::CallLimitExceeded`].
     ///
     /// # Errors
     ///
