@@ -3,9 +3,10 @@
 //! This module owns the `bitty-ai` side of the BII-09 parallel-work split
 //! ([`bitty-side-integration-input.md` BII-09][bii09]): the agent kernel runs
 //! against a scripted deterministic double while the `bitty` track owns the
-//! live capability gateway. Swapping to the live host later is mechanical:
-//! implement [`BittyHost`] for `LiveBittyHost` and replace the construction
-//! site only; callers keep calling the same trait methods.
+//! live capability gateway. Swapping to the live host is mechanical:
+//! [`crate::live_host::LiveBittyHost`] implements [`BittyHost`] over the real
+//! `bitty-ipc` services, so only the construction site changes; callers keep
+//! calling the same trait methods.
 //!
 //! [bii09]: https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/bitty-side-integration-input.md
 //!
@@ -63,8 +64,9 @@
 //! - Live wiring is explicitly out of scope: this file contains no code that
 //!   connects to a real terminal, process, PTY, socket, or network peer
 //!   (no `std::net`, `std::process`, `std::fs`, async runtime, or IPC
-//!   transport). `LiveBittyHost` is a future type implementing [`BittyHost`]
-//!   via the real transport; it is not implemented here.
+//!   transport). The live path is [`crate::live_host::LiveBittyHost`], which
+//!   implements [`BittyHost`] over the real `bitty-ipc` services with an
+//!   injectable provider seam (still no socket, process, network, or secret).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -86,11 +88,11 @@ use bitty_ipc::tool_dispatch::{
 
 use crate::error::SliceError;
 
-/// Host capability surface shared by [`FakeHost`] and the future live host.
+/// Host capability surface shared by [`FakeHost`] and the live host.
 ///
 /// A generic consumer drives the agent kernel through this trait only, so
 /// replacing the construction site (`FakeHost::new` vs
-/// `LiveBittyHost::connect`) is mechanical and no call site changes shape.
+/// `LiveBittyHost::new`) is mechanical and no call site changes shape.
 ///
 /// All methods are deterministic for a given script plus `now_ms`. Failures
 /// are fail-closed with no partial state: a denied dispatch stores nothing

@@ -41,6 +41,7 @@ bridge     Generic host boundary composing real bitty-ipc primitives; unknown me
 error      Typed fail-closed slice errors (unsupported method, consent, budget and bound violations)
 fake_host  Deterministic FakeHost double mirroring bitty dispatch, consent, and result shapes (BII-09)
 harness    Fixtures adapting real IPC snapshots to real runtime inputs with scripted provider
+live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via an injectable seam (BII-09)
 ```
 
 ## Dependencies
@@ -49,18 +50,22 @@ harness    Fixtures adapting real IPC snapshots to real runtime inputs with scri
 - `bitty-ipc` via pinned Git revision (`64e17095ee2f54b3482807cd133fadb9af949925`
   in `Cargo.toml`).
 
-## FakeHost and the future live host
+## FakeHost and the live host
 
 `FakeHost` implements the `BittyHost` trait defined in `src/fake_host.rs`.
-Swapping to the live host later is mechanical: implement `BittyHost` for
-`LiveBittyHost` and replace the construction site only; callers keep calling
-the same trait methods.
+`LiveBittyHost` (`src/live_host.rs`) implements the same trait by delegating
+to the real `bitty-ipc` services (`SnapshotService`, `ToolDispatchService`,
+`ExecutionService`) with the real DTOs, bounds, and `validate()` methods.
+Swapping hosts is mechanical: replace the construction site only; callers
+keep calling the same trait methods.
 
 Live wiring is explicitly out of scope here: this crate contains no code that
 connects to a real terminal, process, PTY, socket, or network peer (no
 `std::net`, `std::process`, `std::fs`, async runtime, or IPC transport).
-`LiveBittyHost` is a future type implementing `BittyHost` via the real
-transport; it is not implemented here.
+`LiveBittyHost` carries only an injectable provider seam (`fn` pointers),
+server-evaluated scopes, and the real consent ledger; tests use canned
+providers as mapping proof and claim no live data. Every operation takes
+caller-supplied `now_ms`, and there are no secret or credential fields.
 
 `FakeHost` is std-only and deterministic: no network, no threads, no
 filesystem, no wall clock. Every method takes caller-supplied `now_ms`;
@@ -83,3 +88,8 @@ cargo test -p bitty-ai-slice
   (4 tests): snapshot, tool dispatch, supervised execution
   (`execute`/`reconcile`/`resolve` including `Unknown`), consent
   grant/revoke/expiry, and the shared `BittyHost` trait surface.
+- `tests/host_conformance.rs` (shared, FakeHost + LiveBittyHost): dispatch
+  prefix order, consent attribution, and `ExecutionResult`/`Unknown`
+  reconcile semantics against the real `bitty-ipc` shapes.
+- `src/live_host.rs` inline tests (4 tests): live delegation for snapshot,
+  tool dispatch, `Unknown` reconcile, and missing-handler fail-closed.
