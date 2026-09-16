@@ -102,6 +102,13 @@ pub const MIN_MAX_TOKENS: u32 = 1;
 /// `AudioInput`, `AudioOutput`, `VideoInput`) extend the text baseline with
 /// the routing inputs AI-0030 requires; unknown transports or model cards
 /// never synthesize a capability.
+///
+/// The multimodal flags (`ImageInput`, `AudioInput`, `AudioOutput`,
+/// `VideoInput`) are routing vocabulary only: no `TurnRequest` surface can
+/// request them (text-only `Message`s), no provider advertises them, and
+/// selection fails closed with `SelectionError::NoCandidate` when they are
+/// required. End-to-end multimodal I/O is a beyond-v0.1 design owned by the
+/// 033 follow-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelCapability {
     /// Plain text completion.
