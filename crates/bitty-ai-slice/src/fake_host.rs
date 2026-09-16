@@ -13,12 +13,14 @@
 //! ## Read-only mirror of merged `bitty` shapes
 //!
 //! No file in the `bitty` repository is modified by this task. Shapes below
-//! mirror `bitty` `main` at `be6e63c` (AI-0073 inspection point), read-only.
-//! The `2cbb1fb..be6e63c` window changes `crates/bitty-ipc` `auth.rs`
-//! (`ChildTokenStore::verify` token-free static reasons plus
-//! `child_token_errors_are_token_free`) and the `devtools` surface;
-//! existing DTO/validate/bounds/scope/wire shapes are byte-identical, so the
-//! mirror needs no shape change beyond this pin reference:
+//! mirror `bitty` `main` at `cfeffa2` (AI-0081 inspection point), read-only.
+//! The `be6e63c..cfeffa2` window changes `crates/bitty-ipc` `wire.rs` /
+//! `lib.rs` (wire negotiation: `SUPPORTED_WIRE_VERSIONS`,
+//! `negotiate_wire_version`, and set-based fail-closed `validate_wire_version`)
+//! plus `channel.rs` / `bridge.rs` / `limits.rs` (sustained rate limiting,
+//! timeout purge of queued requests, unknown-id answers buffered nowhere);
+//! every dispatch/validate/bounds mirror file below is byte-identical across
+//! the window, so the mirrored shapes and line references are unchanged:
 //!
 //! - Dispatch prefix + per-tool consent: `crates/bitty-ipc/src/tool_dispatch.rs`
 //!   `ToolSpec` (`L197`), `ToolRequest` (`L271`, `validate` `L316`),
