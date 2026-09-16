@@ -42,6 +42,13 @@ pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 16 * 1024;
 /// Maximum tool result bytes (`TB-6`).
 pub const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 
+/// FNV-1a-64 offset basis (deterministic across processes and platforms;
+/// mirrors the `cache_key.rs` precedent).
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+/// FNV-1a-64 prime (deterministic across processes and platforms; mirrors
+/// the `cache_key.rs` precedent).
+const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
 /// Tool Bus errors. Validation and authorization failures leave no partial
 /// state: no queue entry, no dispatch, no counter increment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +248,25 @@ impl ToolSpec {
             required_scope: required_scope.into(),
             read_only,
         })
+    }
+
+    /// Deterministic identity of [`ToolSpec::schema_json`] (AI-0090, AIQ-08
+    /// narrowing input): FNV-1a-64 over exactly the schema bytes (inline
+    /// small hasher mirroring the `cache_key.rs` precedent; never
+    /// `DefaultHasher`/`RandomState`). Same bytes give the same digest on
+    /// every platform and process; any byte change moves it. The digest is
+    /// the host-side invalidation handle: the registry keeps refusing
+    /// same-name re-registration ([`ToolError::DuplicateTool`]), so the
+    /// host compares digests across its schema snapshots to detect drift
+    /// and never relies on the digest to smuggle a replacement.
+    #[must_use]
+    pub fn schema_digest(&self) -> u64 {
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in &self.schema_json {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
     }
 }
 
