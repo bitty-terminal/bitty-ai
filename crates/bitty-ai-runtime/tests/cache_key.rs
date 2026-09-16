@@ -224,8 +224,7 @@ fn trailing_only_change_keeps_key_but_moves_canonical_bytes() {
     let common = common_prefix_len(&left, &right);
     assert!(
         common >= left_key.prefix_len,
-        "trailing-only change keeps a measurable common prefix covering the whole hashed region (common {common}, hashed {})",
-        left_key.prefix_len
+        "trailing-only change keeps a measurable common prefix covering the whole hashed region"
     );
     assert_eq!(
         left_key, right_key,
@@ -246,8 +245,7 @@ fn stable_region_change_breaks_key_inside_hashed_region() {
     let common = common_prefix_len(&base, &changed);
     assert!(
         common < base_key.prefix_len,
-        "divergence sits inside the hashed stable prefix (common {common}, hashed {})",
-        base_key.prefix_len
+        "divergence sits inside the hashed stable prefix"
     );
     assert_ne!(
         base_key.stable_prefix_hash, changed_key.stable_prefix_hash,
