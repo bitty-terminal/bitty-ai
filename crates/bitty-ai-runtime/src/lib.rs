@@ -50,6 +50,7 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod cache_key;
 pub mod compression;
 pub mod context;
 pub mod extension;
@@ -69,6 +70,7 @@ pub use bridge::{
     IdentityBridge, MAX_CONSENT_GRANTS, MAX_CONSENT_SCOPE_LEN, MAX_PROTOCOL_ID_LEN,
     MAX_PROTOCOL_ID_SEGMENT_LEN, ProtocolAgentId, ensure_consented, validate_protocol_id,
 };
+pub use cache_key::{CacheKey, CacheKeyError, CacheScope};
 pub use compression::{
     CompressedSpan, CompressedView, CompressionConfig, CompressionError, DEFAULT_MAX_SPAN_BYTES,
     FakeSummarizer, MAX_SPAN_ID_LEN, MAX_SPANS, RetentionClass, RetentionPolicy, RetentionTags,
