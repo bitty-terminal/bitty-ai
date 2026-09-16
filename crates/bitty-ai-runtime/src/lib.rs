@@ -52,6 +52,7 @@ pub mod agent;
 pub mod bridge;
 pub mod compression;
 pub mod context;
+pub mod extension;
 pub mod prompt;
 pub mod provider;
 pub mod reconcile;
@@ -77,6 +78,10 @@ pub use context::{
     ArtifactRef, ArtifactStore, AssembledContent, AssembledContext, AssembledRecord, ContextError,
     ContextPriority, ContextRecord, ContextRequest, DetailLevel, RecordBody, StableId, assemble,
     validate_stable_id,
+};
+pub use extension::{
+    AgentPoint, CommandPoint, CompactorPoint, ContextPoint, ExtensionPoint, Manifest, MemoryPoint,
+    ModelPoint, ToolPoint, UiPoint,
 };
 pub use prompt::assemble as assemble_prompt;
 pub use prompt::{
