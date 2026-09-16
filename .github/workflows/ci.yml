@@ -140,3 +140,39 @@ jobs:
       # so clear before audit to avoid "Refusing to initialize non-empty directory" failure.
       - name: Audit advisories
         run: rm -rf ~/.cargo/advisory-db && cargo audit --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Install the pinned upstream gitleaks release from shell steps only.
+      # The justfile owns the version pin (`gitleaks_version`); this step parses
+      # that line so the workflow and local `just secrets` cannot drift, and the
+      # release asset names (gitleaks_<version>_linux_x64.tar.gz and
+      # gitleaks_<version>_checksums.txt) are verified against the pinned
+      # release tag. The tarball sha256 is verified against the published
+      # checksum file BEFORE extraction; findings make the job fail.
+      - name: Install checksum-verified gitleaks
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^gitleaks_version[[:space:]]*:=[[:space:]]*"\([^"]*\)".*/\1/p' justfile)"
+          test -n "${version}"
+          asset="gitleaks_${version}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${version}"
+          curl --fail --silent --show-error --location --output "${asset}" "${base}/${asset}"
+          curl --fail --silent --show-error --location --output checksums.txt "${base}/gitleaks_${version}_checksums.txt"
+          grep " ${asset}\$" checksums.txt > sha256sums.txt
+          sha256sum --check --strict sha256sums.txt
+          tar --extract --gzip --file "${asset}" gitleaks
+          install --mode 0755 --directory "${HOME}/.local/bin"
+          install --mode 0755 gitleaks "${HOME}/.local/bin/gitleaks"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Scan Git history for secrets
+        run: gitleaks detect --source . --no-banner

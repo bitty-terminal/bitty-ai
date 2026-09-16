@@ -1,3 +1,8 @@
+# Pinned gitleaks release. Single source of truth for both `just secrets` and
+# the `Secret scan` CI job (.github/workflows/ci.yml), which parses this line
+# and checksum-verifies the downloaded artifact against the release checksums.
+gitleaks_version := "8.30.1"
+
 setup:
     cargo fetch
     lefthook install
@@ -18,12 +23,27 @@ typecheck:
 actionlint:
     actionlint -color
 
-# Scan committed Git history for secrets (gitleaks v8.30.1; see
-# .gitleaks.toml). Uncommitted or untracked working-tree content is only
-# covered once it is staged and committed; `secrets` is deliberately not part
-# of `check` so contributors without gitleaks still pass the default gate.
+# Scan committed Git history for secrets (gitleaks pinned via `gitleaks_version`
+# above; see .gitleaks.toml). Uncommitted or untracked working-tree content is
+# only covered once it is staged and committed; `secrets` is deliberately not
+# part of `check` so contributors without gitleaks still pass the default gate.
+# `secrets` runs whatever `gitleaks` is on PATH; CI installs the pinned release
+# and checksum-verifies it in the `Secret scan` job.
 secrets:
     gitleaks detect --source . --no-banner
+
+# Report the pinned gitleaks version and the version the local binary reports.
+# A binary built without ldflags version metadata prints "version is set by
+# build process"; that is reported, not treated as an error.
+gitleaks-version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    printf 'pinned: %s\n' "{{gitleaks_version}}"
+    if command -v gitleaks >/dev/null 2>&1; then
+        printf 'local:  %s\n' "$(gitleaks version 2>&1 || true)"
+    else
+        printf 'local:  (gitleaks not on PATH)\n'
+    fi
 
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}

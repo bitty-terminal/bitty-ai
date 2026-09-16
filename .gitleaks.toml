@@ -1,5 +1,7 @@
-# AI-0068: secret-scan configuration for gitleaks (verified against v8.30.1,
-# the build `just secrets` targets; version pin tracked as risk PX-0320).
+# AI-0068: secret-scan configuration for gitleaks.
+# The version is pinned once in the `justfile` (`gitleaks_version`) and
+# checksum-verified in the `secrets` CI job (.github/workflows/ci.yml); this
+# resolves risk PX-0320 (AI-0074).
 #
 # `gitleaks detect` scans git history, so the AI-0043 wire-probe fixture is
 # reported from commit 1e926a4 and cannot be covered by an inline
