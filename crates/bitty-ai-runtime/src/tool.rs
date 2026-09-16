@@ -725,7 +725,13 @@ impl ToolBus {
             Err(ToolError::EffectUnknown { reason, .. }) => Ok(ToolExecution {
                 execution_id,
                 tool: call.name.clone(),
-                status: ToolStatus::Unknown { reason },
+                // AI-0077: host-shaped uncertainty reasons are bounded at the
+                // bus boundary (`MAX_REASON_BYTES`, scrubbed) so the recorded
+                // `Unknown` status never carries unbounded or newline-bearing
+                // text into reconcile reports or provider messages.
+                status: ToolStatus::Unknown {
+                    reason: crate::bridge::bound_reason(&reason),
+                },
                 summary: "effect uncertain; reconcile before retry".to_owned(),
                 data: Vec::new(),
                 is_untrusted_surface: true,
