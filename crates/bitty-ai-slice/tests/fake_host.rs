@@ -3,11 +3,11 @@
 //!
 //! Every test is deterministic (`now_ms` caller-supplied, no wall clock,
 //! no threads, no network, no filesystem) and single-agent (one `FakeHost`
-//! per `client_id`). Shapes mirror `bitty` `main` at `be6e63c` read-only
-//! (`2cbb1fb..be6e63c` changes `auth.rs` token-free reasons plus the
-//! `devtools` surface; existing DTO shapes are byte-identical, so no mirror
-//! change); live wiring is out of scope and no test connects to a
-//! real host.
+//! per `client_id`). Shapes mirror `bitty` `main` at `cfeffa2` read-only
+//! (`be6e63c..cfeffa2` changes `wire.rs`/`lib.rs` wire negotiation plus
+//! `channel.rs`/`bridge.rs`/`limits.rs` channel robustness; existing DTO
+//! shapes are byte-identical, so no mirror change); live wiring is out of
+//! scope and no test connects to a real host.
 
 use bitty_ai_slice::{BittyHost, FakeHost, SliceError};
 use bitty_ipc::error::IpcError;
@@ -750,11 +750,12 @@ fn execution_truncates_streams_at_caller_budget() {
 
 // ── process.spawn mapping (AI-0027) ─────────────────────────────────────────
 
-// bitty `main` at `be6e63c` carries the bounded consent-gated `process.spawn`
+// bitty `main` at `cfeffa2` carries the bounded consent-gated `process.spawn`
 // surface (#717) behind the `[tools.*]` fail-closed allowlist (#716) in
 // `bitty-runtime` / `bitty-plugin-host` only; `crates/bitty-ipc` is
-// byte-identical across `2cbb1fb..be6e63c` except `auth.rs` token-free reasons
-// plus the `devtools` surface, so `FakeHost` needs no mirror change. This test pins the mapping the new surface relies on: `SpawnService::dispatch`
+// byte-identical across `be6e63c..cfeffa2` except `wire.rs`/`lib.rs` wire
+// negotiation plus `channel.rs`/`bridge.rs`/`limits.rs` channel robustness, so
+// `FakeHost` needs no mirror change. This test pins the mapping the new surface relies on: `SpawnService::dispatch`
 // resolves `SpawnRequest(tool + args)` via the host `SpawnAuthorizer`, then
 // runs the resolved executable under the real `ExecutionService` — the exact
 // prefix `FakeHost::execute` mirrors (scope `process.spawn`, effect opt-in,

@@ -64,7 +64,7 @@ use crate::error::SliceError;
 /// Upstream: `bitty-ipc` `crates/bitty-ipc/src/auth.rs` `MAX_SCOPED_ID_BYTES`
 /// (value `64`), which the tool-dispatch and execution services each alias
 /// (`MAX_TOOL_CLIENT_ID_BYTES` and `MAX_EXEC_CLIENT_ID_BYTES`). Pinned
-/// revision: `be6e63c55a18cb0a4bae1a528527b97251375bff`.
+/// revision: `cfeffa2d8e1387029850940af2b64877dbfbe25f`.
 pub const MAX_WIRE_CLIENT_ID_BYTES: usize = bitty_ipc::auth::MAX_SCOPED_ID_BYTES;
 
 /// Derive the wire `client_id` for a bound protocol principal (`AI-0065`).
@@ -275,6 +275,12 @@ impl IpcBridge {
                 })?;
         let response = peer.serve(&request)?;
         if response.id != id {
+            // Mirror the pinned upstream pre-enqueue refusal (upstream
+            // `BridgeClient::answer` at rev `cfeffa2d8`, CTX-0483): an
+            // uncorrelated answer buffers nothing and consumes no pending
+            // capacity, so a hostile peer cannot pin the correlation table
+            // with mismatched ids.
+            self.endpoint.complete(id);
             return Err(SliceError::ContextUnavailable {
                 reason: "response id does not correlate with the request".to_owned(),
             });

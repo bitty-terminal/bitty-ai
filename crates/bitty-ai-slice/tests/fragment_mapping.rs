@@ -35,8 +35,8 @@
 //! - Headless mapping proof only: no socket, process, PTY, network, wall
 //!   clock, secret, or render/projection step. Drained `RichFragment`s are
 //!   asserted as DTOs; no test claims pixels, `RichBlock`s, or live display.
-//! - `bitty-ipc` is the pinned Git revision `be6e63c` (AI-0073 verified
-//!   `2cbb1fb..be6e63c`: `rich_fragment.rs` byte-identical;
+//! - `bitty-ipc` is the pinned Git revision `cfeffa2` (AI-0081 verified
+//!   `be6e63c..cfeffa2`: `rich_fragment.rs` byte-identical;
 //!   `scope.rs` contains no `rich` method in either). The pin bump is
 //!   mechanics-only in this task.
 //! - Typed gaps (kind erasure, render wiring, wire method, consent and
