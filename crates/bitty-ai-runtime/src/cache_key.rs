@@ -3,7 +3,9 @@
 //! Deterministic keying over [`assemble_prompt`](crate::prompt) canonical
 //! bytes: a [`CacheKey`] pins `(provider_id, model_id, scope,
 //! stable_prefix_hash, prefix_len)` where the stable prefix is the leading
-//! canonical bytes before the Runtime/Turn section header and the digest is
+//! canonical bytes through the end of the Skills/Profile text section
+//! (length-aware boundary parsing over the length-prefixed section layout,
+//! never a marker scan) and the digest is
 //! FNV-1a-64 over exactly those bytes (inline small hasher; never
 //! `DefaultHasher`/`RandomState`, never a `HashMap`).
 //!
@@ -23,10 +25,24 @@ use crate::prompt::MAX_CANONICAL_BYTES;
 use crate::provider::validate_provider_id;
 use crate::selection::validate_model_name;
 
-/// Boundary marker opening the Runtime/Turn section header in the canonical
-/// byte form (see `prompt::render_canonical`). The stable prefix is every
-/// byte before the first occurrence.
-const STABLE_BOUNDARY_MARKER: &[u8] = b"[layer:runtime-turn len=";
+/// Stable section names in canonical order (`prompt::render_canonical`).
+/// The stable prefix ends right after the last one.
+const STABLE_LAYERS: [&str; 4] = ["core-contract", "user", "project", "skills-profile"];
+/// Dynamic section name that must open immediately after the boundary.
+const RUNTIME_LAYER: &str = "runtime-turn";
+/// Fixed first line of the canonical form (`prompt::render_canonical`).
+const CANONICAL_MAGIC: &[u8] = b"prompt/1\n";
+/// Fixed prefix of the pinned-version line (the version itself varies).
+const CORE_VERSION_PREFIX: &[u8] = b"core-version:";
+/// Fixed bytes opening a section header (`[layer:`).
+const SECTION_OPEN: &[u8] = b"[layer:";
+/// Fixed bytes between a section name and its declared length (` len=`).
+const SECTION_LEN_SEP: &[u8] = b" len=";
+/// Fixed bytes closing a section header (`]\n`).
+const SECTION_CLOSE: &[u8] = b"]\n";
+/// Fixed bytes opening the trailing policy block (`prompt::render_canonical`
+/// always emits it after the Runtime/Turn text section).
+const EFFECTIVE_OPEN: &[u8] = b"[effective]\n";
 
 /// FNV-1a-64 offset basis (deterministic across processes and platforms).
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -71,8 +87,8 @@ pub enum CacheKeyError {
     },
     /// No canonical bytes were supplied (no stable prefix exists).
     EmptyCanonical,
-    /// The canonical bytes carry no Runtime/Turn section header, so the
-    /// stable prefix boundary is undefined.
+    /// The canonical bytes do not follow the length-prefixed section layout,
+    /// so the stable prefix boundary is undefined.
     MissingStableMarker,
     /// The canonical bytes exceed [`MAX_CANONICAL_BYTES`].
     CanonicalTooLarge {
@@ -170,20 +186,78 @@ impl CacheKey {
     }
 }
 
-/// Length of the stable prefix: the offset of the first Runtime/Turn section
-/// header in `canonical`, or `None` when the marker is absent (or cannot fit).
+/// Length of the stable prefix: the offset right after the terminating LF
+/// of the last stable text section, walked with the length-prefixed section
+/// headers of `prompt::render_canonical`. Returns `None` when the bytes do
+/// not follow that layout (so `CacheKey::new` reports
+/// [`CacheKeyError::MissingStableMarker`]).
+///
+/// Length-aware walking (never a naive marker scan): stable-layer text may
+/// legally carry the literal `[layer:runtime-turn len=` (text validation
+/// rejects only CR/NUL), so a first-occurrence search truncates the prefix
+/// early and aliases differing stable prefixes to one key. Skipping each
+/// section with its declared `len=` hops over any embedded header-shaped
+/// bytes; anything malformed fails closed.
+#[must_use]
 fn stable_prefix_len(canonical: &[u8]) -> Option<usize> {
-    if canonical.len() < STABLE_BOUNDARY_MARKER.len() {
+    let mut cursor: &[u8] = canonical.strip_prefix(CANONICAL_MAGIC)?;
+    cursor = cursor.strip_prefix(CORE_VERSION_PREFIX)?;
+    let version_end = cursor.iter().position(|byte| *byte == b'\n')?;
+    cursor = &cursor[version_end + 1..];
+    for layer in STABLE_LAYERS {
+        cursor = strip_section(cursor, layer)?;
+    }
+    // The stable prefix ends where the Runtime/Turn section opens: record
+    // that offset, then still validate the trailing runtime section and the
+    // `[effective]` block so malformed tails fail closed instead of keying a
+    // truncated layout.
+    let boundary = canonical.len() - cursor.len();
+    cursor = strip_section(cursor, RUNTIME_LAYER)?;
+    if !cursor.starts_with(EFFECTIVE_OPEN) {
         return None;
     }
-    canonical
-        .windows(STABLE_BOUNDARY_MARKER.len())
-        .position(|window| window == STABLE_BOUNDARY_MARKER)
+    Some(boundary)
+}
+
+/// Strip one `[layer:<name> len=<n>]\n<text>\n` section from the front of
+/// `bytes`, returning the remainder. The declared `len=` drives the skip:
+/// `<text>` hops over any header-shaped bytes it carries, so an embedded
+/// literal can never shift the boundary. A declared length that overruns
+/// the bytes or misses its terminating LF fails closed.
+fn strip_section<'bytes>(bytes: &'bytes [u8], layer: &str) -> Option<&'bytes [u8]> {
+    let (text_len, rest) = section_header_len(bytes, layer)?;
+    rest.get(text_len..)?.strip_prefix(b"\n")
+}
+
+/// Read a `[layer:<layer> len=<n>]\n` header from the front of `bytes`,
+/// returning the declared text length and the remainder starting at the
+/// section text. Rejects a missing shape, a non-decimal or empty length,
+/// or a header naming a different layer.
+///
+/// The header prefix is matched byte-wise (never a substring search) so one
+/// layer's header never parses as another's: a text literal like
+/// `[layer:runtime-turn len=...` sits inside a skipped `<text>` span and is
+/// never re-scanned as a header. The `len=`/`]\n` framing is required, not
+/// just the layer name, so a bare `[layer:runtime-turn` line inside text
+/// still fails closed instead of silently shifting the boundary.
+fn section_header_len<'bytes>(bytes: &'bytes [u8], layer: &str) -> Option<(usize, &'bytes [u8])> {
+    let rest = bytes.strip_prefix(SECTION_OPEN)?;
+    let rest = rest.strip_prefix(layer.as_bytes())?;
+    let rest = rest.strip_prefix(SECTION_LEN_SEP)?;
+    let digits_end = rest.iter().position(|byte| !byte.is_ascii_digit())?;
+    if digits_end == 0 {
+        return None;
+    }
+    let digits = core::str::from_utf8(rest.get(..digits_end)?).ok()?;
+    let text_len = digits.parse::<usize>().ok()?;
+    let rest = rest[digits_end..].strip_prefix(SECTION_CLOSE)?;
+    Some((text_len, rest))
 }
 
 /// Deterministic FNV-1a-64 over `bytes`. Inline small hasher: no
 /// `DefaultHasher`, no `RandomState`, no seed input, identical output on
 /// every platform and process.
+#[must_use]
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     for byte in bytes {

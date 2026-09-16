@@ -82,6 +82,27 @@ fn session_key(provider: &str, model: &str, bytes: &[u8]) -> CacheKey {
     CacheKey::new(provider, model, CacheScope::Session, bytes).expect("valid test key inputs")
 }
 
+/// Assemble canonical bytes with a fixed core/skills head, caller-chosen
+/// user and project texts (which may legally carry section-like literals),
+/// and one tail.
+fn canonical_bytes_with_texts(user_text: &str, project_text: &str, turn_text: &str) -> Vec<u8> {
+    let snapshot = PromptSnapshot::new(
+        "bitty-core-prompt@1",
+        vec![
+            text_layer(PromptLayer::CoreContract, "stable core"),
+            text_layer(PromptLayer::User, user_text),
+            text_layer(PromptLayer::Project, project_text),
+            text_layer(PromptLayer::SkillsProfile, "stable skills"),
+            text_layer(PromptLayer::RuntimeTurn, turn_text),
+        ],
+    )
+    .expect("test snapshot is valid");
+    assemble_prompt(&snapshot)
+        .expect("test snapshot assembles")
+        .canonical_bytes()
+        .to_vec()
+}
+
 /// Test-only deterministic hasher: proves equal keys hash equal without
 /// touching `RandomState`.
 struct FnvHasher(u64);
@@ -329,5 +350,39 @@ fn constructor_rejects_malformed_inputs_fail_closed() {
             CacheKeyError::CanonicalTooLarge { .. }
         ),
         "over-bound canonical bytes must fail closed"
+    );
+}
+
+#[test]
+fn embedded_marker_in_stable_text_must_not_alias_keys() {
+    // AI-0084: stable-layer text may legally carry the
+    // `[layer:runtime-turn len=` literal (text validation rejects only
+    // CR/NUL), so a first-occurrence byte scan truncates the stable prefix
+    // early. Two prompts whose stable bytes differ only after such an
+    // embedded literal must NOT share a key.
+    let head = "payload [layer:runtime-turn len=0]\n";
+    let user_a = format!("{head}stable-variant-alpha-0001");
+    let user_b = format!("{head}stable-variant-beta--0001");
+    assert_eq!(
+        user_a.len(),
+        user_b.len(),
+        "test controls carry equal-length user texts"
+    );
+    let bytes_a = canonical_bytes_with_texts(&user_a, "stable project", "turn one");
+    let bytes_b = canonical_bytes_with_texts(&user_b, "stable project", "turn one");
+    assert_ne!(bytes_a, bytes_b, "stable-region texts differ");
+    let key_a = session_key("bitty-fake", "fake-chat", &bytes_a);
+    let key_b = session_key("bitty-fake", "fake-chat", &bytes_b);
+    assert_eq!(
+        key_a.prefix_len, key_b.prefix_len,
+        "equal-length stable sections share the true boundary"
+    );
+    assert_ne!(
+        key_a.stable_prefix_hash, key_b.stable_prefix_hash,
+        "digest must cover the full stable prefix past any embedded literal"
+    );
+    assert_ne!(
+        key_a, key_b,
+        "differing stable prefixes must never alias to one key"
     );
 }
