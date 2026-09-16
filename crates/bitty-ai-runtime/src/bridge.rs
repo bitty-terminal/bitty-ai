@@ -1307,6 +1307,7 @@ mod tests {
             budget_bytes: 4096,
             timeout_ms: 5_000,
             now_ms: 1_000,
+            sampling: None,
         };
         let turn = provider.complete(&request).expect("scripted turn");
         assert_eq!(turn.text, "gated answer");

@@ -792,6 +792,8 @@ pub enum FallbackDirective {
 ///   [`BudgetExceeded`](ProviderError::BudgetExceeded),
 ///   [`TimeoutTooLarge`](ProviderError::TimeoutTooLarge),
 ///   [`InvalidProviderId`](ProviderError::InvalidProviderId),
+///   [`InvalidSampling`](ProviderError::InvalidSampling) (caller-declared
+///   sampling contract),
 ///   [`Auth`](ProviderError::Auth) (reconcile credentials; never spray),
 ///   [`CapabilityMismatch`](ProviderError::CapabilityMismatch) (routing bug).
 /// - Stop with reconcile (effect uncertain; blind fallback may double-apply):
@@ -807,6 +809,7 @@ pub fn fallback_directive(error: &ProviderError) -> FallbackDirective {
         | ProviderError::BudgetExceeded { .. }
         | ProviderError::TimeoutTooLarge { .. }
         | ProviderError::InvalidProviderId { .. }
+        | ProviderError::InvalidSampling
         | ProviderError::Auth { .. }
         | ProviderError::CapabilityMismatch { .. }
         | ProviderError::Unknown { .. } => FallbackDirective::Stop,
@@ -1465,6 +1468,7 @@ mod tests {
             ProviderError::InvalidProviderId {
                 id: "BAD".to_owned(),
             },
+            ProviderError::InvalidSampling,
             ProviderError::Auth {
                 provider: "p".to_owned(),
                 reason: "revoked".to_owned(),
