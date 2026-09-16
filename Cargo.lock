@@ -24,7 +24,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc"
 version = "0.0.20"
-source = "git+https://github.com/bitty-terminal/bitty?rev=be6e63c55a18cb0a4bae1a528527b97251375bff#be6e63c55a18cb0a4bae1a528527b97251375bff"
+source = "git+https://github.com/bitty-terminal/bitty?rev=cfeffa2d8e1387029850940af2b64877dbfbe25f#cfeffa2d8e1387029850940af2b64877dbfbe25f"
 
 [[package]]
 name = "cc"
