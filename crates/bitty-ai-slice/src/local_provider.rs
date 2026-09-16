@@ -511,6 +511,9 @@ impl ModelProvider for LocalProvider {
                 actual: request.timeout_ms,
             });
         }
+        if let Some(params) = &request.sampling {
+            bitty_ai_runtime::validate_sampling(params)?;
+        }
         if request.model != self.endpoint.model {
             return Err(ProviderError::UnknownModel {
                 name: request.model.clone(),
@@ -1342,6 +1345,7 @@ mod tests {
             budget_bytes: 32 * 1024,
             timeout_ms: 5_000,
             now_ms: 1_000,
+            sampling: None,
         }
     }
 

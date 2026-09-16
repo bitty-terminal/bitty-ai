@@ -100,8 +100,14 @@ pub use prompt::{
     validate_directive_value, validate_layer_text, validate_prompt_tool_name, validate_scope,
 };
 pub use provider::{
-    FakeProvider, ModelCapability, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
-    ProviderUsage, Role, TerminalModelMetadata, ToolCallRequest, TurnRequest, validate_provider_id,
+    FakeProvider, MAX_MIN_P, MAX_PENALTY, MAX_REPETITION_PENALTY, MAX_RESPONSE_SCHEMA_BYTES,
+    MAX_STOP_SEQUENCE_BYTES, MAX_STOP_SEQUENCES, MAX_TEMPERATURE, MAX_TOP_P, MIN_MAX_TOKENS,
+    MIN_MIN_P, MIN_PENALTY, MIN_REASONING_TOKENS, MIN_REPETITION_PENALTY, MIN_TEMPERATURE,
+    MIN_TOP_K, MIN_TOP_P, ModelCapability, ModelDescriptor, ModelProvider, ProviderError,
+    ProviderTurn, ProviderUsage, REASONING_RATIO_HIGH, REASONING_RATIO_LOW, REASONING_RATIO_MAX,
+    REASONING_RATIO_MEDIUM, REASONING_RATIO_MINIMAL, REASONING_RATIO_XHIGH, ReasoningConfig,
+    ReasoningEffort, ResponseFormat, Role, SamplingParams, TerminalModelMetadata, ToolCallRequest,
+    TurnRequest, UnknownReasoningEffort, validate_provider_id, validate_sampling,
 };
 pub use reconcile::{
     DEFAULT_MAX_UNKNOWN_RETRIES, DEFAULT_RECONCILE_BASE_DELAY_MS, DEFAULT_RECONCILE_MAX_DELAY_MS,

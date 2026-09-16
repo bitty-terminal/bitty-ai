@@ -527,6 +527,7 @@ impl<P: ModelProvider> Agent<P> {
                 budget_bytes: self.config.context_budget_bytes,
                 timeout_ms: self.config.provider_timeout_ms,
                 now_ms,
+                sampling: None,
             };
             let turn = match self.provider.complete(&turn_request) {
                 Ok(turn) => turn,
