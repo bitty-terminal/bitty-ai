@@ -48,6 +48,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod adoption;
 pub mod agent;
 pub mod bridge;
 pub mod cache_key;
@@ -62,6 +63,10 @@ pub mod session;
 pub mod stream;
 pub mod tool;
 
+pub use adoption::{
+    AdoptedEffect, AdoptedHistory, AdoptionClaim, AdoptionRefusal, ClaimedUnknownEffect,
+    MAX_ADOPTION_SURVIVORS, UnknownDisposition, check_adoption,
+};
 pub use agent::{
     Agent, AgentConfig, AgentError, ExecOutcome, ExecutionRecord, MAX_EXECUTIONS_PER_AGENT,
 };
