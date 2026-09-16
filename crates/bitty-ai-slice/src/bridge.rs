@@ -64,7 +64,7 @@ use crate::error::SliceError;
 /// Upstream: `bitty-ipc` `crates/bitty-ipc/src/auth.rs` `MAX_SCOPED_ID_BYTES`
 /// (value `64`), which the tool-dispatch and execution services each alias
 /// (`MAX_TOOL_CLIENT_ID_BYTES` and `MAX_EXEC_CLIENT_ID_BYTES`). Pinned
-/// revision: `2cbb1fbed82814c157359b71dd8efbb4be0c36e7`.
+/// revision: `be6e63c55a18cb0a4bae1a528527b97251375bff`.
 pub const MAX_WIRE_CLIENT_ID_BYTES: usize = bitty_ipc::auth::MAX_SCOPED_ID_BYTES;
 
 /// Derive the wire `client_id` for a bound protocol principal (`AI-0065`).
