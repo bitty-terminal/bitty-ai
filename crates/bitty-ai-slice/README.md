@@ -55,7 +55,7 @@ fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB ru
 ## Dependencies
 
 - `bitty-ai-runtime` via local path.
-- `bitty-ipc` via pinned Git revision (`2cbb1fbed82814c157359b71dd8efbb4be0c36e7`
+- `bitty-ipc` via pinned Git revision (`be6e63c55a18cb0a4bae1a528527b97251375bff`
   in `Cargo.toml`). Detect drift between this pin and the local `bitty`
   checkout with `just pin-drift` (`scripts/pin-drift.sh`); it is local-only by
   default and documents the bump checklist in its header. It is intentionally
@@ -109,7 +109,7 @@ deterministic rule that binds them: `client_id` is exactly the validated
 - a bound principal longer than the upstream `client_id` bound
   (`bridge::MAX_WIRE_CLIENT_ID_BYTES`, re-derived from the pinned `bitty-ipc`
   `auth::MAX_SCOPED_ID_BYTES` value `64`, pinned revision
-  `2cbb1fbed82814c157359b71dd8efbb4be0c36e7`) is refused, because the runtime
+  `be6e63c55a18cb0a4bae1a528527b97251375bff`) is refused, because the runtime
   protocol bound (128 bytes) is wider than the host wire bound.
 
 `bridge::verify_wire_client_id` refuses a caller-supplied id that disagrees

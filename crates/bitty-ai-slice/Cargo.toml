@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "2cbb1fbed82814c157359b71dd8efbb4be0c36e7" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "be6e63c55a18cb0a4bae1a528527b97251375bff" }
 # R6 journal prototype (AI-0049, experimental, slice-only). `bundled` compiles
 # vendored SQLite 3.53.2; default features off drops the wasm-only subtree and
 # the statement cache. Dependency review: PX-0298 on AI-0049.

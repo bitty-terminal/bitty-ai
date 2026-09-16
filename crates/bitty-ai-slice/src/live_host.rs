@@ -30,10 +30,9 @@
 //! ## Read-only mirror pin
 //!
 //! No file in the `bitty` repository is modified by this task. The services
-//! used here are read through the pinned `bitty-ipc` revision `2cbb1fb`
-//! (AI-0039 verified `64e1709..2cbb1fb` additive: new `src/host_bridge.rs`
-//! plus `lib.rs` export plus crate `README.md`; existing DTO/validate/bounds
-//! shapes byte-identical):
+//! used here are read through the pinned `bitty-ipc` revision `be6e63c`
+//! (AI-0073 verified `2cbb1fb..be6e63c`: `auth.rs` token-free reasons plus
+//! `devtools` surface; existing DTO/validate/bounds shapes byte-identical):
 //!
 //! - Snapshot DTO/service: `crates/bitty-ipc/src/snapshot.rs` `SNAPSHOT_METHOD`
 //!   (`L64`), `SnapshotRequest` (`L235`, `validate` `L288`), `SnapshotData`
@@ -74,7 +73,7 @@
 //! ## Live-provider mapping (AI-0040, mapping proof only)
 //!
 //! The same seam can point at the real live providers from
-//! `bitty-ipc/src/host_bridge.rs` at pin `2cbb1fb`: `live_snapshot_provider`
+//! `bitty-ipc/src/host_bridge.rs` at pin `be6e63c`: `live_snapshot_provider`
 //! for snapshots plus `inspect_text_provider` / `inspect_status_provider`
 //! (via `register_live_inspect_tools`) for the read-only inspect tools.
 //! There is no live execution provider in this pin, so the execution seam
@@ -230,7 +229,7 @@ impl LiveBittyHost {
     }
 
     /// Construct a live host wired to the real live snapshot provider
-    /// (`host_bridge::live_snapshot_provider` at pin `2cbb1fb`).
+    /// (`host_bridge::live_snapshot_provider` at pin `be6e63c`).
     ///
     /// This is live-provider conformance (mapping proof), not live wiring:
     /// tests publish real `SnapshotData` fixtures with
@@ -307,7 +306,7 @@ impl LiveBittyHost {
 
     /// Register the live read-only inspect tools (`terminal_text` plus
     /// `terminal_status`, both `terminal.inspect`) backed by the real live
-    /// providers at pin `2cbb1fb`.
+    /// providers at pin `be6e63c`.
     ///
     /// This is the tool-side half of live-provider conformance: tests publish
     /// real `SnapshotData` fixtures with `publish_live_snapshot`, then
@@ -619,7 +618,7 @@ mod tests {
 /// (`client_id` plus server-evaluated scopes plus consent at
 /// caller-supplied `now_ms`); no test constructs `VerifiedPeer`, asserts
 /// scope allocation, or reads a clock. Execution keeps its injected
-/// (canned) provider: pin `2cbb1fb` defines no live execution provider.
+/// (canned) provider: pin `be6e63c` defines no live execution provider.
 ///
 /// Serial discipline: the live store is process-global, so every test here
 /// holds `live_test_lock`, uses a unique `t:41xx` terminal id, opens with a

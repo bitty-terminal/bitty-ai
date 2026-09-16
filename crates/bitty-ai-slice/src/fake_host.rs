@@ -13,9 +13,10 @@
 //! ## Read-only mirror of merged `bitty` shapes
 //!
 //! No file in the `bitty` repository is modified by this task. Shapes below
-//! mirror `bitty` `main` at `2cbb1fb` (AI-0039 inspection point), read-only.
-//! The `64e1709..2cbb1fb` window is additive in `crates/bitty-ipc` only
-//! (`src/host_bridge.rs` plus `lib.rs` export plus crate `README.md`);
+//! mirror `bitty` `main` at `be6e63c` (AI-0073 inspection point), read-only.
+//! The `2cbb1fb..be6e63c` window changes `crates/bitty-ipc` `auth.rs`
+//! (`ChildTokenStore::verify` token-free static reasons plus
+//! `child_token_errors_are_token_free`) and the `devtools` surface;
 //! existing DTO/validate/bounds/scope/wire shapes are byte-identical, so the
 //! mirror needs no shape change beyond this pin reference:
 //!

@@ -39,7 +39,7 @@
 #      and `MAX_EXEC_CLIENT_ID_BYTES` (crates/bitty-ai-slice/tests/
 #      client_id_binding.rs) — plus the derived bounds used by the FakeHost.
 #   3. Refresh the mirrored line-number references in the `fake_host.rs` module
-#      header, which cites the pinned inspection point (`2cbb1fb`) by line.
+#      header, which cites the pinned inspection point (`be6e63c`) by line.
 #   4. Re-run `cargo test -p bitty-ai-slice`, especially `host_conformance` and
 #      `client_id_binding`, then `just check`.
 #   5. Bump `rev` in `crates/bitty-ai-slice/Cargo.toml`, refresh the lockfile

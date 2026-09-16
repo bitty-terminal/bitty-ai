@@ -3,10 +3,10 @@
 //!
 //! Every test is deterministic (`now_ms` caller-supplied, no wall clock,
 //! no threads, no network, no filesystem) and single-agent (one `FakeHost`
-//! per `client_id`). Shapes mirror `bitty` `main` at `2cbb1fb` read-only
-//! (`64e1709..2cbb1fb` is additive in `crates/bitty-ipc`: new `host_bridge.rs`
-//! plus `lib.rs` export plus crate `README.md`; existing DTO shapes are
-//! byte-identical, so no mirror change); live wiring is out of scope and no test connects to a
+//! per `client_id`). Shapes mirror `bitty` `main` at `be6e63c` read-only
+//! (`2cbb1fb..be6e63c` changes `auth.rs` token-free reasons plus the
+//! `devtools` surface; existing DTO shapes are byte-identical, so no mirror
+//! change); live wiring is out of scope and no test connects to a
 //! real host.
 
 use bitty_ai_slice::{BittyHost, FakeHost, SliceError};
@@ -750,11 +750,11 @@ fn execution_truncates_streams_at_caller_budget() {
 
 // ── process.spawn mapping (AI-0027) ─────────────────────────────────────────
 
-// bitty `main` at `2cbb1fb` carries the bounded consent-gated `process.spawn`
+// bitty `main` at `be6e63c` carries the bounded consent-gated `process.spawn`
 // surface (#717) behind the `[tools.*]` fail-closed allowlist (#716) in
 // `bitty-runtime` / `bitty-plugin-host` only; `crates/bitty-ipc` is
-// byte-identical across `64e1709..2cbb1fb` except the additive `host_bridge.rs`
-// surface (#723), so `FakeHost` needs no mirror change. This test pins the mapping the new surface relies on: `SpawnService::dispatch`
+// byte-identical across `2cbb1fb..be6e63c` except `auth.rs` token-free reasons
+// plus the `devtools` surface, so `FakeHost` needs no mirror change. This test pins the mapping the new surface relies on: `SpawnService::dispatch`
 // resolves `SpawnRequest(tool + args)` via the host `SpawnAuthorizer`, then
 // runs the resolved executable under the real `ExecutionService` — the exact
 // prefix `FakeHost::execute` mirrors (scope `process.spawn`, effect opt-in,
