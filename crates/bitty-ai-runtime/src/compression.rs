@@ -723,6 +723,28 @@ pub fn compress_records(
     tags: &RetentionTags,
     now_ms: u64,
 ) -> Result<CompressedView, CompressionError> {
+    compress_records_at(records, ranges, summarizer, tags, now_ms, None)
+}
+
+/// Compress with an explicit current generation (AI-CTX-002): every source
+/// record in a compressed range must carry `current_generation`, matching
+/// the [`crate::context::assemble`] admission rule, so stale contributions
+/// cannot hide behind current summary metadata. `None` preserves the legacy
+/// behavior (no generation gate) for callers that do not track generations.
+///
+/// # Errors
+///
+/// Fails closed (no partial view) on generation mismatch, invalid records,
+/// invalid ranges, span id collisions, exhausted/failing summarizers,
+/// over-bound summaries, or span-count overflow.
+pub fn compress_records_at(
+    records: &[ContextRecord],
+    ranges: &[SpanRange],
+    summarizer: &dyn Summarizer,
+    tags: &RetentionTags,
+    now_ms: u64,
+    current_generation: Option<u64>,
+) -> Result<CompressedView, CompressionError> {
     if records.len() > MAX_CONTEXT_RECORDS {
         return Err(CompressionError::Context(ContextError::TooManyRecords {
             limit: MAX_CONTEXT_RECORDS,
@@ -732,6 +754,23 @@ pub fn compress_records(
         record.validate()?;
     }
     validate_ranges(records.len(), ranges)?;
+    if let Some(current) = current_generation {
+        // AI-CTX-002: validate every ranged source against the explicit
+        // current generation before any summarizer contact, mirroring the
+        // assemble-time `StaleGeneration` refusal. A single stale
+        // contribution rejects the whole compression; nothing is derived.
+        for range in ranges {
+            for record in &records[range.start..range.end] {
+                if record.generation != current {
+                    return Err(CompressionError::Context(ContextError::StaleGeneration {
+                        id: record.id.clone(),
+                        actual: record.generation,
+                        current,
+                    }));
+                }
+            }
+        }
+    }
 
     let mut spans: Vec<CompressedSpan> = Vec::with_capacity(ranges.len());
     let mut synthetic: Vec<ContextRecord> = Vec::with_capacity(ranges.len());
@@ -783,6 +822,9 @@ pub fn compress_records(
             .map(source_effective_priority)
             .min()
             .unwrap_or(ContextPriority::Normal);
+        // AI-CTX-002: with an explicit generation gate the covered set is
+        // homogeneous by construction, so max == every source. Without the
+        // gate the legacy max rule stands (unchanged behavior).
         let generation = covered
             .iter()
             .map(|record| record.generation)
@@ -1628,5 +1670,108 @@ mod tests {
         );
         assert!(hostile.pruned_ids.is_empty());
         assert!(hostile.omitted_ids.is_empty());
+    }
+
+    fn generational(id: &str, generation: u64) -> ContextRecord {
+        // AI-CTX-002 test helper: same shape as `record`, but with an
+        // explicit generation.
+        let mut tagged = record(id, "workspace", "timed", 10);
+        tagged.generation = generation;
+        tagged
+    }
+
+    #[test]
+    fn stale_source_rejects_whole_compression_before_summarizer() {
+        // AI-CTX-002: one stale contribution rejects everything; the
+        // summarizer is never contacted (script stays full).
+        let records = vec![generational("cur", 2), generational("stale", 1)];
+        let ranges = vec![SpanRange { start: 0, end: 2 }];
+        let summarizer = scripted(&["must never be consumed"]);
+        let err = compress_records_at(
+            &records,
+            &ranges,
+            &summarizer,
+            &RetentionTags::new(),
+            1_000,
+            Some(2),
+        )
+        .expect_err("stale source must fail");
+        // Summarizer contacted zero times: the gate fires before the first
+        // summarize call.
+        assert_eq!(
+            summarizer.calls(),
+            0,
+            "stale input must never reach the summarizer"
+        );
+        assert!(
+            matches!(
+                err,
+                CompressionError::Context(ContextError::StaleGeneration {
+                    ref id,
+                    actual: 1,
+                    current: 2,
+                }) if id == "stale"
+            ),
+            "must be the stale-generation refusal"
+        );
+    }
+
+    #[test]
+    fn homogeneous_generation_compresses_with_max() {
+        // Valid homogeneous input compresses; the synthetic record carries
+        // the (uniform) generation, so downstream assembly keeps working.
+        let records = vec![generational("a", 2), generational("b", 2)];
+        let ranges = vec![SpanRange { start: 0, end: 2 }];
+        let view = compress_records_at(
+            &records,
+            &ranges,
+            &scripted(&["ok"]),
+            &RetentionTags::new(),
+            1_000,
+            Some(2),
+        )
+        .expect("homogeneous input must compress");
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.spans[0].source_deadline_ms, 100);
+        assert_eq!(view.records[0].generation, 2);
+    }
+
+    #[test]
+    fn legacy_none_path_keeps_max_rule() {
+        // `None` preserves legacy behavior: mixed generations compress and
+        // the synthetic record takes the max (unchanged semantics).
+        let records = vec![generational("old", 1), generational("new", 2)];
+        let ranges = vec![SpanRange { start: 0, end: 2 }];
+        let view = compress_records_at(
+            &records,
+            &ranges,
+            &scripted(&["legacy"]),
+            &RetentionTags::new(),
+            1_000,
+            None,
+        )
+        .expect("legacy path must compress");
+        assert_eq!(view.records[0].generation, 2);
+    }
+
+    #[test]
+    fn out_of_range_sources_are_not_gated() {
+        // Records outside every compressed range pass through untouched even
+        // when stale: the gate covers ranged sources only (summarization
+        // inputs), never passthrough records.
+        let records = vec![generational("stale-out", 1), generational("cur", 2)];
+        let ranges = vec![SpanRange { start: 1, end: 2 }];
+        let view = compress_records_at(
+            &records,
+            &ranges,
+            &scripted(&["ok"]),
+            &RetentionTags::new(),
+            1_000,
+            Some(2),
+        )
+        .expect("out-of-range stale must not block");
+        assert_eq!(view.records.len(), 2);
+        assert_eq!(view.records[0].id, "stale-out");
+        assert_eq!(view.records[1].id, "cmp-0000");
     }
 }
