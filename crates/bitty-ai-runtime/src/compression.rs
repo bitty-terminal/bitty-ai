@@ -468,7 +468,14 @@ pub struct CompressedSpan {
     /// Most restrictive [`RetentionClass`] over the sources (summaries
     /// inherit source retention; compression never extends it).
     pub retention: RetentionClass,
-    /// Caller-supplied compression timestamp (expiry anchor).
+    /// Earliest applicable source deadline for the span (AI-CTX-001): the
+    /// minimum `collected_at_ms` over the span's sources, recorded at
+    /// compression time. Expiry arithmetic anchors here, never at
+    /// [`CompressedSpan::created_at_ms`], so a later summarization cannot
+    /// extend the window its sources were collected under.
+    pub source_deadline_ms: u64,
+    /// Caller-supplied compression timestamp (creation marker only, not an
+    /// expiry anchor).
     pub created_at_ms: u64,
 }
 
@@ -571,9 +578,12 @@ impl CompressedView {
         let mut expired: Vec<String> = Vec::new();
         let mut dropped_spans: Vec<String> = Vec::new();
         self.spans.retain(|span| {
+            // AI-CTX-001: expiry anchors at the span's source deadline
+            // (earliest source collection), never at creation time, so
+            // compression cannot renew the inherited window.
             let over = policy
                 .ttl_for(span.retention)
-                .is_some_and(|ttl| now_ms.saturating_sub(span.created_at_ms) > ttl);
+                .is_some_and(|ttl| now_ms.saturating_sub(span.source_deadline_ms) > ttl);
             if over {
                 expired.push(span.span_id.clone());
                 dropped_spans.push(span.span_id.clone());
@@ -763,6 +773,11 @@ pub fn compress_records(
         }
         let is_untrusted_surface = untrusted_sources > 0;
         let retention = inherit_retention(&source_ids, tags);
+        let source_deadline_ms = covered
+            .iter()
+            .map(|record| record.collected_at_ms)
+            .min()
+            .unwrap_or(now_ms);
         let priority = covered
             .iter()
             .map(source_effective_priority)
@@ -779,6 +794,7 @@ pub fn compress_records(
             summary: summary.clone(),
             is_untrusted_surface,
             retention,
+            source_deadline_ms,
             created_at_ms: now_ms,
         });
         synthetic.push(ContextRecord {
@@ -1224,6 +1240,10 @@ mod tests {
 
     #[test]
     fn retention_expiry_prunes_spans_and_passthrough_by_class() {
+        // AI-CTX-001: span expiry anchors at the source deadline (earliest
+        // source collection), not at compression time. Both sources were
+        // collected at 100, so even though compression runs at 1000, the
+        // ephemeral span is already past its 100ms TTL at 1050.
         let records = vec![
             record("goal", "workspace", "plan", 10),
             record("scratch", "terminal", "grep", 10),
@@ -1234,18 +1254,17 @@ mod tests {
         let ranges = vec![SpanRange { start: 1, end: 2 }];
         let mut view =
             compress_records(&records, &ranges, &scripted(&["s"]), &tags, 1_000).expect("compress");
+        assert_eq!(view.spans[0].source_deadline_ms, 100);
         let policy = RetentionPolicy {
             pinned_ttl_ms: None,
             recent_ttl_ms: Some(60_000),
             normal_ttl_ms: Some(60_000),
             ephemeral_ttl_ms: Some(100),
         };
-        // At +50ms the ephemeral span (created at 1000) survives.
-        let none = view.apply_retention(&policy, 1_050);
-        assert!(none.is_empty());
-        assert_eq!(view.len(), 1);
-        // At +500ms it expires; the pinned passthrough survives.
-        let expired = view.apply_retention(&policy, 1_500);
+        // The span's source deadline (100) plus the 100ms TTL is long past
+        // at 1050: the span expires immediately; the pinned passthrough
+        // survives.
+        let expired = view.apply_retention(&policy, 1_050);
         assert_eq!(expired, vec!["cmp-0000".to_owned()]);
         assert!(view.is_empty());
         assert_eq!(view.records.len(), 1);
@@ -1255,6 +1274,112 @@ mod tests {
             view.resolve_summary("cmp-0000"),
             Err(CompressionError::SummaryUnavailable { .. })
         ));
+    }
+
+    fn timed_record(id: &str, collected_at_ms: u64) -> ContextRecord {
+        let mut tagged = record(id, "workspace", "timed", 10);
+        tagged.collected_at_ms = collected_at_ms;
+        tagged
+    }
+
+    #[test]
+    fn span_deadline_is_earliest_source_collection() {
+        // Mixed deadlines: the span records the minimum source collection
+        // time, regardless of source order in the range.
+        let records = vec![
+            timed_record("late", 900),
+            timed_record("early", 100),
+            timed_record("mid", 500),
+        ];
+        let ranges = vec![SpanRange { start: 0, end: 3 }];
+        let view = compress_records(
+            &records,
+            &ranges,
+            &scripted(&["mixed"]),
+            &RetentionTags::new(),
+            1_000,
+        )
+        .expect("compress");
+        assert_eq!(view.spans[0].source_deadline_ms, 100);
+        assert_eq!(view.spans[0].created_at_ms, 1_000);
+    }
+
+    #[test]
+    fn recompression_does_not_extend_source_deadline() {
+        // AI-CTX-001 core: compressing the same sources later must not push
+        // expiry out. Both spans share the source deadline, so both expire
+        // at the same instant under the same policy.
+        let records = vec![timed_record("r1", 100), timed_record("r2", 200)];
+        let ranges = vec![SpanRange { start: 0, end: 2 }];
+        let early = compress_records(
+            &records,
+            &ranges,
+            &scripted(&["early"]),
+            &RetentionTags::new(),
+            1_000,
+        )
+        .expect("compress");
+        let late = compress_records(
+            &records,
+            &ranges,
+            &scripted(&["late"]),
+            &RetentionTags::new(),
+            50_000,
+        )
+        .expect("compress");
+        assert_eq!(early.spans[0].source_deadline_ms, 100);
+        assert_eq!(late.spans[0].source_deadline_ms, 100);
+        let policy = RetentionPolicy {
+            pinned_ttl_ms: None,
+            recent_ttl_ms: Some(60_000),
+            normal_ttl_ms: Some(1_000),
+            ephemeral_ttl_ms: Some(100),
+        };
+        // Normal-class TTL 1000 from deadline 100: both spans expire past
+        // 1100, both survive at 1100 — identical treatment despite the
+        // 49s gap in compression time.
+        let mut early = early;
+        let mut late = late;
+        assert!(early.apply_retention(&policy, 1_100).is_empty());
+        assert!(late.apply_retention(&policy, 1_100).is_empty());
+        assert_eq!(
+            early.apply_retention(&policy, 1_101),
+            vec!["cmp-0000".to_owned()]
+        );
+        assert_eq!(
+            late.apply_retention(&policy, 1_101),
+            vec!["cmp-0000".to_owned()]
+        );
+    }
+
+    #[test]
+    fn near_expiry_source_yields_near_expiry_span() {
+        // A source collected just inside its TTL produces a span that
+        // survives only the remainder — compression adds no fresh window.
+        let records = vec![timed_record("r1", 950)];
+        let ranges = vec![SpanRange { start: 0, end: 1 }];
+        let mut view = compress_records(
+            &records,
+            &ranges,
+            &scripted(&["near"]),
+            &RetentionTags::new(),
+            1_000,
+        )
+        .expect("compress");
+        let policy = RetentionPolicy {
+            pinned_ttl_ms: None,
+            recent_ttl_ms: Some(60_000),
+            normal_ttl_ms: Some(100),
+            ephemeral_ttl_ms: Some(100),
+        };
+        // Deadline 950 + TTL 100: alive at 1049, gone at 1051.
+        assert!(view.apply_retention(&policy, 1_049).is_empty());
+        assert_eq!(view.len(), 1);
+        assert_eq!(
+            view.apply_retention(&policy, 1_051),
+            vec!["cmp-0000".to_owned()]
+        );
+        assert!(view.is_empty());
     }
 
     #[test]
