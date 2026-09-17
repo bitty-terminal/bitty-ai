@@ -17,8 +17,9 @@
 //!
 //! Covered here:
 //! 1. Multi-turn continuation: two `Unknown` turns keep per-turn reconcile
-//!    counts (stale ids report `NoUnknown`); a `Completed` turn followed by a
-//!    fresh session starts fully clean.
+//!    counts while the earlier id stays queryable in the bounded pending set
+//!    (AI-RUN-001, #186); a `Completed` turn followed by a fresh session
+//!    starts fully clean.
 //! 2. Cancel-then-resume: provider-side cancel between rounds reports a
 //!    reconciled `Canceled` and stays terminal without I/O; an `Unknown`
 //!    turn resolves via reconcile and the next turn on the same agent
@@ -203,9 +204,30 @@ fn unknown_then_unknown_keeps_per_turn_reconcile_counts() {
     let fresh_id = agent.executions()[0].execution_id;
     assert_ne!(stale_id, fresh_id);
 
-    // The current turn's record reconciles; the previous turn's cleared id
-    // is no longer known, so no query runs for it.
+    // AI-RUN-001 (#186): the previous turn's id survives admission in the
+    // bounded pending set, so it stays queryable even though the per-turn
+    // vector was cleared. Resolving it removes it from the pending set.
     let mut reconciler = FakeReconciler::new();
+    reconciler.push_resolved(ToolStatus::Success);
+    let stale = agent.reconcile_unknown(&mut reconciler, stale_id, NOW_MS);
+    assert!(
+        matches!(
+            &stale,
+            ReconcileOutcome::Resolved {
+                status: ToolStatus::Success,
+                attempts: 1,
+                ..
+            }
+        ),
+        "stale id must stay queryable across turns, got: {stale:?}"
+    );
+    assert_eq!(reconciler.query_count(), 1);
+    assert!(agent.pending_unknown().is_empty());
+    // A second query for the same id now finds nothing.
+    let gone = agent.reconcile_unknown(&mut reconciler, stale_id, NOW_MS);
+    assert_eq!(gone, ReconcileOutcome::NoUnknown);
+    assert_eq!(reconciler.query_count(), 1);
+    // The current turn's record still reconciles through the pending set.
     reconciler.push_resolved(ToolStatus::Success);
     let resolved = agent.reconcile_unknown(&mut reconciler, fresh_id, NOW_MS);
     assert!(
@@ -219,10 +241,7 @@ fn unknown_then_unknown_keeps_per_turn_reconcile_counts() {
         ),
         "unexpected outcome: {resolved:?}"
     );
-    assert_eq!(reconciler.query_count(), 1);
-    let stale = agent.reconcile_unknown(&mut reconciler, stale_id, NOW_MS);
-    assert_eq!(stale, ReconcileOutcome::NoUnknown);
-    assert_eq!(reconciler.query_count(), 1);
+    assert_eq!(reconciler.query_count(), 2);
     assert_eq!(agent.session().state(), SessionState::Active);
 }
 
