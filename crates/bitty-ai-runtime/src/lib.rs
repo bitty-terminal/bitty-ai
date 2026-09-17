@@ -55,6 +55,7 @@ pub mod cache_key;
 pub mod compression;
 pub mod context;
 pub mod extension;
+pub mod fallback;
 pub mod fencing;
 pub mod fingerprint;
 pub mod prompt;
@@ -91,6 +92,10 @@ pub use context::{
 pub use extension::{
     AgentPoint, CommandPoint, CompactorPoint, ContextPoint, ExtensionPoint, Manifest, MemoryPoint,
     ModelPoint, ToolPoint, UiPoint,
+};
+pub use fallback::{
+    FALLBACK_ID, FALLBACK_KIND, FallbackEnvelope, FallbackError, MAX_FALLBACK_ID_BYTES,
+    MAX_FALLBACK_KIND_BYTES, MAX_FALLBACK_TEXT_BYTES, fallback_for,
 };
 pub use fencing::{WriterLease, WriterRefusal, check_writer};
 pub use fingerprint::{FingerprintError, InputFingerprint};
