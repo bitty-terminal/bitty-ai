@@ -56,6 +56,7 @@ pub mod compression;
 pub mod context;
 pub mod extension;
 pub mod fencing;
+pub mod fingerprint;
 pub mod prompt;
 pub mod provider;
 pub mod reconcile;
@@ -92,6 +93,7 @@ pub use extension::{
     ModelPoint, ToolPoint, UiPoint,
 };
 pub use fencing::{WriterLease, WriterRefusal, check_writer};
+pub use fingerprint::{FingerprintError, InputFingerprint};
 pub use prompt::assemble as assemble_prompt;
 pub use prompt::{
     AssembledPrompt, AssembledSection, Directive, DirectiveOverride, LayerInput,
