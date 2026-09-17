@@ -350,6 +350,14 @@ pub struct Agent<P: ModelProvider> {
     config: AgentConfig,
     executions: Vec<ExecutionRecord>,
     tool_history: Vec<ContextRecord>,
+    /// Attribution for effects whose outcome stayed `Unknown` when their
+    /// turn ended. Survives [`Agent::run_turn`] admission (unlike
+    /// `executions`, which is per-turn) so a later turn cannot silently
+    /// drop the lookup; reconciling through
+    /// [`Agent::reconcile_unknown`] or explicitly abandoning through
+    /// [`Agent::abandon_pending`] removes entries. Bounded by
+    /// [`MAX_EXECUTIONS_PER_AGENT`].
+    pending_unknown: Vec<ExecutionRecord>,
     turn_cost: u64,
     /// Next unused stream sequence number of the logical turn (`S-8` scheme
     /// A); reset at every [`Agent::run_turn`] entry, advanced by every
@@ -369,6 +377,7 @@ impl<P: ModelProvider> Agent<P> {
             config,
             executions: Vec::new(),
             tool_history: Vec::new(),
+            pending_unknown: Vec::new(),
             turn_cost: 0,
             next_seq: 0,
         }
@@ -392,6 +401,32 @@ impl<P: ModelProvider> Agent<P> {
     #[must_use]
     pub fn executions(&self) -> &[ExecutionRecord] {
         &self.executions
+    }
+
+    /// Unresolved-effect attribution that survived turn admission.
+    /// Entries leave this set only through [`Agent::reconcile_unknown`]
+    /// (terminal resolution), [`Agent::abandon_pending`], or
+    /// escalation-time capture; a new turn never removes them silently.
+    /// Escalation itself does not rewrite the recorded status (the
+    /// reconcile protocol's no-rewrite-on-escalation contract), so an
+    /// escalated entry stays present until abandoned. Bounded by
+    /// [`MAX_EXECUTIONS_PER_AGENT`].
+    #[must_use]
+    pub fn pending_unknown(&self) -> &[ExecutionRecord] {
+        &self.pending_unknown
+    }
+
+    /// Explicitly abandon one pending unresolved effect by its attribution
+    /// handle. Returns `true` when an entry was present and removed.
+    ///
+    /// Abandonment is deliberate host bookkeeping, not reconciliation: the
+    /// caller asserts the effect needs no further status inspection, and
+    /// the entry stops being queryable afterwards.
+    pub fn abandon_pending(&mut self, execution_id: ExecutionId) -> bool {
+        let before = self.pending_unknown.len();
+        self.pending_unknown
+            .retain(|record| record.execution_id != execution_id);
+        self.pending_unknown.len() != before
     }
 
     /// Mutable provider access (test observability: script remainder, call
@@ -502,9 +537,49 @@ impl<P: ModelProvider> Agent<P> {
         messages.push(Message::user(prompt));
         let context_refs = assembled.context_refs.clone();
 
+        // AI-RUN-001: carry unresolved-effect attribution across the
+        // admission boundary. `executions` still holds the *previous* turn's
+        // records here (it is cleared below), so snapshot its `Unknown`
+        // entries into the bounded pending set first; this turn can no
+        // longer drop the lookup silently.
+        //
+        // The loop mutates the pending set (refresh or push), so it iterates
+        // over an owned snapshot of the previous turn's `Unknown` tail —
+        // never over the pending set itself.
+        let carried: Vec<ExecutionRecord> = self
+            .executions
+            .iter()
+            .filter(|record| matches!(record.status, ToolStatus::Unknown { .. }))
+            .cloned()
+            .collect();
+        for record in &carried {
+            // Refresh-before-push: an execution id the host reuses across
+            // turns keeps exactly one pending entry (no duplicates), and the
+            // latest status/reason wins. This is refresh-only: any id already
+            // present is updated in place, never appended.
+            if let Some(slot) = self
+                .pending_unknown
+                .iter_mut()
+                .find(|pending| pending.execution_id == record.execution_id)
+            {
+                slot.status = record.status.clone();
+                slot.tool.clone_from(&record.tool);
+                continue;
+            }
+            if self.pending_unknown.len() >= MAX_EXECUTIONS_PER_AGENT {
+                return self.fail(AgentError::Tool(ToolError::CallLimitExceeded {
+                    limit: MAX_EXECUTIONS_PER_AGENT,
+                }));
+            }
+            self.pending_unknown.push(record.clone());
+        }
+
         self.tools.begin_turn();
         let tool_names = self.tools.tool_names();
         let mut round = 0;
+        // AI-RUN-001: the per-turn vector is cleared here, but the carry
+        // loop above already snapshotted this turn's `Unknown` entries into
+        // the bounded pending set, so the lookup survives admission.
         self.executions.clear();
         self.tool_history.clear();
         self.turn_cost = 0;
@@ -903,6 +978,22 @@ impl<P: ModelProvider> Agent<P> {
         execution_id: ExecutionId,
         now_ms: u64,
     ) -> ReconcileOutcome {
+        // AI-RUN-001: the pending set outlives turn admission, so resolve
+        // against it first; the current-turn vector is the fallback for
+        // records not yet carried across. Both paths mutate the same
+        // underlying record shape, and resolution removes the pending
+        // entry as well so the two views cannot disagree.
+        if let Some(pending) = self
+            .pending_unknown
+            .iter()
+            .position(|record| record.execution_id == execution_id)
+        {
+            let tool = self.pending_unknown[pending].tool.clone();
+            let outcome = self.reconcile_pending_at(pending, &tool, reconciler, now_ms);
+            if !matches!(outcome, ReconcileOutcome::NoUnknown) {
+                return outcome;
+            }
+        }
         let position = self.executions.iter().position(|record| {
             record.execution_id == execution_id
                 && matches!(record.status, ToolStatus::Unknown { .. })
@@ -911,14 +1002,32 @@ impl<P: ModelProvider> Agent<P> {
             return ReconcileOutcome::NoUnknown;
         };
         let tool = self.executions[index].tool.clone();
+        let outcome = self.reconcile_executions_at(index, &tool, reconciler, execution_id, now_ms);
+        if !matches!(outcome, ReconcileOutcome::NoUnknown) {
+            return outcome;
+        }
+        ReconcileOutcome::NoUnknown
+    }
+
+    /// Run the bounded reconcile schedule against one pending-set entry.
+    /// Resolution (terminal answer) clears the entry; escalation captures
+    /// the pending entry's tool attribution into the report so per-turn
+    /// `dispatched` counts never leak across turns.
+    fn reconcile_pending_at(
+        &mut self,
+        pending: usize,
+        tool: &str,
+        reconciler: &mut dyn UnknownReconciler,
+        now_ms: u64,
+    ) -> ReconcileOutcome {
         let dispatched = self.executions.len();
         let config = self.config.reconcile_config();
         let budget = config.effective_retries();
         let ceiling = config.effective_max_delay_ms();
         let base = config.base_delay_ms.min(ceiling);
-        let current_reason = match &self.executions[index].status {
+        let current_reason = match &self.pending_unknown[pending].status {
             ToolStatus::Unknown { reason } => bound_reason(reason),
-            _ => unreachable!("matched Unknown above"),
+            _ => return ReconcileOutcome::NoUnknown,
         };
         let mut delays_ms: Vec<u64> = Vec::new();
         let mut last_reason = current_reason;
@@ -927,7 +1036,8 @@ impl<P: ModelProvider> Agent<P> {
             let delay = reconcile_delay_ms(attempt, base, ceiling);
             delays_ms.push(delay);
             let _next_retry_ms = now_ms.saturating_add(delay);
-            let answer = reconciler.reconcile(&tool, execution_id, now_ms);
+            let answer =
+                reconciler.reconcile(tool, self.pending_unknown[pending].execution_id, now_ms);
             match answer {
                 ReconcileStatus::Resolved(status) => {
                     let terminal = match &status {
@@ -937,7 +1047,17 @@ impl<P: ModelProvider> Agent<P> {
                         ToolStatus::Unknown { .. } => false,
                     };
                     if terminal {
-                        self.executions[index].status = status.clone();
+                        let resolved_id = self.pending_unknown[pending].execution_id;
+                        self.pending_unknown.remove(pending);
+                        // Keep the current-turn view consistent when it
+                        // still holds the same attribution handle.
+                        if let Some(current) = self
+                            .executions
+                            .iter_mut()
+                            .find(|record| record.execution_id == resolved_id)
+                        {
+                            current.status = status.clone();
+                        }
                         return ReconcileOutcome::Resolved {
                             status,
                             attempts: attempt + 1,
@@ -958,7 +1078,81 @@ impl<P: ModelProvider> Agent<P> {
             attempt += 1;
         }
         let report = UnknownEscalation {
-            tool,
+            tool: tool.to_owned(),
+            reason: last_reason,
+            attempts: delays_ms.len(),
+            dispatched,
+            delays_ms,
+        };
+        self.session.finish(true);
+        ReconcileOutcome::Escalated(report)
+    }
+
+    /// Run the bounded reconcile schedule against one current-turn entry.
+    /// This is the original `reconcile_unknown` body, unchanged apart from
+    /// the pending-entry removal on resolution so both views agree.
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_executions_at(
+        &mut self,
+        index: usize,
+        tool: &str,
+        reconciler: &mut dyn UnknownReconciler,
+        execution_id: ExecutionId,
+        now_ms: u64,
+    ) -> ReconcileOutcome {
+        let dispatched = self.executions.len();
+        let config = self.config.reconcile_config();
+        let budget = config.effective_retries();
+        let ceiling = config.effective_max_delay_ms();
+        let base = config.base_delay_ms.min(ceiling);
+        let current_reason = match &self.executions[index].status {
+            ToolStatus::Unknown { reason } => bound_reason(reason),
+            _ => unreachable!("matched Unknown above"),
+        };
+        let mut delays_ms: Vec<u64> = Vec::new();
+        let mut last_reason = current_reason;
+        let mut attempt = 0;
+        while attempt < budget {
+            let delay = reconcile_delay_ms(attempt, base, ceiling);
+            delays_ms.push(delay);
+            let _next_retry_ms = now_ms.saturating_add(delay);
+            let answer = reconciler.reconcile(tool, execution_id, now_ms);
+            match answer {
+                ReconcileStatus::Resolved(status) => {
+                    let terminal = match &status {
+                        ToolStatus::Success
+                        | ToolStatus::Failed { .. }
+                        | ToolStatus::Denied { .. } => true,
+                        ToolStatus::Unknown { .. } => false,
+                    };
+                    if terminal {
+                        self.executions[index].status = status.clone();
+                        // The pending set may hold the same attribution
+                        // handle (carried across admission); resolution
+                        // clears it there too so both views agree.
+                        self.pending_unknown
+                            .retain(|record| record.execution_id != execution_id);
+                        return ReconcileOutcome::Resolved {
+                            status,
+                            attempts: attempt + 1,
+                            delays_ms,
+                        };
+                    }
+                    match status {
+                        ToolStatus::Unknown { reason } => {
+                            last_reason = bound_reason(&reason);
+                        }
+                        _ => unreachable!("non-terminal status is Unknown"),
+                    }
+                }
+                ReconcileStatus::Pending { reason } => {
+                    last_reason = bound_reason(&reason);
+                }
+            }
+            attempt += 1;
+        }
+        let report = UnknownEscalation {
+            tool: tool.to_owned(),
             reason: last_reason,
             attempts: delays_ms.len(),
             dispatched,
