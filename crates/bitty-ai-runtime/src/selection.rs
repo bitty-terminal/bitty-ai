@@ -794,6 +794,9 @@ pub enum FallbackDirective {
 ///   [`InvalidProviderId`](ProviderError::InvalidProviderId),
 ///   [`InvalidSampling`](ProviderError::InvalidSampling) (caller-declared
 ///   sampling contract),
+///   [`UnsupportedSampling`](ProviderError::UnsupportedSampling) (the
+///   selected backend cannot carry a declared field; reconcile the
+///   declaration or backend choice rather than spraying),
 ///   [`Auth`](ProviderError::Auth) (reconcile credentials; never spray),
 ///   [`CapabilityMismatch`](ProviderError::CapabilityMismatch) (routing bug).
 /// - Stop with reconcile (effect uncertain; blind fallback may double-apply):
@@ -810,6 +813,7 @@ pub fn fallback_directive(error: &ProviderError) -> FallbackDirective {
         | ProviderError::TimeoutTooLarge { .. }
         | ProviderError::InvalidProviderId { .. }
         | ProviderError::InvalidSampling
+        | ProviderError::UnsupportedSampling { .. }
         | ProviderError::Auth { .. }
         | ProviderError::CapabilityMismatch { .. }
         | ProviderError::Unknown { .. } => FallbackDirective::Stop,
@@ -1469,6 +1473,7 @@ mod tests {
                 id: "BAD".to_owned(),
             },
             ProviderError::InvalidSampling,
+            ProviderError::UnsupportedSampling { field: "top_k" },
             ProviderError::Auth {
                 provider: "p".to_owned(),
                 reason: "revoked".to_owned(),
