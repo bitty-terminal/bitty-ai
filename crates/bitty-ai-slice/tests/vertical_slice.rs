@@ -38,6 +38,10 @@ use bitty_ipc::scope::{Scope, ScopeSet};
 const NOW_MS: u64 = 1_000;
 const TTL_MS: u64 = 60_000;
 const ANSWER: &str = "The last command printed `hello` with a zero exit status.";
+/// Hard bus ceiling mirrored from the `TB-6` contract (`tool.rs`), asserted
+/// here as a literal (not imported) because the constant is intentionally
+/// crate-private to the bus boundary.
+const BUS_CALL_CAP: usize = 8;
 
 struct LoopbackHost {
     snapshot: Vec<u8>,
@@ -433,7 +437,7 @@ fn unknown_tool_fails_closed_before_dispatch() {
         arguments: br#"{}"#.to_vec(),
     };
     let error = bus
-        .precheck(std::slice::from_ref(&call), &auth_base())
+        .precheck(std::slice::from_ref(&call), &auth_base(), BUS_CALL_CAP)
         .expect_err("unknown tool must fail closed");
     assert_eq!(
         error,
@@ -465,7 +469,7 @@ fn write_tool_is_denied_by_default() {
         arguments: br#"{}"#.to_vec(),
     };
     let error = bus
-        .precheck(std::slice::from_ref(&call), &auth_base())
+        .precheck(std::slice::from_ref(&call), &auth_base(), BUS_CALL_CAP)
         .expect_err("write tool must be denied by default");
     assert!(matches!(error, ToolError::Denied { .. }), "got {error:?}");
 }
