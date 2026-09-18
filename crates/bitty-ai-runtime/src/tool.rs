@@ -27,15 +27,17 @@ pub const MAX_TOOL_DESCRIPTION_LEN: usize = 512;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 16 * 1024;
 /// Maximum registered tools per session (`TB-2`).
 pub const MAX_TOOLS_PER_SESSION: usize = 32;
-/// Maximum tool calls per assistant turn (`TB-6`).
+/// Maximum tool calls per logical assistant turn (`TB-6`).
 ///
 /// Hard bus ceiling: the effective per-turn cap is
 /// `min(crate::agent::AgentConfig::max_tool_calls_per_turn,
-/// MAX_TOOL_CALLS_PER_TURN)`. Raising the config above this constant does
-/// not relax the bus: both [`ToolBus::precheck`] (batch gate) and
-/// [`ToolBus::dispatch`] (per-call counter) still clamp at this constant,
-/// so a config of 16 still fails past 8. Only tighter, never looser
-/// (fail-closed).
+/// MAX_TOOL_CALLS_PER_TURN)`, accounted cumulatively across the turn's
+/// provider rounds. Raising the config above this constant does not relax
+/// the bus: [`ToolBus::precheck`] admits a whole batch only when it fits
+/// both the remaining configured and the remaining hard allowance, and
+/// [`ToolBus::dispatch`] keeps its per-call counter as defense in depth, so
+/// a config of 16 still fails past 8 cumulative calls. Only tighter, never
+/// looser (fail-closed).
 pub const MAX_TOOL_CALLS_PER_TURN: usize = 8;
 /// Maximum tool argument bytes (`TB-3`).
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 16 * 1024;
@@ -727,12 +729,16 @@ impl ToolBus {
         self
     }
 
-    /// Reset the per-turn call counter at the start of each assistant turn.
+    /// Reset the per-turn call counter at the start of each logical
+    /// assistant turn. The counter is the single accounting scope for both
+    /// the configured and the hard call allowance; it stays cumulative
+    /// across every provider round of the turn.
     pub fn begin_turn(&mut self) {
         self.calls_this_turn = 0;
     }
 
-    /// Calls dispatched in the current turn.
+    /// Calls dispatched in the current logical turn (cumulative across its
+    /// provider rounds).
     #[must_use]
     pub fn calls_this_turn(&self) -> usize {
         self.calls_this_turn
@@ -787,25 +793,40 @@ impl ToolBus {
         }
     }
 
-    /// Validate and authorize every call without dispatching any
-    /// (`FS-AI1` transactional denial: a refused turn dispatches nothing).
+    /// Validate and authorize every call without dispatching any, enforcing
+    /// whole-batch admission against the logical-turn budget (`FS-AI1`).
     ///
-    /// Enforces the constant side of the effective cap
-    /// `min(crate::agent::AgentConfig::max_tool_calls_per_turn,
-    /// MAX_TOOL_CALLS_PER_TURN)`: even when the host raises the config, a
-    /// batch larger than [`MAX_TOOL_CALLS_PER_TURN`] still fails here with
-    /// [`ToolError::CallLimitExceeded`].
+    /// The accounting scope is the bus's per-turn counter
+    /// ([`ToolCall`]s dispatched since [`ToolBus::begin_turn`], reported by
+    /// [`ToolBus::calls_this_turn`]): it is cumulative across every provider
+    /// round of one logical assistant turn. A batch is admitted only when it
+    /// fits the remaining effective allowance
+    ///
+    /// ```text
+    /// remaining = min(configured_limit, MAX_TOOL_CALLS_PER_TURN) - calls_this_turn
+    /// ```
+    ///
+    /// and is rejected whole when it does not (`CallLimitExceeded` reporting
+    /// the effective limit), with nothing dispatched and the counter
+    /// unchanged. Rejection is admission-only, never rollback: effects from
+    /// earlier rounds stay recorded.
     ///
     /// # Errors
     ///
     /// Returns the first [`ToolError`] encountered; no call is dispatched.
-    pub fn precheck(&self, calls: &[ToolCall], base: &AuthBase) -> Result<(), ToolError> {
+    pub fn precheck(
+        &self,
+        calls: &[ToolCall],
+        base: &AuthBase,
+        configured_limit: usize,
+    ) -> Result<(), ToolError> {
         for call in calls {
             self.authorize_call(base, call)?;
         }
-        if calls.len() > MAX_TOOL_CALLS_PER_TURN {
+        let effective_limit = configured_limit.min(MAX_TOOL_CALLS_PER_TURN);
+        if calls.len().saturating_add(self.calls_this_turn) > effective_limit {
             return Err(ToolError::CallLimitExceeded {
-                limit: MAX_TOOL_CALLS_PER_TURN,
+                limit: effective_limit,
             });
         }
         Ok(())
@@ -814,11 +835,11 @@ impl ToolBus {
     /// Validate, re-authorize at this dispatch boundary (`PP-6`), and
     /// dispatch one call through `executor`.
     ///
-    /// Enforces the constant side of the effective cap
-    /// `min(crate::agent::AgentConfig::max_tool_calls_per_turn,
-    /// MAX_TOOL_CALLS_PER_TURN)`: the per-turn counter still stops at
-    /// [`MAX_TOOL_CALLS_PER_TURN`] even when the host raises the config,
-    /// failing with [`ToolError::CallLimitExceeded`].
+    /// Defense in depth behind [`ToolBus::precheck`]: the cumulative
+    /// per-turn counter stops at the hard [`MAX_TOOL_CALLS_PER_TURN`]
+    /// ceiling even when a caller bypasses batch admission (through
+    /// `run_turn` the whole-batch gate fires first), failing with
+    /// [`ToolError::CallLimitExceeded`].
     ///
     /// # Errors
     ///
@@ -1088,8 +1109,12 @@ mod tests {
             arguments: br#"{}"#.to_vec(),
         };
         assert_eq!(
-            bus.precheck(std::slice::from_ref(&call), &base())
-                .expect_err("dotted name must fail"),
+            bus.precheck(
+                std::slice::from_ref(&call),
+                &base(),
+                MAX_TOOL_CALLS_PER_TURN
+            )
+            .expect_err("dotted name must fail"),
             ToolError::InvalidName {
                 name: "terminal.read_zone".to_owned(),
             }
@@ -1112,12 +1137,88 @@ mod tests {
         };
         let burst = vec![call; MAX_TOOL_CALLS_PER_TURN + 1];
         assert_eq!(
-            bus.precheck(&burst, &base()).expect_err("burst must fail"),
+            bus.precheck(&burst, &base(), MAX_TOOL_CALLS_PER_TURN)
+                .expect_err("burst must fail"),
             ToolError::CallLimitExceeded {
                 limit: MAX_TOOL_CALLS_PER_TURN,
             }
         );
         assert_eq!(bus.calls_this_turn(), 0);
+    }
+
+    #[test]
+    fn precheck_rejects_a_batch_exceeding_remaining_allowance() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        // Cumulative admission: after seven dispatches in this logical turn,
+        // a two-call batch cannot fit the remaining hard allowance (one),
+        // even though the batch itself is under `MAX_TOOL_CALLS_PER_TURN`
+        // and a tighter configured limit (four) is already spent. The batch
+        // is refused whole with nothing dispatched and the counter unchanged.
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        for _ in 0..7 {
+            executor.push_success("ok", b"data".to_vec());
+        }
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        for _ in 0..7 {
+            bus.dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+                .expect("within the hard cap");
+        }
+        let batch = vec![call.clone(), call];
+        assert_eq!(
+            bus.precheck(&batch, &base(), 4)
+                .expect_err("batch beyond the remaining configured allowance must fail"),
+            ToolError::CallLimitExceeded { limit: 4 }
+        );
+        assert_eq!(bus.calls_this_turn(), 7);
+        assert_eq!(executor.calls().len(), 7);
+    }
+
+    #[test]
+    fn precheck_rejects_a_later_batch_beyond_remaining_hard_allowance() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        // A configured limit at the hard ceiling (8): after six dispatches,
+        // a three-call batch exceeds the remaining hard allowance of two.
+        // The rejection is whole-batch and admission-only: earlier effects
+        // stay recorded and the counter is unchanged.
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        for _ in 0..6 {
+            executor.push_success("ok", b"data".to_vec());
+        }
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        for _ in 0..6 {
+            bus.dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+                .expect("within the hard cap");
+        }
+        let batch = vec![call.clone(), call.clone(), call];
+        assert_eq!(
+            bus.precheck(&batch, &base(), MAX_TOOL_CALLS_PER_TURN)
+                .expect_err("batch beyond the remaining hard allowance must fail"),
+            ToolError::CallLimitExceeded {
+                limit: MAX_TOOL_CALLS_PER_TURN,
+            }
+        );
+        assert_eq!(bus.calls_this_turn(), 6);
+        assert_eq!(executor.calls().len(), 6);
     }
 
     #[test]
@@ -1128,7 +1229,11 @@ mod tests {
             arguments: br#"{}"#.to_vec(),
         };
         assert!(matches!(
-            bus.precheck(std::slice::from_ref(&call), &base()),
+            bus.precheck(
+                std::slice::from_ref(&call),
+                &base(),
+                MAX_TOOL_CALLS_PER_TURN
+            ),
             Err(ToolError::Denied { .. })
         ));
     }
@@ -1147,7 +1252,11 @@ mod tests {
             arguments: br#"{}"#.to_vec(),
         };
         assert!(matches!(
-            bus.precheck(std::slice::from_ref(&call), &base()),
+            bus.precheck(
+                std::slice::from_ref(&call),
+                &base(),
+                MAX_TOOL_CALLS_PER_TURN
+            ),
             Err(ToolError::Denied { .. })
         ));
     }
@@ -1214,8 +1323,12 @@ mod tests {
             name: "workspace_read".to_owned(),
             arguments: br#"{}"#.to_vec(),
         };
-        bus.precheck(std::slice::from_ref(&call), &base())
-            .expect("validation pass allows");
+        bus.precheck(
+            std::slice::from_ref(&call),
+            &base(),
+            MAX_TOOL_CALLS_PER_TURN,
+        )
+        .expect("validation pass allows");
         let mut executor = FakeToolExecutor::new();
         let mut ids = crate::session::IdIssuer::default();
         let error = bus
