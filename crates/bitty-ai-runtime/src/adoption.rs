@@ -62,7 +62,11 @@ use crate::tool::ToolStatus;
 
 /// Hard cap on survivors per adoption claim. Bounds supervisor work even
 /// when a caller ships a larger crash manifest; the check refuses over-bound
-/// sets fail-closed before considering any content.
+/// sets fail-closed before considering any content. The same bound covers
+/// every collection a claim carries — survivor ids, carried evidence, and
+/// the auxiliary `Unknown` disposition list, which cannot legitimately
+/// exceed the survivor set — and is the capacity bound for the check's
+/// scratch vectors.
 pub const MAX_ADOPTION_SURVIVORS: usize = 32;
 
 /// Verified disposition of one carried `Unknown` effect: the pre-crash
@@ -163,8 +167,10 @@ pub enum AdoptionRefusal {
         /// Offending execution.
         execution_id: ExecutionId,
     },
-    /// The survivor set exceeds [`MAX_ADOPTION_SURVIVORS`]. Checked before
-    /// any content so oversized manifests bound supervisor work.
+    /// A claim collection exceeds [`MAX_ADOPTION_SURVIVORS`]: the survivor
+    /// set, the carried evidence, or the named `Unknown` dispositions.
+    /// Every count is checked before any content or allocation so oversized
+    /// manifests bound supervisor work.
     TooManySurvivors {
         /// Bound.
         limit: usize,
@@ -214,10 +220,9 @@ impl Display for AdoptionRefusal {
             Self::DuplicateEffect { execution_id } => {
                 write!(f, "adoption refused: duplicate effect {}", execution_id.0)
             }
-            Self::TooManySurvivors { limit, actual } => write!(
-                f,
-                "adoption refused: {actual} survivors exceed limit {limit}"
-            ),
+            Self::TooManySurvivors { limit, actual } => {
+                write!(f, "adoption refused: {actual} entries exceed limit {limit}")
+            }
             Self::StaleEpoch {
                 claim_epoch,
                 current_epoch,
@@ -297,8 +302,9 @@ impl AdoptedHistory {
 ///
 /// The check performs no effect: it takes no executor, runs no provider
 /// round, issues no reconcile query, and reads no clock. Bounds are checked
-/// before content: over-bound survivor sets refuse without inspecting any
-/// record.
+/// before content: every collection count (survivor ids, carried evidence,
+/// named `Unknown` dispositions) is validated before any content is
+/// inspected or any scratch vector is allocated.
 ///
 /// # Errors
 ///
@@ -311,11 +317,15 @@ pub fn check_adoption(
     evidence: &[ExecutionRecord],
     current_epoch: u64,
 ) -> Result<AdoptedHistory, AdoptionRefusal> {
-    if claim.survivor_ids.len() > MAX_ADOPTION_SURVIVORS || evidence.len() > MAX_ADOPTION_SURVIVORS
-    {
+    let actual = claim
+        .survivor_ids
+        .len()
+        .max(evidence.len())
+        .max(claim.unknown_effects.len());
+    if actual > MAX_ADOPTION_SURVIVORS {
         return Err(AdoptionRefusal::TooManySurvivors {
             limit: MAX_ADOPTION_SURVIVORS,
-            actual: claim.survivor_ids.len().max(evidence.len()),
+            actual,
         });
     }
     if claim.fence_token != current_epoch {
@@ -332,7 +342,10 @@ pub fn check_adoption(
             state: claim.prior_session_state,
         });
     }
-    let mut seen_ids: Vec<ExecutionId> = Vec::with_capacity(evidence.len());
+    // Every count above is validated against the survivor bound, so scratch
+    // capacity is derived from that bound (never from raw untrusted lengths)
+    // and stays bounded even if a future edit reorders this check.
+    let mut seen_ids: Vec<ExecutionId> = Vec::with_capacity(MAX_ADOPTION_SURVIVORS);
     for record in evidence {
         if seen_ids.contains(&record.execution_id) {
             return Err(AdoptionRefusal::DuplicateEffect {
@@ -341,14 +354,14 @@ pub fn check_adoption(
         }
         seen_ids.push(record.execution_id);
     }
-    let mut seen_claims: Vec<ExecutionId> = Vec::with_capacity(claim.survivor_ids.len());
+    let mut seen_claims: Vec<ExecutionId> = Vec::with_capacity(MAX_ADOPTION_SURVIVORS);
     for id in &claim.survivor_ids {
         if seen_claims.contains(id) {
             return Err(AdoptionRefusal::DuplicateEffect { execution_id: *id });
         }
         seen_claims.push(*id);
     }
-    let mut seen_unknowns: Vec<ExecutionId> = Vec::with_capacity(claim.unknown_effects.len());
+    let mut seen_unknowns: Vec<ExecutionId> = Vec::with_capacity(MAX_ADOPTION_SURVIVORS);
     for named in &claim.unknown_effects {
         if seen_unknowns.contains(&named.execution_id) {
             return Err(AdoptionRefusal::DispositionMismatch {
@@ -395,7 +408,7 @@ pub fn check_adoption(
             }
         }
     }
-    let mut effects: Vec<AdoptedEffect> = Vec::with_capacity(claim.survivor_ids.len());
+    let mut effects: Vec<AdoptedEffect> = Vec::with_capacity(MAX_ADOPTION_SURVIVORS);
     for id in &claim.survivor_ids {
         let Some(record) = evidence.iter().find(|record| record.execution_id == *id) else {
             return Err(AdoptionRefusal::MissingEvidence { execution_id: *id });
@@ -501,6 +514,110 @@ mod tests {
         let refusal = check_adoption(&claim(SessionState::Active, &survivors, &[], 0), &[], 1)
             .expect_err("over-bound set must refuse");
         assert!(matches!(refusal, AdoptionRefusal::TooManySurvivors { .. }));
+    }
+
+    /// Boundary table over each collection count independently: the bound
+    /// admits exactly `MAX_ADOPTION_SURVIVORS` entries and refuses the next
+    /// one for survivor ids, carried evidence, and the auxiliary `Unknown`
+    /// disposition list. Refusals carry the observed count and the limit;
+    /// content is never processed before the size gate.
+    #[test]
+    fn every_collection_count_refuses_over_bound_before_content() {
+        let count_cases: [(usize, bool); 2] = [
+            (MAX_ADOPTION_SURVIVORS, false),
+            (MAX_ADOPTION_SURVIVORS + 1, true),
+        ];
+
+        for (count, over_bound) in count_cases {
+            let survivors: Vec<u64> = (1..=count as u64).collect();
+            let evidence: Vec<ExecutionRecord> = (1..=count as u64)
+                .map(|id| record(id, "workspace_read", ToolStatus::Success))
+                .collect();
+
+            let refusal = check_adoption(
+                &claim(SessionState::Failed, &survivors, &[], 7),
+                &evidence,
+                7,
+            );
+            if over_bound {
+                let refusal = refusal.expect_err("over-bound survivors must refuse");
+                assert!(matches!(
+                    refusal,
+                    AdoptionRefusal::TooManySurvivors { limit, actual }
+                        if limit == MAX_ADOPTION_SURVIVORS && actual == count
+                ));
+            } else {
+                assert!(refusal.is_ok(), "at-bound survivors must adopt");
+            }
+
+            // Survivor ids at bound, evidence over bound: the evidence count
+            // alone trips the gate.
+            let refusal = check_adoption(
+                &claim(
+                    SessionState::Failed,
+                    &survivors[..survivors.len() - 1],
+                    &[],
+                    7,
+                ),
+                &evidence,
+                7,
+            );
+            if over_bound {
+                assert!(matches!(
+                    refusal,
+                    Err(AdoptionRefusal::TooManySurvivors { .. })
+                ));
+            }
+
+            // Auxiliary disposition list over bound with a tiny survivor set
+            // and no matching content: the count gate fires before the
+            // membership checks that would otherwise reject these entries.
+            let unknowns: Vec<(u64, UnknownDisposition)> = (1..=count as u64)
+                .map(|id| (1_000 + id, UnknownDisposition::Escalated))
+                .collect();
+            let refusal = check_adoption(
+                &claim(
+                    SessionState::Failed,
+                    &survivors[..survivors.len().saturating_sub(1)],
+                    &unknowns,
+                    7,
+                ),
+                &[],
+                7,
+            );
+            if over_bound {
+                let refusal = refusal.expect_err("over-bound disposition list must refuse");
+                assert!(matches!(
+                    refusal,
+                    AdoptionRefusal::TooManySurvivors { limit, actual }
+                        if limit == MAX_ADOPTION_SURVIVORS && actual == count
+                ));
+            } else {
+                assert!(
+                    matches!(refusal, Err(AdoptionRefusal::MissingEvidence { .. })),
+                    "at-bound disposition list passes the size gate into content checks"
+                );
+            }
+        }
+    }
+
+    /// The size gate outranks every content/state check: an over-bound
+    /// auxiliary list refuses as `TooManySurvivors` even for a live-session
+    /// claim with a stale epoch, proving no content or state inspection
+    /// happens first.
+    #[test]
+    fn over_bound_dispositions_refuse_before_epoch_and_state_checks() {
+        let unknowns: Vec<(u64, UnknownDisposition)> = (1..=MAX_ADOPTION_SURVIVORS as u64 + 1)
+            .map(|id| (id, UnknownDisposition::Escalated))
+            .collect();
+        let refusal = check_adoption(&claim(SessionState::Active, &[1], &unknowns, 0), &[], 99)
+            .expect_err("over-bound disposition list must refuse");
+        assert!(matches!(
+            refusal,
+            AdoptionRefusal::TooManySurvivors { limit, actual }
+                if limit == MAX_ADOPTION_SURVIVORS
+                    && actual == MAX_ADOPTION_SURVIVORS + 1
+        ));
     }
 
     #[test]
