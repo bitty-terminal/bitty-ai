@@ -1,10 +1,12 @@
 //! Deterministic single-agent turn loop.
 //!
 //! The loop drives one agent at one tier: assemble context (L0 + L1),
-//! request a provider turn, stream text fragments, validate and authorize
-//! the requested tool calls as a batch (transactional denial per turn), and
-//! dispatch each through the Tool Bus with cancellation checked before every
-//! dispatch, between stream chunks, and between rounds (`MP-7`).
+//! request a provider turn, stream text fragments, admit the requested tool
+//! calls as a whole batch against the logical-turn call budget
+//! (all-or-nothing admission; a batch that does not fit the remaining
+//! configured or hard allowance dispatches nothing), and dispatch each
+//! through the Tool Bus with cancellation checked before every dispatch,
+//! between stream chunks, and between rounds (`MP-7`).
 //!
 //! Outcomes are structured: `Completed`, `Failed` with a typed error,
 //! `Canceled` with reconciled effect counts, or `Unknown` when an effect may
@@ -61,7 +63,12 @@ pub const MAX_EXECUTIONS_PER_AGENT: usize = 32;
 pub struct AgentConfig {
     /// Maximum provider rounds per turn.
     pub max_rounds: usize,
-    /// Maximum tool calls accepted per assistant turn (`TB-6`).
+    /// Maximum tool calls accepted per logical assistant turn (`TB-6`),
+    /// accounted cumulatively across the turn's provider rounds. The
+    /// effective allowance is
+    /// `min(AgentConfig::max_tool_calls_per_turn, MAX_TOOL_CALLS_PER_TURN)`;
+    /// the bus admits a whole batch only when it fits the remaining
+    /// allowance, and the per-call bus counter stays as defense in depth.
     pub max_tool_calls_per_turn: usize,
     /// Context byte budget for turn assembly (`CP-5` candidate default).
     pub context_budget_bytes: usize,
@@ -641,14 +648,6 @@ impl<P: ModelProvider> Agent<P> {
                 self.session.finish(false);
                 return ExecOutcome::Completed { text: turn.text };
             }
-            if turn.tool_calls.len() > self.config.max_tool_calls_per_turn {
-                return self.fail(
-                    ToolError::CallLimitExceeded {
-                        limit: self.config.max_tool_calls_per_turn,
-                    }
-                    .into(),
-                );
-            }
             let calls: Vec<crate::tool::ToolCall> = turn
                 .tool_calls
                 .iter()
@@ -658,10 +657,18 @@ impl<P: ModelProvider> Agent<P> {
                 })
                 .collect();
             // Transactional gate: authorize everything before dispatching
-            // anything (FS-AI1). Fresh base per round so a rotation that
-            // landed between rounds is already visible here.
+            // anything and admit the whole batch against the logical-turn
+            // budget (`FS-AI1`). The accounting scope is the bus counter,
+            // cumulative across the turn's rounds: a later batch is rejected
+            // whole when it does not fit the remaining configured *or* hard
+            // allowance, with nothing dispatched and earlier effects kept.
+            // Fresh base per round so a rotation that landed between rounds
+            // is already visible here.
             let precheck_base = self.auth_base();
-            if let Err(error) = self.tools.precheck(&calls, &precheck_base) {
+            if let Err(error) =
+                self.tools
+                    .precheck(&calls, &precheck_base, self.config.max_tool_calls_per_turn)
+            {
                 return self.fail(error.into());
             }
             messages.push(Message::assistant(turn.text.clone()));
