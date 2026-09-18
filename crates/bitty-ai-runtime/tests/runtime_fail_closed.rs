@@ -787,9 +787,9 @@ fn context_request_resolves_token_first_budget() {
 #[test]
 fn relaxed_config_still_clamped_by_bus_constant() {
     // P2-5 (AI-0056): effective cap = min(config, MAX_TOOL_CALLS_PER_TURN).
-    // A config of 16 does not relax the hard bus ceiling of 8: nine calls
-    // pass the agent-level config gate but still fail in `ToolBus::precheck`
-    // with limit 8 and dispatch nothing.
+    // A config of 16 does not relax the hard bus ceiling of 8: nine calls in
+    // one batch fail whole-batch admission in `ToolBus::precheck` with
+    // limit 8 and dispatch nothing.
     let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
     provider.push_turn(ProviderTurn {
         text: "burst".to_owned(),

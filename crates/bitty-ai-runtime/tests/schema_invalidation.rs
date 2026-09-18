@@ -49,6 +49,10 @@ use bitty_ai_runtime::{
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
+/// Hard bus ceiling mirrored from the `TB-6` contract (`tool.rs`), asserted
+/// here as a literal (not imported) because the constant is intentionally
+/// crate-private to the bus boundary.
+const BUS_CALL_CAP: usize = 8;
 const TOOL_NAME: &str = "workspace_read";
 const SCHEMA_N: &[u8] = br#"{"type":"object"}"#;
 const SCHEMA_N_PLUS_1: &[u8] = br#"{"type":"object","properties":{"path":{"type":"string"}}}"#;
@@ -195,7 +199,7 @@ fn authorize_then_replace_then_dispatch_binds_original_schema() {
     let recorder = BindingRecorder::default();
     let mut bus = ToolBus::new(registry).with_authorizer(recorder.clone());
     let call = read_call();
-    bus.precheck(std::slice::from_ref(&call), &base())
+    bus.precheck(std::slice::from_ref(&call), &base(), BUS_CALL_CAP)
         .expect("precheck authorizes against N");
     let mut executor = FakeToolExecutor::new();
     executor.push_success("read ok", b"ok".to_vec());
@@ -232,7 +236,7 @@ fn inflight_call_binds_the_spec_authorized_at_precheck() {
     let recorder = BindingRecorder::default();
     let mut bus = ToolBus::new(registry).with_authorizer(recorder.clone());
     let call = read_call();
-    bus.precheck(std::slice::from_ref(&call), &base())
+    bus.precheck(std::slice::from_ref(&call), &base(), BUS_CALL_CAP)
         .expect("precheck authorizes the call");
     let mut executor = FakeToolExecutor::new();
     executor.push_success("read ok", b"ok".to_vec());
