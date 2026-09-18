@@ -3027,6 +3027,109 @@ mod tests {
     }
 
     #[test]
+    fn five_layer_directive_precedence_and_override_audit_are_order_invariant() {
+        let layers_forward = vec![
+            full_layer(
+                PromptLayer::CoreContract,
+                "core",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "core_formal")],
+            ),
+            full_layer(
+                PromptLayer::User,
+                "user",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "user_concise")],
+            ),
+            full_layer(
+                PromptLayer::Project,
+                "project",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "project_casual")],
+            ),
+            full_layer(
+                PromptLayer::SkillsProfile,
+                "skills",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "skills_terse")],
+            ),
+            full_layer(
+                PromptLayer::RuntimeTurn,
+                "turn",
+                None,
+                vec![],
+                None,
+                None,
+                vec![("tone", "turn_verbose")],
+            ),
+        ];
+        let layers_reverse: Vec<LayerInput> = layers_forward.clone().into_iter().rev().collect();
+        let forward_assembled =
+            assemble(&snapshot_with(layers_forward)).expect("forward assembles");
+        let reverse_assembled =
+            assemble(&snapshot_with(layers_reverse)).expect("reverse assembles");
+
+        // Input order does not change the result
+        assert_eq!(forward_assembled, reverse_assembled);
+
+        // Core contract value wins
+        assert_eq!(
+            forward_assembled.effective_directives,
+            vec![Directive {
+                key: "tone".to_owned(),
+                value: "core_formal".to_owned(),
+            }]
+        );
+
+        // Four accurate override records emitted in canonical order
+        assert_eq!(
+            forward_assembled.merge_overrides,
+            vec![
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "core_formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "user_concise".to_owned(),
+                    overridden_layer: PromptLayer::User,
+                },
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "core_formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "project_casual".to_owned(),
+                    overridden_layer: PromptLayer::Project,
+                },
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "core_formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "skills_terse".to_owned(),
+                    overridden_layer: PromptLayer::SkillsProfile,
+                },
+                DirectiveOverride {
+                    key: "tone".to_owned(),
+                    winning_value: "core_formal".to_owned(),
+                    winning_layer: PromptLayer::CoreContract,
+                    overridden_value: "turn_verbose".to_owned(),
+                    overridden_layer: PromptLayer::RuntimeTurn,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn same_directive_same_value_merges() {
         let snapshot = snapshot_with(vec![
             full_layer(
