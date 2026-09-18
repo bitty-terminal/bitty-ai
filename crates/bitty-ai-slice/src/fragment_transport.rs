@@ -50,6 +50,12 @@
 //!    [`FragmentTransportError::InconsistentPartCount`], kept distinct from the
 //!    whole-input [`FragmentTransportError::PartCountMismatch`] so both
 //!    failure modes stay unambiguous.
+//! 9. Both [`reassemble`] and [`reassemble_expected`] enforce the aggregate
+//!    runtime bound [`MAX_FRAGMENT_BYTES`] (64 KiB) before allocating output:
+//!    all parts are validated and their text lengths summed; if `total_bytes`
+//!    exceeds `MAX_FRAGMENT_BYTES`, reassembly fails closed with
+//!    [`FragmentTransportError::OversizedFragment`] without allocating partial
+//!    output.
 //!
 //! # Why this lives in the slice, not in the runtime
 //!
@@ -137,7 +143,8 @@ pub enum FragmentTransportError {
     Runtime(String),
     /// Fragment bytes are not valid UTF-8 and cannot map to transport text.
     NonUtf8,
-    /// A raw fragment exceeds the runtime [`MAX_FRAGMENT_BYTES`] bound.
+    /// A raw fragment or aggregate reassembled fragment exceeds the runtime
+    /// [`MAX_FRAGMENT_BYTES`] bound.
     OversizedFragment {
         /// Observed bytes.
         actual: usize,
@@ -432,9 +439,10 @@ pub fn pre_split_chunk(
 /// 0`, and every part must carry the first part's
 /// `(terminal_id, generation, source_seq)` identity with a transport `seq`
 /// equal to `first_seq + part_index`. Every part must also fit the transport
-/// ceiling. A reordered part is refused instead of silently reassembled.
-/// Successful output is byte-identical to the source fragment when the parts
-/// came from [`pre_split_fragment`].
+/// ceiling, and the aggregate reconstructed bytes must not exceed
+/// [`MAX_FRAGMENT_BYTES`]. A reordered part is refused instead of silently
+/// reassembled. Successful output is byte-identical to the source fragment when
+/// the parts came from [`pre_split_fragment`].
 ///
 /// This entry point anchors identity on the first part, so a wholly foreign but
 /// internally consistent part set is still accepted. Callers that already know
@@ -469,11 +477,16 @@ pub fn reassemble(parts: &[TransportPart]) -> Result<String, FragmentTransportEr
 /// different `part_count` than the first is
 /// [`FragmentTransportError::InconsistentPartCount`].
 ///
+/// All parts are validated and their total text length is checked against
+/// [`MAX_FRAGMENT_BYTES`] before any output is allocated. If the aggregate
+/// length exceeds [`MAX_FRAGMENT_BYTES`], returns
+/// [`FragmentTransportError::OversizedFragment`].
+///
 /// # Errors
 ///
 /// Returns a [`FragmentTransportError`] for empty, mismatched, out-of-order,
-/// foreign-identity, non-contiguous-`seq`, or over-ceiling input. A part set
-/// that does not match `expected` returns
+/// foreign-identity, non-contiguous-`seq`, over-ceiling part, or aggregate
+/// oversized input. A part set that does not match `expected` returns
 /// [`FragmentTransportError::IdentityMismatch`].
 pub fn reassemble_expected(
     parts: &[TransportPart],
@@ -495,7 +508,7 @@ pub fn reassemble_expected(
             actual: parts.len(),
         });
     }
-    let mut out = String::new();
+    let mut total_bytes = 0_usize;
     for (position, part) in parts.iter().enumerate() {
         let expected_index = u32::try_from(position)
             .map_err(|_| FragmentTransportError::TooManyParts { parts: parts.len() })?;
@@ -550,6 +563,16 @@ pub fn reassemble_expected(
                 limit: MAX_FRAGMENT_TEXT_BYTES,
             });
         }
+        total_bytes = total_bytes.saturating_add(part.data.text.len());
+    }
+    if total_bytes > MAX_FRAGMENT_BYTES {
+        return Err(FragmentTransportError::OversizedFragment {
+            actual: total_bytes,
+            limit: MAX_FRAGMENT_BYTES,
+        });
+    }
+    let mut out = String::with_capacity(total_bytes);
+    for part in parts {
         out.push_str(&part.data.text);
     }
     Ok(out)
