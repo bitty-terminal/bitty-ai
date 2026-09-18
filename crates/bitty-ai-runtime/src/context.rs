@@ -607,19 +607,33 @@ pub struct AssembledContext {
 /// reject records outside the request generation (fail closed, rotation
 /// invalidates prior generations); drop records superseded by trusted
 /// host-policy links (untrusted-surface `supersedes` links are ignored as
-/// inert data); collapse full-content
+/// inert data);
+/// collapse full-content
 /// `(provider, owner, summary, canonical body)` duplicates with a
 /// deny-by-default survivor rule (untrusted duplicates never displace a
-/// trusted original); externalize inline bodies over
-/// [`EXTERNALIZE_THRESHOLD_BYTES`]; then greedily include records
-/// highest-effective-priority-first (untrusted clamped to at most
-/// [`ContextPriority::Normal`]) while the budget holds, omitting the rest
-/// with counted truncation. Output order follows the caller order.
+/// trusted original); stage large inline bodies over
+/// [`EXTERNALIZE_THRESHOLD_BYTES`] into provisional externalized references;
+/// then greedily include records highest-effective-priority-first
+/// (untrusted clamped to at most [`ContextPriority::Normal`]) while the
+/// budget holds, omitting the rest with counted truncation. Output order
+/// follows the caller order.
 ///
-/// Atomicity: externalization is a two-phase commit. Large bodies stage into
-/// a local buffer first with predicted references; the caller `store` is
-/// appended only after store-cap and budget checks pass. Any error leaves
-/// the store unchanged (`len`, `total_bytes`, and `next_id` identical).
+/// Atomicity and selected-only storage semantics: externalization is a
+/// two-phase commit. Large bodies stage into local pending buffers first with
+/// predicted references (`artifact://<id>`) so greedy budget selection
+/// evaluates their externalized footprint without mutating the store. Only
+/// records included by budget selection that are pending externalization
+/// commit to [`ArtifactStore`]. Store capacity bounds ([`MAX_ARTIFACTS`] and
+/// [`MAX_ARTIFACT_STORE_BYTES`]) are validated against the selected pending
+/// subset prior to any store mutation; exceeding either cap fails closed with
+/// [`ContextError::ArtifactStoreFull`] with zero store mutation. Records
+/// omitted due to budget constraints do NOT consume store quota (avoiding
+/// quota waste on omitted projection items). Any error leaves the store
+/// unchanged (`len`, `total_bytes`, and `next_id` identical).
+///
+/// Consecutive committed artifact identifiers are assigned in selected order,
+/// and `externalized` in [`AssembledContext`] reports the count of committed
+/// artifacts.
 ///
 /// Record content (`summary` text, body bytes) is never interpreted: no
 /// directive scan runs, and content influences maintenance only through
@@ -720,13 +734,14 @@ pub fn assemble(
     }
 
     // L1 externalize, phase 1 (stage only, zero store mutation): large inline
-    // bodies move into `pending` with predicted `artifact://<id>` references
+    // bodies stage into `staged` with predicted `artifact://<id>` references
     // so budget footprints match the post-commit shape without touching
-    // `store`. Phase 2 commits only after store-cap and budget checks pass.
+    // `store`. Only records included by greedy selection will commit to
+    // `store`.
     let base_next_id = store.next_id();
-    let mut pending: Vec<Vec<u8>> = Vec::new();
-    let mut staged: Vec<(usize, ContextRecord)> = Vec::with_capacity(deduped.len());
-    let mut staged_is_pending: Vec<bool> = Vec::with_capacity(deduped.len());
+    let mut predicted_externalized = 0u64;
+    let mut staged: Vec<(usize, ContextRecord, Option<Vec<u8>>)> =
+        Vec::with_capacity(deduped.len());
     for (index, mut record) in deduped {
         let externalize = matches!(&record.body, RecordBody::Inline(bytes) if bytes.len() > EXTERNALIZE_THRESHOLD_BYTES);
         if externalize {
@@ -744,33 +759,13 @@ pub fn assemble(
                     actual: bytes.len(),
                 });
             }
-            pending.push(bytes);
-            let predicted = format!("artifact://{}", base_next_id + pending.len() as u64);
+            predicted_externalized += 1;
+            let predicted = format!("artifact://{}", base_next_id + predicted_externalized);
             record.body = RecordBody::Artifact(ArtifactRef(predicted));
-            staged.push((index, record));
-            staged_is_pending.push(true);
+            staged.push((index, record, Some(bytes)));
         } else {
-            staged.push((index, record));
-            staged_is_pending.push(false);
+            staged.push((index, record, None));
         }
-    }
-    let externalized = pending.len();
-
-    // Phase 1 validation: store caps against staged bytes, still zero
-    // mutation. Replicates `ArtifactStore::store` bounds for the batch so a
-    // later item failing cannot leave an earlier one retained (quota stolen,
-    // `next_id` advanced). Count first to preserve single-store error
-    // precedence, then total bytes.
-    if store.len() + pending.len() > MAX_ARTIFACTS {
-        return Err(ContextError::ArtifactStoreFull {
-            reason: format!("at most {MAX_ARTIFACTS} artifacts"),
-        });
-    }
-    let pending_bytes: usize = pending.iter().map(Vec::len).sum();
-    if store.total_bytes() + pending_bytes > MAX_ARTIFACT_STORE_BYTES {
-        return Err(ContextError::ArtifactStoreFull {
-            reason: format!("at most {MAX_ARTIFACT_STORE_BYTES} retained bytes"),
-        });
     }
 
     // Greedy include, highest effective priority first (AIQ-11: untrusted
@@ -778,7 +773,7 @@ pub fn assemble(
     let budget = request.effective_budget_bytes();
     let mut order: Vec<usize> = (0..staged.len()).collect();
     order.sort_by_key(|&position| {
-        let (_, record) = &staged[position];
+        let (_, record, _) = &staged[position];
         (
             std::cmp::Reverse(effective_priority(record) as u8),
             position,
@@ -790,7 +785,7 @@ pub fn assemble(
     let mut truncated_bytes: u64 = 0;
     let mut truncated_providers: Vec<String> = Vec::new();
     for position in order {
-        let (_, record) = &staged[position];
+        let (_, record, _) = &staged[position];
         let need = record.footprint_bytes();
         if used + need <= budget {
             included[position] = true;
@@ -806,7 +801,7 @@ pub fn assemble(
     if !staged.is_empty() && !included.iter().any(|kept| *kept) {
         let smallest = staged
             .iter()
-            .map(|(_, record)| record.footprint_bytes())
+            .map(|(_, record, _)| record.footprint_bytes())
             .min()
             .unwrap_or(0);
         return Err(ContextError::BudgetExceeded {
@@ -815,36 +810,57 @@ pub fn assemble(
         });
     }
 
-    // L1 externalize, phase 2 (atomic commit): all budgets and validations
-    // passed, so retain staged bytes. Pre-validation makes each `store`
-    // infallible here; the `?` is defense in depth for future bound changes.
-    // Commit order matches prediction order, so assigned references equal the
-    // predicted ones used for budget accounting.
-    let mut pending_drain = pending.into_iter();
-    for (position, (_, record)) in staged.iter_mut().enumerate() {
-        if staged_is_pending[position] {
-            let bytes = pending_drain
-                .next()
-                .expect("pending aligns with staged flags");
-            let committed = store.store(bytes)?;
-            debug_assert_eq!(
-                record.body,
-                RecordBody::Artifact(committed.clone()),
-                "predicted reference must equal committed reference"
-            );
-            record.body = RecordBody::Artifact(committed);
+    // Store validation for selected-only items: only records included by
+    // budget selection that are pending externalization consume store quota.
+    // Count first to preserve single-store error precedence, then total bytes.
+    let mut included_pending_count = 0usize;
+    let mut included_pending_bytes = 0usize;
+    for (position, (_, _, pending_body)) in staged.iter().enumerate() {
+        if included[position] {
+            if let Some(bytes) = pending_body {
+                included_pending_count += 1;
+                included_pending_bytes += bytes.len();
+            }
         }
     }
-    debug_assert!(
-        pending_drain.next().is_none(),
-        "all pending bytes must commit"
+
+    if store.len() + included_pending_count > MAX_ARTIFACTS {
+        return Err(ContextError::ArtifactStoreFull {
+            reason: format!("at most {MAX_ARTIFACTS} artifacts"),
+        });
+    }
+    if store.total_bytes() + included_pending_bytes > MAX_ARTIFACT_STORE_BYTES {
+        return Err(ContextError::ArtifactStoreFull {
+            reason: format!("at most {MAX_ARTIFACT_STORE_BYTES} retained bytes"),
+        });
+    }
+
+    // L1 externalize, phase 2 (atomic commit): store bodies for selected
+    // records pending externalization. Pre-validation makes each `store`
+    // infallible here; the `?` is defense in depth for future bound changes.
+    // Consecutive committed IDs are assigned in selected order.
+    // Records omitted due to budget constraints are NOT stored into
+    // `ArtifactStore`, avoiding quota waste on omitted projection items.
+    let mut committed_count = 0usize;
+    for (position, (_, record, pending_body)) in staged.iter_mut().enumerate() {
+        if included[position] {
+            if let Some(bytes) = pending_body.take() {
+                let committed = store.store(bytes)?;
+                record.body = RecordBody::Artifact(committed);
+                committed_count += 1;
+            }
+        }
+    }
+    debug_assert_eq!(
+        committed_count, included_pending_count,
+        "all selected pending records must commit"
     );
 
     let mut selected: Vec<(usize, ContextRecord)> = staged
         .into_iter()
         .enumerate()
         .filter(|(position, _)| included[*position])
-        .map(|(_, staged_record)| staged_record)
+        .map(|(_, (index, record, _))| (index, record))
         .collect();
     selected.sort_by_key(|(index, _)| *index);
 
@@ -870,7 +886,7 @@ pub fn assemble(
         context_refs,
         omitted_ids,
         pruned_ids,
-        externalized,
+        externalized: committed_count,
         truncated_bytes,
         truncated_tokens_estimate: ContextRequest::estimate_tokens(truncated_bytes as usize),
         truncated_providers,
@@ -1460,5 +1476,160 @@ mod tests {
         let mut store = ArtifactStore::new();
         let assembled = assemble(&[fresh], &mut store, &budget(8_192)).expect("fresh assembles");
         assert_eq!(assembled.context_refs, vec!["fresh".to_owned()]);
+    }
+
+    #[test]
+    fn selected_only_externalization_respects_count_quota() {
+        // Total pending externalizations exceed store count quota, but only
+        // selected items fit within budget. Omitted pending items must consume
+        // zero store quota.
+        let mut store = ArtifactStore::new();
+        for _ in 0..(MAX_ARTIFACTS - 1) {
+            store
+                .store(vec![b'p'; 16])
+                .expect("fill store to one slot remaining");
+        }
+        let initial_len = store.len();
+        let initial_bytes = store.total_bytes();
+        let initial_next = store.next_id();
+
+        let mut high = record("high", "project", "manifest", 8_192);
+        high.priority = ContextPriority::High;
+        let mut low = record("low", "diagnostics", "lint dump", 8_192);
+        low.priority = ContextPriority::Low;
+
+        // Total pending count is 2, which would exceed the count cap (initial_len + 2 > MAX_ARTIFACTS).
+        // Sizing budget to fit only one record (~21 bytes footprint: summary 8 + ref ~13).
+        let assembled = assemble(&[high.clone(), low.clone()], &mut store, &budget(35))
+            .expect("selected pending fits within count cap");
+        assert_eq!(assembled.records.len(), 1);
+        assert_eq!(assembled.records[0].id, "high");
+        assert_eq!(assembled.omitted_ids, vec!["low".to_owned()]);
+        assert_eq!(assembled.externalized, 1);
+        assert_eq!(store.len(), initial_len + 1);
+        assert_eq!(store.total_bytes(), initial_bytes + 8_192);
+        assert_eq!(store.next_id(), initial_next + 1);
+
+        // When selected pending items exceed store count quota, assembly fails
+        // closed with ArtifactStoreFull and store is unmutated.
+        let mut full_store = ArtifactStore::new();
+        for _ in 0..(MAX_ARTIFACTS - 1) {
+            full_store
+                .store(vec![b'p'; 16])
+                .expect("fill store to one slot remaining");
+        }
+        let full_len = full_store.len();
+        let full_bytes = full_store.total_bytes();
+        let full_next = full_store.next_id();
+
+        let err = assemble(&[high, low], &mut full_store, &budget(32_768))
+            .expect_err("selected pending count exceeds store cap");
+        assert!(matches!(err, ContextError::ArtifactStoreFull { .. }));
+        assert_eq!(full_store.len(), full_len);
+        assert_eq!(full_store.total_bytes(), full_bytes);
+        assert_eq!(full_store.next_id(), full_next);
+    }
+
+    #[test]
+    fn selected_only_externalization_respects_byte_quota() {
+        // Total pending externalization bytes exceed store byte quota, but only
+        // selected items fit within budget. Omitted pending items must consume
+        // zero store bytes.
+        let mut store = ArtifactStore::new();
+        // Fill store so remaining byte quota is 10_000 bytes.
+        let target_bytes = MAX_ARTIFACT_STORE_BYTES - 10_000;
+        let mut filled = 0;
+        while filled + MAX_ARTIFACT_BYTES <= target_bytes {
+            store
+                .store(vec![b'b'; MAX_ARTIFACT_BYTES])
+                .expect("fill artifact");
+            filled += MAX_ARTIFACT_BYTES;
+        }
+        if filled < target_bytes {
+            store
+                .store(vec![b'b'; target_bytes - filled])
+                .expect("fill remaining target");
+        }
+        assert_eq!(store.total_bytes(), target_bytes);
+        let initial_len = store.len();
+        let initial_bytes = store.total_bytes();
+        let initial_next = store.next_id();
+
+        let mut high = record("high", "project", "manifest", 8_192);
+        high.priority = ContextPriority::High;
+        let mut low = record("low", "diagnostics", "lint dump", 8_192);
+        low.priority = ContextPriority::Low;
+
+        // Total pending bytes = 16,384 > 10,000 remaining byte quota.
+        // Budget fits only one record (~21 bytes).
+        let assembled = assemble(&[high.clone(), low.clone()], &mut store, &budget(35))
+            .expect("selected pending fits within byte cap");
+        assert_eq!(assembled.records.len(), 1);
+        assert_eq!(assembled.records[0].id, "high");
+        assert_eq!(assembled.omitted_ids, vec!["low".to_owned()]);
+        assert_eq!(assembled.externalized, 1);
+        assert_eq!(store.len(), initial_len + 1);
+        assert_eq!(store.total_bytes(), initial_bytes + 8_192);
+        assert_eq!(store.next_id(), initial_next + 1);
+
+        // When selected pending bytes exceed store byte quota, assembly fails
+        // closed with ArtifactStoreFull and store is unmutated.
+        let mut full_store = ArtifactStore::new();
+        let mut filled = 0;
+        while filled + MAX_ARTIFACT_BYTES <= target_bytes {
+            full_store
+                .store(vec![b'b'; MAX_ARTIFACT_BYTES])
+                .expect("fill artifact");
+            filled += MAX_ARTIFACT_BYTES;
+        }
+        if filled < target_bytes {
+            full_store
+                .store(vec![b'b'; target_bytes - filled])
+                .expect("fill remaining target");
+        }
+        let full_len = full_store.len();
+        let full_bytes = full_store.total_bytes();
+        let full_next = full_store.next_id();
+
+        let err = assemble(&[high, low], &mut full_store, &budget(32_768))
+            .expect_err("selected pending bytes exceed store cap");
+        assert!(matches!(err, ContextError::ArtifactStoreFull { .. }));
+        assert_eq!(full_store.len(), full_len);
+        assert_eq!(full_store.total_bytes(), full_bytes);
+        assert_eq!(full_store.next_id(), full_next);
+    }
+
+    #[test]
+    fn selected_only_externalization_assigns_consecutive_ids() {
+        let mut store = ArtifactStore::new();
+        let mut r1 = record("r1", "diagnostics", "lint 1", 8_192);
+        r1.priority = ContextPriority::Low;
+        let mut r2 = record("r2", "project", "manifest 2", 8_192);
+        r2.priority = ContextPriority::High;
+        let mut r3 = record("r3", "terminal", "zone 3", 8_192);
+        r3.priority = ContextPriority::High;
+
+        // Budget fits 2 records (footprint r2: 22 bytes, r3: 18 bytes = 40 bytes, budget = 45).
+        // r2 and r3 (High priority) are included; r1 (Low priority) is omitted.
+        let assembled = assemble(&[r1, r2, r3], &mut store, &budget(45))
+            .expect("assemble two high priority records");
+        assert_eq!(assembled.records.len(), 2);
+        assert_eq!(assembled.omitted_ids, vec!["r1".to_owned()]);
+        assert_eq!(assembled.externalized, 2);
+        assert_eq!(store.len(), 2);
+
+        // Committed references are consecutive artifact://1 and artifact://2.
+        let ref2 = match &assembled.records[0].content {
+            AssembledContent::Reference(r) => r.clone(),
+            _ => panic!("expected reference for r2"),
+        };
+        let ref3 = match &assembled.records[1].content {
+            AssembledContent::Reference(r) => r.clone(),
+            _ => panic!("expected reference for r3"),
+        };
+        assert_eq!(ref2.as_str(), "artifact://1");
+        assert_eq!(ref3.as_str(), "artifact://2");
+        assert_eq!(store.resolve(&ref2).expect("resolve ref2").len(), 8_192);
+        assert_eq!(store.resolve(&ref3).expect("resolve ref3").len(), 8_192);
     }
 }
