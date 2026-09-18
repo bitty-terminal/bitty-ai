@@ -9,8 +9,9 @@
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ExecOutcome, ExecutionId,
     FakeProvider, FakeReconciler, FakeToolExecutor, ModelProvider, ProviderTurn, ProviderUsage,
-    ReconcileOutcome, ReconcileStatus, SessionState, ToolAuthorizer, ToolBus, ToolCallRequest,
-    ToolError, ToolRegistry, ToolSpec, ToolStatus, UnknownReconciler, VecSink, reconcile_delay_ms,
+    ReconcileOutcome, ReconcileStatus, RecordingExecutor, SessionState, ToolAuthorizer, ToolBus,
+    ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, UnknownReconciler, VecSink,
+    reconcile_delay_ms,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -433,4 +434,146 @@ fn zero_retry_budget_escalates_without_query() {
     assert_eq!(reconciler.query_count(), 0);
     assert_eq!(executor.calls().len(), 1);
     assert_eq!(agent.session().state(), SessionState::Failed);
+}
+
+#[test]
+fn dispatch_identity_propagation_and_reconciler_inspection() {
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    // Turn 1: request three tool calls: two benign successes, followed by one EffectUnknown
+    provider.push_turn(ProviderTurn {
+        text: "three calls".to_owned(),
+        tool_calls: vec![
+            ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"first"}"#.to_vec(),
+            },
+            ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"second"}"#.to_vec(),
+            },
+            ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"uncertain"}"#.to_vec(),
+            },
+        ],
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    // Turn 2 unreached because turn stops at the first Unknown
+    provider.push_turn(ProviderTurn {
+        text: "unreached".to_owned(),
+        tool_calls: Vec::new(),
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+
+    let mut executor = RecordingExecutor::new();
+    executor.push_success("first ok", b"first result".to_vec());
+    executor.push_success("second ok", b"second result".to_vec());
+    executor.push_error(ToolError::EffectUnknown {
+        name: "workspace_read".to_owned(),
+        reason: "network drop before ack".to_owned(),
+    });
+
+    let session = session();
+    let mut agent = Agent::new(provider, read_tool_bus(), session, AgentConfig::default());
+    let mut sink = VecSink::new();
+
+    let outcome = agent.run_turn(
+        &mut executor,
+        "fake-chat",
+        "run tasks",
+        &[],
+        &mut sink,
+        NOW_MS,
+    );
+    assert!(
+        matches!(outcome, ExecOutcome::Unknown { .. }),
+        "turn must stop at first unknown: {outcome:?}"
+    );
+
+    // Three dispatches occurred before the turn stopped
+    assert_eq!(agent.executions().len(), 3);
+    assert_eq!(executor.call_count(), 3);
+
+    let id_0 = agent.executions()[0].execution_id;
+    let id_1 = agent.executions()[1].execution_id;
+    let id_2 = agent.executions()[2].execution_id;
+
+    // All execution IDs are distinct
+    assert_ne!(id_0, id_1);
+    assert_ne!(id_1, id_2);
+    assert_ne!(id_0, id_2);
+
+    // Consistent attribution: RecordingExecutor received the exact ExecutionIds from runtime
+    assert_eq!(executor.calls()[0].0, id_0);
+    assert_eq!(executor.calls()[0].1, "workspace_read");
+    assert_eq!(executor.calls()[0].2, br#"{"path":"first"}"#);
+
+    assert_eq!(executor.calls()[1].0, id_1);
+    assert_eq!(executor.calls()[1].1, "workspace_read");
+    assert_eq!(executor.calls()[1].2, br#"{"path":"second"}"#);
+
+    assert_eq!(executor.calls()[2].0, id_2);
+    assert_eq!(executor.calls()[2].1, "workspace_read");
+    assert_eq!(executor.calls()[2].2, br#"{"path":"uncertain"}"#);
+
+    // Reconciler keyed by exact ExecutionId inspects status without re-running the tool
+    struct CorrelatingStatusReconciler<'a> {
+        recorded: &'a [(ExecutionId, String, Vec<u8>)],
+        inspected: Vec<(String, ExecutionId)>,
+    }
+    impl<'a> UnknownReconciler for CorrelatingStatusReconciler<'a> {
+        fn reconcile(
+            &mut self,
+            tool: &str,
+            execution_id: ExecutionId,
+            _now_ms: u64,
+        ) -> ReconcileStatus {
+            self.inspected.push((tool.to_owned(), execution_id));
+            if let Some((_id, recorded_tool, _args)) =
+                self.recorded.iter().find(|(id, _, _)| *id == execution_id)
+            {
+                assert_eq!(recorded_tool, tool);
+                ReconcileStatus::Resolved(ToolStatus::Success)
+            } else {
+                ReconcileStatus::Pending {
+                    reason: "unknown execution id".to_owned(),
+                }
+            }
+        }
+    }
+
+    let mut reconciler = CorrelatingStatusReconciler {
+        recorded: executor.calls(),
+        inspected: Vec::new(),
+    };
+
+    let reconcile_outcome = agent.reconcile_unknown(&mut reconciler, id_2, NOW_MS);
+    assert!(
+        matches!(
+            reconcile_outcome,
+            ReconcileOutcome::Resolved {
+                status: ToolStatus::Success,
+                attempts: 1,
+                ..
+            }
+        ),
+        "reconcile resolution failed: {reconcile_outcome:?}"
+    );
+
+    // Verification: status inspection performed without tool re-execution
+    assert_eq!(
+        executor.call_count(),
+        3,
+        "executor must not be re-invoked during reconcile"
+    );
+    assert_eq!(reconciler.inspected.len(), 1);
+    assert_eq!(reconciler.inspected[0], ("workspace_read".to_owned(), id_2));
+
+    // Agent executions all resolved with correct statuses
+    assert_eq!(agent.executions()[0].status, ToolStatus::Success);
+    assert_eq!(agent.executions()[1].status, ToolStatus::Success);
+    assert_eq!(agent.executions()[2].status, ToolStatus::Success);
+    assert_eq!(agent.session().state(), SessionState::Active);
 }

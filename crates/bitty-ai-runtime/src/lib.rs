@@ -144,7 +144,7 @@ pub use stream::{
     fragment_text, validate_chunk,
 };
 pub use tool::{
-    AuthBase, AuthContext, AuthDecision, DenyAllAuthorizer, FakeToolExecutor, ToolAuthorizer,
-    ToolBus, ToolCall, ToolError, ToolExecution, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus,
-    ToolSuccess, validate_tool_name,
+    AuthBase, AuthContext, AuthDecision, DenyAllAuthorizer, ExecutionContext, FakeToolExecutor,
+    RecordingExecutor, ToolAuthorizer, ToolBus, ToolCall, ToolError, ToolExecution, ToolExecutor,
+    ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, validate_tool_name,
 };

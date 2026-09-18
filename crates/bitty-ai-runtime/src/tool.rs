@@ -489,6 +489,15 @@ impl ToolSuccess {
     }
 }
 
+/// Context for a single tool dispatch attempt presented to [`ToolExecutor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionContext {
+    /// Attribution handle for this dispatch issued by the runtime.
+    pub execution_id: crate::session::ExecutionId,
+    /// Caller-supplied dispatch timestamp in milliseconds.
+    pub now_ms: u64,
+}
+
 /// Host/runtime seam that executes a tool (`TB-7`: the agent layer never
 /// does). Implementations must be deterministic for a given script plus
 /// `now_ms` when used under test.
@@ -506,6 +515,26 @@ pub trait ToolExecutor {
         arguments: &[u8],
         now_ms: u64,
     ) -> Result<ToolSuccess, ToolError>;
+
+    /// Execute `tool` with bounded `arguments` and typed dispatch
+    /// [`ExecutionContext`].
+    ///
+    /// By default delegates to [`ToolExecutor::execute`] using `context.now_ms`
+    /// so existing adapters compile without breakage. Adapters requiring dispatch
+    /// identity propagation (such as correlation with host-side reconciliation ledgers)
+    /// should override this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`ToolExecutor::execute`].
+    fn execute_with_context(
+        &mut self,
+        tool: &str,
+        arguments: &[u8],
+        context: &ExecutionContext,
+    ) -> Result<ToolSuccess, ToolError> {
+        self.execute(tool, arguments, context.now_ms)
+    }
 }
 
 /// Deterministic test peer for [`ToolExecutor`]. Replays scripted outcomes
@@ -566,6 +595,94 @@ impl ToolExecutor for FakeToolExecutor {
                 session.cancel();
             }
         }
+        self.script.pop_front().unwrap_or(Ok(ToolSuccess {
+            summary: String::new(),
+            data: Vec::new(),
+        }))
+    }
+}
+
+/// Deterministic recording test peer for [`ToolExecutor`].
+///
+/// Records every invocation as `(execution_id, tool, arguments)` triples,
+/// preserving exact [`crate::session::ExecutionId`] attribution handles across
+/// dispatches. Replays scripted outcomes FIFO (defaulting to empty success).
+#[derive(Debug, Default)]
+pub struct RecordingExecutor {
+    script: VecDeque<Result<ToolSuccess, ToolError>>,
+    calls: Vec<(crate::session::ExecutionId, String, Vec<u8>)>,
+}
+
+impl RecordingExecutor {
+    /// Construct an empty recording executor.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue a successful outcome.
+    pub fn push_success(&mut self, summary: impl Into<String>, data: Vec<u8>) {
+        self.script.push_back(Ok(ToolSuccess {
+            summary: summary.into(),
+            data,
+        }));
+    }
+
+    /// Queue a failing outcome.
+    pub fn push_error(&mut self, error: ToolError) {
+        self.script.push_back(Err(error));
+    }
+
+    /// Invocations so far as `(execution_id, tool, arguments)` triples.
+    #[must_use]
+    pub fn calls(&self) -> &[(crate::session::ExecutionId, String, Vec<u8>)] {
+        &self.calls
+    }
+
+    /// Number of invocations recorded so far.
+    #[must_use]
+    pub fn call_count(&self) -> usize {
+        self.calls.len()
+    }
+
+    /// Number of invocations recorded so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.calls.len()
+    }
+
+    /// Whether no invocations have been recorded yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+}
+
+impl ToolExecutor for RecordingExecutor {
+    fn execute(
+        &mut self,
+        tool: &str,
+        arguments: &[u8],
+        now_ms: u64,
+    ) -> Result<ToolSuccess, ToolError> {
+        self.execute_with_context(
+            tool,
+            arguments,
+            &ExecutionContext {
+                execution_id: crate::session::ExecutionId(0),
+                now_ms,
+            },
+        )
+    }
+
+    fn execute_with_context(
+        &mut self,
+        tool: &str,
+        arguments: &[u8],
+        context: &ExecutionContext,
+    ) -> Result<ToolSuccess, ToolError> {
+        self.calls
+            .push((context.execution_id, tool.to_owned(), arguments.to_vec()));
         self.script.pop_front().unwrap_or(Ok(ToolSuccess {
             summary: String::new(),
             data: Vec::new(),
@@ -723,7 +840,11 @@ impl ToolBus {
                 limit: MAX_TOOL_CALLS_PER_TURN,
             });
         }
-        let outcome = executor.execute(&call.name, &call.arguments, now_ms);
+        let context = ExecutionContext {
+            execution_id,
+            now_ms,
+        };
+        let outcome = executor.execute_with_context(&call.name, &call.arguments, &context);
         self.calls_this_turn += 1;
         match outcome {
             Ok(success) => {
@@ -1103,5 +1224,82 @@ mod tests {
         assert!(matches!(error, ToolError::Denied { .. }));
         assert!(executor.calls().is_empty(), "revoked call never dispatched");
         assert_eq!(bus.calls_this_turn(), 0);
+    }
+
+    #[test]
+    fn dispatch_propagates_execution_context_to_recording_executor() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = RecordingExecutor::new();
+        executor.push_success("ok 1", b"res 1".to_vec());
+        executor.push_success("ok 2", b"res 2".to_vec());
+
+        let call1 = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{"path":"file1"}"#.to_vec(),
+        };
+        let call2 = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{"path":"file2"}"#.to_vec(),
+        };
+
+        let mut ids = crate::session::IdIssuer::default();
+        let exec_id_1 = ids.execution();
+        let exec_id_2 = ids.execution();
+
+        let execution1 = bus
+            .dispatch(&mut executor, &call1, &base(), exec_id_1, 1_000)
+            .expect("dispatch call 1");
+        assert_eq!(execution1.execution_id, exec_id_1);
+        assert_eq!(execution1.status, ToolStatus::Success);
+
+        let execution2 = bus
+            .dispatch(&mut executor, &call2, &base(), exec_id_2, 2_000)
+            .expect("dispatch call 2");
+        assert_eq!(execution2.execution_id, exec_id_2);
+        assert_eq!(execution2.status, ToolStatus::Success);
+
+        assert_eq!(executor.call_count(), 2);
+        assert_eq!(executor.calls()[0].0, exec_id_1);
+        assert_eq!(executor.calls()[0].1, "workspace_read");
+        assert_eq!(executor.calls()[0].2, br#"{"path":"file1"}"#);
+
+        assert_eq!(executor.calls()[1].0, exec_id_2);
+        assert_eq!(executor.calls()[1].1, "workspace_read");
+        assert_eq!(executor.calls()[1].2, br#"{"path":"file2"}"#);
+    }
+
+    #[test]
+    fn default_execute_with_context_delegates_to_execute() {
+        struct LegacyExecutor {
+            recorded_now_ms: Option<u64>,
+        }
+        impl ToolExecutor for LegacyExecutor {
+            fn execute(
+                &mut self,
+                _tool: &str,
+                _arguments: &[u8],
+                now_ms: u64,
+            ) -> Result<ToolSuccess, ToolError> {
+                self.recorded_now_ms = Some(now_ms);
+                Ok(ToolSuccess::new("ok".to_owned(), Vec::new()).expect("valid"))
+            }
+        }
+
+        let mut legacy = LegacyExecutor {
+            recorded_now_ms: None,
+        };
+        let ctx = ExecutionContext {
+            execution_id: crate::session::ExecutionId(42),
+            now_ms: 12345,
+        };
+        let res = legacy.execute_with_context("tool", b"arg", &ctx);
+        assert!(res.is_ok());
+        assert_eq!(legacy.recorded_now_ms, Some(12345));
     }
 }
