@@ -694,6 +694,61 @@ fn adoption_coverage_and_bounds_refuse_fail_closed() {
         "over-bound survivor set must refuse as TooManySurvivors"
     );
 
+    // The auxiliary `Unknown` disposition list is bounded too: it cannot
+    // legitimately exceed the survivor cap, and an over-bound list refuses
+    // as a typed size refusal before any allocation or content inspection,
+    // even though none of its entries could ever verify against evidence.
+    let mut disposition_issuer = IdIssuer::default();
+    let wide_unknowns: Vec<ClaimedUnknownEffect> = (0..=MAX_ADOPTION_SURVIVORS)
+        .map(|_| ClaimedUnknownEffect {
+            execution_id: disposition_issuer.execution(),
+            disposition: UnknownDisposition::Escalated,
+        })
+        .collect();
+    assert_eq!(wide_unknowns.len(), MAX_ADOPTION_SURVIVORS + 1);
+    let wide_dispositions = AdoptionClaim {
+        prior_session_state: SessionState::Failed,
+        survivor_ids: vec![terminal_id],
+        unknown_effects: wide_unknowns,
+        fence_token: EPOCH,
+    };
+    let refusal = check_adoption(&wide_dispositions, &terminal_evidence, EPOCH)
+        .expect_err("over-bound disposition list must refuse");
+    assert!(
+        matches!(
+            refusal,
+            AdoptionRefusal::TooManySurvivors { limit, actual }
+                if limit == MAX_ADOPTION_SURVIVORS && actual == MAX_ADOPTION_SURVIVORS + 1
+        ),
+        "over-bound disposition list must refuse as TooManySurvivors"
+    );
+
+    // The disposition count alone drives the refusal: a live-session claim
+    // with a stale epoch and an over-bound disposition list still refuses as
+    // a size refusal, proving the count gate runs before content and state
+    // checks.
+    let size_first = AdoptionClaim {
+        prior_session_state: SessionState::Active,
+        survivor_ids: vec![terminal_id],
+        unknown_effects: (0..=MAX_ADOPTION_SURVIVORS)
+            .map(|_| ClaimedUnknownEffect {
+                execution_id: disposition_issuer.execution(),
+                disposition: UnknownDisposition::Escalated,
+            })
+            .collect(),
+        fence_token: EPOCH + 1,
+    };
+    let refusal = check_adoption(&size_first, &terminal_evidence, EPOCH)
+        .expect_err("size gate must outrank state and epoch checks");
+    assert!(
+        matches!(
+            refusal,
+            AdoptionRefusal::TooManySurvivors { limit, actual }
+                if limit == MAX_ADOPTION_SURVIVORS && actual == MAX_ADOPTION_SURVIVORS + 1
+        ),
+        "size refusal must precede state and epoch checks"
+    );
+
     // The empty crash adopts vacuously: nothing to recover is a success with
     // the empty set, not a refusal.
     let empty_session = session();
