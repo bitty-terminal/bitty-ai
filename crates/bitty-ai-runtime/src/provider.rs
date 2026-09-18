@@ -568,6 +568,15 @@ pub enum ProviderError {
     /// No value is echoed: the rejection carries no model, sampling, or
     /// host input, so logs and reconcile reports stay static.
     InvalidSampling,
+    /// Declared sampling contract is valid but the backend cannot carry one
+    /// or more declared fields (`MP-5`). The refusal names the backend field
+    /// kind with a static adapter label; no caller value, model, or host
+    /// input is echoed, so logs and reconcile reports stay static.
+    UnsupportedSampling {
+        /// Static backend field label (`"top_k"`, `"reasoning"`, ...),
+        /// never caller input.
+        field: &'static str,
+    },
 }
 
 impl Display for ProviderError {
@@ -618,6 +627,9 @@ impl Display for ProviderError {
                 write!(f, "provider {provider} effect unknown: {reason}")
             }
             Self::InvalidSampling => write!(f, "invalid sampling parameters"),
+            Self::UnsupportedSampling { field } => {
+                write!(f, "sampling option unsupported by backend: {field}")
+            }
         }
     }
 }
