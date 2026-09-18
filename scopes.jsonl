@@ -3,3 +3,4 @@
 {"created_at":"2026-09-15T03:18:17.023600297+00:00","id":"01M2HH535ZARZTQ26R1K0ZVRCW","kind":"include","pattern":"crates/bitty-ai-slice/src/lib.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
 {"created_at":"2026-09-15T03:18:17.053972292+00:00","id":"01M2HH536YGE6T8MSC5D8TWZWF","kind":"include","pattern":"crates/bitty-ai-slice/tests/fake_host.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HH0899BYKWV42Z45BR87X8"}
 {"created_at":"2026-09-15T03:49:51.645853375+00:00","id":"01M2HJYXCX8VM3MQ7MKSVDNXAH","kind":"include","pattern":"docs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2HJYF3P4KZJ4YDF0ES4RBW1"}
+{"created_at":"2026-09-18T07:21:29.151668824+00:00","id":"01M2SP8J9Z3SGFNSXQ1D5BXGT3","kind":"include","pattern":"crates/bitty-ai-runtime/src/prompt.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2SP85BRK24PTWF93RWPCCKB"}
