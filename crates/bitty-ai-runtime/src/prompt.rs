@@ -2,7 +2,7 @@
 //!
 //! Mirrors the draft `docs/specifications/prompt-layering-design.md` (status:
 //! draft, not an accepted contract): five layers from most stable to most
-//! dynamic — Core Contract, User, Project/`.bitty`, Skills/Profile, and
+//! dynamic — Core Contract, User, Project/`.wheel`, Skills/Profile, and
 //! Runtime/Turn — assembled stable-before-dynamic and aligned with the
 //! prefix-cache layering in
 //! `docs/specifications/prefix-cache-context-design.md`.
@@ -150,7 +150,7 @@ pub enum PromptLayer {
     CoreContract,
     /// User-owned global instructions; preferences only, no capability effect.
     User,
-    /// Project-owned `.bitty` manifest intent; untrusted until reviewed.
+    /// Project-owned `.wheel` manifest intent; untrusted until reviewed.
     Project,
     /// Single-agent skills/profile pack (v0.1 single-agent only).
     SkillsProfile,
@@ -1396,7 +1396,7 @@ pub fn check_dispatch(
 }
 
 // ---------------------------------------------------------------------------
-// Declarative loading: `.bitty` project files + skill/profile registry.
+// Declarative loading: `.wheel` project files + skill/profile registry.
 //
 // Design note (AI-0045): these loaders EXTEND the narrowing-only assembly
 // above. They are pure `&str`-in / [`LayerInput`]-out constructors. The host
@@ -1723,7 +1723,7 @@ fn project_parts_to_layer(mut parts: ProjectParts) -> Result<LayerInput, PromptE
 }
 
 impl LayerInput {
-    /// Parse one declarative `.bitty` project file body into a Project
+    /// Parse one declarative `.wheel` project file body into a Project
     /// layer.
     ///
     /// The caller (host) reads the file and passes its bytes; this
@@ -1740,9 +1740,9 @@ impl LayerInput {
         project_parts_to_layer(parts)
     }
 
-    /// Merge declarative `.bitty` project files into one Project layer.
+    /// Merge declarative `.wheel` project files into one Project layer.
     ///
-    /// `roots` are explicit caller-supplied roots (for example `".bitty"`);
+    /// `roots` are explicit caller-supplied roots (for example `".wheel"`);
     /// every candidate path in `files` must pass [`admit_project_path`]
     /// against them — escapes fail closed before any byte is parsed. Each
     /// body parses via [`LayerInput::project_from_str`] rules. Merge is
@@ -3429,26 +3429,26 @@ mod tests {
 
     #[test]
     fn project_paths_admit_only_explicit_roots() {
-        let roots = [".bitty"];
-        assert!(admit_project_path(&roots, ".bitty/prompt.conf").is_ok());
-        assert!(admit_project_path(&roots, ".bitty/nested/file.conf").is_ok());
+        let roots = [".wheel"];
+        assert!(admit_project_path(&roots, ".wheel/prompt.conf").is_ok());
+        assert!(admit_project_path(&roots, ".wheel/nested/file.conf").is_ok());
         // Absolute-root style works for hosts that pass absolute paths.
-        assert!(admit_project_path(&["/repo/.bitty"], "/repo/.bitty/a.conf").is_ok());
+        assert!(admit_project_path(&["/repo/.wheel"], "/repo/.wheel/a.conf").is_ok());
         let escapes = [
             "../evil.conf",
-            ".bitty/../evil.conf",
-            ".bitty/./sneaky.conf",
-            ".bitty//double.conf",
-            ".bitty/",
+            ".wheel/../evil.conf",
+            ".wheel/./sneaky.conf",
+            ".wheel//double.conf",
+            ".wheel/",
             "/etc/passwd",
             "/repo/other.conf",
             "other/file.conf",
             "",
             ".",
-            ".bitty\\win.conf",
-            ".bitty/bad\0conf",
-            ".bitty/bad\rc",
-            ".bitty/bad\nc",
+            ".wheel\\win.conf",
+            ".wheel/bad\0conf",
+            ".wheel/bad\rc",
+            ".wheel/bad\nc",
         ];
         for bad in escapes {
             assert!(
@@ -3461,7 +3461,7 @@ mod tests {
         }
         // Empty roots admit nothing (fail-closed default).
         assert!(matches!(
-            admit_project_path(&[], ".bitty/a.conf"),
+            admit_project_path(&[], ".wheel/a.conf"),
             Err(PromptError::InvalidProjectPath { .. })
         ));
     }
@@ -3470,20 +3470,20 @@ mod tests {
     fn project_multi_file_merge_is_deterministic_and_narrowing() {
         let files = [
             (
-                ".bitty/b.conf",
+                ".wheel/b.conf",
                 "deny_tool = panel_close\nbudget = 1024\ntext:\nBee.\n",
             ),
             (
-                ".bitty/a.conf",
+                ".wheel/a.conf",
                 "allow_tool = panel_open\ndirective.tone = concise\nbudget = 4096\ntext:\nAye.\n",
             ),
         ];
         let forward =
-            LayerInput::project_from_files_under_roots(&[".bitty"], &files).expect("merges");
+            LayerInput::project_from_files_under_roots(&[".wheel"], &files).expect("merges");
         let mut reversed = files;
         reversed.reverse();
         let backward =
-            LayerInput::project_from_files_under_roots(&[".bitty"], &reversed).expect("merges");
+            LayerInput::project_from_files_under_roots(&[".wheel"], &reversed).expect("merges");
         assert_eq!(forward, backward);
         // Sorted by path: a.conf text first.
         assert_eq!(forward.text, "Aye.\nBee.");
@@ -3495,9 +3495,9 @@ mod tests {
         // An escape anywhere in the set refuses the whole merge.
         assert!(matches!(
             LayerInput::project_from_files_under_roots(
-                &[".bitty"],
+                &[".wheel"],
                 &[
-                    (".bitty/a.conf", "text:\nHi.\n"),
+                    (".wheel/a.conf", "text:\nHi.\n"),
                     ("../evil.conf", "text:\nEvil.\n")
                 ]
             ),
@@ -3506,10 +3506,10 @@ mod tests {
         // Duplicate paths are ambiguous discovery: fail closed.
         assert!(matches!(
             LayerInput::project_from_files_under_roots(
-                &[".bitty"],
+                &[".wheel"],
                 &[
-                    (".bitty/a.conf", "text:\nOne.\n"),
-                    (".bitty/a.conf", "text:\nTwo.\n")
+                    (".wheel/a.conf", "text:\nOne.\n"),
+                    (".wheel/a.conf", "text:\nTwo.\n")
                 ]
             ),
             Err(PromptError::MalformedProject { .. })
@@ -3519,20 +3519,20 @@ mod tests {
     #[test]
     fn project_same_layer_directive_conflict_fails_closed() {
         let conflict = [
-            (".bitty/a.conf", "directive.tone = concise\n"),
-            (".bitty/b.conf", "directive.tone = casual\n"),
+            (".wheel/a.conf", "directive.tone = concise\n"),
+            (".wheel/b.conf", "directive.tone = casual\n"),
         ];
         assert!(matches!(
-            LayerInput::project_from_files_under_roots(&[".bitty"], &conflict),
+            LayerInput::project_from_files_under_roots(&[".wheel"], &conflict),
             Err(PromptError::UnresolvableConflict { key, .. }) if key == "tone"
         ));
         // Same key with the same value merges silently.
         let agreed = [
-            (".bitty/a.conf", "directive.tone = concise\n"),
-            (".bitty/b.conf", "directive.tone = concise\n"),
+            (".wheel/a.conf", "directive.tone = concise\n"),
+            (".wheel/b.conf", "directive.tone = concise\n"),
         ];
         let layer =
-            LayerInput::project_from_files_under_roots(&[".bitty"], &agreed).expect("merges");
+            LayerInput::project_from_files_under_roots(&[".wheel"], &agreed).expect("merges");
         assert_eq!(layer.directives.len(), 1);
     }
 
@@ -3841,34 +3841,34 @@ mod tests {
         let body = format!("text:\n{chunk}\n");
         assert!(body.len() <= MAX_PROJECT_FILE_BYTES);
         let files = [
-            (".bitty/a.conf", body.as_str()),
-            (".bitty/b.conf", body.as_str()),
-            (".bitty/c.conf", body.as_str()),
+            (".wheel/a.conf", body.as_str()),
+            (".wheel/b.conf", body.as_str()),
+            (".wheel/c.conf", body.as_str()),
         ];
         assert!(matches!(
-            LayerInput::project_from_files_under_roots(&[".bitty"], &files),
+            LayerInput::project_from_files_under_roots(&[".wheel"], &files),
             Err(PromptError::LayerTextTooLarge { .. })
         ));
         // More files than the discovery bound.
         let one = "text:\nhi\n";
         let many: Vec<(&str, &str)> = (0..MAX_PROJECT_FILES + 1)
-            .map(|_| (".bitty/a.conf", one))
+            .map(|_| (".wheel/a.conf", one))
             .collect();
         assert!(matches!(
-            LayerInput::project_from_files_under_roots(&[".bitty"], &many),
+            LayerInput::project_from_files_under_roots(&[".wheel"], &many),
             Err(PromptError::TooManyProjectFiles { .. })
         ));
         // Exactly the discovery bound is accepted (distinct paths; duplicate
         // paths fail closed regardless of count).
         let exact: Vec<(String, &str)> = (0..MAX_PROJECT_FILES)
-            .map(|index| (format!(".bitty/f{index:02}.conf"), one))
+            .map(|index| (format!(".wheel/f{index:02}.conf"), one))
             .collect();
         let exact_refs: Vec<(&str, &str)> = exact
             .iter()
             .map(|(path, body)| (path.as_str(), *body))
             .collect();
         assert!(
-            LayerInput::project_from_files_under_roots(&[".bitty"], &exact_refs).is_ok(),
+            LayerInput::project_from_files_under_roots(&[".wheel"], &exact_refs).is_ok(),
             "exactly MAX_PROJECT_FILES must be accepted"
         );
         // Registry over the whole-document bound.
