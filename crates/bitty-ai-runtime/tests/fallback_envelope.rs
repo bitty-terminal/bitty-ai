@@ -48,13 +48,16 @@ fn round_trip_preserves_all_three_fields_byte_exact() {
     );
     let bytes = envelope.to_bytes();
     let decoded = FallbackEnvelope::from_bytes(&bytes).expect("own encoding must decode");
-    assert!(decoded.id == "disclosure-7", "round-trip must preserve id");
     assert!(
-        decoded.kind == "syntax-fallback",
+        decoded.id() == "disclosure-7",
+        "round-trip must preserve id"
+    );
+    assert!(
+        decoded.kind() == "syntax-fallback",
         "round-trip must preserve kind"
     );
     assert!(
-        decoded.text == "héllo wörld ✓ plain",
+        decoded.text() == "héllo wörld ✓ plain",
         "round-trip must preserve text byte-exact"
     );
     assert!(
@@ -71,15 +74,15 @@ fn boundary_lengths_pass_and_round_trip() {
         "t".repeat(MAX_FALLBACK_TEXT_BYTES),
     );
     assert!(
-        envelope.id.len() == MAX_FALLBACK_ID_BYTES,
+        envelope.id().len() == MAX_FALLBACK_ID_BYTES,
         "id at exactly the cap must pass"
     );
     assert!(
-        envelope.kind.len() == MAX_FALLBACK_KIND_BYTES,
+        envelope.kind().len() == MAX_FALLBACK_KIND_BYTES,
         "kind at exactly the cap must pass"
     );
     assert!(
-        envelope.text.len() == MAX_FALLBACK_TEXT_BYTES,
+        envelope.text().len() == MAX_FALLBACK_TEXT_BYTES,
         "text at exactly the cap must pass"
     );
     let decoded =
@@ -227,28 +230,28 @@ fn fallback_for_is_total_over_adversarial_inputs() {
         match fallback_for(input) {
             Ok(envelope) => {
                 assert!(
-                    envelope.id == FALLBACK_ID,
+                    envelope.id() == FALLBACK_ID,
                     "fallback identity must be fixed"
                 );
                 assert!(
-                    envelope.kind == FALLBACK_KIND,
+                    envelope.kind() == FALLBACK_KIND,
                     "fallback kind must be fixed"
                 );
                 assert!(
-                    envelope.id.len() <= MAX_FALLBACK_ID_BYTES,
+                    envelope.id().len() <= MAX_FALLBACK_ID_BYTES,
                     "emitted id must satisfy the cap"
                 );
                 assert!(
-                    envelope.kind.len() <= MAX_FALLBACK_KIND_BYTES,
+                    envelope.kind().len() <= MAX_FALLBACK_KIND_BYTES,
                     "emitted kind must satisfy the cap"
                 );
                 assert!(
-                    envelope.text.len() <= MAX_FALLBACK_TEXT_BYTES,
+                    envelope.text().len() <= MAX_FALLBACK_TEXT_BYTES,
                     "emitted text must satisfy the cap"
                 );
                 assert!(
                     envelope
-                        .text
+                        .text()
                         .chars()
                         .all(|c| c.is_ascii_graphic() || c == ' '),
                     "emitted text must stay readable ASCII"
@@ -264,15 +267,15 @@ fn fallback_for_is_total_over_adversarial_inputs() {
 fn fallback_for_maps_empty_input_to_empty_text_envelope() {
     let envelope = fallback_for(b"").expect("empty input must still envelope");
     assert!(
-        envelope.id == FALLBACK_ID,
+        envelope.id() == FALLBACK_ID,
         "empty input keeps the fixed identity"
     );
     assert!(
-        envelope.kind == FALLBACK_KIND,
+        envelope.kind() == FALLBACK_KIND,
         "empty input keeps the fixed kind"
     );
     assert!(
-        envelope.text.is_empty(),
+        envelope.text().is_empty(),
         "empty input carries no payload text"
     );
 }
@@ -281,12 +284,12 @@ fn fallback_for_maps_empty_input_to_empty_text_envelope() {
 fn fallback_for_scrubs_without_silent_truncation() {
     let envelope = fallback_for(b"hello world").expect("short readable input must envelope");
     assert!(
-        envelope.text == "hello world",
+        envelope.text() == "hello world",
         "readable input must pass through unchanged"
     );
     let scrubbed = fallback_for(b"a\x00b\xff\n").expect("scrubbable input must envelope");
     assert!(
-        scrubbed.text == "a?b??",
+        scrubbed.text() == "a?b??",
         "unreadable bytes must scrub to placeholders"
     );
 }
@@ -308,8 +311,89 @@ fn fallback_for_refuses_over_cap_text_instead_of_truncating() {
     let edge = "y".repeat(MAX_FALLBACK_TEXT_BYTES);
     let envelope = fallback_for(edge.as_bytes()).expect("boundary payload must envelope whole");
     assert!(
-        envelope.text.len() == MAX_FALLBACK_TEXT_BYTES,
+        envelope.text().len() == MAX_FALLBACK_TEXT_BYTES,
         "boundary payload must survive whole"
+    );
+}
+
+/// Reference scrub for independent expected values: lossy-decode the input
+/// and map every character outside printable ASCII to `?`. Small test inputs
+/// only; the point is pinning exact scrub length semantics.
+fn reference_scrub(unreadable: &[u8]) -> String {
+    String::from_utf8_lossy(unreadable)
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() || character == ' ' {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn over_cap_refusal_reports_exact_scrubbed_length() {
+    let unit = b"a\xC3\xA9\xE2\x9C\x93\x00\xFF\xF0";
+    let input = unit.repeat(90);
+    let expected = reference_scrub(&input);
+    assert!(
+        expected.len() > MAX_FALLBACK_TEXT_BYTES,
+        "mixed-cap payload must exceed the scrubbed cap"
+    );
+    assert!(
+        expected.len() < input.len(),
+        "scrubbed length must differ from raw bytes"
+    );
+    let Err(FallbackError::TextTooLarge { limit, actual }) = fallback_for(&input) else {
+        panic!("over-cap scrubbed payload must refuse");
+    };
+    assert!(
+        limit == MAX_FALLBACK_TEXT_BYTES,
+        "refusal must report the documented cap"
+    );
+    assert!(
+        actual == expected.len(),
+        "refusal must report the exact scrubbed length"
+    );
+    assert!(
+        actual != input.len(),
+        "refusal must not report the raw byte length"
+    );
+}
+
+#[test]
+fn scrubbed_to_cap_output_matches_the_reference_scrub() {
+    let unit = b"a\xC3\xA9\xE2\x9C\x93\x00\xFF\xF0";
+    let input = unit.repeat(50);
+    let expected = reference_scrub(&input);
+    assert!(
+        expected.len() <= MAX_FALLBACK_TEXT_BYTES,
+        "fixture must stay inside the scrubbed cap"
+    );
+    let envelope = fallback_for(&input).expect("in-cap scrubbed payload must envelope");
+    assert!(
+        envelope.text() == expected,
+        "in-cap scrubbed text must match the reference scrub"
+    );
+}
+
+#[test]
+fn raw_bytes_over_cap_still_envelope_when_scrubbed_fits() {
+    let text = "é".repeat(MAX_FALLBACK_TEXT_BYTES / 2 + 1);
+    assert!(
+        text.len() > MAX_FALLBACK_TEXT_BYTES,
+        "fixture must exceed the cap in raw bytes"
+    );
+    let envelope =
+        fallback_for(text.as_bytes()).expect("scrubbed payload inside the cap envelopes");
+    assert!(
+        envelope.text() == reference_scrub(text.as_bytes()),
+        "multi-byte input must scrub to the reference text"
+    );
+    assert!(
+        envelope.text().len() <= MAX_FALLBACK_TEXT_BYTES,
+        "enveloped text must satisfy the scrubbed cap"
     );
 }
 
