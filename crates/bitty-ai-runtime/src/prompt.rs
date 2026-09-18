@@ -3864,6 +3864,107 @@ mod tests {
     }
 
     #[test]
+    fn skills_loader_cross_entry_tool_narrowing_and_disjoint_allow_assembly() {
+        let skills_source = concat!(
+            "version = 1\n",
+            "---\n",
+            "name = git-reader\n",
+            "version = 1\n",
+            "allow_tool = git_status\n",
+            "allow_tool = git_diff\n",
+            "deny_tool = git_push\n",
+            "text:\n",
+            "Read-only git skills.\n",
+            "---\n",
+            "name = git-writer\n",
+            "version = 1\n",
+            "allow_tool = git_commit\n",
+            "deny_tool = git_status\n",
+            "text:\n",
+            "Git commit skills.\n",
+        );
+        let skills_layer =
+            LayerInput::skills_from_str(skills_source).expect("skills registry parses");
+        assert_eq!(skills_layer.layer, PromptLayer::SkillsProfile);
+        assert_eq!(
+            skills_layer.allowed_tools,
+            Some(vec![
+                "git_commit".to_owned(),
+                "git_diff".to_owned(),
+                "git_status".to_owned()
+            ])
+        );
+        assert_eq!(
+            skills_layer.denied_tools,
+            vec!["git_push".to_owned(), "git_status".to_owned()]
+        );
+
+        // Exercise full loader-to-assembly path with a loaded project layer.
+        let project = LayerInput::project_from_str(concat!(
+            "allow_tool = git_status\n",
+            "allow_tool = git_diff\n",
+            "text:\n",
+            "Project admits status and diff.\n",
+        ))
+        .expect("project parses");
+
+        let assembled =
+            assemble(&snapshot_with(vec![project, skills_layer.clone()])).expect("assembles");
+
+        // Intersection narrows allowed tools to ["git_diff", "git_status"]
+        assert_eq!(
+            assembled.effective_allowed_tools,
+            Some(vec!["git_diff".to_owned(), "git_status".to_owned()])
+        );
+        // Union preserves denied tools
+        assert_eq!(
+            assembled.effective_denied_tools,
+            vec!["git_push".to_owned(), "git_status".to_owned()]
+        );
+
+        // Dispatch checks:
+        // git_diff is in allowed and not denied -> Ok
+        assert!(check_dispatch(&assembled, "git_diff", true).is_ok());
+        // git_status is in allowed but denied by git-writer entry -> Err(PromptDenied)
+        assert_eq!(
+            check_dispatch(&assembled, "git_status", true),
+            Err(PromptError::PromptDenied {
+                tool: "git_status".to_owned()
+            })
+        );
+        // git_commit was in skills allowed but not in project allowed -> Err(PromptNotAllowed)
+        assert_eq!(
+            check_dispatch(&assembled, "git_commit", true),
+            Err(PromptError::PromptNotAllowed {
+                tool: "git_commit".to_owned()
+            })
+        );
+        // git_push was denied -> Err(PromptDenied)
+        assert_eq!(
+            check_dispatch(&assembled, "git_push", true),
+            Err(PromptError::PromptDenied {
+                tool: "git_push".to_owned()
+            })
+        );
+
+        // Cross-entry disjoint allow sets fail closed with the typed empty-allow refusal
+        let disjoint_project = LayerInput::project_from_str(concat!(
+            "allow_tool = cargo_build\n",
+            "text:\n",
+            "Project admits only cargo_build.\n",
+        ))
+        .expect("disjoint project parses");
+
+        assert_eq!(
+            assemble(&snapshot_with(vec![disjoint_project, skills_layer]))
+                .expect_err("disjoint allow-sets must fail closed"),
+            PromptError::PromptNotAllowed {
+                tool: EMPTY_ALLOW_SET_SENTINEL.to_owned(),
+            }
+        );
+    }
+
+    #[test]
     fn loaded_text_claiming_capability_never_dispatches_without_grant() {
         let project = LayerInput::project_from_str(concat!(
             "text:\n",
