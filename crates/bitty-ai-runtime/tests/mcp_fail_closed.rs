@@ -63,6 +63,10 @@ use bitty_ai_runtime::{
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
+/// Hard bus ceiling mirrored from the `TB-6` contract (`tool.rs`), asserted
+/// here as a literal (not imported) because the constant is intentionally
+/// crate-private to the bus boundary.
+const BUS_CALL_CAP: usize = 8;
 const TOOL_NAME: &str = "workspace_read";
 const FOREIGN_NAME: &str = "mcp_foreign_tool";
 const SCHEMA_N: &[u8] = br#"{"type":"object"}"#;
@@ -167,7 +171,7 @@ fn dispatch_binds_the_registered_spec_never_a_call_side_schema() {
         .expect("registry accepts");
     let mut bus = ToolBus::new(registry).with_authorizer(Allow);
     let invocation = call(TOOL_NAME);
-    bus.precheck(std::slice::from_ref(&invocation), &base())
+    bus.precheck(std::slice::from_ref(&invocation), &base(), BUS_CALL_CAP)
         .expect("precheck authorizes");
     let mut executor = FakeToolExecutor::new();
     executor.push_success("read ok", b"ok".to_vec());
@@ -231,7 +235,7 @@ fn precheck_fails_closed_on_unknown_tool_with_no_dispatch() {
     let bus = ToolBus::new(registry).with_authorizer(Allow);
     let invocation = call(FOREIGN_NAME);
     let error = bus
-        .precheck(std::slice::from_ref(&invocation), &base())
+        .precheck(std::slice::from_ref(&invocation), &base(), BUS_CALL_CAP)
         .expect_err("unknown tool must fail");
     assert!(
         matches!(error, ToolError::UnknownTool { .. }),
@@ -281,7 +285,7 @@ fn missing_authorizer_denies_even_a_registered_spec() {
     let bus = ToolBus::new(registry);
     let invocation = call(TOOL_NAME);
     let error = bus
-        .precheck(std::slice::from_ref(&invocation), &base())
+        .precheck(std::slice::from_ref(&invocation), &base(), BUS_CALL_CAP)
         .expect_err("missing authorizer must fail");
     assert!(
         matches!(error, ToolError::Denied { .. }),
