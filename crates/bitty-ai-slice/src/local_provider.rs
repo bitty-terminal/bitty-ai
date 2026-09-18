@@ -39,8 +39,9 @@
 //! ## Protocol (minimal, fail-closed)
 //!
 //! Requests are OpenAI-compatible chat completions
-//! (`POST {path}` with `{"model","messages","stream":false}`), which a local
-//! Ollama server also serves at `/v1/chat/completions`. Tool observations
+//! (`POST {path}` with `{"model","messages","stream":false}` plus any
+//! declared, mapped sampling fields), which a local Ollama server also
+//! serves at `/v1/chat/completions`. Tool observations
 //! (`Role::Tool`) are folded into `user` messages with a `[tool] ` prefix so
 //! no OpenAI tool protocol is required. Responses look up
 //! `choices[0].message.content` by path (OpenAI chat / Ollama chat); a missing
@@ -77,6 +78,24 @@
 //!   mirroring [`FakeProvider`] (model mismatch, context budget, timeout
 //!   ceiling); the script is never consumed on failure (there is no script;
 //!   `complete_calls` only increments on success).
+//! - `InvalidSampling` / `UnsupportedSampling`: pre-I/O sampling refusal
+//!   (below).
+//!
+//! ## Sampling mapping (AI-CTX-004)
+//!
+//! A declared [`SamplingParams`] contract is validated fail-closed before any
+//! I/O, then mapped to the OpenAI-compatible body with an explicit
+//! backend-field mapping: `temperature` -> `temperature`, `top_p` -> `top_p`,
+//! `frequency_penalty` -> `frequency_penalty`, `presence_penalty` ->
+//! `presence_penalty`, `seed` -> `seed`, `max_tokens` -> `max_tokens`,
+//! `stop` -> `stop`. Absent fields emit nothing (undeclared is not a default)
+//! and every emitted value carries its declared form. Fields this minimal
+//! backend does not carry reject before I/O with
+//! [`ProviderError::UnsupportedSampling`]: `top_k`, `repetition_penalty`,
+//! `min_p`, `response_format`, and `reasoning`. The completion `max_tokens`
+//! value is serialized for the backend to interpret; it is a declared request
+//! field, never a client-side enforcement, and the response-byte ceiling
+//! remains an unrelated transport bound.
 //!
 //! [`ModelProvider`]: bitty_ai_runtime::provider::ModelProvider
 //! [`FakeProvider`]: bitty_ai_runtime::provider::FakeProvider
@@ -91,7 +110,7 @@ use bitty_ai_runtime::bridge::MAX_CONSENT_SCOPE_LEN;
 use bitty_ai_runtime::prompt::MAX_CANONICAL_BYTES;
 use bitty_ai_runtime::provider::{
     MAX_REQUEST_TIMEOUT_MS, ModelCapability, ModelDescriptor, ModelProvider, ProviderError,
-    ProviderTurn, ProviderUsage, Role, TurnRequest, validate_provider_id,
+    ProviderTurn, ProviderUsage, Role, SamplingParams, TurnRequest, validate_provider_id,
 };
 use bitty_ai_runtime::selection::validate_model_name;
 use bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES;
@@ -513,6 +532,7 @@ impl ModelProvider for LocalProvider {
         }
         if let Some(params) = &request.sampling {
             bitty_ai_runtime::validate_sampling(params)?;
+            check_supported_sampling(params)?;
         }
         if request.model != self.endpoint.model {
             return Err(ProviderError::UnknownModel {
@@ -526,7 +546,11 @@ impl ModelProvider for LocalProvider {
                 actual,
             });
         }
-        let body = build_chat_body(&self.endpoint.model, &request.messages);
+        let body = build_chat_body(
+            &self.endpoint.model,
+            &request.messages,
+            request.sampling.as_ref(),
+        );
         if body.len() > MAX_LOCAL_REQUEST_BYTES {
             return Err(ProviderError::Transport {
                 provider: self.provider_id().to_owned(),
@@ -581,12 +605,99 @@ fn role_name(role: &Role) -> &'static str {
     }
 }
 
-/// Build the minimal OpenAI-compatible chat body.
+/// Reject declared sampling fields this minimal backend does not carry.
+///
+/// Validation support does not imply backend support: a valid declaration
+/// still refuses before any I/O when the backend has no explicit mapping for
+/// it. The label is a static field name, never caller input.
+fn check_supported_sampling(params: &SamplingParams) -> Result<(), ProviderError> {
+    if params.top_k.is_some() {
+        return Err(ProviderError::UnsupportedSampling { field: "top_k" });
+    }
+    if params.repetition_penalty.is_some() {
+        return Err(ProviderError::UnsupportedSampling {
+            field: "repetition_penalty",
+        });
+    }
+    if params.min_p.is_some() {
+        return Err(ProviderError::UnsupportedSampling { field: "min_p" });
+    }
+    if params.response_format.is_some() {
+        return Err(ProviderError::UnsupportedSampling {
+            field: "response_format",
+        });
+    }
+    if params.reasoning.is_some() {
+        return Err(ProviderError::UnsupportedSampling { field: "reasoning" });
+    }
+    Ok(())
+}
+
+/// Append one explicitly declared field name so values stay caller-ordered.
+fn push_field_name(out: &mut String, name: &'static str) {
+    out.push_str(",\"");
+    out.push_str(name);
+    out.push_str("\":");
+}
+
+/// Append the declared sampling fields this backend maps.
+///
+/// Fixed order and shortest decimal form make the body byte-deterministic.
+/// Only `Some` fields emit: absent means undeclared and stays absent, never
+/// defaulted. `max_tokens` is the declared completion-token field for the
+/// backend to interpret; it is not client-side enforcement, and the separate
+/// response-byte ceiling is an unrelated transport bound.
+fn append_sampling_fields(out: &mut String, params: &SamplingParams) {
+    if let Some(value) = params.temperature {
+        push_field_name(out, "temperature");
+        out.push_str(&value.to_string());
+    }
+    if let Some(value) = params.top_p {
+        push_field_name(out, "top_p");
+        out.push_str(&value.to_string());
+    }
+    if let Some(value) = params.frequency_penalty {
+        push_field_name(out, "frequency_penalty");
+        out.push_str(&value.to_string());
+    }
+    if let Some(value) = params.presence_penalty {
+        push_field_name(out, "presence_penalty");
+        out.push_str(&value.to_string());
+    }
+    if let Some(value) = params.seed {
+        push_field_name(out, "seed");
+        out.push_str(&value.to_string());
+    }
+    if let Some(value) = params.max_tokens {
+        push_field_name(out, "max_tokens");
+        out.push_str(&value.to_string());
+    }
+    if let Some(stops) = &params.stop {
+        push_field_name(out, "stop");
+        out.push('[');
+        for (index, stop) in stops.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(&json_escape(stop));
+            out.push('"');
+        }
+        out.push(']');
+    }
+}
+
+/// Build the minimal OpenAI-compatible chat body plus mapped sampling.
 ///
 /// `Role::Tool` observations are folded into `user` messages with a `[tool] `
 /// prefix so no OpenAI tool protocol is required; the untrusted surface stays
-/// labeled in the text itself.
-fn build_chat_body(model: &str, messages: &[bitty_ai_runtime::provider::Message]) -> Vec<u8> {
+/// labeled in the text itself. Declared sampling fields emit only when
+/// present; undeclared fields never become defaults.
+fn build_chat_body(
+    model: &str,
+    messages: &[bitty_ai_runtime::provider::Message],
+    sampling: Option<&SamplingParams>,
+) -> Vec<u8> {
     let mut out = String::from("{\"model\":\"");
     out.push_str(&json_escape(model));
     out.push_str("\",\"messages\":[");
@@ -603,7 +714,11 @@ fn build_chat_body(model: &str, messages: &[bitty_ai_runtime::provider::Message]
         out.push_str(&json_escape(&message.content));
         out.push_str("\"}");
     }
-    out.push_str("],\"stream\":false}");
+    out.push_str("],\"stream\":false");
+    if let Some(params) = sampling {
+        append_sampling_fields(&mut out, params);
+    }
+    out.push('}');
     out.into_bytes()
 }
 
@@ -1325,7 +1440,9 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use bitty_ai_runtime::provider::Message;
+    use bitty_ai_runtime::provider::{
+        Message, ReasoningConfig, ReasoningEffort, ResponseFormat, SamplingParams,
+    };
     use bitty_ai_runtime::selection::{
         ModelRegistration, ProviderRegistry, SelectRequest, SelectedModel,
     };
@@ -2293,5 +2410,193 @@ mod tests {
             .complete(&turn_request("llama3.1:8b", "say ok"))
             .expect("live turn");
         assert!(!turn.text.is_empty());
+    }
+
+    // ── AI-CTX-004: declared sampling reaches the backend ───────────────────
+
+    /// A sampling contract with every field undeclared.
+    fn blank_sampling() -> SamplingParams {
+        SamplingParams {
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            min_p: None,
+            seed: None,
+            max_tokens: None,
+            stop: None,
+            response_format: None,
+            reasoning: None,
+        }
+    }
+
+    fn body_with(sampling: Option<&SamplingParams>) -> String {
+        let body = build_chat_body("llama3.1:8b", &[Message::user("hi")], sampling);
+        String::from_utf8(body).expect("utf-8 body")
+    }
+
+    fn unbound_provider() -> LocalProvider {
+        LocalProvider::new(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+        )
+    }
+
+    #[test]
+    fn supported_sampling_fields_serialize_with_backend_names_ai_ctx_004() {
+        let mut params = blank_sampling();
+        params.temperature = Some(0.7);
+        params.top_p = Some(0.9);
+        params.frequency_penalty = Some(-0.5);
+        params.presence_penalty = Some(0.25);
+        params.seed = Some(7);
+        params.max_tokens = Some(128);
+        let text = body_with(Some(&params));
+        assert!(text.contains("\"temperature\":0.7"));
+        assert!(text.contains("\"top_p\":0.9"));
+        assert!(text.contains("\"frequency_penalty\":-0.5"));
+        assert!(text.contains("\"presence_penalty\":0.25"));
+        assert!(text.contains("\"seed\":7"));
+        assert!(text.contains("\"max_tokens\":128"));
+        assert!(text.contains("\"stream\":false"));
+        // Undeclared fields stay absent: never defaulted.
+        assert!(!text.contains("\"top_k\":"));
+        assert!(!text.contains("\"stop\":"));
+        assert!(!text.contains("\"reasoning\":"));
+        assert!(!text.contains("\"response_format\":"));
+    }
+
+    #[test]
+    fn declared_completion_token_limit_serializes_when_supported_ai_ctx_004() {
+        // The declared completion-token limit is a backend request field for
+        // the server to interpret. The separate response-byte ceiling is a
+        // transport bound and never presented as token-budget enforcement.
+        let mut declared = blank_sampling();
+        declared.max_tokens = Some(256);
+        let text = body_with(Some(&declared));
+        assert!(text.contains("\"max_tokens\":256"));
+
+        let mut absent = blank_sampling();
+        absent.max_tokens = None;
+        let text = body_with(Some(&absent));
+        assert!(!text.contains("\"max_tokens\":"));
+    }
+
+    #[test]
+    fn declared_stop_sequences_serialize_escaped_ai_ctx_004() {
+        let mut params = blank_sampling();
+        params.stop = Some(vec!["END".to_owned(), "\"quoted\"\n".to_owned()]);
+        let text = body_with(Some(&params));
+        assert!(text.contains("\"stop\":[\"END\",\"\\\"quoted\\\"\\n\"]"));
+        assert!(!text.contains("\"top_p\":"));
+    }
+
+    #[test]
+    fn absent_versus_explicit_sampling_distinction_is_preserved_ai_ctx_004() {
+        // `None` and an all-undeclared contract serialize identically: absent
+        // stays absent. An explicit value (even the lower range bound `0`)
+        // emits its field, so undeclared and declared are distinguishable.
+        let absent = body_with(None);
+        let blank = body_with(Some(&blank_sampling()));
+        assert_eq!(absent, blank);
+
+        let mut explicit = blank_sampling();
+        explicit.temperature = Some(0.0);
+        let declared = body_with(Some(&explicit));
+        assert_ne!(blank, declared);
+        assert!(declared.contains("\"temperature\":0"));
+    }
+
+    #[test]
+    fn unsupported_sampling_is_refused_before_io_ai_ctx_004() {
+        // Validation support is not backend support: fields this minimal
+        // OpenAI-compatible body does not carry refuse typed before any I/O.
+        // No stub is bound, so zero sockets can open.
+        let mut top_k = blank_sampling();
+        top_k.top_k = Some(40);
+        let mut repetition = blank_sampling();
+        repetition.repetition_penalty = Some(1.1);
+        let mut min_p = blank_sampling();
+        min_p.min_p = Some(0.05);
+        let mut response_format = blank_sampling();
+        response_format.response_format = Some(ResponseFormat::JsonObject);
+        let mut reasoning = blank_sampling();
+        reasoning.reasoning = Some(ReasoningConfig {
+            effort: Some(ReasoningEffort::Low),
+            max_tokens: None,
+            exclude: false,
+        });
+        let cases = [
+            (top_k, "top_k"),
+            (repetition, "repetition_penalty"),
+            (min_p, "min_p"),
+            (response_format, "response_format"),
+            (reasoning, "reasoning"),
+        ];
+        for (params, field) in cases {
+            let mut provider = unbound_provider();
+            let request = TurnRequest {
+                sampling: Some(params),
+                ..turn_request("llama3.1:8b", "hi")
+            };
+            let err = provider
+                .complete(&request)
+                .expect_err("unsupported declaration must refuse");
+            assert_eq!(err, ProviderError::UnsupportedSampling { field });
+            assert_eq!(provider.complete_calls(), 0);
+        }
+    }
+
+    #[test]
+    fn unsupported_sampling_display_is_static_ai_ctx_004() {
+        let err = ProviderError::UnsupportedSampling { field: "top_k" };
+        assert_eq!(
+            err.to_string(),
+            "sampling option unsupported by backend: top_k"
+        );
+    }
+
+    #[test]
+    fn invalid_sampling_takes_precedence_over_unsupported_ai_ctx_004() {
+        // Range validation runs before backend support: an out-of-range
+        // declaration is `InvalidSampling` even when another field would be
+        // unsupported. No stub is bound, so zero sockets open.
+        let mut provider = unbound_provider();
+        let mut params = blank_sampling();
+        params.top_k = Some(-1);
+        params.min_p = Some(0.5);
+        let request = TurnRequest {
+            sampling: Some(params),
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        let err = provider
+            .complete(&request)
+            .expect_err("invalid declaration must refuse");
+        assert_eq!(err, ProviderError::InvalidSampling);
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn supported_sampling_declaration_still_serializes_every_declared_field_ai_ctx_004() {
+        // The mapped fields together form one deterministic body; every
+        // declared value appears exactly once with its backend field name.
+        let mut params = blank_sampling();
+        params.temperature = Some(1.5);
+        params.top_p = Some(0.8);
+        params.frequency_penalty = Some(0.0);
+        params.presence_penalty = Some(-1.0);
+        params.seed = Some(-3);
+        params.max_tokens = Some(4_096);
+        params.stop = Some(vec!["done".to_owned()]);
+        let text = body_with(Some(&params));
+        assert_eq!(text.matches("\"temperature\":").count(), 1);
+        assert_eq!(text.matches("\"top_p\":").count(), 1);
+        assert_eq!(text.matches("\"frequency_penalty\":").count(), 1);
+        assert_eq!(text.matches("\"presence_penalty\":").count(), 1);
+        assert_eq!(text.matches("\"seed\":").count(), 1);
+        assert_eq!(text.matches("\"max_tokens\":").count(), 1);
+        assert_eq!(text.matches("\"stop\":").count(), 1);
+        assert_eq!(text.matches("\"top_k\":").count(), 0);
     }
 }
