@@ -48,7 +48,9 @@
 //! explicit test/host seam and are documented as such.
 
 use bitty_ai_runtime::bridge::IdentityBridge;
-use bitty_ipc::channel::{DEFAULT_REQUEST_TIMEOUT_MS, IpcEndpoint, IpcRequest, IpcResponse};
+use bitty_ipc::channel::{
+    DEFAULT_REQUEST_TIMEOUT_MS, IpcEndpoint, IpcRequest, IpcResponse, RequestId,
+};
 use bitty_ipc::error::IpcError;
 use bitty_ipc::scope::{
     ConsentLedger, Scope, ScopeSet, authorize_method, required_scope_for_method,
@@ -148,6 +150,9 @@ pub trait HostPeer {
     /// Implementations may return [`SliceError`] for transport-level faults;
     /// application-level refusal should instead be returned as an error
     /// [`IpcResponse`] so correlation and fail-closed typing are preserved.
+    /// [`IpcBridge::call`] finalizes the pending correlation entry on every
+    /// terminal exit after admission, so a returned transport fault is
+    /// surfaced unchanged without pinning pending capacity.
     fn serve(&mut self, request: &IpcRequest) -> Result<IpcResponse, SliceError>;
 }
 
@@ -230,6 +235,12 @@ impl IpcBridge {
 
     /// Validate, authorize, send, and correlate one bounded request.
     ///
+    /// Every terminal exit **after admission** (`IpcEndpoint::send_request`
+    /// succeeded) finalizes the pending correlation entry exactly once
+    /// (`AI-CTX-007`): dequeue does not remove pending state, and the bridge
+    /// exposes no expiry/drain recovery, so a leak would pin finite pending
+    /// capacity for the bridge's lifetime.
+    ///
     /// # Errors
     ///
     /// - [`SliceError::Ipc`] when the wire/method/scope primitives reject.
@@ -267,6 +278,25 @@ impl IpcBridge {
             DEFAULT_REQUEST_TIMEOUT_MS,
         )?;
         self.endpoint.send_request(request.clone())?;
+        let outcome = self.serve_admitted(id, peer);
+        // AI-CTX-007: centralized terminal-exit cleanup. `serve_admitted`
+        // returns the original typed peer error untouched, and its own
+        // mismatch/correlation paths may have completed `id` already;
+        // `complete` is idempotent, so this single call covers every exit.
+        self.endpoint.complete(id);
+        outcome
+    }
+
+    /// Serve one admitted request and correlate its response.
+    ///
+    /// Called only after [`IpcEndpoint::send_request`] admitted `id`; the
+    /// caller owns pending finalization, so a transport-level `HostPeer`
+    /// error returning here cannot leak the correlation entry.
+    fn serve_admitted(
+        &mut self,
+        id: RequestId,
+        peer: &mut dyn HostPeer,
+    ) -> Result<Vec<u8>, SliceError> {
         let request =
             self.endpoint
                 .recv_request()
@@ -280,7 +310,6 @@ impl IpcBridge {
             // uncorrelated answer buffers nothing and consumes no pending
             // capacity, so a hostile peer cannot pin the correlation table
             // with mismatched ids.
-            self.endpoint.complete(id);
             return Err(SliceError::ContextUnavailable {
                 reason: "response id does not correlate with the request".to_owned(),
             });
