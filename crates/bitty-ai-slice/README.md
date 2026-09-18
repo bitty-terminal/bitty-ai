@@ -156,6 +156,11 @@ part_index > 0`.
    `part_count` disagrees with the first reports
    `FragmentTransportError::InconsistentPartCount`, kept distinct from the
    supplied-length `FragmentTransportError::PartCountMismatch`.
+8. `reassemble` and `reassemble_expected` enforce aggregate admission bounds
+   against `MAX_FRAGMENT_BYTES` (64 KiB) before allocating reconstructed output
+   (AI-0104): all parts are validated and their text lengths summed into
+   `total_bytes`; if `total_bytes > MAX_FRAGMENT_BYTES`, reassembly fails closed
+   with `FragmentTransportError::OversizedFragment` before any output allocation.
 
 This module is the runtime-to-transport mapping layer, not a shipped
 transport. `bitty-ai-runtime` stays std-only with zero dependencies and cannot
@@ -200,7 +205,9 @@ cargo test -p bitty-ai-slice
   additions prove `reassemble_expected` rejects a foreign but internally
   consistent part set (`IdentityMismatch`) that `reassemble` alone accepts, and
   that the two `part_count` failure modes stay distinguishable
-  (`PartCountMismatch` vs `InconsistentPartCount`).
+  (`PartCountMismatch` vs `InconsistentPartCount`). The AI-0104 additions prove
+  that aggregate parts exceeding `MAX_FRAGMENT_BYTES` fail closed with
+  `OversizedFragment` before output allocation while exact-bound sets reassemble.
 - `src/live_host.rs` inline tests (4 tests): live delegation for snapshot,
   tool dispatch, `Unknown` reconcile, and missing-handler fail-closed.
 - `src/journal_prototype.rs` inline tests (8 tests): append/read-back order

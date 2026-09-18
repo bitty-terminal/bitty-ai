@@ -856,3 +856,92 @@ fn pre_split_fragment_accepts_exactly_the_runtime_bound() {
         "x".repeat(MAX_FRAGMENT_BYTES)
     );
 }
+
+// ── AI-0104 aggregate admission bounds for public reassembly ────────────────
+
+#[test]
+fn reassemble_refuses_aggregate_oversized_parts_before_allocation() {
+    // Each part is within MAX_FRAGMENT_TEXT_BYTES (16 KiB), but the aggregate
+    // sum exceeds MAX_FRAGMENT_BYTES (64 KiB). Reassembly must fail closed
+    // with OversizedFragment before allocating output.
+    let part_size = MAX_FRAGMENT_TEXT_BYTES;
+    let part_count = 5_u32;
+    let total_bytes = part_size * 4 + 1; // 65537 bytes: MAX_FRAGMENT_BYTES + 1
+    assert!(total_bytes > MAX_FRAGMENT_BYTES);
+
+    let parts: Vec<TransportPart> = (0..part_count)
+        .map(|i| {
+            let text_len = if i < 4 { part_size } else { 1 };
+            TransportPart {
+                data: FragmentData {
+                    terminal_id: TERMINAL_ID.to_owned(),
+                    generation: GENERATION,
+                    seq: u64::from(i),
+                    zone: None,
+                    text: "a".repeat(text_len),
+                },
+                part_index: i,
+                part_count,
+                source_seq: 0,
+                is_continuation: i > 0,
+            }
+        })
+        .collect();
+
+    let err = reassemble(&parts).expect_err("aggregate parts exceeding 64 KiB must fail closed");
+    assert_eq!(
+        err,
+        FragmentTransportError::OversizedFragment {
+            actual: total_bytes,
+            limit: MAX_FRAGMENT_BYTES,
+        }
+    );
+
+    let expected = FragmentIdentity::new(TERMINAL_ID, GENERATION, 0);
+    let expected_err = reassemble_expected(&parts, &expected)
+        .expect_err("reassemble_expected must also fail closed on aggregate oversized parts");
+    assert_eq!(
+        expected_err,
+        FragmentTransportError::OversizedFragment {
+            actual: total_bytes,
+            limit: MAX_FRAGMENT_BYTES,
+        }
+    );
+}
+
+#[test]
+fn reassemble_accepts_exact_aggregate_runtime_bound() {
+    // Exactly MAX_FRAGMENT_BYTES (64 KiB = 4 * 16 KiB) across multiple parts
+    // must be admitted and reassembled cleanly.
+    let part_size = MAX_FRAGMENT_TEXT_BYTES;
+    let part_count = 4_u32;
+    let total_bytes = part_size * 4;
+    assert_eq!(total_bytes, MAX_FRAGMENT_BYTES);
+
+    let parts: Vec<TransportPart> = (0..part_count)
+        .map(|i| TransportPart {
+            data: FragmentData {
+                terminal_id: TERMINAL_ID.to_owned(),
+                generation: GENERATION,
+                seq: u64::from(i),
+                zone: None,
+                text: "z".repeat(part_size),
+            },
+            part_index: i,
+            part_count,
+            source_seq: 0,
+            is_continuation: i > 0,
+        })
+        .collect();
+
+    let reassembled = reassemble(&parts)
+        .expect("exact MAX_FRAGMENT_BYTES aggregate parts must reassemble cleanly");
+    assert_eq!(reassembled.len(), MAX_FRAGMENT_BYTES);
+    assert_eq!(reassembled, "z".repeat(MAX_FRAGMENT_BYTES));
+
+    let expected = FragmentIdentity::new(TERMINAL_ID, GENERATION, 0);
+    let reassembled_expected = reassemble_expected(&parts, &expected)
+        .expect("reassemble_expected admits exact MAX_FRAGMENT_BYTES");
+    assert_eq!(reassembled_expected.len(), MAX_FRAGMENT_BYTES);
+    assert_eq!(reassembled_expected, "z".repeat(MAX_FRAGMENT_BYTES));
+}
