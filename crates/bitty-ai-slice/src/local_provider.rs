@@ -16,6 +16,20 @@
 //!   attempted. The host field must be bare (no `://` scheme smuggling).
 //! - Mandatory timeouts: both connect and read timeouts are required
 //!   (`1..=MAX_REQUEST_TIMEOUT_MS`); construction fails closed otherwise.
+//!   Read/write-timeout arming is mandatory too: a failed arm refuses rather
+//!   than silently dropping the declared duration.
+//! - One request deadline: the adapter owns a monotonic clock and arms a
+//!   single deadline at adapter-now + `timeout_ms` for the whole request.
+//!   Connect, write, and read each derive their remaining allowance at the
+//!   moment they start (bounded by the endpoint policy), so no operation is
+//!   granted time past the caller-declared deadline. A zero-duration request,
+//!   or an operation starting with no remaining time, refuses before I/O.
+//!   Socket timeouts bind the per-call allowance, not preemption: a
+//!   drip-feeding peer can still hold a call to its granted allowance. The
+//!   caller keeps its own logical time (`now_ms`), which never anchors the
+//!   deadline; the adapter reads no wall clock and makes no latency or
+//!   outage claim (the success turn keeps `latency_ms: 0`, meaning
+//!   unreported).
 //! - No secrets in code: a local Ollama endpoint needs no key. Any
 //!   key-bearing OpenAI-compatible path takes a caller-supplied value only,
 //!   never hardcoded, never logged (see [`LocalEndpoint`] `Debug`
@@ -64,9 +78,16 @@
 //! - `Transport`: non-loopback refusal, connect failure, malformed envelope,
 //!   missing content field, over-large response, unsupported chunked
 //!   encoding, non-2xx other than below (no secrets carried).
-//! - `Timeout`: connect/read timeout (socket timeout is
-//!   `min(endpoint, request)`; the reported `latency_ms` is the effective
-//!   timeout plus one so `latency > timeout` holds deterministically).
+//! - `Timeout`: connect/write/read timeout. Per-operation allowance is
+//!   `min(endpoint, remaining-from-request-deadline)`; an operation that
+//!   starts with no remaining time refuses immediately. The reported
+//!   `latency_ms` is the effective allowance plus one so `latency > timeout`
+//!   holds deterministically.
+//! - `Transport` (timeout-arm): a mandatory write/read timeout that fails
+//!   to arm refuses instead of being silently ignored, because an unarmed
+//!   operation would run outside the request deadline. Before the request is
+//!   sent the refusal is `Transport`; a read-timeout arm failure after the
+//!   request was sent is `Unknown` (the effect may have happened).
 //! - `Unknown`: truncated response (EOF before headers complete, or body
 //!   shorter than declared `Content-Length`, or I/O error mid-body). The
 //!   effect is uncertain from the client view, so the caller reconciles
@@ -74,10 +95,12 @@
 //! - `Auth` (HTTP 401/403), `RateLimited` (HTTP 429, with `Retry-After`
 //!   seconds converted to ms when present), `ModelUnavailable` (HTTP 404):
 //!   precise status mapping reusing existing variants.
-//! - `UnknownModel` / `BudgetExceeded` / `TimeoutTooLarge`: pre-I/O checks
-//!   mirroring [`FakeProvider`] (model mismatch, context budget, timeout
-//!   ceiling); the script is never consumed on failure (there is no script;
-//!   `complete_calls` only increments on success).
+//! - `TimeoutTooLarge`: pre-I/O checks mirroring [`FakeProvider`] (model
+//!   mismatch, context budget, timeout ceiling); the script is never consumed
+//!   on failure (there is no script; `complete_calls` only increments on
+//!   success). A zero `timeout_ms` refuses with `Transport` before I/O, and
+//!   an operation that starts with no remaining deadline time refuses with
+//!   `Timeout`.
 //! - `InvalidSampling` / `UnsupportedSampling`: pre-I/O sampling refusal
 //!   (below).
 //!
@@ -104,7 +127,8 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bitty_ai_runtime::bridge::MAX_CONSENT_SCOPE_LEN;
 use bitty_ai_runtime::prompt::MAX_CANONICAL_BYTES;
@@ -135,6 +159,80 @@ pub const DEFAULT_LOCAL_READ_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_LOCAL_PATH: &str = "/v1/chat/completions";
 /// Default provider id (`MP-2` shape).
 pub const DEFAULT_LOCAL_PROVIDER_ID: &str = "local-ollama";
+
+/// Adapter-owned monotonic clock seam for one request's deadline.
+///
+/// The adapter measures monotonic elapsed time; the caller only supplies the
+/// logical budget (`TurnRequest::timeout_ms`). Tests inject a deterministic
+/// fixed clock, so no test reads a real clock, sleeps, or opens a socket.
+pub trait MonotonicClock {
+    /// Monotonic instant in milliseconds; callers make no wall-clock claim.
+    fn now_ms(&self) -> u64;
+}
+
+/// Production clock: `Instant` elapsed since the adapter was built.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemMonotonicClock {
+    origin: Instant,
+}
+
+impl SystemMonotonicClock {
+    /// Anchor the clock at the current monotonic instant.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemMonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonotonicClock for SystemMonotonicClock {
+    fn now_ms(&self) -> u64 {
+        self.origin
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+/// One request's monotonic deadline: `start_ms + timeout_ms`, saturating.
+///
+/// Every mandatory operation (connect, write, read) derives its remaining
+/// allowance from this single deadline, so the caller-declared whole-request
+/// duration is upheld instead of granting each operation an independent
+/// allowance.
+#[derive(Debug, Clone, Copy)]
+struct RequestDeadline {
+    end_ms: u64,
+}
+
+impl RequestDeadline {
+    /// Arm a deadline `timeout_ms` after `start_ms` (saturating).
+    fn armed_at(start_ms: u64, timeout_ms: u64) -> Self {
+        Self {
+            end_ms: start_ms.saturating_add(timeout_ms),
+        }
+    }
+
+    /// Milliseconds left before the deadline; 0 once it has passed.
+    fn remaining_ms(&self, now_ms: u64) -> u64 {
+        self.end_ms.saturating_sub(now_ms)
+    }
+}
+
+/// Effective per-operation allowance: the endpoint policy and the request's
+/// remaining time, whichever is smaller, floored at 1 ms so zero never
+/// disables a socket timeout.
+fn effective_allowance_ms(endpoint_ms: u64, remaining_ms: u64) -> u64 {
+    endpoint_ms.min(remaining_ms).max(1)
+}
 
 /// Localhost-only endpoint configuration.
 ///
@@ -485,17 +583,28 @@ fn host_header_value(host: &str) -> String {
 ///
 /// Std-only (`TcpStream`); zero new dependencies. See the module docs for
 /// the localhost, timeout, bound, and error-mapping contract.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalProvider {
     endpoint: LocalEndpoint,
     models: Vec<ModelDescriptor>,
     complete_calls: u64,
+    clock: Arc<dyn MonotonicClock + Send + Sync>,
 }
 
 impl LocalProvider {
     /// Build a provider from a validated [`LocalEndpoint`].
     #[must_use]
     pub fn new(endpoint: LocalEndpoint) -> Self {
+        Self::with_monotonic_clock(endpoint, Arc::new(SystemMonotonicClock::new()))
+    }
+
+    /// Build a provider with an injected monotonic clock (deterministic
+    /// tests). The endpoint's loopback policy is unchanged.
+    #[must_use]
+    pub fn with_monotonic_clock(
+        endpoint: LocalEndpoint,
+        clock: Arc<dyn MonotonicClock + Send + Sync>,
+    ) -> Self {
         let models = vec![ModelDescriptor {
             name: endpoint.model.clone(),
             capabilities: vec![ModelCapability::Text],
@@ -504,6 +613,7 @@ impl LocalProvider {
             endpoint,
             models,
             complete_calls: 0,
+            clock,
         }
     }
 
@@ -511,6 +621,17 @@ impl LocalProvider {
     #[must_use]
     pub fn endpoint(&self) -> &LocalEndpoint {
         &self.endpoint
+    }
+}
+
+impl fmt::Debug for LocalProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalProvider")
+            .field("endpoint", &self.endpoint)
+            .field("models", &self.models)
+            .field("complete_calls", &self.complete_calls)
+            .field("clock", &"monotonic")
+            .finish()
     }
 }
 
@@ -524,6 +645,12 @@ impl ModelProvider for LocalProvider {
     }
 
     fn complete(&mut self, request: &TurnRequest) -> Result<ProviderTurn, ProviderError> {
+        if request.timeout_ms == 0 {
+            return Err(ProviderError::Transport {
+                provider: self.provider_id().to_owned(),
+                reason: "request timeout must be non-zero".to_owned(),
+            });
+        }
         if request.timeout_ms > MAX_REQUEST_TIMEOUT_MS {
             return Err(ProviderError::TimeoutTooLarge {
                 max: MAX_REQUEST_TIMEOUT_MS,
@@ -557,7 +684,12 @@ impl ModelProvider for LocalProvider {
                 reason: format!("request over-large (max {MAX_LOCAL_REQUEST_BYTES})"),
             });
         }
-        let text = http_round_trip(&self.endpoint, &body, request.timeout_ms)?;
+        // One monotonic deadline owns the whole request: connect, write, and
+        // read each derive their remaining allowance from it, so the declared
+        // whole-request duration is upheld instead of granting each operation
+        // an independent allowance.
+        let deadline = RequestDeadline::armed_at(self.clock.now_ms(), request.timeout_ms);
+        let text = http_round_trip(&self.endpoint, &body, &deadline, self.clock.as_ref())?;
         self.complete_calls += 1;
         Ok(ProviderTurn {
             text,
@@ -722,31 +854,25 @@ fn build_chat_body(
     out.into_bytes()
 }
 
-/// One blocking HTTP/1.1 round-trip with mandatory timeouts and bounded reads.
+/// One blocking HTTP/1.1 round-trip under one monotonic request deadline.
+///
+/// Every operation derives its remaining allowance from `deadline` at the
+/// moment it starts (never an independent per-operation budget), and both
+/// timeout arms are mandatory: a failed arm refuses instead of silently
+/// dropping the declared whole-request duration.
 fn http_round_trip(
     endpoint: &LocalEndpoint,
     body: &[u8],
-    request_timeout_ms: u64,
+    deadline: &RequestDeadline,
+    clock: &dyn MonotonicClock,
 ) -> Result<String, ProviderError> {
     let provider = endpoint.provider_id().to_owned();
     let addr = endpoint.socket_addr()?;
-    // Effective timeouts respect both the mandatory endpoint policy and the
-    // caller deadline: the smaller of the two fires first.
-    let connect_ms = endpoint
-        .connect_timeout_ms
-        .min(request_timeout_ms.max(1))
-        .max(1);
-    let read_ms = endpoint
-        .read_timeout_ms
-        .min(request_timeout_ms.max(1))
-        .max(1);
-    let mut stream =
-        TcpStream::connect_timeout(&addr, Duration::from_millis(connect_ms)).map_err(|error| {
+    let connect_budget = operation_allowance_ms(endpoint.connect_timeout_ms, deadline, clock)?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(connect_budget))
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
-                ProviderError::Timeout {
-                    timeout_ms: connect_ms,
-                    latency_ms: connect_ms.saturating_add(1),
-                }
+                remaining_timeout(connect_budget)
             } else {
                 ProviderError::Transport {
                     provider: provider.clone(),
@@ -754,15 +880,14 @@ fn http_round_trip(
                 }
             }
         })?;
+    // Mandatory, not best-effort: ignoring a failed write arm would silently
+    // leave the write side unbounded and break the declared whole-request
+    // duration. The refusal is pre-send, so no request bytes are known to
+    // have been applied and `Transport` (advance) is the safe mapping.
+    let write_budget = operation_allowance_ms(endpoint.connect_timeout_ms, deadline, clock)?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(read_ms)))
-        .map_err(|error| ProviderError::Transport {
-            provider: provider.clone(),
-            reason: format!("read timeout arm failed: {}", short_io_kind(&error)),
-        })?;
-    // `set_write_timeout` is best-effort hardening; a missing write timeout
-    // still leaves the read timeout as the binding deadline.
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(connect_ms)));
+        .set_write_timeout(Some(Duration::from_millis(write_budget)))
+        .map_err(|error| map_arm_error(&provider, TimeoutArm::Write, false, &error))?;
 
     let mut head = format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -779,12 +904,19 @@ fn http_round_trip(
     head.push_str("\r\n");
     stream
         .write_all(head.as_bytes())
-        .map_err(|error| map_write_error(&provider, &error, connect_ms, body.len(), false))?;
+        .map_err(|error| map_write_error(&provider, &error, write_budget, body.len(), false))?;
     stream
         .write_all(body)
-        .map_err(|error| map_write_error(&provider, &error, connect_ms, body.len(), true))?;
+        .map_err(|error| map_write_error(&provider, &error, write_budget, body.len(), true))?;
 
-    let raw = read_bounded(&mut stream, &provider, read_ms)?;
+    // Derived at read start, after the connect/write consumption has already
+    // been deducted from the same deadline: this is the remaining allowance,
+    // never a second full budget.
+    let read_budget = operation_allowance_ms(endpoint.read_timeout_ms, deadline, clock)?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(read_budget)))
+        .map_err(|error| map_arm_error(&provider, TimeoutArm::Read, true, &error))?;
+    let raw = read_bounded(&mut stream, &provider, read_budget)?;
     let (status, response_body) = split_response(&raw, &provider)?;
     check_status(endpoint, status, &raw, &provider)?;
     if response_body.len() > MAX_LOCAL_RESPONSE_BYTES {
@@ -795,6 +927,69 @@ fn http_round_trip(
     }
     let content_type = response_content_type(&raw);
     extract_assistant_text(response_body, content_type.as_deref(), &provider)
+}
+
+/// Which mandatory socket timeout failed to arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutArm {
+    Read,
+    Write,
+}
+
+/// Map a failed mandatory timeout-arm call to a fail-closed refusal.
+///
+/// Timeout arming cannot be ignored: an unarmed operation would run outside
+/// the request deadline. A failure before any request bytes are sent is
+/// [`ProviderError::Transport`] (safe to advance); after the request was
+/// sent it is [`ProviderError::Unknown`], because the server may already
+/// have applied the request and the acknowledgement is unobtainable under
+/// policy. The reason carries only a static arm label plus the short I/O
+/// kind, never a caller value.
+fn map_arm_error(
+    provider: &str,
+    arm: TimeoutArm,
+    request_sent: bool,
+    error: &std::io::Error,
+) -> ProviderError {
+    let label = match arm {
+        TimeoutArm::Read => "read",
+        TimeoutArm::Write => "write",
+    };
+    let reason = format!("{label} timeout arm failed: {}", short_io_kind(error));
+    if request_sent {
+        ProviderError::Unknown {
+            provider: provider.to_owned(),
+            reason,
+        }
+    } else {
+        ProviderError::Transport {
+            provider: provider.to_owned(),
+            reason,
+        }
+    }
+}
+
+/// Derive one operation's allowance from the request deadline, refusing with
+/// [`ProviderError::Timeout`] when no time remains.
+fn operation_allowance_ms(
+    endpoint_ms: u64,
+    deadline: &RequestDeadline,
+    clock: &dyn MonotonicClock,
+) -> Result<u64, ProviderError> {
+    let remaining = deadline.remaining_ms(clock.now_ms());
+    if remaining == 0 {
+        return Err(remaining_timeout(0));
+    }
+    Ok(effective_allowance_ms(endpoint_ms, remaining))
+}
+
+/// Timeout variant for an allowance; `latency_ms > timeout_ms` always holds so
+/// the runtime invariant is deterministic.
+fn remaining_timeout(allowance_ms: u64) -> ProviderError {
+    ProviderError::Timeout {
+        timeout_ms: allowance_ms,
+        latency_ms: allowance_ms.saturating_add(1),
+    }
 }
 
 fn short_io_kind(error: &std::io::Error) -> String {
@@ -825,14 +1020,14 @@ fn is_timeout_kind(error: &std::io::Error) -> bool {
 fn map_write_error(
     provider: &str,
     error: &std::io::Error,
-    connect_ms: u64,
+    write_ms: u64,
     body_len: usize,
     body_started: bool,
 ) -> ProviderError {
     if is_timeout_kind(error) {
         return ProviderError::Timeout {
-            timeout_ms: connect_ms,
-            latency_ms: connect_ms.saturating_add(1),
+            timeout_ms: write_ms,
+            latency_ms: write_ms.saturating_add(1),
         };
     }
     if body_started && body_len > 0 && is_uncertain_kind(error) {
@@ -1436,6 +1631,7 @@ fn parse_json_string(text: &str, open: usize) -> Option<(String, usize)> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -2598,5 +2794,244 @@ mod tests {
         assert_eq!(text.matches("\"max_tokens\":").count(), 1);
         assert_eq!(text.matches("\"stop\":").count(), 1);
         assert_eq!(text.matches("\"top_k\":").count(), 0);
+    }
+
+    /// Fixed deterministic clock: tests set the instant explicitly; no
+    /// thread, sleep, wall clock, or socket is consulted.
+    struct FixedClock {
+        instant_ms: AtomicU64,
+    }
+
+    impl FixedClock {
+        fn new(instant_ms: u64) -> Self {
+            Self {
+                instant_ms: AtomicU64::new(instant_ms),
+            }
+        }
+
+        fn set(&self, instant_ms: u64) {
+            self.instant_ms.store(instant_ms, Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for FixedClock {
+        fn now_ms(&self) -> u64 {
+            self.instant_ms.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn request_deadline_remaining_derives_and_saturates_ai_ctx_005() {
+        let deadline = RequestDeadline::armed_at(1_000, 500);
+        assert_eq!(deadline.remaining_ms(1_000), 500);
+        assert_eq!(deadline.remaining_ms(1_400), 100);
+        assert_eq!(deadline.remaining_ms(1_500), 0);
+        assert_eq!(deadline.remaining_ms(u64::MAX), 0);
+        // Arming saturates instead of wrapping past `u64::MAX`.
+        let saturated = RequestDeadline::armed_at(u64::MAX - 50, 100);
+        assert_eq!(saturated.remaining_ms(u64::MAX - 50), 50);
+    }
+
+    #[test]
+    fn effective_allowance_is_the_smaller_bound_ai_ctx_005() {
+        assert_eq!(effective_allowance_ms(5_000, 1_000), 1_000);
+        assert_eq!(effective_allowance_ms(200, 5_000), 200);
+        assert_eq!(effective_allowance_ms(200, 1), 1);
+    }
+
+    #[test]
+    fn operation_allowance_derives_from_remaining_time_ai_ctx_005() {
+        // The injected clock drives every derivation: the endpoint policy
+        // bounds the first operation, then the same deadline bounds the rest.
+        let clock = FixedClock::new(0);
+        let deadline = RequestDeadline::armed_at(0, 1_000);
+        let first = operation_allowance_ms(400, &deadline, &clock).expect("remaining time");
+        assert_eq!(first, 400, "the endpoint policy is the smaller bound");
+        clock.set(800);
+        let second = operation_allowance_ms(400, &deadline, &clock).expect("remaining time");
+        assert_eq!(
+            second, 200,
+            "the remaining request time is the smaller bound"
+        );
+        clock.set(999);
+        let last = operation_allowance_ms(5_000, &deadline, &clock).expect("remaining time");
+        assert_eq!(last, 1, "the last millisecond stays armed at one");
+        clock.set(1_000);
+        let err = operation_allowance_ms(5_000, &deadline, &clock).expect_err("deadline passed");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Timeout {
+                    timeout_ms: 0,
+                    latency_ms: 1
+                }
+            ),
+            "an operation starting at the deadline must refuse with Timeout"
+        );
+    }
+
+    #[test]
+    fn operation_allowances_never_extend_past_the_deadline_ai_ctx_005() {
+        // Each operation derives its allowance from the same deadline at its
+        // own start, so even an operation that consumes its full allowance
+        // cannot run past the caller-declared end: start + allowance never
+        // exceeds the deadline.
+        let clock = FixedClock::new(0);
+        let deadline = RequestDeadline::armed_at(0, 300);
+        for (now_ms, expected) in [(0_u64, 300_u64), (100, 200), (250, 50), (299, 1)] {
+            clock.set(now_ms);
+            let granted =
+                operation_allowance_ms(10_000, &deadline, &clock).expect("remaining time");
+            assert_eq!(granted, expected, "allowance is the remaining time");
+            assert!(
+                now_ms + granted <= 300,
+                "an operation started now cannot be allowed past the deadline"
+            );
+        }
+        clock.set(300);
+        assert!(
+            operation_allowance_ms(10_000, &deadline, &clock).is_err(),
+            "no operation may start at or after the deadline"
+        );
+    }
+
+    #[test]
+    fn expired_deadline_refuses_before_connect_ai_ctx_005() {
+        // Connect is the first operation observed: an already-expired
+        // deadline refuses with no socket opened (port 11434 has no stub in
+        // this test), so the refusal cannot be a connect failure.
+        let clock = FixedClock::new(10);
+        let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint");
+        let deadline = RequestDeadline::armed_at(10, 5);
+        clock.set(15);
+        let err = http_round_trip(&endpoint, b"{}", &deadline, &clock).expect_err("must refuse");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Timeout {
+                    timeout_ms: 0,
+                    latency_ms: 1
+                }
+            ),
+            "an expired deadline must refuse with Timeout before connect"
+        );
+    }
+
+    #[test]
+    fn zero_request_timeout_refuses_before_io_ai_ctx_005() {
+        // A zero-duration request refuses before any socket is opened; the
+        // fixed clock proves the adapter consults only its own clock seam.
+        let clock = Arc::new(FixedClock::new(4_242));
+        let mut provider = LocalProvider::with_monotonic_clock(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+            clock,
+        );
+        let request = TurnRequest {
+            timeout_ms: 0,
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        let err = provider
+            .complete(&request)
+            .expect_err("zero duration must refuse");
+        assert!(
+            matches!(&err, ProviderError::Transport { reason, .. }
+                if reason.contains("non-zero")),
+            "a zero-duration request must refuse before I/O"
+        );
+        assert!(
+            provider.complete_calls() == 0,
+            "no turn completes on refusal"
+        );
+    }
+
+    /// Deterministic stepping clock: every read advances by a fixed step, so
+    /// a request can be driven exactly onto its deadline without sleeping.
+    struct StepClock {
+        step_ms: u64,
+        now_ms: AtomicU64,
+    }
+
+    impl StepClock {
+        fn new(step_ms: u64) -> Self {
+            Self {
+                step_ms,
+                now_ms: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl MonotonicClock for StepClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms.fetch_add(self.step_ms, Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn provider_complete_refuses_when_deadline_expired_at_first_operation_ai_ctx_005() {
+        // The injected clock is threaded through construction: arming
+        // consumes one instant and the first operation's derivation consumes
+        // the next, landing exactly on the deadline. The refusal is before
+        // connect, so no socket is opened (the endpoint port has no stub).
+        let clock = Arc::new(StepClock::new(50));
+        let mut provider = LocalProvider::with_monotonic_clock(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+            clock,
+        );
+        let request = TurnRequest {
+            timeout_ms: 50,
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        let err = provider
+            .complete(&request)
+            .expect_err("expired deadline must refuse");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Timeout {
+                    timeout_ms: 0,
+                    latency_ms: 1
+                }
+            ),
+            "the first operation at the deadline must refuse with Timeout"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn write_arm_failure_before_send_is_transport_ai_ctx_005() {
+        let error = std::io::Error::other("probe");
+        let mapped = map_arm_error("local-ollama", TimeoutArm::Write, false, &error);
+        assert!(
+            matches!(&mapped, ProviderError::Transport { provider, reason }
+                if provider == "local-ollama" && reason.contains("write timeout arm failed")),
+            "a pre-send write arm failure must refuse as Transport"
+        );
+    }
+
+    #[test]
+    fn read_arm_failure_after_send_is_unknown_ai_ctx_005() {
+        // The read timeout arms only after the request bytes were sent, so a
+        // failed arm leaves the model effect uncertain: `Unknown`, which the
+        // runtime reconciles instead of blind-advancing.
+        let error = std::io::Error::other("probe");
+        let mapped = map_arm_error("local-ollama", TimeoutArm::Read, true, &error);
+        assert!(
+            matches!(&mapped, ProviderError::Unknown { provider, reason }
+                if provider == "local-ollama" && reason.contains("read timeout arm failed")),
+            "a post-send read arm failure must refuse as Unknown"
+        );
+    }
+
+    #[test]
+    fn arm_error_reason_carries_no_runtime_detail_ai_ctx_005() {
+        // The reason maps the I/O kind to a static label; the underlying
+        // error text never reaches the caller-facing refusal.
+        let error = std::io::Error::other("probe-value-must-not-leak");
+        let mapped = map_arm_error("local-ollama", TimeoutArm::Read, false, &error);
+        let rendered = mapped.to_string();
+        assert!(
+            !rendered.contains("probe-value-must-not-leak"),
+            "the arm refusal must not echo runtime detail"
+        );
     }
 }

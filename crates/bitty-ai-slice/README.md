@@ -47,7 +47,7 @@ error      Typed fail-closed slice errors (unsupported method, consent, budget a
 fake_host  Deterministic FakeHost double mirroring bitty dispatch, consent, and result shapes (BII-09)
 harness    Fixtures adapting real IPC snapshots to real runtime inputs with scripted provider
 live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via an injectable seam (BII-09)
-local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, and bounded fail-closed JSON
+local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, one monotonic request deadline (AI-CTX-005), and bounded fail-closed JSON
 journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite journal with deletion tombstones, bounded fields, and fail-closed corruption handling (no FTS5, no scheduler, caller-supplied timestamps)
 fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker, dense seq, and a caller-bindable reassembly identity
 ```

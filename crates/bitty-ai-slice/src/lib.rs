@@ -62,4 +62,4 @@ pub use harness::{
     test_tool_registry,
 };
 pub use live_host::LiveBittyHost;
-pub use local_provider::{LocalEndpoint, LocalProvider};
+pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
