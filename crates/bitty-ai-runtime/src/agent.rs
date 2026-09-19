@@ -663,6 +663,14 @@ impl<P: ModelProvider> Agent<P> {
                 Err(error) => return self.fail(error.into()),
             }
             if turn.tool_calls.is_empty() {
+                // AI-RUN-005: cancellation observed at/after final text
+                // delivery must reconcile as cancellation, never be
+                // declared `Completed` (which would also leave the session
+                // `Canceled` by disagreeing with the outcome). Recheck after
+                // the full batch was accepted and before completion.
+                if self.session.is_cancelled() {
+                    return self.reconcile_cancel();
+                }
                 self.session.finish(false);
                 return ExecOutcome::Completed { text: turn.text };
             }
