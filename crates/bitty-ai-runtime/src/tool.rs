@@ -433,12 +433,69 @@ pub enum ToolStatus {
         /// Hook or host reason.
         reason: String,
     },
+    /// Refused at the dispatch boundary before any executor contact (no
+    /// effect, and nothing was attempted against the host). Distinct from
+    /// [`ToolStatus::Failed`] (an executed effect that the host reported as
+    /// failed) and from a result rejection ([`ResultDisposition::Rejected`],
+    /// an executed effect whose result the bus could not accept).
+    ///
+    /// The variant carries the typed admission cause (validation,
+    /// authorization, or cap) so callers can fail closed with the exact
+    /// [`ToolError`] instead of re-deriving one from text.
+    Refused {
+        /// Typed admission failure.
+        cause: ToolError,
+    },
     /// Effect uncertain: reconcile (status inspection or user direction)
     /// before retry; never blindly retry (`MP-7`).
     Unknown {
         /// What is uncertain.
         reason: String,
     },
+}
+
+impl ToolStatus {
+    /// Whether this status represents a call refused at the dispatch
+    /// boundary before any executor contact (no effect, no host attempt).
+    ///
+    /// [`ToolStatus::Refused`] is admission-only; [`ToolStatus::Denied`] is a
+    /// host/policy refusal returned by the executor after contact, so it is
+    /// deliberately not included here.
+    #[must_use]
+    pub fn is_admission_refusal(&self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+}
+
+/// Terminal accepted-or-refused marker kept separate from [`ToolStatus`] so
+/// an acknowledged effect is never conflated with its result acceptance.
+///
+/// The bus always produces a [`ToolExecution`]: no call, attempt, or effect
+/// leaves the executor return path un-attributed. [`ToolStatus::Refused`] is
+/// the only bus-originated pre-dispatch state (the executor was never
+/// contacted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultDisposition {
+    /// The result was accepted and recorded as-is.
+    Accepted,
+    /// The effect happened but the payload could not be accepted (over-bound
+    /// summary or result bytes).
+    ///
+    /// Carries the typed bound failure so callers can fail closed with the
+    /// exact cause; the paired effect status stays [`ToolStatus::Success`].
+    Rejected {
+        /// Typed acceptance failure.
+        cause: ToolError,
+    },
+}
+
+impl ResultDisposition {
+    /// Whether the effect happened but its payload was refused by the bus
+    /// (over-bound summary or result bytes).
+    #[must_use]
+    pub fn is_rejection(&self) -> bool {
+        matches!(self, Self::Rejected { .. })
+    }
 }
 
 /// One recorded tool execution (L0 structured result shape).
@@ -450,6 +507,10 @@ pub struct ToolExecution {
     pub tool: String,
     /// Structured status.
     pub status: ToolStatus,
+    /// Whether the result payload was accepted or rejected. Always present:
+    /// every dispatch is attributed a terminal outcome, so a post-effect
+    /// rejection cannot be mistaken for an un-attributed attempt.
+    pub result_disposition: ResultDisposition,
     /// Bounded L0 summary (always inline).
     pub summary: String,
     /// Bounded result bytes (empty for denials).
@@ -838,15 +899,32 @@ impl ToolBus {
     /// Defense in depth behind [`ToolBus::precheck`]: the cumulative
     /// per-turn counter stops at the hard [`MAX_TOOL_CALLS_PER_TURN`]
     /// ceiling even when a caller bypasses batch admission (through
-    /// `run_turn` the whole-batch gate fires first), failing with
-    /// [`ToolError::CallLimitExceeded`].
+    /// `run_turn` the whole-batch gate fires first).
+    ///
+    /// Every dispatch leaves a terminal [`ToolExecution`] attributed to
+    /// `execution_id`; no code path returns a bare error for a call that
+    /// never reached the executor. Outcomes are separated into three axes
+    /// (AI-RUN-004):
+    ///
+    /// - **admission** — validation and authorization failures before any
+    ///   executor contact become [`ToolStatus::Refused`] carrying the typed
+    ///   cause, with [`ResultDisposition::Accepted`] (nothing was attempted);
+    /// - **effect** — the executor return path maps to
+    ///   [`ToolStatus::Success`]/[`ToolStatus::Failed`]/[`ToolStatus::Denied`]/
+    ///   [`ToolStatus::Unknown`] with no conflation;
+    /// - **result acceptance** — a success whose payload is over-bound keeps
+    ///   [`ToolStatus::Success`] (the effect happened) and records a
+    ///   [`ResultDisposition::Rejected`] carrying the typed bound failure,
+    ///   instead of a generic failure.
     ///
     /// # Errors
     ///
-    /// Fails closed with [`ToolError`] for validation, authorization, cap, or
-    /// over-bound results. [`ToolError::EffectUnknown`] and
-    /// [`ToolError::Denied`] from the executor become recorded
-    /// [`ToolExecution`] statuses instead of errors.
+    /// Fails closed only for a non-[`ToolSuccess`] executor error that is
+    /// neither [`ToolError::EffectUnknown`] nor [`ToolError::Denied`]. The
+    /// caller observes [`ToolStatus::Refused`] (admission) and
+    /// [`ResultDisposition::Rejected`] (acceptance) through the returned
+    /// [`ToolExecution`] and fails the turn itself with the carried typed
+    /// cause.
     pub fn dispatch(
         &mut self,
         executor: &mut dyn ToolExecutor,
@@ -855,11 +933,17 @@ impl ToolBus {
         execution_id: crate::session::ExecutionId,
         now_ms: u64,
     ) -> Result<ToolExecution, ToolError> {
-        self.authorize_call(base, call)?;
+        if let Err(error) = self.authorize_call(base, call) {
+            return Ok(Self::refused(execution_id, call, error));
+        }
         if self.calls_this_turn >= MAX_TOOL_CALLS_PER_TURN {
-            return Err(ToolError::CallLimitExceeded {
-                limit: MAX_TOOL_CALLS_PER_TURN,
-            });
+            return Ok(Self::refused(
+                execution_id,
+                call,
+                ToolError::CallLimitExceeded {
+                    limit: MAX_TOOL_CALLS_PER_TURN,
+                },
+            ));
         }
         let context = ExecutionContext {
             execution_id,
@@ -870,21 +954,30 @@ impl ToolBus {
         match outcome {
             Ok(success) => {
                 if success.summary.len() > MAX_SUMMARY_BYTES {
-                    return Err(ToolError::SummaryTooLarge {
-                        limit: MAX_SUMMARY_BYTES,
-                        actual: success.summary.len(),
-                    });
+                    return Ok(Self::result_rejected(
+                        execution_id,
+                        call,
+                        ToolError::SummaryTooLarge {
+                            limit: MAX_SUMMARY_BYTES,
+                            actual: success.summary.len(),
+                        },
+                    ));
                 }
                 if success.data.len() > MAX_TOOL_RESULT_BYTES {
-                    return Err(ToolError::ResultTooLarge {
-                        limit: MAX_TOOL_RESULT_BYTES,
-                        actual: success.data.len(),
-                    });
+                    return Ok(Self::result_rejected(
+                        execution_id,
+                        call,
+                        ToolError::ResultTooLarge {
+                            limit: MAX_TOOL_RESULT_BYTES,
+                            actual: success.data.len(),
+                        },
+                    ));
                 }
                 Ok(ToolExecution {
                     execution_id,
                     tool: call.name.clone(),
                     status: ToolStatus::Success,
+                    result_disposition: ResultDisposition::Accepted,
                     summary: success.summary,
                     data: success.data,
                     is_untrusted_surface: true,
@@ -900,6 +993,7 @@ impl ToolBus {
                 status: ToolStatus::Unknown {
                     reason: crate::bridge::bound_reason(&reason),
                 },
+                result_disposition: ResultDisposition::Accepted,
                 summary: "effect uncertain; reconcile before retry".to_owned(),
                 data: Vec::new(),
                 is_untrusted_surface: true,
@@ -908,11 +1002,53 @@ impl ToolBus {
                 execution_id,
                 tool: call.name.clone(),
                 status: ToolStatus::Denied { reason },
+                result_disposition: ResultDisposition::Accepted,
                 summary: "host denied execution".to_owned(),
                 data: Vec::new(),
                 is_untrusted_surface: true,
             }),
             Err(error) => Err(error),
+        }
+    }
+
+    /// Record a call refused at the dispatch boundary before any executor
+    /// contact: no effect, nothing attempted, [`ResultDisposition::Accepted`]
+    /// because there was no result to accept or reject. The typed cause is
+    /// carried on the status for the caller's fail-closed attribution.
+    fn refused(
+        execution_id: crate::session::ExecutionId,
+        call: &ToolCall,
+        cause: ToolError,
+    ) -> ToolExecution {
+        ToolExecution {
+            execution_id,
+            tool: call.name.clone(),
+            status: ToolStatus::Refused { cause },
+            result_disposition: ResultDisposition::Accepted,
+            summary: "refused before dispatch".to_owned(),
+            data: Vec::new(),
+            is_untrusted_surface: false,
+        }
+    }
+
+    /// Record an acknowledged effect whose returned payload the bus could
+    /// not accept. [`ToolStatus::Success`] is preserved (the effect
+    /// happened); only the result is marked [`ResultDisposition::Rejected`]
+    /// with the typed acceptance cause. Rejection is terminal for the turn,
+    /// never a silent truncation or an empty-bytes substitute (S-2).
+    fn result_rejected(
+        execution_id: crate::session::ExecutionId,
+        call: &ToolCall,
+        cause: ToolError,
+    ) -> ToolExecution {
+        ToolExecution {
+            execution_id,
+            tool: call.name.clone(),
+            status: ToolStatus::Success,
+            result_disposition: ResultDisposition::Rejected { cause },
+            summary: "executed; result rejected by bus".to_owned(),
+            data: Vec::new(),
+            is_untrusted_surface: true,
         }
     }
 }
@@ -1299,7 +1435,9 @@ mod tests {
         // Revocation between the transactional gate and the next dispatch
         // boundary must take effect: the hook allows the validation pass and
         // denies every later check (`PP-6`). The call is refused before the
-        // executor with no partial state.
+        // executor with no partial state, attributed as an admission
+        // refusal (`Refused`, AI-RUN-004) carrying the typed cause, never as
+        // an executed failure.
         struct RevokeAfterPrecheck {
             checks: Cell<usize>,
         }
@@ -1331,10 +1469,19 @@ mod tests {
         .expect("validation pass allows");
         let mut executor = FakeToolExecutor::new();
         let mut ids = crate::session::IdIssuer::default();
-        let error = bus
+        let execution = bus
             .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
-            .expect_err("dispatch boundary must re-check the hook");
-        assert!(matches!(error, ToolError::Denied { .. }));
+            .expect("admission refusal is a recorded status, not a bus error");
+        assert!(
+            matches!(
+                &execution.status,
+                ToolStatus::Refused {
+                    cause: ToolError::Denied { .. }
+                }
+            ),
+            "dispatch boundary must record the revocation as a typed refusal"
+        );
+        assert_eq!(execution.result_disposition, ResultDisposition::Accepted);
         assert!(executor.calls().is_empty(), "revoked call never dispatched");
         assert_eq!(bus.calls_this_turn(), 0);
     }
@@ -1385,6 +1532,87 @@ mod tests {
         assert_eq!(executor.calls()[1].0, exec_id_2);
         assert_eq!(executor.calls()[1].1, "workspace_read");
         assert_eq!(executor.calls()[1].2, br#"{"path":"file2"}"#);
+    }
+
+    #[test]
+    fn dispatch_records_admission_refusal_without_executor_contact() {
+        // AI-RUN-004: a dispatch-boundary authorization refusal is a
+        // pre-dispatch admission decision. It becomes `Refused` carrying the
+        // typed cause (never `Failed`, which claims an executed effect), the
+        // executor is never contacted, no per-turn call is counted, and the
+        // result disposition stays `Accepted` (there was no result).
+        let mut bus = ToolBus::new(read_only_registry());
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("admission refusal is a recorded status, not a bus error");
+        assert!(execution.status.is_admission_refusal());
+        assert!(
+            matches!(
+                &execution.status,
+                ToolStatus::Refused {
+                    cause: ToolError::Denied { .. }
+                }
+            ),
+            "admission refusal must carry the typed authorization cause"
+        );
+        assert_eq!(execution.result_disposition, ResultDisposition::Accepted);
+        assert!(!execution.result_disposition.is_rejection());
+        assert!(execution.data.is_empty());
+        assert!(!execution.is_untrusted_surface);
+        assert_eq!(execution.tool, "workspace_read");
+        assert!(
+            executor.calls().is_empty(),
+            "refusal never reaches the host"
+        );
+        assert_eq!(bus.calls_this_turn(), 0);
+    }
+
+    #[test]
+    fn dispatch_keeps_success_when_returned_payload_is_rejected() {
+        // AI-RUN-004: the executor acknowledged an effect, but the returned
+        // payload is over-bound. The effect status must stay `Success` (it
+        // happened) and only the result disposition becomes `Rejected` with
+        // the typed bound failure: never a generic executed-failure
+        // attribution, and never un-attributed bytes.
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("read ok", vec![b'y'; MAX_TOOL_RESULT_BYTES + 1]);
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("an acknowledged effect is recorded, not errored");
+        assert_eq!(execution.status, ToolStatus::Success);
+        assert!(execution.result_disposition.is_rejection());
+        assert!(
+            matches!(
+                &execution.result_disposition,
+                ResultDisposition::Rejected {
+                    cause: ToolError::ResultTooLarge { .. }
+                }
+            ),
+            "rejection must carry the typed result-bound cause"
+        );
+        assert_eq!(executor.calls().len(), 1, "the effect was attempted once");
+        assert_eq!(bus.calls_this_turn(), 1, "an executed attempt is counted");
+        assert!(execution.data.is_empty(), "no un-attributed bytes are kept");
+        assert!(execution.is_untrusted_surface);
     }
 
     #[test]

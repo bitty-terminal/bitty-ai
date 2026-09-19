@@ -19,7 +19,7 @@
 //! - `runtime_fail_closed.rs`: fail-closed mechanics (S-2 store-full,
 //!   denial attribution, oversized results). S-2 and denial appear here
 //!   only for the disclosure fields that file leaves out (typed `Display`,
-//!   card words, no-card-on-dispatch-error).
+//!   card words, no-card-on-result-rejection).
 //! - `context.rs` unit tests: truncation ordering/counting mechanics; here
 //!   truncation appears as provider-visible disclosure plus the accounting
 //!   fields through the public [`assemble`] API in a multi-provider shape.
@@ -28,9 +28,9 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, ArtifactStore, AuthContext, AuthDecision, ContextError,
     ContextPriority, ContextRecord, ContextRequest, ExecOutcome, FakeProvider, FakeToolExecutor,
     FragmentKind, IdIssuer, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
-    ProviderUsage, RecordBody, SessionState, StableId, StreamSink, ToolAuthorizer, ToolBus,
-    ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, TurnRequest, VecSink, assemble,
-    validate_chunk,
+    ProviderUsage, RecordBody, ResultDisposition, SessionState, StableId, StreamSink,
+    ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus,
+    TurnRequest, VecSink, assemble, validate_chunk,
 };
 use bitty_ai_runtime::{AgentSession, MAX_RECONCILE_REASON_BYTES};
 
@@ -562,9 +562,13 @@ fn unknown_maps_to_unknown_word_and_record() {
 }
 
 #[test]
-fn failed_dispatch_errors_emit_no_card() {
-    // A dispatch-time failure records `Failed` and fails the turn without
-    // emitting any card: failures are never substituted with an empty card.
+fn rejected_result_keeps_success_and_emits_no_card() {
+    // AI-RUN-004: the executor acknowledged the effect but the returned
+    // payload exceeded the result bound. The effect status stays `Success`
+    // (the host ran it) and the acceptance axis carries the typed bound
+    // failure; the turn fails closed with that same typed error. No card is
+    // emitted because there is no accepted payload to disclose, and no
+    // empty-bytes substitute is recorded.
     let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
     provider.push_turn(tool_turn("reading", 1, 0));
     let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
@@ -578,18 +582,24 @@ fn failed_dispatch_errors_emit_no_card() {
     let limit = 16 * 1024;
     let detail = format!("tool result of {actual} bytes exceeds {limit} byte limit");
     let ExecOutcome::Failed { error } = &outcome else {
-        panic!("oversized result must fail the turn, got: {outcome:?}");
+        panic!("a rejected over-bound result must fail the turn with a typed cause");
     };
     assert_eq!(error.to_string(), format!("tool: {detail}"));
     assert_eq!(tool_card_text(&sink), "");
+    // The effect happened: success is preserved, never relabeled as an
+    // executed failure; only the acceptance axis is rejected.
+    assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
     assert!(
         matches!(
-            &agent.executions()[0].status,
-            ToolStatus::Failed { reason } if reason == &detail
+            &agent.executions()[0].result_disposition,
+            ResultDisposition::Rejected {
+                cause: ToolError::ResultTooLarge { .. }
+            }
         ),
         "unexpected record: {:?}",
         agent.executions()[0]
     );
+    assert_eq!(agent.tool_records().len(), 0);
     assert_eq!(agent.session().state(), SessionState::Failed);
 }
 
