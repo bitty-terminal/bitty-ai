@@ -280,10 +280,16 @@ pub fn fragment_text(kind: FragmentKind, text: &str) -> Vec<Fragment> {
 /// batch carries the running water mark `total = start_seq + fragments.len()`
 /// and the batch-closing chunk is marked `is_final`.
 ///
-/// Returns `Ok(Some(next_seq))` when every fragment was emitted, where
-/// `next_seq` is the next unused sequence number for a later batch of the
-/// same turn; `Ok(None)` when cancellation stopped emission early
+/// Returns `Ok(Some(next_seq))` when every fragment was emitted and no
+/// cancellation was observed at any boundary, where `next_seq` is the next
+/// unused sequence number for a later batch of the same turn; `Ok(None)`
+/// when cancellation was requested before, during, or after delivery
 /// (already-emitted chunks stay emitted; the caller reconciles).
+///
+/// Cancellation is rechecked after the final delivery because a callback
+/// (`sink.emit`) can request it while accepting the last fragment: without
+/// the post-delivery check a batch whose final callback cancelled would be
+/// reported as complete, disagreeing with the session's terminal state.
 ///
 /// # Errors
 ///
@@ -315,11 +321,21 @@ pub fn emit_fragments(
             fragment: fragment.clone(),
         })?;
     }
+    // AI-RUN-005: a callback can request cancellation while accepting the
+    // final fragment, so acceptance is not completion. Recheck after
+    // delivery and report `None` (the caller's reconcile path) rather than
+    // advancing the water mark; delivered bytes stay in the sink.
+    if is_cancelled() {
+        return Ok(None);
+    }
     Ok(Some(next_seq))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
 
     #[test]
@@ -447,5 +463,76 @@ mod tests {
         let next = emit_fragments(&mut sink, &fragments, 0, &|| true).expect("no chunk error");
         assert!(next.is_none());
         assert!(sink.is_empty());
+    }
+
+    /// Sink wrapper that requests cancellation while accepting a chunk whose
+    /// `is_final` is true — the deterministic analogue of a transport
+    /// callback cancelling on the batch-closing delivery.
+    struct CancelOnFinal {
+        inner: VecSink,
+        cancelled: Rc<Cell<bool>>,
+    }
+
+    impl StreamSink for CancelOnFinal {
+        fn emit(&mut self, chunk: StreamChunk) -> Result<(), StreamError> {
+            let is_final = chunk.is_final;
+            self.inner.emit(chunk)?;
+            if is_final {
+                self.cancelled.set(true);
+            }
+            Ok(())
+        }
+
+        fn chunks(&self) -> &[StreamChunk] {
+            self.inner.chunks()
+        }
+    }
+
+    fn cancel_on_final_sink() -> (CancelOnFinal, Rc<Cell<bool>>) {
+        let cancelled = Rc::new(Cell::new(false));
+        (
+            CancelOnFinal {
+                inner: VecSink::new(),
+                cancelled: Rc::clone(&cancelled),
+            },
+            cancelled,
+        )
+    }
+
+    #[test]
+    fn emit_rechecks_cancellation_after_final_delivery() {
+        // AI-RUN-005: cancel landing on the final delivery must not report
+        // the batch complete. The bytes are already accepted and preserved,
+        // but the outcome is the cancellation signal (`None`).
+        let (mut sink, cancelled) = cancel_on_final_sink();
+        let fragments = fragment_text(FragmentKind::Markdown, "final");
+        let next =
+            emit_fragments(&mut sink, &fragments, 0, &|| cancelled.get()).expect("no chunk error");
+        assert!(next.is_none());
+        assert!(cancelled.get());
+        assert_eq!(sink.chunks().len(), fragments.len());
+        assert!(sink.chunks()[0].is_final);
+    }
+
+    #[test]
+    fn emit_rechecks_cancellation_after_multi_fragment_final_delivery() {
+        // Same boundary with a multi-fragment batch: the cancel lands on the
+        // last of several chunks, so the whole batch is delivered, yet the
+        // batch still reports cancellation rather than completion.
+        let (mut sink, cancelled) = cancel_on_final_sink();
+        let text = "é".repeat(MAX_FRAGMENT_BYTES);
+        let fragments = fragment_text(FragmentKind::Markdown, &text);
+        assert!(fragments.len() > 1);
+        let next =
+            emit_fragments(&mut sink, &fragments, 0, &|| cancelled.get()).expect("no chunk error");
+        assert!(next.is_none());
+        assert_eq!(sink.chunks().len(), fragments.len());
+        let joined: Vec<u8> = sink
+            .chunks()
+            .iter()
+            .flat_map(|chunk| chunk.fragment.bytes.iter().copied())
+            .collect();
+        assert_eq!(joined, text.as_bytes());
+        assert!(sink.chunks().last().expect("last chunk").is_final);
     }
 }
