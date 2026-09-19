@@ -674,6 +674,7 @@ fn adoption_coverage_and_bounds_refuse_fail_closed() {
             execution_id: id,
             tool: "workspace_read".to_owned(),
             status: ToolStatus::Success,
+            result_disposition: bitty_ai_runtime::ResultDisposition::Accepted,
         });
     }
     assert_eq!(wide_ids.len(), MAX_ADOPTION_SURVIVORS + 1);

@@ -53,8 +53,8 @@
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AgentLevel, AuthBase, AuthContext, AuthDecision, ExecOutcome,
     FakeProvider, FakeToolExecutor, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage,
-    RecordingExecutor, SessionState, ToolAuthorizer, ToolBus, ToolCall, ToolCallRequest, ToolError,
-    ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, VecSink,
+    RecordingExecutor, ResultDisposition, SessionState, ToolAuthorizer, ToolBus, ToolCall,
+    ToolCallRequest, ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, VecSink,
 };
 
 /// Hard bus ceiling mirrored from the `TB-6` contract (`tool.rs`). Asserted
@@ -320,8 +320,13 @@ fn bus_per_call_counter_is_fail_closed_past_the_cap() {
     // through `run_turn` this path is unreachable (the cumulative batch gate
     // fires first in every round), so it is pinned here on the bus. Earlier
     // dispatches stay recorded; the counter is unchanged by the refusal.
+    // AI-RUN-004: the ninth call is a pre-dispatch admission refusal
+    // (`Refused` with the typed cap cause), not an executed failure. With
+    // the inert recording double the counts separate exactly: attempts
+    // (`call_count`) and admitted calls (`calls_this_turn`) stay at eight,
+    // and the refusal disposition is `Accepted` (no result existed).
     let mut bus = read_tool_bus();
-    let mut executor = FakeToolExecutor::new();
+    let mut executor = RecordingExecutor::new();
     for _ in 0..8 {
         executor.push_success("ok", b"data".to_vec());
     }
@@ -334,18 +339,26 @@ fn bus_per_call_counter_is_fail_closed_past_the_cap() {
         bus.dispatch(&mut executor, &call, &base(), issuer.execution(), NOW_MS)
             .expect("first eight dispatches fit the cap");
     }
+    assert_eq!(executor.call_count(), 8);
     assert_eq!(bus.calls_this_turn(), 8);
-    let error = bus
+    let execution = bus
         .dispatch(&mut executor, &call, &base(), issuer.execution(), NOW_MS)
-        .expect_err("ninth dispatch must fail closed");
-    assert_eq!(
-        error,
-        ToolError::CallLimitExceeded {
-            limit: BUS_CALL_CAP
-        }
+        .expect("admission refusal is a recorded status, not a bus error");
+    assert!(execution.status.is_admission_refusal());
+    assert!(
+        matches!(
+            &execution.status,
+            ToolStatus::Refused {
+                cause: ToolError::CallLimitExceeded {
+                    limit: BUS_CALL_CAP
+                }
+            }
+        ),
+        "cap refusal must carry the typed limit cause"
     );
-    assert_eq!(executor.calls().len(), 8);
-    assert_eq!(bus.calls_this_turn(), 8);
+    assert_eq!(execution.result_disposition, ResultDisposition::Accepted);
+    assert_eq!(executor.call_count(), 8, "a refusal is never an attempt");
+    assert_eq!(bus.calls_this_turn(), 8, "a refusal is never admitted");
 }
 
 #[test]

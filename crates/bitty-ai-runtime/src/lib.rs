@@ -145,6 +145,7 @@ pub use stream::{
 };
 pub use tool::{
     AuthBase, AuthContext, AuthDecision, DenyAllAuthorizer, ExecutionContext, FakeToolExecutor,
-    RecordingExecutor, ToolAuthorizer, ToolBus, ToolCall, ToolError, ToolExecution, ToolExecutor,
-    ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, validate_tool_name,
+    RecordingExecutor, ResultDisposition, ToolAuthorizer, ToolBus, ToolCall, ToolError,
+    ToolExecution, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, ToolSuccess,
+    validate_tool_name,
 };

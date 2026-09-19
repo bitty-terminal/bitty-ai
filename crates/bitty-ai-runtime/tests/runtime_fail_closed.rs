@@ -8,8 +8,9 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AgentLevel, AuthContext, AuthDecision, ContextError,
     ContextPriority, ContextRecord, ElevationGrant, ExecOutcome, FakeProvider, FakeToolExecutor,
     FragmentKind, ModelProvider, ProviderError, ProviderTurn, ProviderUsage, RecordBody,
-    SessionState, StableId, StreamSink, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError,
-    ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, VecSink,
+    RecordingExecutor, ResultDisposition, SessionState, StableId, StreamSink, ToolAuthorizer,
+    ToolBus, ToolCallRequest, ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus,
+    ToolSuccess, VecSink,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -471,13 +472,21 @@ fn mid_turn_generation_rotation_downgrades_remaining_writes() {
     // Second dispatch never reached the host: fail closed before execute.
     assert_eq!(executor.calls.len(), 1);
     // Already-dispatched effect is kept, never rolled back; the denied
-    // remainder is recorded as a failed attribution.
+    // remainder is a pre-dispatch admission refusal (`Refused`, AI-RUN-004),
+    // never an executed-failure attribution: the host never ran it.
     assert_eq!(agent.executions().len(), 2);
     assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
+    assert!(agent.executions()[1].status.is_admission_refusal());
     assert!(matches!(
         agent.executions()[1].status,
-        ToolStatus::Failed { .. }
+        ToolStatus::Refused {
+            cause: ToolError::Denied { .. }
+        }
     ));
+    assert_eq!(
+        agent.executions()[1].result_disposition,
+        ResultDisposition::Accepted
+    );
     assert_eq!(agent.provider_mut().complete_calls(), 1);
     assert_eq!(session.state(), SessionState::Failed);
 }
@@ -540,13 +549,141 @@ fn oversized_result_fails_after_single_dispatch() {
         ),
         "unexpected outcome: {outcome:?}"
     );
-    // The dispatch happened exactly once and is recorded as failed.
+    // AI-RUN-004: the dispatch happened exactly once and its effect is
+    // acknowledged (`Success`); only the result acceptance was refused, and
+    // the turn failed with the typed bound cause. Acknowledged success is
+    // never relabeled as an executed failure.
     assert_eq!(executor.calls().len(), 1);
     assert_eq!(agent.executions().len(), 1);
+    assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
+    assert!(
+        matches!(
+            &agent.executions()[0].result_disposition,
+            ResultDisposition::Rejected {
+                cause: ToolError::ResultTooLarge { .. }
+            }
+        ),
+        "rejection must carry the typed result-bound cause"
+    );
+    assert_eq!(agent.tool_records().len(), 0);
+}
+
+#[test]
+fn oversized_summary_fails_after_single_dispatch_with_success_kept() {
+    // Same separation for the summary bound: a successful executor response
+    // whose summary is over-bound keeps `Success` on the effect axis and
+    // records the typed `SummaryTooLarge` rejection on the acceptance axis.
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "reading".to_owned(),
+        tool_calls: vec![ToolCallRequest {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        }],
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
+    let mut executor = FakeToolExecutor::new();
+    executor.push_success("s".repeat(4 * 1024 + 1), Vec::new());
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::SummaryTooLarge { .. })
+            }
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(executor.calls().len(), 1);
+    assert_eq!(agent.executions().len(), 1);
+    assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
     assert!(matches!(
-        agent.executions()[0].status,
-        ToolStatus::Failed { .. }
+        agent.executions()[0].result_disposition,
+        ResultDisposition::Rejected {
+            cause: ToolError::SummaryTooLarge { .. }
+        }
     ));
+}
+
+#[test]
+fn rejected_result_keeps_completed_counts_with_inert_double() {
+    // AI-RUN-004 acceptance: attempted / completed counts are attributed on
+    // the separate axes with an inert recording double. Round one requests
+    // three calls: one acknowledged (accepted) effect, one acknowledged
+    // effect whose payload is rejected, and a third the host is never
+    // contacted for. The rejected second result ends the turn first, so:
+    //
+    // - `attempted` (recording-executor invocations): 2 — the two calls the
+    //   host was contacted for, never the third;
+    // - `completed` (recorded `Success` executions): 2 — both acknowledged
+    //   effects stay attributed as completed effects even though the second
+    //   payload was rejected on the acceptance axis.
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    provider.push_turn(ProviderTurn {
+        text: "two reads".to_owned(),
+        tool_calls: vec![
+            ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"a"}"#.to_vec(),
+            },
+            ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"b"}"#.to_vec(),
+            },
+            ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"c"}"#.to_vec(),
+            },
+        ],
+        latency_ms: 0,
+        usage: ProviderUsage::default(),
+    });
+    let mut agent = Agent::new(provider, read_tool_bus(), session(), AgentConfig::default());
+    let mut executor = RecordingExecutor::new();
+    executor.push_success("a ok", b"a".to_vec());
+    executor.push_success("b over-bound", vec![b'y'; 17 * 1024]);
+    executor.push_success("must never dispatch", b"c".to_vec());
+    let mut sink = VecSink::new();
+
+    let outcome = run(&mut agent, &mut executor, "hi", &[], &mut sink);
+
+    assert!(
+        matches!(
+            &outcome,
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::ResultTooLarge { .. })
+            }
+        ),
+        "a rejected over-bound result must fail the turn with the typed bound cause"
+    );
+    // Attempted: the host was contacted exactly twice; the rejected attempt
+    // still counts as one attempt, and the third call was never attempted
+    // because the turn failed on the rejected result.
+    assert_eq!(executor.call_count(), 2);
+    // Completed: both acknowledged effects are attributed as `Success`; the
+    // first accepted with its payload, the second rejected on the result
+    // axis only.
+    assert_eq!(agent.executions().len(), 2);
+    assert!(
+        agent
+            .executions()
+            .iter()
+            .all(|record| matches!(record.status, ToolStatus::Success)),
+        "acknowledged effects must stay attributed as completed Success records"
+    );
+    assert_eq!(
+        agent.executions()[0].result_disposition,
+        ResultDisposition::Accepted
+    );
+    assert!(agent.executions()[1].result_disposition.is_rejection());
+    // Only the accepted effect produced an L0 record; the refused payload
+    // produced no empty substitute.
+    assert_eq!(agent.tool_records().len(), 1);
 }
 
 #[test]

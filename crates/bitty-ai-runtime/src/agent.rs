@@ -39,7 +39,8 @@ use crate::stream::{
     Fragment, FragmentKind, StreamError, StreamSink, emit_fragments, fragment_text,
 };
 use crate::tool::{
-    AuthBase, MAX_TOOL_CALLS_PER_TURN, ToolBus, ToolError, ToolExecution, ToolExecutor, ToolStatus,
+    AuthBase, MAX_TOOL_CALLS_PER_TURN, ResultDisposition, ToolBus, ToolError, ToolExecution,
+    ToolExecutor, ToolStatus,
 };
 
 /// Skeleton liveness bound: maximum provider rounds per turn. A turn that
@@ -313,8 +314,15 @@ pub struct ExecutionRecord {
     pub execution_id: ExecutionId,
     /// Tool name.
     pub tool: String,
-    /// Recorded status (including `Unknown`).
+    /// Recorded effect status (including `Unknown`). `Refused` marks a
+    /// pre-dispatch admission refusal that never contacted the executor;
+    /// `Success` with [`ResultDisposition::Rejected`] marks an acknowledged
+    /// effect whose payload the bus refused (AI-RUN-004).
     pub status: ToolStatus,
+    /// Result-acceptance axis of the dispatch outcome (AI-RUN-004),
+    /// preserved alongside the effect status so record consumers can tell an
+    /// executed effect from its result handling.
+    pub result_disposition: ResultDisposition,
 }
 
 /// Structured turn outcome.
@@ -486,6 +494,15 @@ impl<P: ModelProvider> Agent<P> {
     /// rollback of earlier recorded rounds. Cost accounting never authorizes
     /// or bypasses the byte budget or authorization gates.
     ///
+    /// Tool outcomes are attributed on three separate axes (AI-RUN-004): a
+    /// call refused at the dispatch boundary before executor contact is
+    /// recorded as [`ToolStatus::Refused`] (never `Failed`, which claims an
+    /// executed effect) and fails the turn with its typed cause; an
+    /// acknowledged effect whose returned payload is over-bound stays
+    /// recorded as [`ToolStatus::Success`] with
+    /// [`ResultDisposition::Rejected`] and fails the turn with the typed
+    /// acceptance cause, never a generic execution failure.
+    ///
     /// Lifecycle: a `Canceled` session returns `Canceled` without I/O; a
     /// `Completed`/`Failed` session returns
     /// `Failed(Session(AlreadyTerminated))` without I/O, preserving the
@@ -570,6 +587,7 @@ impl<P: ModelProvider> Agent<P> {
                 .find(|pending| pending.execution_id == record.execution_id)
             {
                 slot.status = record.status.clone();
+                slot.result_disposition = record.result_disposition.clone();
                 slot.tool.clone_from(&record.tool);
                 continue;
             }
@@ -695,6 +713,36 @@ impl<P: ModelProvider> Agent<P> {
                     .dispatch(executor, call, &base, execution_id, now_ms)
                 {
                     Ok(execution) => {
+                        // AI-RUN-004: a pre-dispatch admission refusal never
+                        // reached the host: it is attributed as `Refused`
+                        // (never an executed `Failed`) and the turn fails
+                        // closed with the carried typed cause. No L0 record
+                        // is appended: there is no result to disclose.
+                        if execution.status.is_admission_refusal() {
+                            self.attribute_execution(&execution);
+                            let cause = match execution.status {
+                                ToolStatus::Refused { cause } => cause,
+                                _ => unreachable!("matched an admission refusal above"),
+                            };
+                            return self.fail(cause.into());
+                        }
+                        // AI-RUN-004: the executor acknowledged an effect
+                        // whose returned payload the bus could not accept.
+                        // The effect stays attributed as `Success` (it
+                        // happened, and `completed` counts keep it); the
+                        // turn fails closed with the typed acceptance cause,
+                        // never a generic executed-failure and never silent
+                        // truncation (S-2).
+                        if execution.result_disposition.is_rejection() {
+                            self.attribute_execution(&execution);
+                            let cause = match &execution.result_disposition {
+                                ResultDisposition::Rejected { cause } => cause.clone(),
+                                ResultDisposition::Accepted => {
+                                    unreachable!("matched a rejection above")
+                                }
+                            };
+                            return self.fail(cause.into());
+                        }
                         let unknown = matches!(execution.status, ToolStatus::Unknown { .. });
                         let denied = matches!(execution.status, ToolStatus::Denied { .. });
                         // S-2: externalization failure fails the turn; never
@@ -735,6 +783,7 @@ impl<P: ModelProvider> Agent<P> {
                             status: ToolStatus::Failed {
                                 reason: error.to_string(),
                             },
+                            result_disposition: ResultDisposition::Accepted,
                         });
                         return self.fail(error.into());
                     }
@@ -777,6 +826,7 @@ impl<P: ModelProvider> Agent<P> {
             ToolStatus::Success => "ok",
             ToolStatus::Failed { .. } => "failed",
             ToolStatus::Denied { .. } => "denied",
+            ToolStatus::Refused { .. } => "refused",
             ToolStatus::Unknown { .. } => "unknown",
         };
         let card = format!(
@@ -832,11 +882,7 @@ impl<P: ModelProvider> Agent<P> {
         execution: &ToolExecution,
         now_ms: u64,
     ) -> Result<(), ContextError> {
-        self.executions.push(ExecutionRecord {
-            execution_id: execution.execution_id,
-            tool: execution.tool.clone(),
-            status: execution.status.clone(),
-        });
+        self.attribute_execution(execution);
         let body = if execution.data.len() > crate::context::EXTERNALIZE_THRESHOLD_BYTES {
             let reference = self.artifacts.store(execution.data.clone())?;
             RecordBody::Artifact(reference)
@@ -862,12 +908,30 @@ impl<P: ModelProvider> Agent<P> {
         Ok(())
     }
 
+    /// Push one attributed [`ExecutionRecord`] for a dispatch that produces
+    /// no disclosable L0 payload (admission refusal or rejected result):
+    /// the effect/acceptance axes are preserved even though no bytes enter
+    /// the context history (AI-RUN-004).
+    fn attribute_execution(&mut self, execution: &ToolExecution) {
+        self.executions.push(ExecutionRecord {
+            execution_id: execution.execution_id,
+            tool: execution.tool.clone(),
+            status: execution.status.clone(),
+            result_disposition: execution.result_disposition.clone(),
+        });
+    }
+
     /// Render one execution as a tool message for the next provider round.
+    ///
+    /// A rejected result never reaches this mapping: rejection fails the turn
+    /// before the message is built, and the separation is carried on
+    /// [`ExecutionRecord::result_disposition`] instead (AI-RUN-004).
     fn execution_message(&self, execution: &ToolExecution) -> Message {
         let status = match &execution.status {
             ToolStatus::Success => "ok".to_owned(),
             ToolStatus::Failed { reason } => format!("failed: {reason}"),
             ToolStatus::Denied { reason } => format!("denied: {reason}"),
+            ToolStatus::Refused { cause } => format!("refused: {cause}"),
             ToolStatus::Unknown { reason } => format!("unknown: {reason}"),
         };
         Message::tool(format!(
@@ -1050,7 +1114,8 @@ impl<P: ModelProvider> Agent<P> {
                     let terminal = match &status {
                         ToolStatus::Success
                         | ToolStatus::Failed { .. }
-                        | ToolStatus::Denied { .. } => true,
+                        | ToolStatus::Denied { .. }
+                        | ToolStatus::Refused { .. } => true,
                         ToolStatus::Unknown { .. } => false,
                     };
                     if terminal {
@@ -1129,7 +1194,8 @@ impl<P: ModelProvider> Agent<P> {
                     let terminal = match &status {
                         ToolStatus::Success
                         | ToolStatus::Failed { .. }
-                        | ToolStatus::Denied { .. } => true,
+                        | ToolStatus::Denied { .. }
+                        | ToolStatus::Refused { .. } => true,
                         ToolStatus::Unknown { .. } => false,
                     };
                     if terminal {
