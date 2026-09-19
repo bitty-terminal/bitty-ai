@@ -27,3 +27,5 @@
 {"created_at":"2026-09-18T20:30:45.935301717+00:00","id":"01M2V3DS5F7P1TS7WFAM286X20","kind":"include","pattern":"crates/bitty-ai-runtime/src/fallback.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2V3DS4K6SCK8B4EC5QY88PW"}
 {"created_at":"2026-09-18T20:30:45.962963675+00:00","id":"01M2V3DS6B9HSC8M5BNADNZ8FR","kind":"include","pattern":"crates/bitty-ai-runtime/tests/fallback_envelope.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2V3DS4K6SCK8B4EC5QY88PW"}
 {"created_at":"2026-09-18T20:30:48.732657754+00:00","id":"01M2V3DVWWM9F0J9NFP4THSS6P","kind":"include","pattern":"crates/bitty-ai-slice/src/journal_prototype.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2V3DVVXGCZR3Y2AR64RM2GP"}
+{"created_at":"2026-09-19T06:39:50.353834006+00:00","id":"01M2W6912HWJNTZHGWMRRABSCZ","kind":"include","pattern":".gitignore","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2W68YFP1YE7R7A2RCJM8QNV"}
+{"created_at":"2026-09-19T06:39:50.432715774+00:00","id":"01M2W691508X9XDW0BDCD7FDZM","kind":"include","pattern":"repo.toml","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2W68YFP1YE7R7A2RCJM8QNV"}
