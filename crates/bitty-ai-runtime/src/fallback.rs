@@ -5,14 +5,16 @@
 //! (`id` + `kind` + `text`) — machine-parseable, consistent with the
 //! existing typed-error style.
 //!
-//! A [`FallbackEnvelope`] carries exactly three fields. The fields are
-//! `String` (never raw bytes) so the envelope stays readable text end to
-//! end; every bound is a byte bound enforced fail-closed at construction
-//! (over-cap input refuses with a typed [`FallbackError` — never truncated
-//! silently, which would hide disclosure bytes, and never split at a UTF-8
-//! boundary). Byte bounds match the codebase convention: `.len()` counts
-//! bytes, exactly like every `*_BYTES`/`*_LEN` bound in `tool.rs`,
-//! `prompt.rs`, and `reconcile.rs`.
+//! A [`FallbackEnvelope`] carries exactly three fields, private so every
+//! construction path ([`FallbackEnvelope::new`],
+//! [`FallbackEnvelope::from_bytes`], and [`fallback_for`]) enforces the byte
+//! bounds. The fields are `String` (never raw bytes) so the envelope stays
+//! readable text end to end; every bound is a byte bound enforced fail-closed
+//! at construction (over-cap input refuses with a typed [`FallbackError`] —
+//! never truncated silently, which would hide disclosure bytes, and never
+//! split at a UTF-8 boundary). Byte bounds match the codebase convention:
+//! `.len()` counts bytes, exactly like every `*_BYTES`/`*_LEN` bound in
+//! `tool.rs`, `prompt.rs`, and `reconcile.rs`.
 //!
 //! The wire form is length-prefixed framing (`fallback/1` magic plus one
 //! `u64` little-endian length per field, mirroring the length-aware
@@ -115,16 +117,22 @@ impl std::error::Error for FallbackError {}
 
 /// One permanently-readable minimal disclosure envelope.
 ///
+/// Fields are private: the only ways in are [`FallbackEnvelope::new`] and
+/// [`FallbackEnvelope::from_bytes`], both of which enforce every field bound
+/// fail-closed, so no public mutable field can reach
+/// [`FallbackEnvelope::to_bytes`] without the constructor invariants. The
+/// read-only accessors expose each field.
+///
 /// Equality covers every field: the same unreadable input rebuilds the same
 /// envelope (see [`fallback_for`]), and any field change compares unequal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FallbackEnvelope {
     /// Envelope identity (bounded by [`MAX_FALLBACK_ID_BYTES`]).
-    pub id: String,
+    id: String,
     /// Envelope kind tag (bounded by [`MAX_FALLBACK_KIND_BYTES`]).
-    pub kind: String,
+    kind: String,
     /// Readable disclosure text (bounded by [`MAX_FALLBACK_TEXT_BYTES`]).
-    pub text: String,
+    text: String,
 }
 
 impl FallbackEnvelope {
@@ -300,26 +308,66 @@ fn declared_len(header: Option<&[u8]>) -> Option<usize> {
     usize::try_from(u64::from_le_bytes(raw)).ok()
 }
 
-/// Scrub unreadable disclosure bytes to readable envelope text: every
-/// character outside printable ASCII (`0x20..=0x7E`, so spaces are kept)
-/// becomes `?`, which defuses CR/LF log injection, terminal escapes, and
-/// confusable non-ASCII bytes. Non-UTF-8 input decodes lossy first, so each
-/// undecodable run becomes one replacement character and then one `?`; the
-/// result is deterministic, silent (no ellipsis marker that could itself
-/// exceed the bound), and never splits a character, so callers can log the
-/// value directly. Mirrors the `bridge::bound_reason` scrub rule; unlike
-/// that helper this function refuses (never truncates) past the cap.
-fn scrub_text(unreadable: &[u8]) -> String {
-    let decoded = String::from_utf8_lossy(unreadable);
-    let mut scrubbed = String::with_capacity(decoded.len().min(MAX_FALLBACK_TEXT_BYTES));
-    for character in decoded.chars() {
-        if character.is_ascii_graphic() || character == ' ' {
-            scrubbed.push(character);
-        } else {
-            scrubbed.push('?');
+/// Incrementally scrub unreadable disclosure bytes to readable envelope text:
+/// every character outside printable ASCII (`0x20..=0x7E`, so spaces are
+/// kept) becomes `?`, which defuses CR/LF log injection, terminal escapes,
+/// and confusable non-ASCII bytes. Non-UTF-8 input decodes lossily chunk by
+/// chunk, so each undecodable run becomes one replacement character and then
+/// one `?`; the result is byte-identical to scrubbing
+/// `String::from_utf8_lossy(unreadable)`, deterministic, silent (no ellipsis
+/// marker that could itself exceed the bound), and never splits a character,
+/// so callers can log the value directly. Mirrors the `bridge::bound_reason`
+/// scrub rule; unlike that helper this function refuses (never truncates)
+/// past the cap.
+///
+/// The scrubbed text is retained only up to [`MAX_FALLBACK_TEXT_BYTES`]: once
+/// the cap is reached the loop keeps counting characters without retaining
+/// them, so an over-cap payload reports its exact scrubbed length without
+/// scratch memory proportional to the input. The chunked decode borrows the
+/// input and retained scratch stays capped, so this function is `O(input)`
+/// time and `O(cap)` space.
+///
+/// # Errors
+///
+/// Returns [`FallbackError::TextTooLarge`] with the exact scrubbed length in
+/// bytes when that length exceeds [`MAX_FALLBACK_TEXT_BYTES`].
+fn scrub_text(unreadable: &[u8]) -> Result<String, FallbackError> {
+    let mut scrubbed = String::with_capacity(MAX_FALLBACK_TEXT_BYTES.min(unreadable.len()));
+    let mut counted = 0usize;
+    let mut excess = false;
+    for chunk in unreadable.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            counted += 1;
+            if counted <= MAX_FALLBACK_TEXT_BYTES {
+                if character.is_ascii_graphic() || character == ' ' {
+                    scrubbed.push(character);
+                } else {
+                    scrubbed.push('?');
+                }
+            } else {
+                excess = true;
+            }
+        }
+        if !chunk.invalid().is_empty() {
+            counted += 1;
+            if counted <= MAX_FALLBACK_TEXT_BYTES {
+                scrubbed.push('?');
+            } else {
+                excess = true;
+            }
         }
     }
-    scrubbed
+    if excess {
+        return Err(FallbackError::TextTooLarge {
+            limit: MAX_FALLBACK_TEXT_BYTES,
+            actual: counted,
+        });
+    }
+    debug_assert!(
+        counted == scrubbed.len(),
+        "scrubbed count must match the retained text"
+    );
+    Ok(scrubbed)
 }
 
 /// Fall back to the minimal envelope for unreadable structured disclosure
@@ -338,13 +386,7 @@ fn scrub_text(unreadable: &[u8]) -> String {
 /// [`MAX_FALLBACK_TEXT_BYTES`]. This is the only failure; identity and kind
 /// are fixed constants inside their caps, so no other error is reachable.
 pub fn fallback_for(unreadable: &[u8]) -> Result<FallbackEnvelope, FallbackError> {
-    let text = scrub_text(unreadable);
-    if text.len() > MAX_FALLBACK_TEXT_BYTES {
-        return Err(FallbackError::TextTooLarge {
-            limit: MAX_FALLBACK_TEXT_BYTES,
-            actual: text.len(),
-        });
-    }
+    let text = scrub_text(unreadable)?;
     Ok(FallbackEnvelope {
         id: FALLBACK_ID.to_owned(),
         kind: FALLBACK_KIND.to_owned(),
@@ -360,5 +402,45 @@ mod tests {
     fn fixed_identity_satisfies_its_caps() {
         assert!(FALLBACK_ID.len() <= MAX_FALLBACK_ID_BYTES);
         assert!(FALLBACK_KIND.len() <= MAX_FALLBACK_KIND_BYTES);
+    }
+
+    #[test]
+    fn scrub_text_counts_exactly_and_retains_at_most_the_cap() {
+        let over = vec![b'x'; 3 * MAX_FALLBACK_TEXT_BYTES + 7];
+        let Err(FallbackError::TextTooLarge { limit, actual }) = scrub_text(&over) else {
+            panic!("over-cap scrub must refuse");
+        };
+        assert!(
+            limit == MAX_FALLBACK_TEXT_BYTES,
+            "scrub refusal must report the documented cap"
+        );
+        assert!(
+            actual == over.len(),
+            "scrub refusal must count every character exactly"
+        );
+
+        let mixed = vec![0xFF; 3 * MAX_FALLBACK_TEXT_BYTES + 7];
+        let Err(FallbackError::TextTooLarge { limit, actual }) = scrub_text(&mixed) else {
+            panic!("over-cap lossy scrub must refuse");
+        };
+        assert!(
+            limit == MAX_FALLBACK_TEXT_BYTES,
+            "lossy scrub refusal must report the documented cap"
+        );
+        assert!(
+            actual == mixed.len(),
+            "each undecodable byte run must count as one placeholder"
+        );
+
+        let boundary = vec![b'y'; MAX_FALLBACK_TEXT_BYTES];
+        let retained = scrub_text(&boundary).expect("boundary scrub must succeed");
+        assert!(
+            retained.len() == MAX_FALLBACK_TEXT_BYTES,
+            "boundary scrub must retain the whole payload"
+        );
+        assert!(
+            retained.capacity() <= MAX_FALLBACK_TEXT_BYTES,
+            "retained scratch must stay inside the cap"
+        );
     }
 }
