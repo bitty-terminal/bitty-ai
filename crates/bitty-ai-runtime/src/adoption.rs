@@ -449,6 +449,7 @@ mod tests {
             execution_id: ExecutionId(id),
             tool: tool.to_owned(),
             status,
+            result_disposition: crate::tool::ResultDisposition::Accepted,
         }
     }
 

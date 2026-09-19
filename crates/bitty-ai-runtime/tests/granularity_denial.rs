@@ -532,12 +532,14 @@ fn stale_entry_under_tightened_grant_denies_without_host_dispatch() {
     // The denied call never reached the host executor.
     assert_eq!(executor.calls, vec!["workspace_write".to_owned()]);
     // The already-dispatched effect is kept, never rolled back; the denied
-    // remainder is recorded as a failed attribution.
+    // remainder is a pre-dispatch admission refusal (`Refused`, AI-RUN-004),
+    // never an executed-failure attribution: the host never saw it.
     assert_eq!(agent.executions().len(), 2);
     assert!(matches!(agent.executions()[0].status, ToolStatus::Success));
+    assert!(agent.executions()[1].status.is_admission_refusal());
     assert!(matches!(
         agent.executions()[1].status,
-        ToolStatus::Failed { .. }
+        ToolStatus::Refused { .. }
     ));
     assert_eq!(agent.provider_mut().complete_calls(), 1);
     assert_eq!(sess.state(), bitty_ai_runtime::SessionState::Failed);
