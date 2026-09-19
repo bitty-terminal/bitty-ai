@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
+use crate::bridge::bound_reason;
 use crate::context::MAX_SUMMARY_BYTES;
 use crate::session::{AgentInstanceId, AgentLevel, AgentSession, SessionId};
 
@@ -176,6 +177,51 @@ impl Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+impl ToolError {
+    /// Apply the one bounded diagnostic policy (`AI-RUN-008`) to every
+    /// host-supplied string carried by this error, returning the error
+    /// unchanged when it already fits.
+    ///
+    /// The runtime-owned numeric/typed fields (bounds, limits, counts) are
+    /// preserved verbatim; only externally sourced text — tool names and
+    /// authorizer/executor denial reasons — is scrubbed to printable ASCII
+    /// and bounded to [`crate::bridge::MAX_REASON_BYTES`]. Conversion sites
+    /// call this once when a host or model string enters the typed error
+    /// surface, so `Display`, logs, and reconcile reports never carry
+    /// unbounded or newline-bearing text.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::InvalidName { name } => Self::InvalidName {
+                name: bound_reason(&name),
+            },
+            Self::UnknownTool { name } => Self::UnknownTool {
+                name: bound_reason(&name),
+            },
+            Self::DuplicateTool { name } => Self::DuplicateTool {
+                name: bound_reason(&name),
+            },
+            Self::Denied { name, reason } => Self::Denied {
+                name: bound_reason(&name),
+                reason: bound_reason(&reason),
+            },
+            Self::EffectUnknown { name, reason } => Self::EffectUnknown {
+                name: bound_reason(&name),
+                reason: bound_reason(&reason),
+            },
+            // Bound-arithmetic variants carry only runtime-owned numeric
+            // fields: nothing external to normalize.
+            Self::ArgumentsTooLarge { .. }
+            | Self::ResultTooLarge { .. }
+            | Self::SummaryTooLarge { .. }
+            | Self::CallLimitExceeded { .. }
+            | Self::RegistryFull { .. }
+            | Self::DescriptionTooLarge { .. }
+            | Self::SchemaTooLarge { .. } => self,
+        }
+    }
+}
+
 /// Validate a tool name (`TB-2`): non-empty, at most 64 bytes,
 /// `^[a-z][a-z0-9_]*$` within the owner namespace.
 ///
@@ -192,8 +238,11 @@ pub fn validate_tool_name(name: &str) -> Result<(), ToolError> {
     if valid {
         Ok(())
     } else {
+        // AI-RUN-008: the echoed malformed name is host/model-supplied, so it
+        // is bounded and scrubbed at this conversion boundary like every
+        // other outbound diagnostic string.
         Err(ToolError::InvalidName {
-            name: name.to_owned(),
+            name: bound_reason(name),
         })
     }
 }
@@ -464,6 +513,34 @@ impl ToolStatus {
     #[must_use]
     pub fn is_admission_refusal(&self) -> bool {
         matches!(self, Self::Refused { .. })
+    }
+
+    /// Apply the one bounded diagnostic policy (`AI-RUN-008`) to the
+    /// host/reconciler-supplied reason carried by a terminal status,
+    /// returning the status unchanged when it already fits.
+    ///
+    /// Terminal statuses arrive from the reconcile seam (host `Display`
+    /// reason text) as well as from the bus, so this conversion must scrub
+    /// them exactly like the bus path. `Success` has no text to normalize;
+    /// the typed admission [`ToolError`] on `Refused` is normalized through
+    /// [`ToolError::normalized`].
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Failed { reason } => Self::Failed {
+                reason: bound_reason(&reason),
+            },
+            Self::Denied { reason } => Self::Denied {
+                reason: bound_reason(&reason),
+            },
+            Self::Unknown { reason } => Self::Unknown {
+                reason: bound_reason(&reason),
+            },
+            Self::Refused { cause } => Self::Refused {
+                cause: cause.normalized(),
+            },
+            Self::Success => Self::Success,
+        }
     }
 }
 
@@ -850,7 +927,10 @@ impl ToolBus {
             AuthDecision::Deny { reason } => Err(ToolError::Denied {
                 name: call.name.clone(),
                 reason,
-            }),
+            }
+            // AI-RUN-008: the hook reason is host-supplied text entering the
+            // runtime error surface, so it is bounded and scrubbed here.
+            .normalized()),
         }
     }
 
@@ -986,12 +1066,12 @@ impl ToolBus {
             Err(ToolError::EffectUnknown { reason, .. }) => Ok(ToolExecution {
                 execution_id,
                 tool: call.name.clone(),
-                // AI-0077: host-shaped uncertainty reasons are bounded at the
-                // bus boundary (`MAX_REASON_BYTES`, scrubbed) so the recorded
+                // AI-0077 / AI-RUN-008: host-shaped uncertainty reasons are
+                // scrubbed and bounded at the bus boundary so the recorded
                 // `Unknown` status never carries unbounded or newline-bearing
                 // text into reconcile reports or provider messages.
                 status: ToolStatus::Unknown {
-                    reason: crate::bridge::bound_reason(&reason),
+                    reason: bound_reason(&reason),
                 },
                 result_disposition: ResultDisposition::Accepted,
                 summary: "effect uncertain; reconcile before retry".to_owned(),
@@ -1001,7 +1081,12 @@ impl ToolBus {
             Err(ToolError::Denied { reason, .. }) => Ok(ToolExecution {
                 execution_id,
                 tool: call.name.clone(),
-                status: ToolStatus::Denied { reason },
+                // AI-RUN-008: the executor's denial reason is host-supplied;
+                // normalize it before it becomes a status that is displayed,
+                // messaged to the provider, and mapped back into ToolError.
+                status: ToolStatus::Denied {
+                    reason: bound_reason(&reason),
+                },
                 result_disposition: ResultDisposition::Accepted,
                 summary: "host denied execution".to_owned(),
                 data: Vec::new(),
@@ -1642,5 +1727,213 @@ mod tests {
         let res = legacy.execute_with_context("tool", b"arg", &ctx);
         assert!(res.is_ok());
         assert_eq!(legacy.recorded_now_ms, Some(12345));
+    }
+
+    /// Assert one outbound string is length-bounded, printable-ASCII
+    /// (display-safe: no CR/LF, escape, DEL, or non-ASCII confusables).
+    /// Static assert messages only (`AI-0082`).
+    fn assert_display_safe(value: &str) {
+        assert!(value.len() <= crate::bridge::MAX_REASON_BYTES);
+        assert!(value.bytes().all(|byte| (0x20..=0x7E).contains(&byte)));
+    }
+
+    /// Assert a rendered diagnostic carries no control bytes. The composed
+    /// `Display` concatenates several already-bounded fields, so only
+    /// single-field values are length-checked; the render must still be
+    /// single-line and escape-free.
+    fn assert_single_line(value: &str) {
+        assert!(!value.contains('\n'));
+        assert!(!value.contains('\r'));
+        assert!(!value.contains('\u{1b}'));
+        assert!(!value.contains('\u{7f}'));
+    }
+
+    /// Hostile fixture: newline + ESC + DEL + multi-byte UTF-8 + over-bound
+    /// filler, shared by the conversion-branch table below.
+    fn hostile(prefix: &str) -> String {
+        format!(
+            "{prefix}\n\u{1b}[2J\u{7f}🦀{}",
+            "x".repeat(crate::bridge::MAX_REASON_BYTES * 2)
+        )
+    }
+
+    #[test]
+    fn tool_error_normalization_covers_every_external_branch() {
+        // AI-RUN-008 table: malformed-name, unknown, duplicate and denial
+        // errors normalize at the boundary; bound-arithmetic variants (no
+        // external text) pass through unchanged.
+        let cases = vec![
+            ToolError::InvalidName {
+                name: hostile("bad name "),
+            },
+            ToolError::UnknownTool {
+                name: hostile("ghost "),
+            },
+            ToolError::DuplicateTool {
+                name: hostile("dup "),
+            },
+            ToolError::Denied {
+                name: hostile("deny "),
+                reason: hostile("policy "),
+            },
+            ToolError::EffectUnknown {
+                name: hostile("unknown "),
+                reason: hostile("ack "),
+            },
+        ];
+        for error in cases {
+            let normalized = error.normalized();
+            // `Display` interpolates every string field, so a control-free
+            // render proves each carried field was scrubbed.
+            assert_single_line(&normalized.to_string());
+            match &normalized {
+                ToolError::InvalidName { name }
+                | ToolError::UnknownTool { name }
+                | ToolError::DuplicateTool { name } => assert_display_safe(name),
+                ToolError::Denied { name, reason } | ToolError::EffectUnknown { name, reason } => {
+                    assert_display_safe(name);
+                    assert_display_safe(reason);
+                }
+                _ => panic!("expected an external-text variant"),
+            }
+        }
+
+        let numeric = vec![
+            ToolError::ArgumentsTooLarge {
+                limit: 1,
+                actual: 2,
+            },
+            ToolError::ResultTooLarge {
+                limit: 1,
+                actual: 2,
+            },
+            ToolError::SummaryTooLarge {
+                limit: 1,
+                actual: 2,
+            },
+            ToolError::CallLimitExceeded { limit: 8 },
+            ToolError::RegistryFull { limit: 32 },
+            ToolError::DescriptionTooLarge {
+                limit: 1,
+                actual: 2,
+            },
+            ToolError::SchemaTooLarge {
+                limit: 1,
+                actual: 2,
+            },
+        ];
+        for error in numeric {
+            let normalized = error.clone().normalized();
+            assert_eq!(normalized, error);
+        }
+    }
+
+    #[test]
+    fn invalid_name_conversion_is_bounded_and_scrubbed() {
+        let name = hostile("terminal.read_zone ");
+        let error = validate_tool_name(&name).expect_err("malformed name must fail");
+        let ToolError::InvalidName { name } = error else {
+            panic!("expected InvalidName");
+        };
+        assert_display_safe(&name);
+    }
+
+    #[test]
+    fn authorizer_denial_is_bounded_at_the_bus_boundary() {
+        struct Hostile {
+            reason: String,
+        }
+        impl ToolAuthorizer for Hostile {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Deny {
+                    reason: self.reason.clone(),
+                }
+            }
+        }
+        let reason = hostile("hook ");
+        let bus = ToolBus::new(read_only_registry()).with_authorizer(Hostile { reason });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let error = bus
+            .precheck(
+                std::slice::from_ref(&call),
+                &base(),
+                MAX_TOOL_CALLS_PER_TURN,
+            )
+            .expect_err("denying hook must fail closed");
+        let ToolError::Denied { reason, .. } = error else {
+            panic!("expected Denied");
+        };
+        assert_display_safe(&reason);
+    }
+
+    #[test]
+    fn executor_denial_status_is_bounded_at_the_bus_boundary() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_error(ToolError::Denied {
+            name: "workspace_read".to_owned(),
+            reason: hostile("executor "),
+        });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("host denial is a recorded status");
+        let ToolStatus::Denied { reason } = execution.status else {
+            panic!("expected Denied status");
+        };
+        assert_display_safe(&reason);
+    }
+
+    #[test]
+    fn tool_status_normalization_covers_every_terminal_branch() {
+        let cases = vec![
+            ToolStatus::Failed {
+                reason: hostile("failed "),
+            },
+            ToolStatus::Denied {
+                reason: hostile("denied "),
+            },
+            ToolStatus::Unknown {
+                reason: hostile("unknown "),
+            },
+            ToolStatus::Refused {
+                cause: ToolError::Denied {
+                    name: hostile("refused "),
+                    reason: hostile("cause "),
+                },
+            },
+        ];
+        for status in cases {
+            match status.normalized() {
+                ToolStatus::Failed { reason }
+                | ToolStatus::Denied { reason }
+                | ToolStatus::Unknown { reason } => assert_display_safe(&reason),
+                ToolStatus::Refused { cause } => {
+                    assert_single_line(&cause.to_string());
+                    match cause {
+                        ToolError::Denied { name, reason } => {
+                            assert_display_safe(&name);
+                            assert_display_safe(&reason);
+                        }
+                        _ => panic!("expected a Denied cause"),
+                    }
+                }
+                ToolStatus::Success => panic!("unexpected success"),
+            }
+        }
+        assert_eq!(ToolStatus::Success.normalized(), ToolStatus::Success);
     }
 }
