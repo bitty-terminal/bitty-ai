@@ -59,7 +59,7 @@
 
 use bitty_ai_runtime::{
     AgentLevel, AuthBase, AuthContext, AuthDecision, FakeToolExecutor, IdIssuer, ToolAuthorizer,
-    ToolBus, ToolCall, ToolError, ToolRegistry, ToolSpec,
+    ToolBus, ToolCall, ToolError, ToolRegistry, ToolSpec, ToolStatus,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -249,14 +249,16 @@ fn precheck_fails_closed_on_unknown_tool_with_no_dispatch() {
 fn dispatch_fails_closed_on_unknown_tool_with_no_executor_contact() {
     // The dispatch boundary re-checks the registry before touching the
     // executor: an unregistered (unversioned) name is refused with no
-    // executor contact and no per-turn counter increment.
+    // executor contact and no per-turn counter increment. The refusal is a
+    // pre-dispatch admission decision (AI-RUN-004): `Refused` carrying the
+    // typed `UnknownTool` cause, never an executed failure.
     let registry = ToolRegistry::new();
     let mut bus = ToolBus::new(registry).with_authorizer(Allow);
     let invocation = call(FOREIGN_NAME);
     let mut executor = FakeToolExecutor::new();
     executor.push_success("must never run", b"nope".to_vec());
     let mut issuer = IdIssuer::default();
-    let error = bus
+    let execution = bus
         .dispatch(
             &mut executor,
             &invocation,
@@ -264,10 +266,16 @@ fn dispatch_fails_closed_on_unknown_tool_with_no_executor_contact() {
             issuer.execution(),
             NOW_MS,
         )
-        .expect_err("unknown tool must fail");
+        .expect("admission refusal is a recorded status, not a bus error");
+    assert!(execution.status.is_admission_refusal());
     assert!(
-        matches!(error, ToolError::UnknownTool { .. }),
-        "unregistered name must fail as unknown"
+        matches!(
+            &execution.status,
+            ToolStatus::Refused {
+                cause: ToolError::UnknownTool { .. }
+            }
+        ),
+        "unregistered name must be refused as a typed unknown-tool admission"
     );
     assert!(executor.calls().is_empty());
     assert_eq!(bus.calls_this_turn(), 0);

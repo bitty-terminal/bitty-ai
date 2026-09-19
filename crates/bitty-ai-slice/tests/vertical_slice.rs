@@ -23,7 +23,7 @@ use bitty_ai_runtime::{
     AgentError, AgentLevel, AuthBase, ContextError, ExecOutcome, FakeToolExecutor, Fragment,
     FragmentKind, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage, RecordBody, StreamChunk,
     StreamError, StreamSink, ToolBus, ToolCall, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
-    VecSink,
+    ToolStatus, VecSink,
 };
 use bitty_ai_slice::{
     AllowReadOnly, HARNESS_MODEL, HARNESS_PROVIDER_ID, HARNESS_TOOL, HostPeer, IpcBridge,
@@ -492,10 +492,18 @@ fn tool_call_limit_is_enforced() {
         bus.dispatch(&mut executor, &call, &base, ids.execution(), NOW_MS)
             .expect("within limit");
     }
-    let error = bus
+    // AI-RUN-004: the ninth call is a pre-dispatch admission refusal carrying
+    // the typed cap cause, not an executed failure; the host is never
+    // contacted for it.
+    let execution = bus
         .dispatch(&mut executor, &call, &base, ids.execution(), NOW_MS)
-        .expect_err("ninth call must fail");
-    assert_eq!(error, ToolError::CallLimitExceeded { limit: 8 });
+        .expect("admission refusal is a recorded status, not a bus error");
+    assert!(matches!(
+        execution.status,
+        ToolStatus::Refused {
+            cause: ToolError::CallLimitExceeded { limit: 8 }
+        }
+    ));
 }
 
 #[test]
