@@ -777,11 +777,16 @@ impl<P: ModelProvider> Agent<P> {
                         }
                     }
                     Err(error) => {
+                        // AI-RUN-008: a generic executor error can still carry
+                        // host-supplied name/reason text; normalize it before
+                        // it enters the attributed record and the typed
+                        // `AgentError` surface.
+                        let error = error.normalized();
                         self.executions.push(ExecutionRecord {
                             execution_id,
                             tool: call.name.clone(),
                             status: ToolStatus::Failed {
-                                reason: error.to_string(),
+                                reason: bound_reason(&error.to_string()),
                             },
                             result_disposition: ResultDisposition::Accepted,
                         });
@@ -979,8 +984,11 @@ impl<P: ModelProvider> Agent<P> {
     /// Record an unreconciled effect without failing the session: the turn
     /// stops, the session stays usable for reconciliation and retry.
     fn unknown(&mut self, reason: &str, tool: String) -> ExecOutcome {
+        // AI-RUN-008: the tool name is model-supplied and reaches this
+        // outbound `Unknown` reason through the dispatch record; bound and
+        // scrub it so the status text stays single-line and display-safe.
         ExecOutcome::Unknown {
-            reason: format!("{reason} (tool {tool})"),
+            reason: format!("{reason} (tool {})", bound_reason(&tool)),
             dispatched: self.executions.len(),
         }
     }
@@ -1111,6 +1119,11 @@ impl<P: ModelProvider> Agent<P> {
                 reconciler.reconcile(tool, self.pending_unknown[pending].execution_id, now_ms);
             match answer {
                 ReconcileStatus::Resolved(status) => {
+                    // AI-RUN-008: a reconciler is host-owned and may answer
+                    // with raw text; normalize the status once here so both
+                    // the recorded terminal status and the resolved outcome
+                    // share the single bounded diagnostic policy.
+                    let status = status.normalized();
                     let terminal = match &status {
                         ToolStatus::Success
                         | ToolStatus::Failed { .. }
@@ -1191,6 +1204,9 @@ impl<P: ModelProvider> Agent<P> {
             let answer = reconciler.reconcile(tool, execution_id, now_ms);
             match answer {
                 ReconcileStatus::Resolved(status) => {
+                    // AI-RUN-008: normalize the host reconciler's terminal
+                    // status before it is stored and returned.
+                    let status = status.normalized();
                     let terminal = match &status {
                         ToolStatus::Success
                         | ToolStatus::Failed { .. }

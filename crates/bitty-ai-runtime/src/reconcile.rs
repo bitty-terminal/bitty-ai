@@ -51,7 +51,12 @@ pub const MAX_RECONCILE_ATTEMPTS: usize = 16;
 pub const MAX_RECONCILE_DELAY_MS: u64 = 30_000;
 
 /// Maximum bytes kept for a pending reason surfaced on escalation.
-pub const MAX_RECONCILE_REASON_BYTES: usize = 512;
+///
+/// Aliases [`crate::bridge::MAX_REASON_BYTES`]: every runtime-owned reason
+/// surface shares one bound and one scrub rule (`AI-RUN-008`), so a pending
+/// reconcile reason carries the same length ceiling and printable-ASCII text
+/// as any other outbound diagnostic.
+pub const MAX_RECONCILE_REASON_BYTES: usize = crate::bridge::MAX_REASON_BYTES;
 
 /// Bounded reconcile configuration. Separate from the tool-call budget by
 /// construction: it counts status queries, never dispatches.
@@ -187,20 +192,17 @@ pub fn reconcile_delay_ms(attempt: usize, base_delay_ms: u64, max_delay_ms: u64)
     delay.min(ceiling)
 }
 
-/// Truncate a pending reason to [`MAX_RECONCILE_REASON_BYTES`] bytes on a
-/// character boundary.
+/// Apply the one outbound diagnostic policy (`AI-RUN-008`) to a pending
+/// reconcile reason: scrub every character outside printable ASCII
+/// (`0x20..=0x7E`) to `?` and stop at [`MAX_RECONCILE_REASON_BYTES`].
+///
+/// Delegates to [`crate::bridge::bound_reason`] so a host/model-supplied
+/// pending reason reaches an escalation report with the same single-line,
+/// UTF-8-safe, bounded shape as every other runtime error/status surface.
+/// Previously this was a separate truncate-only helper, which let control
+/// bytes through on this path.
 pub(crate) fn bound_reason(reason: &str) -> String {
-    if reason.len() <= MAX_RECONCILE_REASON_BYTES {
-        return reason.to_owned();
-    }
-    let mut end = MAX_RECONCILE_REASON_BYTES;
-    while end > 0 {
-        if reason.is_char_boundary(end) {
-            break;
-        }
-        end -= 1;
-    }
-    reason[..end].to_owned()
+    crate::bridge::bound_reason(reason)
 }
 
 /// Deterministic test peer for [`UnknownReconciler`]. Replays scripted
@@ -295,13 +297,17 @@ mod tests {
     }
 
     #[test]
-    fn reason_truncates_on_char_boundary() {
+    fn reason_is_bounded_and_scrubbed_to_printable_ascii() {
         let long = "e".repeat(MAX_RECONCILE_REASON_BYTES + 10);
         assert_eq!(bound_reason(&long).len(), MAX_RECONCILE_REASON_BYTES);
-        let emoji = "e".repeat(MAX_RECONCILE_REASON_BYTES - 1) + "🦀🦀";
+        // Hostile bytes are scrubbed, not retained: CR/LF, ESC, DEL and
+        // multi-byte UTF-8 all collapse to `?` under the shared policy.
+        let hostile = "line1\r\nline2\u{1b}[2J\u{7f}🦀";
+        assert_eq!(bound_reason(hostile), "line1??line2?[2J??");
+        let emoji = "🦀".repeat(MAX_RECONCILE_REASON_BYTES);
         let bounded = bound_reason(&emoji);
         assert!(bounded.len() <= MAX_RECONCILE_REASON_BYTES);
-        assert!(bounded.ends_with('e') || bounded.ends_with("🦀"));
+        assert!(bounded.bytes().all(|byte| byte == b'?'));
     }
 
     #[test]
