@@ -31,13 +31,18 @@ harness fails closed and the gap is recorded rather than worked around with
 a new Core API.
 
 The harness is deterministic: every operation takes a caller-supplied
-`now_ms`, there is no wall-clock, thread, async runtime, network, or secret,
-and the model provider is the runtime's scripted `FakeProvider` — except the
-`journal_prototype` experiment (AI-0049), which persists an append-ordered
-single-writer journal through SQLite in a caller-supplied database file. That
-module is a prototype for the draft R6 persistence profile
-(`docs/specifications/persistence-profile-r6.md`); it is evidence only and
-decides no open register entry.
+`now_ms`, there is no wall-clock, thread, or async runtime, and the model
+provider is the runtime's scripted `FakeProvider`. The harness paths
+themselves (`FakeHost`, `LiveBittyHost`, `IpcBridge`, `harness`) open no
+socket and contain no secret field. Two experiments are the documented
+exceptions. The `local_provider` experiment (AI-0042) opens loopback-only
+`TcpStream` connections with loopback enforcement, mandatory timeouts, one
+monotonic request deadline (AI-CTX-005), and a caller-supplied, redacted key;
+`journal_prototype` (AI-0049) persists an append-ordered single-writer journal
+through SQLite in a caller-supplied database file. The journal module is a
+prototype for the draft R6 persistence profile
+(`docs/specifications/persistence-profile-r6.md`); both are evidence only and
+decide no open register entry.
 
 ## Modules
 
@@ -75,17 +80,19 @@ to the real `bitty-ipc` services (`SnapshotService`, `ToolDispatchService`,
 Swapping hosts is mechanical: replace the construction site only; callers
 keep calling the same trait methods.
 
-Live wiring is explicitly out of scope here: this crate contains no code that
-connects to a real terminal, process, PTY, socket, or network peer (no
-`std::net`, `std::process`, async runtime, or IPC transport). Filesystem
-access appears only in the `journal_prototype` experiment (the caller-supplied
+Live wiring is explicitly out of scope here: the harness path contains no
+code that connects to a real terminal, process, PTY, socket, or network peer
+(no `std::process`, async runtime, or IPC transport). `LiveBittyHost` carries
+only an injectable provider seam (`fn` pointers), server-evaluated scopes, and
+the real consent ledger; tests use canned providers as mapping proof and claim
+no live data. Every operation takes caller-supplied `now_ms`. The
+`local_provider` experiment (AI-0042) is the one path with a real socket:
+loopback-only `TcpStream` with loopback enforcement, mandatory timeouts, one
+monotonic request deadline (AI-CTX-005), and a caller-supplied, redacted key —
+no other secret or credential field exists in the crate. Filesystem access
+appears only in the `journal_prototype` experiment (the caller-supplied
 database path and SQLite's own sidecar files in that directory) and its test
-scratch directories. `LiveBittyHost` carries only an injectable provider seam
-(`fn` pointers), server-evaluated scopes, and the real consent ledger; tests
-use canned providers as mapping proof and claim no live data. Every operation
-takes caller-supplied `now_ms`, and there are no secret or credential fields —
-except the `local_provider` experiment, which opens loopback-only TCP with
-mandatory timeouts and a caller-supplied, redacted key.
+scratch directories.
 
 `FakeHost` is std-only and deterministic: no network, no threads, no
 filesystem, no wall clock. Every method takes caller-supplied `now_ms`;

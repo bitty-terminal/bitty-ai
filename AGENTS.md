@@ -16,15 +16,24 @@
 
 ## Current phase
 
-- The repository is newly initialized and pre-implementation.
+- Experimental, pre-alpha status: the repository contains an experimental
+  implementation inspected at `bcb8365015a5726ba4beefecde14096274878a6b`
+  (2026-09-19) — two workspace crates, `bitty-ai-runtime` (deterministic
+  single-agent runtime skeleton, AI-0009, draft scope) and `bitty-ai-slice`
+  (pressure-test harness, not a shipped component, AI-0005). It is not the
+  complete proposed runtime, and no behavior is verified,
+  compatibility-guaranteed, or production-ready.
 - Documentation-first: architecture, security requirements, and design decisions
   must be captured in the `docs/` submodule (bitty-ai-docs) before
   implementation.
 - Do not add product code unless a later task authorizes it and its architecture
   and security gates are accepted.
-- Rust components use edition 2024. Dependencies, workspace layout, MSRV,
-  nightly policy, and release profiles remain undecided until an ADR accepts
-  them.
+- Rust components use edition 2024 and resolver 3, with MSRV 1.85 declared in
+  `Cargo.toml` (`rust-version`) and `clippy.toml`, enforced by the CI `msrv`
+  job; the pinned toolchain is stable `1.98.1` (`rust-toolchain.toml`) and no
+  nightly is used. Further crate splits, additional dependencies, and release
+  profiles remain proposal-stage (the v0.1 Implementation Profile and
+  Dependency Strategy are draft; AIQ-5C stays open).
 - Never describe planned behavior, a candidate dependency, or a configuration
   file as implemented evidence.
 
