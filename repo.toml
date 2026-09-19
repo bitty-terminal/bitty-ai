@@ -3,6 +3,6 @@
 name = "bitty-ai"
 kind = "core"
 lang = "rust"
-role = "AI runtime: inference sessions, context slices (2 crates)"
-owner = "TBD"
+role = "AI runtime: inference sessions, context slices (2 crates); hosts AI-owned nested plugins under plugins/"
+owner = "bitty-ai"
 docs = "bitty-ai-docs"

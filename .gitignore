@@ -2,3 +2,10 @@
 .worktrees/
 /target/
 recording/
+
+# Grouped workspace checkouts: nested clones (NOT git submodules).
+# Each plugins/<name>/ (e.g. wheel) is an independent full clone with its own
+# git history; there is intentionally no `[submodule "plugins/..."]` section
+# for them in .gitmodules. Keep this ignore line so the parent index never
+# absorbs the nested checkouts; remotes stay authoritative.
+plugins/
