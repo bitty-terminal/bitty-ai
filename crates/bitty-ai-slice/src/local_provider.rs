@@ -42,7 +42,13 @@
 //! - Request body ceiling: [`MAX_CANONICAL_BYTES`] (96 KiB, canonical prompt
 //!   ceiling from `bitty-ai-runtime::prompt`). Larger requests fail closed.
 //! - Header ceiling: 8 KiB policy bound (intrinsic HTTP header bound for
-//!   this minimal client; headers larger than this fail closed).
+//!   this minimal client; headers larger than this fail closed, including a
+//!   completed header block).
+//! - Response-parser ceilings: the bounded JSON walk enforces an explicit
+//!   nesting depth ([`MAX_LOCAL_JSON_DEPTH`]) and an explicit work budget
+//!   ([`MAX_LOCAL_PARSER_STEPS`]) in addition to the body-byte ceiling, with
+//!   checked byte access and saturating offset arithmetic throughout, so
+//!   malformed or hostile text yields a typed refusal, never a panic.
 //! - Path ceiling: [`MAX_CONSENT_SCOPE_LEN`] (128 bytes, consent-scope bound
 //!   reused for the short request-target string).
 //! - Model-name shape: [`validate_model_name`] (`MAX_MODEL_NAME_LEN`,
@@ -149,6 +155,23 @@ pub const MAX_LOCAL_HEADERS_BYTES: usize = 8 * 1024;
 pub const MAX_LOCAL_PATH_LEN: usize = MAX_CONSENT_SCOPE_LEN;
 /// Host string ceiling: 253 bytes (intrinsic DNS name maximum).
 pub const MAX_LOCAL_HOST_LEN: usize = 253;
+/// Response-parser nesting ceiling (AI-CTX-006): the accepted body may not
+/// nest objects/arrays deeper than this, so recursion is explicitly bounded.
+pub const MAX_LOCAL_JSON_DEPTH: usize = 64;
+/// Response-parser work ceiling (AI-CTX-006): a hard upper bound on the number
+/// of parser steps for one body, independent of the body-byte ceiling.
+///
+/// The accepted `choices[0].message.content` shape is walked by at most five
+/// bounded scans of the same bytes: the root envelope, the `choices` lookup,
+/// the `choices[0]` shape check, the `message` lookup, and the `content`
+/// lookup. Each scan charges at most two steps per value token, and every value
+/// token spans at least two bytes once its separator is counted, so the true
+/// worst case is about five steps per input byte. This ceiling keeps an
+/// explicit safety margin above that worst case, so no valid body at or under
+/// [`MAX_LOCAL_RESPONSE_BYTES`] can be refused by the work budget, while a
+/// hostile body that provokes more work still exhausts the budget and is
+/// refused typed.
+pub const MAX_LOCAL_PARSER_STEPS: usize = 8 * MAX_LOCAL_RESPONSE_BYTES;
 /// Read chunk size for socket draining (intrinsic I/O buffer choice).
 const LOCAL_READ_CHUNK: usize = 4 * 1024;
 /// Default connect timeout in ms (policy, bounded by `MP-8`).
@@ -1104,6 +1127,7 @@ fn read_bounded(
     Ok(raw)
 }
 
+#[derive(Debug)]
 struct HttpStatus {
     code: u16,
 }
@@ -1131,10 +1155,34 @@ fn split_response<'a>(
             }
         }
     })?;
-    let header_block = &text[..split];
+    let header_block = text.get(..split).ok_or_else(|| ProviderError::Transport {
+        provider: provider.to_owned(),
+        reason: "malformed response offset".to_owned(),
+    })?;
+    // The header ceiling is independent of the aggregate receive cap: a
+    // completed header block that exceeds it is refused even though a
+    // terminator was found (AI-CTX-006).
+    if header_block.len() > MAX_LOCAL_HEADERS_BYTES {
+        return Err(ProviderError::Transport {
+            provider: provider.to_owned(),
+            reason: "response headers over-large".to_owned(),
+        });
+    }
     // Byte offset of the body equals the string offset here because the
-    // separator is ASCII and `text` borrows `raw`.
-    let body = &raw[split + 4..];
+    // separator is ASCII and `text` borrows `raw`. The offset is checked so
+    // the slice can never panic.
+    let body_start = split
+        .checked_add(4)
+        .ok_or_else(|| ProviderError::Transport {
+            provider: provider.to_owned(),
+            reason: "malformed response offset".to_owned(),
+        })?;
+    let body = raw
+        .get(body_start..)
+        .ok_or_else(|| ProviderError::Transport {
+            provider: provider.to_owned(),
+            reason: "malformed response offset".to_owned(),
+        })?;
     let status_line = header_block
         .lines()
         .next()
@@ -1248,7 +1296,7 @@ fn check_status(
 fn retry_after_ms(raw: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(raw).ok()?;
     let end = text.find("\r\n\r\n")?;
-    for line in text[..end].lines().skip(1) {
+    for line in text.get(..end)?.lines().skip(1) {
         if let Some(value) = header_value(line, "retry-after") {
             let seconds: u64 = value.trim().parse().ok()?;
             return Some(seconds.saturating_mul(1_000));
@@ -1275,39 +1323,420 @@ fn extract_assistant_text(
     content_type: Option<&str>,
     provider: &str,
 ) -> Result<String, ProviderError> {
-    let missing = || ProviderError::Transport {
-        provider: provider.to_owned(),
-        reason: "response missing content/response".to_owned(),
-    };
     let text = std::str::from_utf8(body).map_err(|_| ProviderError::Transport {
         provider: provider.to_owned(),
         reason: "response body is not UTF-8".to_owned(),
     })?;
-    // The top level must be a single JSON object (trailing bytes rejected).
-    let obj_start = skip_ws(text, 0).ok_or_else(missing)?;
-    if text.as_bytes().get(obj_start) != Some(&b'{') {
-        return Err(missing());
+    // One bounded parser owns every walk over the untrusted body: checked byte
+    // access, saturating offset arithmetic, an explicit work budget, and an
+    // explicit nesting budget make the whole parse panic-free and bounded
+    // (AI-CTX-006).
+    let mut parser = JsonParser::new(text);
+    parser
+        .extract_root(content_type)
+        .ok_or_else(|| parser.fail(provider))
+}
+
+/// A malformed or over-budget JSON response that cannot be mapped to a more
+/// precise variant from the parser itself.
+fn parse_refusal(provider: &str, reason: &str) -> ProviderError {
+    ProviderError::Transport {
+        provider: provider.to_owned(),
+        reason: reason.to_owned(),
     }
-    let obj_end = skip_json_object(text, obj_start).ok_or_else(missing)?;
-    let trail = skip_ws(text, obj_end).ok_or_else(missing)?;
-    if trail != text.len() {
-        return Err(missing());
+}
+
+/// Bounded, checked, single-pass JSON parser over an untrusted response body.
+///
+/// Every byte access is checked, every offset advance saturates or is proven
+/// in range, and two explicit budgets bound the work: [`MAX_LOCAL_PARSER_STEPS`]
+/// charges each structural action, and [`MAX_LOCAL_JSON_DEPTH`] bounds object
+/// and array nesting, so recursion cannot exhaust the stack no matter how the
+/// input nests. The parser never slices with an unchecked range and never
+/// unwraps untrusted input.
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    steps: usize,
+    depth: usize,
+    over_budget: bool,
+    too_deep: bool,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            bytes: text.as_bytes(),
+            steps: 0,
+            depth: 0,
+            over_budget: false,
+            too_deep: false,
+        }
     }
-    if let Some((choices_start, choices_end)) = find_field_in_object(text, obj_start, "choices") {
-        extract_choices_message_content(text, choices_start, choices_end).ok_or_else(missing)
-    } else {
+
+    /// Typed refusal for the first reason encountered, as a static policy
+    /// label (no runtime value is formatted into the reason).
+    fn fail(&self, provider: &str) -> ProviderError {
+        if self.over_budget {
+            parse_refusal(provider, "response parser over work budget")
+        } else if self.too_deep {
+            parse_refusal(provider, "response nesting over budget")
+        } else {
+            parse_refusal(provider, "malformed response envelope")
+        }
+    }
+
+    /// Charge one unit of parser work; returns `false` once the explicit work
+    /// budget is exhausted.
+    fn spend(&mut self) -> bool {
+        if self.steps >= MAX_LOCAL_PARSER_STEPS {
+            self.over_budget = true;
+            return false;
+        }
+        self.steps += 1;
+        true
+    }
+
+    /// Enter one nesting level under the explicit depth budget.
+    fn enter(&mut self) -> bool {
+        if self.depth >= MAX_LOCAL_JSON_DEPTH {
+            self.too_deep = true;
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn byte(&self, index: usize) -> Option<u8> {
+        self.bytes.get(index).copied()
+    }
+
+    fn skip_ws(&self, from: usize) -> usize {
+        let mut index = from.min(self.bytes.len());
+        while let Some(byte) = self.byte(index) {
+            if matches!(byte, b' ' | b'\t' | b'\n' | b'\r') {
+                index = index.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        index
+    }
+
+    fn extract_root(&mut self, content_type: Option<&str>) -> Option<String> {
+        let obj_start = self.skip_ws(0);
+        if self.byte(obj_start) != Some(b'{') {
+            return None;
+        }
+        let obj_end = self.skip_object(obj_start)?;
+        if self.skip_ws(obj_end) != self.bytes.len() {
+            return None;
+        }
+        if let Some((choices_start, choices_end)) = self.find_field(obj_start, "choices") {
+            return self.extract_choices_content(choices_start, choices_end);
+        }
         if !is_json_content_type(content_type) {
-            return Err(missing());
+            return None;
         }
-        let (resp_start, resp_end) =
-            find_field_in_object(text, obj_start, "response").ok_or_else(missing)?;
-        if text.as_bytes().get(resp_start) != Some(&b'"') {
-            return Err(missing());
+        let (resp_start, resp_end) = self.find_field(obj_start, "response")?;
+        if self.byte(resp_start) != Some(b'"') {
+            return None;
         }
-        match parse_json_string(text, resp_start) {
-            Some((value, end)) if end == resp_end => Ok(value),
-            _ => Err(missing()),
+        match self.parse_string(resp_start) {
+            Some((value, end)) if end == resp_end => Some(value),
+            _ => None,
         }
+    }
+
+    /// `choices[0].message.content`, or `None` for any shape mismatch.
+    fn extract_choices_content(
+        &mut self,
+        choices_start: usize,
+        choices_end: usize,
+    ) -> Option<String> {
+        if self.byte(choices_start) != Some(b'[') {
+            return None;
+        }
+        if choices_end <= choices_start || choices_end > self.bytes.len() {
+            return None;
+        }
+        let cursor = self.skip_ws(choices_start.saturating_add(1));
+        if self.byte(cursor) == Some(b']') {
+            return None;
+        }
+        let first_start = cursor;
+        if self.byte(first_start) != Some(b'{') {
+            return None;
+        }
+        let first_end = self.skip_object(first_start)?;
+        if first_end > choices_end {
+            return None;
+        }
+        let (msg_start, _) = self.find_field(first_start, "message")?;
+        if self.byte(msg_start) != Some(b'{') {
+            return None;
+        }
+        let (content_start, content_end) = self.find_field(msg_start, "content")?;
+        if self.byte(content_start) != Some(b'"') {
+            return None;
+        }
+        let (value, end) = self.parse_string(content_start)?;
+        if end == content_end {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    /// First matching field's value range inside the object at `obj_start`.
+    fn find_field(&mut self, obj_start: usize, want: &str) -> Option<(usize, usize)> {
+        if self.byte(obj_start) != Some(b'{') {
+            return None;
+        }
+        let mut cursor = self.skip_ws(obj_start.saturating_add(1));
+        if self.byte(cursor) == Some(b'}') {
+            return None;
+        }
+        loop {
+            if !self.spend() || self.byte(cursor) != Some(b'"') {
+                return None;
+            }
+            let (key, key_end) = self.parse_string(cursor)?;
+            cursor = self.skip_ws(key_end);
+            if self.byte(cursor) != Some(b':') {
+                return None;
+            }
+            cursor = self.skip_ws(cursor.saturating_add(1));
+            let value_start = cursor;
+            let value_end = self.skip_value(cursor)?;
+            if key == want {
+                return Some((value_start, value_end));
+            }
+            cursor = self.skip_ws(value_end);
+            match self.byte(cursor) {
+                Some(b',') => {
+                    cursor = self.skip_ws(cursor.saturating_add(1));
+                    continue;
+                }
+                Some(b'}') => return None,
+                _ => return None,
+            }
+        }
+    }
+
+    fn skip_value(&mut self, cursor: usize) -> Option<usize> {
+        if !self.spend() {
+            return None;
+        }
+        let start = self.skip_ws(cursor);
+        match self.byte(start) {
+            Some(b'"') => self.parse_string(start).map(|(_, end)| end),
+            Some(b'{') => self.skip_object(start),
+            Some(b'[') => self.skip_array(start),
+            Some(b't') => self.skip_literal(start, "true", 4),
+            Some(b'f') => self.skip_literal(start, "false", 5),
+            Some(b'n') => self.skip_literal(start, "null", 4),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(start),
+            _ => None,
+        }
+    }
+
+    fn skip_literal(&mut self, start: usize, literal: &str, len: usize) -> Option<usize> {
+        let end = start.checked_add(len)?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        if self.bytes.get(start..end) == Some(literal.as_bytes()) {
+            Some(end)
+        } else {
+            None
+        }
+    }
+
+    fn skip_object(&mut self, cursor: usize) -> Option<usize> {
+        if !self.spend() || !self.enter() {
+            return None;
+        }
+        if self.byte(cursor) != Some(b'{') {
+            self.leave();
+            return None;
+        }
+        let mut index = self.skip_ws(cursor.saturating_add(1));
+        if self.byte(index) == Some(b'}') {
+            self.leave();
+            return Some(index.saturating_add(1));
+        }
+        loop {
+            if !self.spend() || self.byte(index) != Some(b'"') {
+                self.leave();
+                return None;
+            }
+            let (_, key_end) = self.parse_string(index)?;
+            index = self.skip_ws(key_end);
+            if self.byte(index) != Some(b':') {
+                self.leave();
+                return None;
+            }
+            index = self.skip_ws(index.saturating_add(1));
+            index = self.skip_value(index)?;
+            index = self.skip_ws(index);
+            match self.byte(index) {
+                Some(b',') => {
+                    index = self.skip_ws(index.saturating_add(1));
+                    continue;
+                }
+                Some(b'}') => {
+                    self.leave();
+                    return Some(index.saturating_add(1));
+                }
+                _ => {
+                    self.leave();
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn skip_array(&mut self, cursor: usize) -> Option<usize> {
+        if !self.spend() || !self.enter() {
+            return None;
+        }
+        if self.byte(cursor) != Some(b'[') {
+            self.leave();
+            return None;
+        }
+        let mut index = self.skip_ws(cursor.saturating_add(1));
+        if self.byte(index) == Some(b']') {
+            self.leave();
+            return Some(index.saturating_add(1));
+        }
+        loop {
+            index = self.skip_value(index)?;
+            index = self.skip_ws(index);
+            match self.byte(index) {
+                Some(b',') => {
+                    index = self.skip_ws(index.saturating_add(1));
+                    continue;
+                }
+                Some(b']') => {
+                    self.leave();
+                    return Some(index.saturating_add(1));
+                }
+                _ => {
+                    self.leave();
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn skip_number(&mut self, cursor: usize) -> Option<usize> {
+        if !self.spend() {
+            return None;
+        }
+        let mut index = cursor;
+        if self.byte(index) == Some(b'-') {
+            index = index.saturating_add(1);
+        }
+        match self.byte(index) {
+            Some(b'0') => index = index.saturating_add(1),
+            Some(b'1'..=b'9') => {
+                index = index.saturating_add(1);
+                while matches!(self.byte(index), Some(b'0'..=b'9')) {
+                    index = index.saturating_add(1);
+                }
+            }
+            _ => return None,
+        }
+        if self.byte(index) == Some(b'.') {
+            index = index.saturating_add(1);
+            if !matches!(self.byte(index), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.byte(index), Some(b'0'..=b'9')) {
+                index = index.saturating_add(1);
+            }
+        }
+        if matches!(self.byte(index), Some(b'e' | b'E')) {
+            index = index.saturating_add(1);
+            if matches!(self.byte(index), Some(b'+' | b'-')) {
+                index = index.saturating_add(1);
+            }
+            if !matches!(self.byte(index), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(self.byte(index), Some(b'0'..=b'9')) {
+                index = index.saturating_add(1);
+            }
+        }
+        Some(index)
+    }
+
+    /// Parse a JSON string at the opening quote.
+    ///
+    /// Returns the unescaped value and the byte index just past the closing
+    /// quote. Fails closed (`None`) on unterminated strings, bad escapes,
+    /// invalid `\u`, or raw control characters. Digits and boundaries are
+    /// inspected as checked bytes and the value is assembled from bytes, so
+    /// no string slice can panic on a byte that is not a character boundary.
+    fn parse_string(&mut self, open: usize) -> Option<(String, usize)> {
+        if !self.spend() || self.byte(open) != Some(b'"') {
+            return None;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut index = open.saturating_add(1);
+        while index < self.bytes.len() {
+            match self.byte(index)? {
+                b'"' => {
+                    let value = String::from_utf8(out).ok()?;
+                    return Some((value, index.saturating_add(1)));
+                }
+                b'\\' => {
+                    index = index.saturating_add(1);
+                    match self.byte(index)? {
+                        b'"' => out.push(b'"'),
+                        b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0C),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            index = index.saturating_add(1);
+                            let mut unit: u32 = 0;
+                            for _ in 0..4 {
+                                let digit = match self.byte(index)? {
+                                    byte @ b'0'..=b'9' => u32::from(byte - b'0'),
+                                    byte @ b'a'..=b'f' => u32::from(byte - b'a') + 10,
+                                    byte @ b'A'..=b'F' => u32::from(byte - b'A') + 10,
+                                    _ => return None,
+                                };
+                                unit = unit.checked_mul(16)?.checked_add(digit)?;
+                                index = index.saturating_add(1);
+                            }
+                            // Reject surrogates and out-of-range units: fail
+                            // closed rather than emit replacement characters.
+                            let ch = char::from_u32(unit)?;
+                            let mut buf = [0_u8; 4];
+                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                    index = index.saturating_add(1);
+                }
+                byte if byte < 0x20 => return None,
+                byte => {
+                    out.push(byte);
+                    index = index.saturating_add(1);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -1331,297 +1760,9 @@ fn is_json_content_type(content_type: Option<&str>) -> bool {
 fn response_content_type(raw: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(raw).ok()?;
     let end = text.find("\r\n\r\n")?;
-    for line in text[..end].lines().skip(1) {
+    for line in text.get(..end)?.lines().skip(1) {
         if let Some(value) = header_value(line, "content-type") {
             return Some(value.trim().to_owned());
-        }
-    }
-    None
-}
-
-/// Look up `choices[0].message.content` by path inside already-validated JSON.
-///
-/// `choices_start`/`choices_end` delimit the `choices` value. Returns the
-/// unescaped `content` string only for the exact path
-/// `choices(array)[0](object).message(object).content(string)`; any shape
-/// mismatch (non-array, empty array, non-object element/message, missing or
-/// non-string content) returns `None` (caller maps to `Transport`).
-fn extract_choices_message_content(
-    text: &str,
-    choices_start: usize,
-    choices_end: usize,
-) -> Option<String> {
-    if text.as_bytes().get(choices_start) != Some(&b'[') {
-        return None;
-    }
-    let _ = choices_end;
-    let mut cursor = skip_ws(text, choices_start + 1)?;
-    if text.as_bytes().get(cursor) == Some(&b']') {
-        return None;
-    }
-    let first_start = cursor;
-    if text.as_bytes().get(first_start) != Some(&b'{') {
-        return None;
-    }
-    let first_end = skip_json_object(text, first_start)?;
-    cursor = skip_ws(text, first_end)?;
-    // Only index 0 is honored; trailing elements are ignored but must not
-    // affect the path lookup (the top-level object was already validated).
-    let _ = cursor;
-    let (msg_start, _) = find_field_in_object(text, first_start, "message")?;
-    if text.as_bytes().get(msg_start) != Some(&b'{') {
-        return None;
-    }
-    let (content_start, content_end) = find_field_in_object(text, msg_start, "content")?;
-    if text.as_bytes().get(content_start) != Some(&b'"') {
-        return None;
-    }
-    let (value, end) = parse_json_string(text, content_start)?;
-    if end == content_end {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// Find the value range for `want` inside the object at `obj_start`.
-///
-/// Returns `Some((value_start, value_end))` for the first matching field and
-/// `None` when absent or malformed (callers treat both as fail-closed; the
-/// top-level well-formedness check in [`extract_assistant_text`] already
-/// separates malformed bodies from well-formed-but-absent for the `choices`
-/// branch decision).
-fn find_field_in_object(text: &str, obj_start: usize, want: &str) -> Option<(usize, usize)> {
-    if text.as_bytes().get(obj_start) != Some(&b'{') {
-        return None;
-    }
-    let mut cursor = skip_ws(text, obj_start + 1)?;
-    if text.as_bytes().get(cursor) == Some(&b'}') {
-        return None;
-    }
-    loop {
-        if text.as_bytes().get(cursor) != Some(&b'"') {
-            return None;
-        }
-        let (key, key_end) = parse_json_string(text, cursor)?;
-        cursor = skip_ws(text, key_end)?;
-        if text.as_bytes().get(cursor) != Some(&b':') {
-            return None;
-        }
-        cursor = skip_ws(text, cursor + 1)?;
-        let value_start = cursor;
-        let value_end = skip_json_value(text, cursor)?;
-        if key == want {
-            return Some((value_start, value_end));
-        }
-        cursor = skip_ws(text, value_end)?;
-        match text.as_bytes().get(cursor) {
-            Some(b',') => {
-                cursor = skip_ws(text, cursor + 1)?;
-                continue;
-            }
-            Some(b'}') => return None,
-            _ => return None,
-        }
-    }
-}
-
-/// Skip one JSON value starting at `cursor` (after leading whitespace).
-///
-/// Returns the byte index just past the value, or `None` on malformed input.
-/// Objects/arrays recurse; strings reuse [`parse_json_string`]; numbers use
-/// strict JSON number syntax; literals are `true`/`false`/`null`.
-fn skip_json_value(text: &str, cursor: usize) -> Option<usize> {
-    let start = skip_ws(text, cursor)?;
-    match text.as_bytes().get(start) {
-        Some(b'"') => {
-            let (_, end) = parse_json_string(text, start)?;
-            Some(end)
-        }
-        Some(b'{') => skip_json_object(text, start),
-        Some(b'[') => skip_json_array(text, start),
-        Some(b't') => {
-            if text[start..].starts_with("true") {
-                Some(start + 4)
-            } else {
-                None
-            }
-        }
-        Some(b'f') => {
-            if text[start..].starts_with("false") {
-                Some(start + 5)
-            } else {
-                None
-            }
-        }
-        Some(b'n') => {
-            if text[start..].starts_with("null") {
-                Some(start + 4)
-            } else {
-                None
-            }
-        }
-        Some(b'-' | b'0'..=b'9') => skip_json_number(text, start),
-        _ => None,
-    }
-}
-
-/// Skip a JSON object starting at the opening `{`.
-fn skip_json_object(text: &str, cursor: usize) -> Option<usize> {
-    if text.as_bytes().get(cursor) != Some(&b'{') {
-        return None;
-    }
-    let mut index = skip_ws(text, cursor + 1)?;
-    if text.as_bytes().get(index) == Some(&b'}') {
-        return Some(index + 1);
-    }
-    loop {
-        if text.as_bytes().get(index) != Some(&b'"') {
-            return None;
-        }
-        let (_, key_end) = parse_json_string(text, index)?;
-        index = skip_ws(text, key_end)?;
-        if text.as_bytes().get(index) != Some(&b':') {
-            return None;
-        }
-        index = skip_ws(text, index + 1)?;
-        index = skip_json_value(text, index)?;
-        index = skip_ws(text, index)?;
-        match text.as_bytes().get(index) {
-            Some(b',') => {
-                index = skip_ws(text, index + 1)?;
-                continue;
-            }
-            Some(b'}') => return Some(index + 1),
-            _ => return None,
-        }
-    }
-}
-
-/// Skip a JSON array starting at the opening `[`.
-fn skip_json_array(text: &str, cursor: usize) -> Option<usize> {
-    if text.as_bytes().get(cursor) != Some(&b'[') {
-        return None;
-    }
-    let mut index = skip_ws(text, cursor + 1)?;
-    if text.as_bytes().get(index) == Some(&b']') {
-        return Some(index + 1);
-    }
-    loop {
-        index = skip_json_value(text, index)?;
-        index = skip_ws(text, index)?;
-        match text.as_bytes().get(index) {
-            Some(b',') => {
-                index = skip_ws(text, index + 1)?;
-                continue;
-            }
-            Some(b']') => return Some(index + 1),
-            _ => return None,
-        }
-    }
-}
-
-/// Skip a strict JSON number starting at `cursor`.
-fn skip_json_number(text: &str, cursor: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut index = cursor;
-    if bytes.get(index) == Some(&b'-') {
-        index += 1;
-    }
-    match bytes.get(index) {
-        Some(b'0') => index += 1,
-        Some(b'1'..=b'9') => {
-            while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-                index += 1;
-            }
-        }
-        _ => return None,
-    }
-    if bytes.get(index) == Some(&b'.') {
-        index += 1;
-        if !matches!(bytes.get(index), Some(b'0'..=b'9')) {
-            return None;
-        }
-        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-            index += 1;
-        }
-    }
-    if matches!(bytes.get(index), Some(b'e' | b'E')) {
-        index += 1;
-        if matches!(bytes.get(index), Some(b'+' | b'-')) {
-            index += 1;
-        }
-        if !matches!(bytes.get(index), Some(b'0'..=b'9')) {
-            return None;
-        }
-        while matches!(bytes.get(index), Some(b'0'..=b'9')) {
-            index += 1;
-        }
-    }
-    Some(index)
-}
-
-fn skip_ws(text: &str, mut cursor: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    while cursor < bytes.len() && matches!(bytes[cursor], b' ' | b'\t' | b'\n' | b'\r') {
-        cursor += 1;
-    }
-    if cursor <= bytes.len() {
-        Some(cursor)
-    } else {
-        None
-    }
-}
-
-/// Parse a JSON string starting at the opening quote.
-///
-/// Returns the unescaped value and the byte index just past the closing
-/// quote. Fails closed (`None`) on unterminated strings, bad escapes,
-/// invalid `\u`, or raw control characters.
-fn parse_json_string(text: &str, open: usize) -> Option<(String, usize)> {
-    let bytes = text.as_bytes();
-    if bytes.get(open) != Some(&b'"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut index = open + 1;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'"' => return Some((out, index + 1)),
-            b'\\' => {
-                index += 1;
-                let escaped = *bytes.get(index)?;
-                match escaped {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{08}'),
-                    b'f' => out.push('\u{0C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        if index + 4 >= bytes.len() {
-                            return None;
-                        }
-                        let hex = &text[index + 1..index + 5];
-                        let unit = u32::from_str_radix(hex, 16).ok()?;
-                        // Reject surrogates without pair handling: fail
-                        // closed rather than emit replacement characters.
-                        let ch = char::from_u32(unit)?;
-                        out.push(ch);
-                        index += 4;
-                    }
-                    _ => return None,
-                }
-                index += 1;
-            }
-            byte if byte < 0x20 => return None,
-            _ => {
-                let ch = text[index..].chars().next()?;
-                out.push(ch);
-                index += ch.len_utf8();
-            }
         }
     }
     None
@@ -3033,5 +3174,266 @@ mod tests {
             !rendered.contains("probe-value-must-not-leak"),
             "the arm refusal must not echo runtime detail"
         );
+    }
+
+    // ── AI-CTX-006: bounded, panic-free response parsing ────────────────────
+
+    /// Parse one body with no content type (the choices path only).
+    fn parse_body(body: &str) -> Result<String, ProviderError> {
+        extract_assistant_text(body.as_bytes(), None, "local-ollama")
+    }
+
+    #[test]
+    fn hostile_json_corpus_refuses_with_typed_errors_ai_ctx_006() {
+        // Deterministic hostile-input corpus: every case must return a typed
+        // `Transport` refusal without panicking. Assert messages are static
+        // (AI-0082): no runtime value is formatted into a panic path.
+        let corpus = [
+            // Truncated document, unterminated object, string, and escape.
+            r#"{"choices":[{"message":{"content":"hi"}"#,
+            r#"{"choices":[{"message":{"content":"unterminated"#,
+            r#"{"choices":[{"message":{"content":"\#,
+            // Malformed structure and stray bytes.
+            r#"{"choices":[{"message":{"content":"hi"}}]}"#,
+            r#"{"choices":not-json}"#,
+            r#"{"choices":[{"message":{"content":123}}]}"#,
+            r#"{} trailing"#,
+            r#"[1,2,3]"#,
+            // Invalid/partial Unicode escapes: surrogate, bad hex, short run,
+            // escape truncated at end, and a multibyte byte where a hex digit
+            // is required (the old unchecked slice boundary).
+            r#"{"choices":[{"message":{"content":"\uD800"}}]}"#,
+            r#"{"choices":[{"message":{"content":"\uZZZZ"}}]}"#,
+            r#"{"choices":[{"message":{"content":"\u12"}}]}"#,
+            r#"{"choices":[{"message":{"content":"\u00"}}]}"#,
+            "{\"choices\":[{\"message\":{\"content\":\"\\u\u{e9}0\"}}]}",
+            "{\"choices\":[{\"message\":{\"content\":\"\\u00\u{e9}\"}}]}",
+            // Missing content and wrong shape.
+            r#"{"choices":[]}"#,
+            r#"{"choices":[{"message":{}}]}"#,
+            r#"{"choices":[{"message":{"content":[]}}]}"#,
+            // Raw control byte inside a string.
+            "{\"choices\":[{\"message\":{\"content\":\"a\u{1}b\"}}]}",
+        ];
+        for body in corpus {
+            match parse_body(body) {
+                Err(ProviderError::Transport { .. }) => {}
+                _ => panic!("hostile body must refuse with a typed Transport error"),
+            }
+        }
+    }
+
+    #[test]
+    fn valid_json_and_multibyte_escapes_still_parse_ai_ctx_006() {
+        // The bounded parser preserves every valid path, including raw
+        // multibyte text and valid `\u` escapes.
+        let raw = parse_body(r#"{"choices":[{"message":{"content":"café"}}]}"#)
+            .expect("raw multibyte content");
+        assert_eq!(raw, "café");
+        let escaped = parse_body(r#"{"choices":[{"message":{"content":"caf\u00e9 \u0041"}}]}"#)
+            .expect("escaped content");
+        assert_eq!(escaped, "caf\u{e9} A");
+        let nested =
+            parse_body(r#"{"choices":[{"message":{"content":"hi"},"extra":{"a":[1,true,null]}}]}"#)
+                .expect("nested valid content");
+        assert_eq!(nested, "hi");
+    }
+
+    #[test]
+    fn parser_nesting_budget_is_explicit_ai_ctx_006() {
+        // At the boundary the parse succeeds; one level deeper it refuses
+        // typed instead of recursing without a bound.
+        let mut allowed = "[".repeat(MAX_LOCAL_JSON_DEPTH);
+        allowed.push_str(&"]".repeat(MAX_LOCAL_JSON_DEPTH));
+        let mut parser = JsonParser::new(&allowed);
+        assert!(
+            parser.skip_value(0).is_some(),
+            "nesting at the budget must parse"
+        );
+        assert!(!parser.too_deep, "nesting at the budget is not over budget");
+
+        let mut over = "[".repeat(MAX_LOCAL_JSON_DEPTH + 1);
+        over.push_str(&"]".repeat(MAX_LOCAL_JSON_DEPTH + 1));
+        let mut parser = JsonParser::new(&over);
+        assert!(
+            parser.skip_value(0).is_none(),
+            "nesting over budget must refuse"
+        );
+        assert!(parser.too_deep, "nesting over budget must be recorded");
+        let err = parser.fail("local-ollama");
+        assert!(
+            matches!(&err, ProviderError::Transport { provider, reason }
+                if provider == "local-ollama" && reason.contains("nesting over budget")),
+            "over-deep nesting must map to a static typed refusal"
+        );
+    }
+
+    #[test]
+    fn parser_work_budget_is_explicit_and_typed_ai_ctx_006() {
+        // The work budget is an explicit finite bound: once exhausted the
+        // parser refuses instead of continuing to walk the input.
+        let mut parser = JsonParser::new("[0]");
+        parser.steps = MAX_LOCAL_PARSER_STEPS;
+        assert!(
+            parser.skip_value(0).is_none(),
+            "exhausted work budget must refuse"
+        );
+        assert!(parser.over_budget, "the work budget exhaustion is recorded");
+        let err = parser.fail("local-ollama");
+        assert!(
+            matches!(&err, ProviderError::Transport { provider, reason }
+                if provider == "local-ollama" && reason.contains("work budget")),
+            "work budget exhaustion must map to a static typed refusal"
+        );
+    }
+
+    /// Build a `choices[0].message.content` body no larger than `filler_cap`
+    /// bytes whose accepted path re-walks a flat filler array placed before
+    /// `content`, i.e. the shape that maximizes accepted parser steps per byte.
+    fn worst_case_choices_body(filler_cap: usize) -> String {
+        let mut body = String::from("{\"choices\":[{\"message\":{\"filler\":[");
+        let head = body.len();
+        let tail = "],\"content\":\"hi\"}}]}";
+        // Each element after the first occupies two bytes (`0,`).
+        let elements = filler_cap.saturating_sub(head + tail.len() + 1) / 2;
+        for index in 0..elements {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push('0');
+        }
+        body.push_str(tail);
+        body
+    }
+
+    #[test]
+    fn max_size_valid_choices_body_parses_within_work_budget_ai_ctx_006() {
+        // Regression (AI-0115 F1/PX-0483): a valid body at the response-byte
+        // cap, whose accepted path re-walks a large filler array five times,
+        // must still parse and return its content instead of being refused by
+        // the work budget.
+        let body = worst_case_choices_body(MAX_LOCAL_RESPONSE_BYTES);
+        assert!(
+            body.len() <= MAX_LOCAL_RESPONSE_BYTES,
+            "the regression body must sit at or under the response cap"
+        );
+        assert!(
+            body.len().saturating_add(256) >= MAX_LOCAL_RESPONSE_BYTES,
+            "the regression body must be near the response cap"
+        );
+        let parsed = parse_body(&body).expect("max-size valid body must parse");
+        assert_eq!(parsed, "hi", "the accepted content must be returned");
+
+        // The accepted path stays strictly inside the explicit work ceiling, so
+        // the ceiling is a real margin above the worst-case accepted cost.
+        let mut parser = JsonParser::new(&body);
+        assert!(
+            parser.extract_root(None).is_some(),
+            "the near-cap accepted body must parse"
+        );
+        assert!(
+            parser.steps < MAX_LOCAL_PARSER_STEPS,
+            "accepted work must remain under the work ceiling"
+        );
+        assert!(!parser.over_budget, "an accepted body is not over budget");
+    }
+
+    #[test]
+    fn over_cap_pathological_body_still_exhausts_work_budget_ai_ctx_006() {
+        // The work ceiling remains a genuine guard: input forcing more than the
+        // worst-case accepted charge per byte (here, a body well beyond the
+        // response cap) exhausts the budget and is refused typed, so the parser
+        // always terminates on hostile input.
+        let body = worst_case_choices_body(4 * MAX_LOCAL_RESPONSE_BYTES);
+        let mut parser = JsonParser::new(&body);
+        assert!(
+            parser.extract_root(None).is_none(),
+            "a body over the work budget must refuse"
+        );
+        assert!(parser.over_budget, "the work budget exhaustion is recorded");
+        let err = parser.fail("local-ollama");
+        assert!(
+            matches!(&err, ProviderError::Transport { provider, reason }
+                if provider == "local-ollama" && reason.contains("work budget")),
+            "over-budget input must map to a static typed refusal"
+        );
+    }
+
+    #[test]
+    fn completed_header_block_over_ceiling_is_refused_ai_ctx_006() {
+        // The header ceiling applies to a completed block, not only to a
+        // missing terminator.
+        let mut raw = String::from("HTTP/1.1 200 OK\r\n");
+        raw.push_str("X-Pad: ");
+        raw.push_str(&"a".repeat(MAX_LOCAL_HEADERS_BYTES));
+        raw.push_str("\r\n\r\n{}");
+        let err = split_response(raw.as_bytes(), "local-ollama").expect_err("over-large headers");
+        assert!(
+            matches!(&err, ProviderError::Transport { reason, .. }
+                if reason.contains("headers over-large")),
+            "completed headers over the ceiling must be refused"
+        );
+
+        // A small completed block still parses.
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        assert!(
+            split_response(ok, "local-ollama").is_ok(),
+            "small headers must parse"
+        );
+    }
+
+    #[test]
+    fn malformed_and_huge_declared_length_refuse_typed_ai_ctx_006() {
+        // A huge but parseable declared length is refused as over-large; a
+        // non-numeric one is refused as malformed. Neither panics or
+        // allocates.
+        let huge = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n{}";
+        let err = split_response(huge, "local-ollama").expect_err("huge declared length");
+        assert!(
+            matches!(&err, ProviderError::Transport { reason, .. }
+                if reason.contains("over-large")),
+            "huge declared length must be refused as over-large"
+        );
+
+        let malformed = b"HTTP/1.1 200 OK\r\nContent-Length: 12x34\r\n\r\n{}";
+        let err = split_response(malformed, "local-ollama").expect_err("malformed length");
+        assert!(
+            matches!(&err, ProviderError::Transport { reason, .. }
+                if reason.contains("malformed content-length")),
+            "non-numeric declared length must be refused as malformed"
+        );
+
+        let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}";
+        let err = split_response(truncated, "local-ollama").expect_err("short body");
+        assert!(
+            matches!(err, ProviderError::Unknown { .. }),
+            "a short body against a declared length must be Unknown"
+        );
+
+        let overlong = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n{}";
+        let err = split_response(overlong, "local-ollama").expect_err("long body");
+        assert!(
+            matches!(&err, ProviderError::Transport { reason, .. }
+                if reason.contains("longer than declared")),
+            "a body longer than declared must be refused"
+        );
+    }
+
+    #[test]
+    fn parser_never_panics_on_single_byte_prefixes_ai_ctx_006() {
+        // Exhaustive byte-prefix sweep of a valid body (and of a body that
+        // contains a multibyte character) proves checked access: any prefix
+        // either parses or refuses, never panics.
+        for full in [
+            r#"{"choices":[{"message":{"content":"hi"}}]}"#,
+            r#"{"choices":[{"message":{"content":"café"}}]}"#,
+            r#"{"choices":[{"message":{"content":"\u00e9"}}]}"#,
+        ] {
+            for end in 0..=full.len() {
+                if full.is_char_boundary(end) {
+                    let _ = parse_body(&full[..end]);
+                }
+            }
+        }
     }
 }
