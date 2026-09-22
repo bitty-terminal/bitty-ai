@@ -385,6 +385,123 @@ pub fn project_layer_text(summary: &str, full_digest: &str) -> String {
     format!("project-snapshot/1 {summary} full-digest {full_digest}")
 }
 
+/// Stable marker prefixing every snapshot-backed PROJECT layer text (see
+/// [`project_layer_text`]). The builder gates on it so a non-snapshot record
+/// can never silently fill the PROJECT layer.
+pub const SNAPSHOT_LAYER_MARKER: &str = "project-snapshot/1";
+
+/// Errors building a prompt snapshot with a snapshot-backed PROJECT layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectLayerError {
+    /// The record is not a snapshot-backed project record (wrong provider).
+    /// Carries the offending provider, never content.
+    NotProjectRecord {
+        /// Offending provider string.
+        provider: String,
+    },
+    /// The record summary lacks the digest prefix of the supplied full
+    /// digest (not rendered by the snapshot path, or a digest that does not
+    /// belong to the record). Carries no content.
+    DigestMismatch,
+    /// A layer text violates prompt bounds (caller-supplied fixed layers or
+    /// a hostile snapshot overflowing the summary bound). Carries the
+    /// runtime message, never record content.
+    InvalidLayer {
+        /// Runtime validation message.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ProjectLayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotProjectRecord { provider } => {
+                write!(f, "not a project snapshot record: provider {provider}")
+            }
+            Self::DigestMismatch => {
+                write!(
+                    f,
+                    "project record summary digest does not match the supplied digest"
+                )
+            }
+            Self::InvalidLayer { message } => {
+                write!(f, "project prompt layer invalid: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectLayerError {}
+
+/// Build a validated [`PromptSnapshot`](bitty_ai_runtime::PromptSnapshot)
+/// with the PROJECT layer filled from an ingested snapshot record.
+///
+/// Host adapter (AIQ-12/AIQ-13): the caller supplies the raw ingested
+/// project `record` (exactly as [`ingest_snapshot`] returned it) plus the
+/// verified `full_digest` it ingested against, plus the four fixed
+/// surrounding layer texts (`core_contract`, `user`, `skills_profile`,
+/// `runtime_turn`). The builder checks the summary carries the digest prefix
+/// of `full_digest` (binding the record to the digest — a mismatched digest
+/// fails closed instead of silently breaking cache affinity), renders the
+/// marker-prefixed PROJECT text itself via [`project_layer_text`], and
+/// validates the whole snapshot before returning.
+///
+/// Fail-closed on non-project records (wrong provider) and on digest
+/// mismatch: a hand-written or foreign record, or a digest that does not
+/// belong to the record, can never silently occupy the PROJECT layer.
+///
+/// # Errors
+///
+/// Returns [`ProjectLayerError`] for non-project records, digest mismatch,
+/// or the runtime [`PromptError`](bitty_ai_runtime::PromptError) when any
+/// layer text violates prompt bounds.
+pub fn prompt_snapshot_with_project(
+    record: &ContextRecord,
+    full_digest: &str,
+    core_contract: &str,
+    user: &str,
+    skills_profile: &str,
+    runtime_turn: &str,
+    core_version: &str,
+) -> Result<bitty_ai_runtime::PromptSnapshot, ProjectLayerError> {
+    use bitty_ai_runtime::{LayerInput, PromptLayer, PromptSnapshot};
+    if record.provider != SNAPSHOT_PROVIDER {
+        return Err(ProjectLayerError::NotProjectRecord {
+            provider: record.provider.clone(),
+        });
+    }
+    // Bind the record to the digest: the L0 summary always ends with
+    // `digest <prefix12>` (see `build_summary`); the prefix must equal the
+    // leading bytes of the caller-supplied full digest. A wrong or empty
+    // digest fails closed here instead of silently poisoning the PROJECT
+    // layer and the cache-affinity claim built on it.
+    let expected_tail = format!(
+        "digest {}",
+        full_digest.get(..SNAPSHOT_DIGEST_PREFIX_LEN).unwrap_or("")
+    );
+    if !record.summary.ends_with(&expected_tail) {
+        return Err(ProjectLayerError::DigestMismatch);
+    }
+    let project_text = project_layer_text(&record.summary, full_digest);
+    debug_assert!(
+        project_text.starts_with(SNAPSHOT_LAYER_MARKER),
+        "renderer must prefix the marker"
+    );
+    PromptSnapshot::new(
+        core_version,
+        vec![
+            LayerInput::text_only(PromptLayer::CoreContract, core_contract),
+            LayerInput::text_only(PromptLayer::User, user),
+            LayerInput::text_only(PromptLayer::Project, project_text),
+            LayerInput::text_only(PromptLayer::SkillsProfile, skills_profile),
+            LayerInput::text_only(PromptLayer::RuntimeTurn, runtime_turn),
+        ],
+    )
+    .map_err(|err| ProjectLayerError::InvalidLayer {
+        message: format!("{err}"),
+    })
+}
+
 /// Truncate `value` to at most `max_bytes` at a UTF-8 code-point boundary.
 fn truncate_at_boundary(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
