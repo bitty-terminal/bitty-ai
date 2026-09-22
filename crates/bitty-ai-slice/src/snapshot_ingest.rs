@@ -393,6 +393,17 @@ pub fn ingest_snapshot(
             actual: actual_digest,
         });
     }
+    // Bound the input before parsing: oversized bytes are rejected without
+    // decoding them into a `Value` (fail closed, no allocation beyond the
+    // caller-supplied slice, no store mutation).
+    if request.canonical_bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err(SnapshotIngestError::Context(
+            ContextError::ArtifactTooLarge {
+                limit: MAX_ARTIFACT_BYTES,
+                actual: request.canonical_bytes.len(),
+            },
+        ));
+    }
     let value: serde_json::Value =
         serde_json::from_slice(request.canonical_bytes).map_err(|_| {
             SnapshotIngestError::MalformedSnapshot {
@@ -410,14 +421,8 @@ pub fn ingest_snapshot(
         ));
     }
     let owner = StableId::new(request.owner)?;
-    if request.canonical_bytes.len() > MAX_ARTIFACT_BYTES {
-        return Err(SnapshotIngestError::Context(
-            ContextError::ArtifactTooLarge {
-                limit: MAX_ARTIFACT_BYTES,
-                actual: request.canonical_bytes.len(),
-            },
-        ));
-    }
+    // The input length was already gated above (before parsing), so this
+    // branch only selects inline versus externalized storage.
     // Single store mutation, last fallible step before validation: small
     // bodies stay inline (L1 assembly externalizes over its own threshold
     // through its two-phase commit); large bodies externalize here so the
