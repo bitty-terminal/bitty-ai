@@ -1,9 +1,10 @@
 //! Snapshot-backed PROJECT layer builder (AI-0128).
 //!
 //! Follows AI-0127: [`project_layer_text`] renders the text; this builder
-//! fills the PROJECT layer of a validated [`PromptSnapshot`] from an
-//! ingested record, failing closed on non-project or marker-less records.
-//! Slice-only adapter tests; no runtime changes.
+//! fills the PROJECT layer of a validated [`PromptSnapshot`] from a raw
+//! ingested record plus its verified digest, failing closed on non-project
+//! records and digest mismatches. Slice-only adapter tests; no runtime
+//! changes.
 
 use bitty_ai_runtime::{ArtifactStore, ContextPriority, PromptLayer, assemble_prompt};
 use bitty_ai_slice::{
@@ -45,12 +46,10 @@ fn fixed_layers() -> (&'static str, &'static str, &'static str, &'static str) {
 }
 
 #[test]
-fn builder_fills_project_layer_from_ingested_record() {
-    let (mut record, digest) = ingest("abc123");
-    // The builder gates on the marker: the L0 summary alone lacks it, so
-    // wrap it the way the PROJECT text path does (summary is one consumer,
-    // the marker-prefixed rendering is the other — see AI-0127).
-    record.summary = format!("project-snapshot/1 {}", record.summary);
+fn builder_fills_project_layer_from_raw_ingested_record() {
+    // Raw ingest record in, no caller-side wrapping: the builder renders the
+    // marker itself exactly once.
+    let (record, digest) = ingest("abc123");
     let (core, user, skills, turn) = fixed_layers();
     let snapshot = prompt_snapshot_with_project(
         &record,
@@ -68,9 +67,10 @@ fn builder_fills_project_layer_from_ingested_record() {
         .iter()
         .find(|section| section.layer == PromptLayer::Project)
         .expect("project section present");
-    assert!(
-        project.text.starts_with("project-snapshot/1 "),
-        "{}",
+    assert_eq!(
+        project.text.matches("project-snapshot/1").count(),
+        1,
+        "marker rendered exactly once: {}",
         project.text
     );
     assert!(
@@ -85,7 +85,6 @@ fn builder_fills_project_layer_from_ingested_record() {
 fn builder_rejects_non_project_provider() {
     let (mut record, digest) = ingest("abc123");
     record.provider = "diagnostics".to_owned();
-    record.summary = format!("project-snapshot/1 {}", record.summary);
     let (core, user, skills, turn) = fixed_layers();
     let err = prompt_snapshot_with_project(
         &record,
@@ -106,32 +105,34 @@ fn builder_rejects_non_project_provider() {
 }
 
 #[test]
-fn builder_rejects_marker_less_summary() {
-    // A project-provider record whose summary was not produced by the
-    // snapshot rendering path (no marker) must not fill the layer.
-    let (record, digest) = ingest("abc123");
-    assert!(
-        !record.summary.contains("project-snapshot/1"),
-        "L0 summary itself carries no marker"
-    );
+fn builder_rejects_digest_mismatch() {
+    // A digest that does not belong to the record fails closed instead of
+    // silently poisoning the PROJECT layer and the cache-affinity claim.
+    let (record, _) = ingest("abc123");
+    let (other, other_digest) = ingest("xyz999");
+    let _ = other;
     let (core, user, skills, turn) = fixed_layers();
     let err = prompt_snapshot_with_project(
         &record,
-        &digest,
+        &other_digest,
         core,
         user,
         skills,
         turn,
         "bitty-core-prompt@1",
     )
-    .expect_err("marker-less summary must fail");
-    assert_eq!(err, ProjectLayerError::MissingMarker);
+    .expect_err("foreign digest must fail");
+    assert_eq!(err, ProjectLayerError::DigestMismatch);
+    // Empty digest fails the same way (no vacuous binding).
+    let err =
+        prompt_snapshot_with_project(&record, "", core, user, skills, turn, "bitty-core-prompt@1")
+            .expect_err("empty digest must fail");
+    assert_eq!(err, ProjectLayerError::DigestMismatch);
 }
 
 #[test]
 fn builder_propagates_layer_bound_violations() {
-    let (mut record, digest) = ingest("abc123");
-    record.summary = format!("project-snapshot/1 {}", record.summary);
+    let (record, digest) = ingest("abc123");
     let (_, user, skills, turn) = fixed_layers();
     let oversized = "x".repeat(bitty_ai_runtime::MAX_LAYER_TEXT_BYTES + 1);
     let err = prompt_snapshot_with_project(

@@ -399,9 +399,10 @@ pub enum ProjectLayerError {
         /// Offending provider string.
         provider: String,
     },
-    /// The record summary lacks the snapshot marker (not rendered by
-    /// [`project_layer_text`], or hand-written text smuggled in).
-    MissingMarker,
+    /// The record summary lacks the digest prefix of the supplied full
+    /// digest (not rendered by the snapshot path, or a digest that does not
+    /// belong to the record). Carries no content.
+    DigestMismatch,
     /// A layer text violates prompt bounds (caller-supplied fixed layers or
     /// a hostile snapshot overflowing the summary bound). Carries the
     /// runtime message, never record content.
@@ -417,8 +418,11 @@ impl std::fmt::Display for ProjectLayerError {
             Self::NotProjectRecord { provider } => {
                 write!(f, "not a project snapshot record: provider {provider}")
             }
-            Self::MissingMarker => {
-                write!(f, "project record summary lacks the snapshot layer marker")
+            Self::DigestMismatch => {
+                write!(
+                    f,
+                    "project record summary digest does not match the supplied digest"
+                )
             }
             Self::InvalidLayer { message } => {
                 write!(f, "project prompt layer invalid: {message}")
@@ -432,23 +436,25 @@ impl std::error::Error for ProjectLayerError {}
 /// Build a validated [`PromptSnapshot`](bitty_ai_runtime::PromptSnapshot)
 /// with the PROJECT layer filled from an ingested snapshot record.
 ///
-/// Host adapter (AIQ-12/AIQ-13): the caller supplies the already-ingested
-/// project `record` plus the four fixed surrounding layer texts
-/// (`core_contract`, `user`, `skills_profile`, `runtime_turn`); the builder
-/// renders the PROJECT text from the record summary via
-/// [`ingest_snapshot`]-verified digest material and validates the whole
-/// snapshot before returning. Fail-closed on non-project records (wrong
-/// provider) and on summaries lacking [`SNAPSHOT_LAYER_MARKER`] — a
-/// hand-written or foreign record can never silently occupy the PROJECT
-/// layer. The digest is recovered from the record summary's trailing
-/// `full-digest <hex>` field, which [`build_summary`] plus
-/// [`project_layer_text`] always emit verbatim.
+/// Host adapter (AIQ-12/AIQ-13): the caller supplies the raw ingested
+/// project `record` (exactly as [`ingest_snapshot`] returned it) plus the
+/// verified `full_digest` it ingested against, plus the four fixed
+/// surrounding layer texts (`core_contract`, `user`, `skills_profile`,
+/// `runtime_turn`). The builder checks the summary carries the digest prefix
+/// of `full_digest` (binding the record to the digest — a mismatched digest
+/// fails closed instead of silently breaking cache affinity), renders the
+/// marker-prefixed PROJECT text itself via [`project_layer_text`], and
+/// validates the whole snapshot before returning.
+///
+/// Fail-closed on non-project records (wrong provider) and on digest
+/// mismatch: a hand-written or foreign record, or a digest that does not
+/// belong to the record, can never silently occupy the PROJECT layer.
 ///
 /// # Errors
 ///
-/// Returns [`ProjectLayerError`] for non-project or marker-less records, or
-/// the runtime [`PromptError`](bitty_ai_runtime::PromptError) when any layer
-/// text violates prompt bounds.
+/// Returns [`ProjectLayerError`] for non-project records, digest mismatch,
+/// or the runtime [`PromptError`](bitty_ai_runtime::PromptError) when any
+/// layer text violates prompt bounds.
 pub fn prompt_snapshot_with_project(
     record: &ContextRecord,
     full_digest: &str,
@@ -464,13 +470,23 @@ pub fn prompt_snapshot_with_project(
             provider: record.provider.clone(),
         });
     }
-    if !record.summary.contains(SNAPSHOT_LAYER_MARKER) {
-        // The summary is the L0 record text; the PROJECT layer text is the
-        // marker-prefixed rendering. A project record whose summary was not
-        // produced by the snapshot rendering path must not fill the layer.
-        return Err(ProjectLayerError::MissingMarker);
+    // Bind the record to the digest: the L0 summary always ends with
+    // `digest <prefix12>` (see `build_summary`); the prefix must equal the
+    // leading bytes of the caller-supplied full digest. A wrong or empty
+    // digest fails closed here instead of silently poisoning the PROJECT
+    // layer and the cache-affinity claim built on it.
+    let expected_tail = format!(
+        "digest {}",
+        full_digest.get(..SNAPSHOT_DIGEST_PREFIX_LEN).unwrap_or("")
+    );
+    if !record.summary.ends_with(&expected_tail) {
+        return Err(ProjectLayerError::DigestMismatch);
     }
     let project_text = project_layer_text(&record.summary, full_digest);
+    debug_assert!(
+        project_text.starts_with(SNAPSHOT_LAYER_MARKER),
+        "renderer must prefix the marker"
+    );
     PromptSnapshot::new(
         core_version,
         vec![
