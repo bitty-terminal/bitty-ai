@@ -364,6 +364,27 @@ pub fn snapshot_digest_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Render the PROJECT-layer prompt text for a verified snapshot digest.
+///
+/// Cache affinity (AIQ-12/AIQ-13): the PROJECT layer of the prompt stable
+/// prefix carries this text, so the prefix-cache key warms exactly when the
+/// snapshot digest is unchanged and misses exactly when it changes. The text
+/// is the L0 summary verbatim — one rendering, two consumers — prefixed with
+/// a stable `project-snapshot/1` marker so the layer is self-describing and
+/// distinguishable from hand-written project text.
+///
+/// Inputs are untrusted snapshot data carried as inert text (the prompt
+/// assembler never interprets layer bytes): the full digest hex is embedded
+/// so any snapshot change alters this text byte-for-byte, which is precisely
+/// the affinity property. Bounded by the same truncation as the summary, so
+/// output always fits layer-text bounds for real snapshots (the summary is
+/// far below `MAX_LAYER_TEXT_BYTES`; oversized results fail closed at
+/// assembly, never silently truncated here).
+#[must_use]
+pub fn project_layer_text(summary: &str, full_digest: &str) -> String {
+    format!("project-snapshot/1 {summary} full-digest {full_digest}")
+}
+
 /// Truncate `value` to at most `max_bytes` at a UTF-8 code-point boundary.
 fn truncate_at_boundary(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
@@ -397,6 +418,11 @@ fn array_len(value: &serde_json::Value, field: &str) -> usize {
 /// (assembly never interprets summary bytes, AIQ-11). Label and revision are
 /// truncated before formatting so the result always fits
 /// [`MAX_SUMMARY_BYTES`].
+///
+/// The summary is ALSO the PROJECT-layer text rendered for the prompt
+/// stable prefix (see [`project_layer_text`]): one canonical rendering feeds
+/// both the L0 record and the cache-affinity input, so the digest the record
+/// pins is the digest the cache key warms on.
 fn build_summary(value: &serde_json::Value, actual_digest: &str) -> String {
     let label = nested_str(value, "source", "label").unwrap_or("unknown");
     let revision = nested_str(value, "source", "revision").unwrap_or("unknown");

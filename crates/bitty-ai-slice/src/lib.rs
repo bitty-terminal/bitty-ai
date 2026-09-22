@@ -74,5 +74,5 @@ pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMon
 pub use snapshot_ingest::{
     RefreshAuthorization, RefreshError, RefreshLedger, SNAPSHOT_CANONICALIZATION_VERSION,
     SNAPSHOT_DIGEST_PREFIX_LEN, SNAPSHOT_PROVIDER, SNAPSHOT_SCHEMA_VERSION, SnapshotIngestError,
-    SnapshotIngestRequest, ingest_snapshot, snapshot_digest_hex,
+    SnapshotIngestRequest, ingest_snapshot, project_layer_text, snapshot_digest_hex,
 };
