@@ -281,7 +281,7 @@ fn large_real_shape_ingest_externalizes_and_round_trips() {
         RecordBody::Artifact(reference) => {
             assert_eq!(store.len(), 1);
             assert_eq!(
-                store.resolve(reference).expect("artifact resolves"),
+                store.resolve(reference, 9).expect("artifact resolves"),
                 LARGE_BYTES
             );
         }
@@ -298,7 +298,7 @@ fn large_real_shape_ingest_externalizes_and_round_trips() {
     match &assembled.records[0].content {
         AssembledContent::Reference(reference) => {
             assert_eq!(
-                store.resolve(reference).expect("reference resolves"),
+                store.resolve(reference, 9).expect("reference resolves"),
                 LARGE_BYTES,
                 "artifact resolves to the exact recorded bytes"
             );

@@ -430,7 +430,12 @@ pub fn ingest_snapshot(
     let body = if request.canonical_bytes.len() <= MAX_RECORD_BODY_BYTES {
         RecordBody::Inline(request.canonical_bytes.to_vec())
     } else {
-        RecordBody::Artifact(store.store(request.canonical_bytes.to_vec())?)
+        // Snapshot payloads pin to the refresh generation: rotation retires
+        // the payload together with the record pin (AG-2, AIQ-03/AIQ-04).
+        RecordBody::Artifact(store.store(
+            request.canonical_bytes.to_vec(),
+            request.refresh.generation(),
+        )?)
     };
     let record = ContextRecord {
         id: request.record_id.to_owned(),
@@ -553,7 +558,7 @@ mod tests {
             RecordBody::Artifact(reference) => {
                 assert_eq!(store.len(), 1);
                 assert_eq!(
-                    store.resolve(reference).expect("resolves"),
+                    store.resolve(reference, 3).expect("resolves"),
                     bytes.as_slice()
                 );
             }

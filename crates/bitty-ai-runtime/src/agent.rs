@@ -897,7 +897,11 @@ impl<P: ModelProvider> Agent<P> {
     ) -> Result<(), ContextError> {
         self.attribute_execution(execution);
         let body = if execution.data.len() > crate::context::EXTERNALIZE_THRESHOLD_BYTES {
-            let reference = self.artifacts.store(execution.data.clone())?;
+            // Tool-history artifacts pin to the session generation: refresh
+            // rotates the record pin (AG-2) and the payload retires with it.
+            let reference = self
+                .artifacts
+                .store(execution.data.clone(), self.session.generation())?;
             RecordBody::Artifact(reference)
         } else {
             RecordBody::Inline(execution.data.clone())
