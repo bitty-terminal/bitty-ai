@@ -411,7 +411,7 @@ fn artifact_set_change_denies_prior_resolution_with_typed_absence() {
     // Owning set still serves exactly: denial is scoped, not destructive.
     assert_eq!(
         owner
-            .resolve(&reference)
+            .resolve(&reference, GENERATION)
             .expect("owning store resolves its reference")
             .len(),
         bitty_ai_runtime::context::EXTERNALIZE_THRESHOLD_BYTES + 64
@@ -427,7 +427,7 @@ fn artifact_set_change_denies_prior_resolution_with_typed_absence() {
     assert_eq!(foreign.len(), 0);
     assert_eq!(foreign.total_bytes(), 0);
     let err = foreign
-        .resolve(&reference)
+        .resolve(&reference, GENERATION)
         .expect_err("foreign reference must deny");
     assert!(
         matches!(

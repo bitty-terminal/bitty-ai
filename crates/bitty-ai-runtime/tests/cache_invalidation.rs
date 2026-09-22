@@ -334,7 +334,7 @@ fn foreign_artifact_references_fail_closed_without_stale_bytes() {
     // The owning store resolves the exact retained bytes (no stale mix).
     assert_eq!(
         store
-            .resolve(&reference)
+            .resolve(&reference, GENERATION)
             .expect("owning store resolves its reference"),
         vec![b'z'; EXTERNALIZE_THRESHOLD_BYTES + 1024].as_slice()
     );
@@ -343,7 +343,7 @@ fn foreign_artifact_references_fail_closed_without_stale_bytes() {
     // exact dangling reference: attributable, never substituted.
     let foreign = ArtifactStore::new();
     let err = foreign
-        .resolve(&reference)
+        .resolve(&reference, GENERATION)
         .expect_err("foreign reference must fail");
     assert!(
         matches!(
@@ -390,11 +390,15 @@ fn retained_artifacts_resolve_to_exact_bytes_without_cross_talk() {
     let second_ref = ref_of(&second);
     assert_ne!(first_ref, second_ref);
     assert_eq!(
-        store.resolve(&first_ref).expect("first resolves"),
+        store
+            .resolve(&first_ref, GENERATION)
+            .expect("first resolves"),
         vec![b'a'; EXTERNALIZE_THRESHOLD_BYTES + 16].as_slice()
     );
     assert_eq!(
-        store.resolve(&second_ref).expect("second resolves"),
+        store
+            .resolve(&second_ref, GENERATION)
+            .expect("second resolves"),
         vec![b'b'; EXTERNALIZE_THRESHOLD_BYTES + 32].as_slice()
     );
 }
@@ -406,13 +410,13 @@ fn store_count_cap_fails_closed_with_identity_unchanged() {
     // typed reason and leaves count, bytes, and id sequence unchanged.
     let mut store = ArtifactStore::new();
     for _ in 0..MAX_ARTIFACTS {
-        store.store(vec![b'a'; 8]).expect("fill fits");
+        store.store(vec![b'a'; 8], GENERATION).expect("fill fits");
     }
     assert_eq!(store.len(), MAX_ARTIFACTS);
     let before_bytes = store.total_bytes();
     let before_next = store.next_id();
     let err = store
-        .store(vec![b'b'; 8])
+        .store(vec![b'b'; 8], GENERATION)
         .expect_err("count-full store must fail");
     assert!(
         matches!(err, ContextError::ArtifactStoreFull { .. }),

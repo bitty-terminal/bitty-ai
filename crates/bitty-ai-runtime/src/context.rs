@@ -124,10 +124,22 @@ pub enum ContextError {
         /// Which bound was hit.
         reason: String,
     },
-    /// Reference names no retained artifact. Missing, expired, or deleted
-    /// content is explicitly unavailable, never silently substituted.
+    /// Reference names no retained artifact. Missing or deleted content is
+    /// explicitly unavailable, never silently substituted. Expired
+    /// (out-of-generation) references fail with
+    /// [`ContextError::ArtifactExpired`], not this variant, so callers can
+    /// distinguish gone content from stale content.
     ArtifactUnavailable {
         /// Dangling reference.
+        reference: String,
+    },
+    /// Reference names a retained artifact stored at a different generation
+    /// than the caller's current generation. Generations are exact pins, not
+    /// ranges: only the current generation resolves, so a refreshed pin
+    /// (`AG-2`) truly retires prior payloads instead of leaving them
+    /// resolvable (AIQ-03/AIQ-04). Carries the reference only, never bytes.
+    ArtifactExpired {
+        /// Stale reference.
         reference: String,
     },
     /// Even the smallest record does not fit the resolved budget.
@@ -181,6 +193,9 @@ impl Display for ContextError {
             }
             Self::ArtifactUnavailable { reference } => {
                 write!(f, "artifact unavailable: {reference}")
+            }
+            Self::ArtifactExpired { reference } => {
+                write!(f, "artifact expired: {reference}")
             }
             Self::BudgetExceeded { limit, actual } => write!(
                 f,
@@ -334,11 +349,29 @@ impl Display for ArtifactRef {
 /// Bounded in-memory artifact store (L1 externalize target). Retention is
 /// session-scoped and consent-bounded by the host; the store itself only
 /// enforces byte/count caps and typed absence.
+///
+/// Generation scope (AIQ-03/AIQ-04): every artifact records the generation it
+/// was stored at. `resolve` enforces an exact-generation pin — only the
+/// caller's current generation resolves — so a refresh truly retires prior
+/// payloads instead of leaving them resolvable behind a rotated record pin.
+/// Expiry is fail-closed and typed (`ArtifactExpired`), never silent.
+/// Explicit host-authorized deletion goes through `invalidate`, which drops
+/// the bytes and frees the budget.
 #[derive(Debug, Default)]
 pub struct ArtifactStore {
-    entries: Vec<(String, Vec<u8>)>,
+    entries: Vec<ArtifactEntry>,
     total_bytes: usize,
     next_id: u64,
+}
+
+/// One retained artifact: reference name, bytes, and the generation the host
+/// stored it at. The generation is host-supplied metadata (like record
+/// generations), never derived from content.
+#[derive(Debug)]
+struct ArtifactEntry {
+    reference: String,
+    bytes: Vec<u8>,
+    generation: u64,
 }
 
 impl ArtifactStore {
@@ -374,13 +407,18 @@ impl ArtifactStore {
         self.next_id
     }
 
-    /// Retain `bytes` and return its reference.
+    /// Retain `bytes` stored at `generation` and return its reference.
+    ///
+    /// The generation is host-supplied (typically the record generation the
+    /// artifact backs, or the request's current generation for
+    /// assembly-internal externalization) and becomes the exact pin that
+    /// `resolve` later enforces.
     ///
     /// # Errors
     ///
     /// Fails closed with [`ContextError::ArtifactTooLarge`] or
     /// [`ContextError::ArtifactStoreFull`]; the store is unchanged on error.
-    pub fn store(&mut self, bytes: Vec<u8>) -> Result<ArtifactRef, ContextError> {
+    pub fn store(&mut self, bytes: Vec<u8>, generation: u64) -> Result<ArtifactRef, ContextError> {
         if bytes.len() > MAX_ARTIFACT_BYTES {
             return Err(ContextError::ArtifactTooLarge {
                 limit: MAX_ARTIFACT_BYTES,
@@ -400,23 +438,68 @@ impl ArtifactStore {
         self.next_id += 1;
         let reference = format!("artifact://{}", self.next_id);
         self.total_bytes += bytes.len();
-        self.entries.push((reference.clone(), bytes));
+        self.entries.push(ArtifactEntry {
+            reference: reference.clone(),
+            bytes,
+            generation,
+        });
         Ok(ArtifactRef(reference))
     }
 
     /// Resolve a reference to retained bytes (`CP-6` drill-down primitive).
     ///
+    /// Generation scope is exact: only artifacts stored at
+    /// `current_generation` resolve. A retained artifact from any other
+    /// generation fails closed with [`ContextError::ArtifactExpired`], so a
+    /// refreshed pin retires prior payloads instead of leaving them
+    /// resolvable. Dangling references (never stored, or removed via
+    /// `invalidate`) fail with [`ContextError::ArtifactUnavailable`].
+    ///
     /// # Errors
     ///
-    /// Returns [`ContextError::ArtifactUnavailable`] for dangling references.
-    pub fn resolve(&self, reference: &ArtifactRef) -> Result<&[u8], ContextError> {
-        self.entries
+    /// Returns [`ContextError::ArtifactExpired`] for out-of-generation
+    /// references, [`ContextError::ArtifactUnavailable`] for dangling ones.
+    pub fn resolve(
+        &self,
+        reference: &ArtifactRef,
+        current_generation: u64,
+    ) -> Result<&[u8], ContextError> {
+        let entry = self
+            .entries
             .iter()
-            .find(|(name, _)| name == &reference.0)
-            .map(|(_, bytes)| bytes.as_slice())
+            .find(|entry| entry.reference == reference.0)
             .ok_or_else(|| ContextError::ArtifactUnavailable {
                 reference: reference.0.clone(),
-            })
+            })?;
+        if entry.generation != current_generation {
+            return Err(ContextError::ArtifactExpired {
+                reference: reference.0.clone(),
+            });
+        }
+        Ok(entry.bytes.as_slice())
+    }
+
+    /// Explicit host-authorized invalidation (AIQ-03 deletion facet): drop
+    /// the named artifact, freeing its bytes and budget. After invalidation
+    /// the reference is dangling and `resolve` fails with
+    /// [`ContextError::ArtifactUnavailable`].
+    ///
+    /// The host decides what to delete and when; the store only enforces the
+    /// removal. Returns `true` when an artifact was removed, `false` when the
+    /// reference was already dangling (idempotent: double-invalidate is not
+    /// an error).
+    pub fn invalidate(&mut self, reference: &ArtifactRef) -> bool {
+        if let Some(position) = self
+            .entries
+            .iter()
+            .position(|entry| entry.reference == reference.0)
+        {
+            let entry = self.entries.remove(position);
+            self.total_bytes -= entry.bytes.len();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -838,6 +921,10 @@ pub fn assemble(
     // L1 externalize, phase 2 (atomic commit): store bodies for selected
     // records pending externalization. Pre-validation makes each `store`
     // infallible here; the `?` is defense in depth for future bound changes.
+    // Committed artifacts pin to the request's current generation: every
+    // record reaching this point already passed the StaleGeneration gate, so
+    // the request generation equals each record's generation, and payloads
+    // retire exactly when the record pin rotates.
     // Consecutive committed IDs are assigned in selected order.
     // Records omitted due to budget constraints are NOT stored into
     // `ArtifactStore`, avoiding quota waste on omitted projection items.
@@ -845,7 +932,7 @@ pub fn assemble(
     for (position, (_, record, pending_body)) in staged.iter_mut().enumerate() {
         if included[position] {
             if let Some(bytes) = pending_body.take() {
-                let committed = store.store(bytes)?;
+                let committed = store.store(bytes, request.current_generation)?;
                 record.body = RecordBody::Artifact(committed);
                 committed_count += 1;
             }
@@ -1011,8 +1098,97 @@ mod tests {
         let store = ArtifactStore::new();
         let missing = ArtifactRef("artifact://9".to_owned());
         assert!(matches!(
-            store.resolve(&missing),
+            store.resolve(&missing, 1),
             Err(ContextError::ArtifactUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_expiry_is_generation_exact() {
+        // Store at generation 1; the same generation resolves, any other
+        // generation (older or future/forged) fails closed with the typed
+        // expiry variant — never silent, never bytes.
+        let mut store = ArtifactStore::new();
+        let reference = store.store(vec![b'x'; 16], 1).expect("store at gen 1");
+        assert_eq!(
+            store
+                .resolve(&reference, 1)
+                .expect("same gen resolves")
+                .len(),
+            16
+        );
+        assert!(matches!(
+            store.resolve(&reference, 2),
+            Err(ContextError::ArtifactExpired { .. })
+        ));
+        assert!(matches!(
+            store.resolve(&reference, 0),
+            Err(ContextError::ArtifactExpired { .. })
+        ));
+        assert!(matches!(
+            store.resolve(&reference, u64::MAX),
+            Err(ContextError::ArtifactExpired { .. })
+        ));
+        // Expiry carries the reference only, never content.
+        let err = store.resolve(&reference, 2).expect_err("expired must fail");
+        assert_eq!(
+            format!("{err}"),
+            format!("artifact expired: {}", reference.as_str())
+        );
+        // The store is unchanged by failed resolves: still exactly one entry.
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 16);
+    }
+
+    #[test]
+    fn invalidate_drops_bytes_and_frees_budget() {
+        let mut store = ArtifactStore::new();
+        let first = store.store(vec![b'a'; 32], 1).expect("store first");
+        let second = store.store(vec![b'b'; 64], 1).expect("store second");
+        assert_eq!(store.total_bytes(), 96);
+        // Host-authorized deletion drops the bytes and frees the budget.
+        assert!(store.invalidate(&first));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 64);
+        assert!(matches!(
+            store.resolve(&first, 1),
+            Err(ContextError::ArtifactUnavailable { .. })
+        ));
+        // The surviving artifact still resolves at its generation.
+        assert_eq!(
+            store.resolve(&second, 1).expect("survivor resolves").len(),
+            64
+        );
+        // Idempotent: double-invalidate is not an error.
+        assert!(!store.invalidate(&first));
+        // Dangling references invalidate to false, never panic.
+        let missing = ArtifactRef("artifact://9".to_owned());
+        assert!(!store.invalidate(&missing));
+    }
+
+    #[test]
+    fn assemble_committed_artifacts_pin_request_generation() {
+        // Assembly-internal externalization pins committed artifacts to the
+        // request's current generation: they resolve at that generation and
+        // expire at any other — the payload retires with the record pin.
+        let mut store = ArtifactStore::new();
+        let assembled = assemble(
+            &[record("big", "project", "manifest", 8_192)],
+            &mut store,
+            &budget(32_768),
+        )
+        .expect("assembles with externalization");
+        let reference = match &assembled.records[0].content {
+            AssembledContent::Reference(r) => r.clone(),
+            _ => panic!("large body must externalize"),
+        };
+        assert_eq!(
+            store.resolve(&reference, 1).expect("gen 1 resolves").len(),
+            8_192
+        );
+        assert!(matches!(
+            store.resolve(&reference, 2),
+            Err(ContextError::ArtifactExpired { .. })
         ));
     }
 
@@ -1339,7 +1515,7 @@ mod tests {
         let mut store = ArtifactStore::new();
         for _ in 0..(MAX_ARTIFACT_STORE_BYTES / MAX_ARTIFACT_BYTES) {
             store
-                .store(vec![b'a'; MAX_ARTIFACT_BYTES])
+                .store(vec![b'a'; MAX_ARTIFACT_BYTES], 1)
                 .expect("fill fits");
         }
         let before_len = store.len();
@@ -1368,7 +1544,7 @@ mod tests {
         let mut partial = ArtifactStore::new();
         for _ in 0..(MAX_ARTIFACTS - 1) {
             partial
-                .store(vec![b'p'; 16])
+                .store(vec![b'p'; 16], 1)
                 .expect("fill to one below count cap");
         }
         let partial_len = partial.len();
@@ -1486,7 +1662,7 @@ mod tests {
         let mut store = ArtifactStore::new();
         for _ in 0..(MAX_ARTIFACTS - 1) {
             store
-                .store(vec![b'p'; 16])
+                .store(vec![b'p'; 16], 1)
                 .expect("fill store to one slot remaining");
         }
         let initial_len = store.len();
@@ -1515,7 +1691,7 @@ mod tests {
         let mut full_store = ArtifactStore::new();
         for _ in 0..(MAX_ARTIFACTS - 1) {
             full_store
-                .store(vec![b'p'; 16])
+                .store(vec![b'p'; 16], 1)
                 .expect("fill store to one slot remaining");
         }
         let full_len = full_store.len();
@@ -1541,13 +1717,13 @@ mod tests {
         let mut filled = 0;
         while filled + MAX_ARTIFACT_BYTES <= target_bytes {
             store
-                .store(vec![b'b'; MAX_ARTIFACT_BYTES])
+                .store(vec![b'b'; MAX_ARTIFACT_BYTES], 1)
                 .expect("fill artifact");
             filled += MAX_ARTIFACT_BYTES;
         }
         if filled < target_bytes {
             store
-                .store(vec![b'b'; target_bytes - filled])
+                .store(vec![b'b'; target_bytes - filled], 1)
                 .expect("fill remaining target");
         }
         assert_eq!(store.total_bytes(), target_bytes);
@@ -1578,13 +1754,13 @@ mod tests {
         let mut filled = 0;
         while filled + MAX_ARTIFACT_BYTES <= target_bytes {
             full_store
-                .store(vec![b'b'; MAX_ARTIFACT_BYTES])
+                .store(vec![b'b'; MAX_ARTIFACT_BYTES], 1)
                 .expect("fill artifact");
             filled += MAX_ARTIFACT_BYTES;
         }
         if filled < target_bytes {
             full_store
-                .store(vec![b'b'; target_bytes - filled])
+                .store(vec![b'b'; target_bytes - filled], 1)
                 .expect("fill remaining target");
         }
         let full_len = full_store.len();
@@ -1629,7 +1805,7 @@ mod tests {
         };
         assert_eq!(ref2.as_str(), "artifact://1");
         assert_eq!(ref3.as_str(), "artifact://2");
-        assert_eq!(store.resolve(&ref2).expect("resolve ref2").len(), 8_192);
-        assert_eq!(store.resolve(&ref3).expect("resolve ref3").len(), 8_192);
+        assert_eq!(store.resolve(&ref2, 1).expect("resolve ref2").len(), 8_192);
+        assert_eq!(store.resolve(&ref3, 1).expect("resolve ref3").len(), 8_192);
     }
 }
