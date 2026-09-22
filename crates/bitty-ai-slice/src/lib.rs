@@ -41,6 +41,13 @@
 //! boundary. It is the mapping layer, not a shipped transport: the runtime is
 //! std-only and cannot name the transport ceiling, and `bitty-ipc` is upstream
 //! and unchanged.
+//!
+//! [`snapshot_ingest`] (AI-0121) is the host-side ProjectSnapshot v1
+//! ingestion experiment: pure bytes-in/record-out verification of `psnap`
+//! canonical bytes plus an explicit per-invocation refresh authorization,
+//! adapted to a runtime `ContextRecord` (provider `"project"`,
+//! untrusted-surface). The host spawns `psnap` out-of-process; this crate
+//! never does.
 
 #![deny(unsafe_code)]
 
@@ -52,6 +59,7 @@ pub mod harness;
 pub mod journal_prototype;
 pub mod live_host;
 pub mod local_provider;
+pub mod snapshot_ingest;
 
 pub use bridge::{HostPeer, IpcBridge};
 pub use error::SliceError;
@@ -63,3 +71,8 @@ pub use harness::{
 };
 pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
+pub use snapshot_ingest::{
+    RefreshAuthorization, SNAPSHOT_CANONICALIZATION_VERSION, SNAPSHOT_DIGEST_PREFIX_LEN,
+    SNAPSHOT_PROVIDER, SNAPSHOT_SCHEMA_VERSION, SnapshotIngestError, SnapshotIngestRequest,
+    ingest_snapshot, snapshot_digest_hex,
+};
