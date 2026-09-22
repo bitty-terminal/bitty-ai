@@ -16,6 +16,13 @@ workspace = true
 [dependencies]
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "cfeffa2d8e1387029850940af2b64877dbfbe25f" }
+# AI-0121 snapshot-ingest experiment (slice-only): maintained SHA-256 (`sha2`)
+# plus lowercase hex (`hex`) for digest verification, and minimal field
+# extraction (`serde_json`) for the version gate and the L0 summary. None of
+# these cross the runtime boundary: `bitty-ai-runtime` stays std-only.
+hex = { version = "=0.4.3" }
+serde_json = { version = "=1.0.151" }
+sha2 = { version = "=0.10.9" }
 # R6 journal prototype (AI-0049, experimental, slice-only). `bundled` compiles
 # vendored SQLite 3.53.2; default features off drops the wasm-only subtree and
 # the statement cache. Dependency review: PX-0298 on AI-0049.
