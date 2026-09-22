@@ -120,6 +120,15 @@ pub const MAX_SNAPSHOT_REVISION_BYTES: usize = 128;
 /// advances generations per refresh gets rotation invalidation for free: the
 /// runtime's assembly rejects prior-generation records with
 /// `StaleGeneration` (`AG-2`), and future/forged generations never assemble.
+///
+/// Lifecycle (enforced by [`RefreshLedger`]): tokens are issued in strictly
+/// increasing generation order. The ledger remembers the highest issued
+/// generation; issuing a generation at or below it fails closed (replay and
+/// duplicate-authorize are both forgeries from the ledger's view). The first
+/// issuance in a session retires nothing; every later issuance retires the
+/// previously highest generation, and the retired generation is recorded for
+/// audit. The ledger is host-held session state — one ledger per snapshot
+/// stream — and carries no bytes, only generation numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshAuthorization {
     generation: u64,
@@ -139,6 +148,108 @@ impl RefreshAuthorization {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+}
+
+/// Host-held refresh lifecycle tracker: one per snapshot stream per session.
+///
+/// The ledger makes the refresh authority auditable without touching bytes:
+/// it records the highest issued generation and the full retired chain, so a
+/// reviewer can prove every refresh advanced the pin exactly once and no
+/// generation was ever authorized twice. Pure generation arithmetic — no
+/// bytes, no clock, no I/O — so it stays deterministic and side-effect free.
+///
+/// Typical host flow: create one ledger per snapshot stream, call
+/// [`RefreshLedger::issue`] instead of `RefreshAuthorization::authorize`
+/// directly, and pass the returned token into [`ingest_snapshot`]. When the
+/// host rotates (new `psnap` output), it issues the next generation; the
+/// ledger retires the old one. On host restart the ledger restarts: the new
+/// session must advance past every generation the old session issued (the
+/// host knows its own stream; the ledger cannot vouch across restarts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshLedger {
+    /// Highest generation issued so far (`None` before the first issuance).
+    highest: Option<u64>,
+    /// Retired generations in issuance order (every superseded pin, kept for
+    /// audit; the host drops cached contexts for these, cf. AI-0125).
+    retired: Vec<u64>,
+}
+
+/// Refresh lifecycle errors. Every variant fails closed: no token exists, so
+/// no ingestion call can proceed on the disputed generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshError {
+    /// Requested generation does not advance past the highest issued
+    /// generation (replay of an old generation, or a duplicate authorize of
+    /// the current one). Carries the requested and highest generations.
+    NotAdvancing {
+        /// Requested generation.
+        requested: u64,
+        /// Highest generation issued so far.
+        highest: u64,
+    },
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAdvancing { requested, highest } => write!(
+                f,
+                "refresh generation {requested} does not advance past issued {highest}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RefreshError {}
+
+impl RefreshLedger {
+    /// Begin a new snapshot stream with no issued generation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            highest: None,
+            retired: Vec::new(),
+        }
+    }
+
+    /// Highest generation issued so far (`None` before first issuance).
+    #[must_use]
+    pub fn highest(&self) -> Option<u64> {
+        self.highest
+    }
+
+    /// Retired generations in issuance order (empty before the second
+    /// issuance). The host should have dropped cached contexts pinning these.
+    #[must_use]
+    pub fn retired(&self) -> &[u64] {
+        &self.retired
+    }
+
+    /// Issue the refresh token for `generation`, retiring the previously
+    /// highest generation (if any).
+    ///
+    /// Fails closed with [`RefreshError::NotAdvancing`] when `generation`
+    /// does not strictly exceed the highest issued generation — replay and
+    /// duplicate-authorize included. The ledger is unchanged on error.
+    pub fn issue(&mut self, generation: u64) -> Result<RefreshAuthorization, RefreshError> {
+        if let Some(highest) = self.highest {
+            if generation <= highest {
+                return Err(RefreshError::NotAdvancing {
+                    requested: generation,
+                    highest,
+                });
+            }
+            self.retired.push(highest);
+        }
+        self.highest = Some(generation);
+        Ok(RefreshAuthorization::authorize(generation))
+    }
+}
+
+impl Default for RefreshLedger {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -683,5 +794,107 @@ mod tests {
             .expect("hostile summary ingests as inert data");
         assert!(record.summary.len() <= MAX_SUMMARY_BYTES);
         record.validate().expect("bounded record validates");
+    }
+
+    #[test]
+    fn refresh_ledger_advances_monotonically() {
+        // First issuance retires nothing; each later issuance retires the
+        // previously highest generation, building the audit chain.
+        let mut ledger = RefreshLedger::new();
+        assert_eq!(ledger.highest(), None);
+        assert!(ledger.retired().is_empty());
+        let first = ledger.issue(1).expect("first issuance advances");
+        assert_eq!(first.generation(), 1);
+        assert_eq!(ledger.highest(), Some(1));
+        assert!(ledger.retired().is_empty());
+        let second = ledger.issue(2).expect("second issuance advances");
+        assert_eq!(second.generation(), 2);
+        assert_eq!(ledger.highest(), Some(2));
+        assert_eq!(ledger.retired(), &[1]);
+        let third = ledger.issue(7).expect("skipped generations advance");
+        assert_eq!(third.generation(), 7);
+        assert_eq!(ledger.highest(), Some(7));
+        assert_eq!(ledger.retired(), &[1, 2]);
+    }
+
+    #[test]
+    fn refresh_replay_and_duplicate_fail_closed() {
+        // Replay of a retired generation and duplicate-authorize of the
+        // current generation both fail with the typed error; the ledger is
+        // unchanged, so no token exists for the disputed generation.
+        let mut ledger = RefreshLedger::new();
+        ledger.issue(3).expect("first issuance");
+        ledger.issue(5).expect("second issuance");
+        let before = ledger.clone();
+        assert_eq!(
+            ledger.issue(3),
+            Err(RefreshError::NotAdvancing {
+                requested: 3,
+                highest: 5
+            })
+        );
+        assert_eq!(
+            ledger.issue(5),
+            Err(RefreshError::NotAdvancing {
+                requested: 5,
+                highest: 5
+            })
+        );
+        assert_eq!(
+            ledger.issue(0),
+            Err(RefreshError::NotAdvancing {
+                requested: 0,
+                highest: 5
+            })
+        );
+        assert_eq!(
+            ledger, before,
+            "failed issuance leaves the ledger unchanged"
+        );
+        // Display carries generations, never bytes (the ledger holds none).
+        assert_eq!(
+            format!(
+                "{}",
+                RefreshError::NotAdvancing {
+                    requested: 3,
+                    highest: 5
+                }
+            ),
+            "refresh generation 3 does not advance past issued 5"
+        );
+    }
+
+    #[test]
+    fn ledger_issued_token_ingests_at_its_generation() {
+        // End to end: a ledger-issued token drives ingest at the issued
+        // generation, and the retired chain tells the host which cached
+        // contexts to drop (AI-0125 contract).
+        let value = serde_json::json!({
+            "schema": {"name": "ProjectSnapshot", "version": 1, "canonicalization_version": 1},
+            "source": {"label": "demo", "revision": "abc124"},
+            "project_units": [{"id": 1}],
+            "entrypoints": [],
+            "dependencies": [],
+        });
+        let bytes = serde_json::to_vec(&value).expect("fixture serializes");
+        let digest = snapshot_digest_hex(&bytes);
+        let mut ledger = RefreshLedger::new();
+        let mut store = ArtifactStore::new();
+        let token = ledger.issue(2).expect("issues gen 2");
+        let request = SnapshotIngestRequest {
+            canonical_bytes: &bytes,
+            expected_digest: &digest,
+            record_id: "ledger-demo",
+            owner: "term-1",
+            collected_at_ms: 200,
+            priority: ContextPriority::High,
+            refresh: token,
+        };
+        let record = ingest_snapshot(&request, &mut store).expect("ledger token ingests");
+        assert_eq!(record.generation, 2);
+        assert!(
+            ledger.retired().is_empty(),
+            "first issuance retires nothing"
+        );
     }
 }
