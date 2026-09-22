@@ -385,6 +385,107 @@ pub fn project_layer_text(summary: &str, full_digest: &str) -> String {
     format!("project-snapshot/1 {summary} full-digest {full_digest}")
 }
 
+/// Stable marker prefixing every snapshot-backed PROJECT layer text (see
+/// [`project_layer_text`]). The builder gates on it so a non-snapshot record
+/// can never silently fill the PROJECT layer.
+pub const SNAPSHOT_LAYER_MARKER: &str = "project-snapshot/1";
+
+/// Errors building a prompt snapshot with a snapshot-backed PROJECT layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectLayerError {
+    /// The record is not a snapshot-backed project record (wrong provider).
+    /// Carries the offending provider, never content.
+    NotProjectRecord {
+        /// Offending provider string.
+        provider: String,
+    },
+    /// The record summary lacks the snapshot marker (not rendered by
+    /// [`project_layer_text`], or hand-written text smuggled in).
+    MissingMarker,
+    /// A layer text violates prompt bounds (caller-supplied fixed layers or
+    /// a hostile snapshot overflowing the summary bound). Carries the
+    /// runtime message, never record content.
+    InvalidLayer {
+        /// Runtime validation message.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ProjectLayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotProjectRecord { provider } => {
+                write!(f, "not a project snapshot record: provider {provider}")
+            }
+            Self::MissingMarker => {
+                write!(f, "project record summary lacks the snapshot layer marker")
+            }
+            Self::InvalidLayer { message } => {
+                write!(f, "project prompt layer invalid: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectLayerError {}
+
+/// Build a validated [`PromptSnapshot`](bitty_ai_runtime::PromptSnapshot)
+/// with the PROJECT layer filled from an ingested snapshot record.
+///
+/// Host adapter (AIQ-12/AIQ-13): the caller supplies the already-ingested
+/// project `record` plus the four fixed surrounding layer texts
+/// (`core_contract`, `user`, `skills_profile`, `runtime_turn`); the builder
+/// renders the PROJECT text from the record summary via
+/// [`ingest_snapshot`]-verified digest material and validates the whole
+/// snapshot before returning. Fail-closed on non-project records (wrong
+/// provider) and on summaries lacking [`SNAPSHOT_LAYER_MARKER`] — a
+/// hand-written or foreign record can never silently occupy the PROJECT
+/// layer. The digest is recovered from the record summary's trailing
+/// `full-digest <hex>` field, which [`build_summary`] plus
+/// [`project_layer_text`] always emit verbatim.
+///
+/// # Errors
+///
+/// Returns [`ProjectLayerError`] for non-project or marker-less records, or
+/// the runtime [`PromptError`](bitty_ai_runtime::PromptError) when any layer
+/// text violates prompt bounds.
+pub fn prompt_snapshot_with_project(
+    record: &ContextRecord,
+    full_digest: &str,
+    core_contract: &str,
+    user: &str,
+    skills_profile: &str,
+    runtime_turn: &str,
+    core_version: &str,
+) -> Result<bitty_ai_runtime::PromptSnapshot, ProjectLayerError> {
+    use bitty_ai_runtime::{LayerInput, PromptLayer, PromptSnapshot};
+    if record.provider != SNAPSHOT_PROVIDER {
+        return Err(ProjectLayerError::NotProjectRecord {
+            provider: record.provider.clone(),
+        });
+    }
+    if !record.summary.contains(SNAPSHOT_LAYER_MARKER) {
+        // The summary is the L0 record text; the PROJECT layer text is the
+        // marker-prefixed rendering. A project record whose summary was not
+        // produced by the snapshot rendering path must not fill the layer.
+        return Err(ProjectLayerError::MissingMarker);
+    }
+    let project_text = project_layer_text(&record.summary, full_digest);
+    PromptSnapshot::new(
+        core_version,
+        vec![
+            LayerInput::text_only(PromptLayer::CoreContract, core_contract),
+            LayerInput::text_only(PromptLayer::User, user),
+            LayerInput::text_only(PromptLayer::Project, project_text),
+            LayerInput::text_only(PromptLayer::SkillsProfile, skills_profile),
+            LayerInput::text_only(PromptLayer::RuntimeTurn, runtime_turn),
+        ],
+    )
+    .map_err(|err| ProjectLayerError::InvalidLayer {
+        message: format!("{err}"),
+    })
+}
+
 /// Truncate `value` to at most `max_bytes` at a UTF-8 code-point boundary.
 fn truncate_at_boundary(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {

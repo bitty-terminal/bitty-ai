@@ -72,7 +72,8 @@ pub use harness::{
 pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
 pub use snapshot_ingest::{
-    RefreshAuthorization, RefreshError, RefreshLedger, SNAPSHOT_CANONICALIZATION_VERSION,
-    SNAPSHOT_DIGEST_PREFIX_LEN, SNAPSHOT_PROVIDER, SNAPSHOT_SCHEMA_VERSION, SnapshotIngestError,
-    SnapshotIngestRequest, ingest_snapshot, project_layer_text, snapshot_digest_hex,
+    ProjectLayerError, RefreshAuthorization, RefreshError, RefreshLedger,
+    SNAPSHOT_CANONICALIZATION_VERSION, SNAPSHOT_DIGEST_PREFIX_LEN, SNAPSHOT_LAYER_MARKER,
+    SNAPSHOT_PROVIDER, SNAPSHOT_SCHEMA_VERSION, SnapshotIngestError, SnapshotIngestRequest,
+    ingest_snapshot, project_layer_text, prompt_snapshot_with_project, snapshot_digest_hex,
 };
