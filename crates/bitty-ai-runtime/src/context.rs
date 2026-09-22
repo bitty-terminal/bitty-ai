@@ -488,6 +488,16 @@ impl ArtifactStore {
     /// removal. Returns `true` when an artifact was removed, `false` when the
     /// reference was already dangling (idempotent: double-invalidate is not
     /// an error).
+    ///
+    /// Deletion-propagation contract (AIQ-03/AIQ-55): invalidation retires
+    /// the bytes, and every later `resolve` of the reference fails closed —
+    /// no stale payload survives through the store. What the store cannot do
+    /// is reach into host-held clones: the host MUST drop cached
+    /// `AssembledContext` values pinning the invalidated generation (or the
+    /// whole store epoch) after invalidating, otherwise its own copies keep
+    /// circulating detached summaries. Summaries are always inline inert
+    /// text (digest prefixes at most), never payload, so dropping the
+    /// assembled value completes the propagation.
     pub fn invalidate(&mut self, reference: &ArtifactRef) -> bool {
         if let Some(position) = self
             .entries
@@ -1190,6 +1200,47 @@ mod tests {
             store.resolve(&reference, 2),
             Err(ContextError::ArtifactExpired { .. })
         ));
+    }
+
+    #[test]
+    fn derived_records_fail_closed_after_invalidation() {
+        // Deletion propagation (AIQ-03/AIQ-55): after the host invalidates
+        // the backing artifact, every derived holder of its reference —
+        // the assembled record from this turn — re-resolves fail-closed
+        // with typed absence, never stale bytes. Summaries stay inline and
+        // inert (they carry only a digest prefix, never content), so no
+        // payload survives through them.
+        let mut store = ArtifactStore::new();
+        let assembled = assemble(
+            &[record("big", "project", "manifest", 8_192)],
+            &mut store,
+            &budget(32_768),
+        )
+        .expect("assembles with externalization");
+        let reference = match &assembled.records[0].content {
+            AssembledContent::Reference(r) => r.clone(),
+            _ => panic!("large body must externalize"),
+        };
+        // Before invalidation the derived reference resolves at its pin.
+        assert_eq!(
+            store
+                .resolve(&reference, 1)
+                .expect("pre-invalidation resolves")
+                .len(),
+            8_192
+        );
+        // Host-authorized deletion drops the bytes and frees the budget.
+        assert!(store.invalidate(&reference));
+        // After invalidation the same derived reference fails closed with
+        // typed absence — no stale bytes, no silent substitution.
+        assert!(matches!(
+            store.resolve(&reference, 1),
+            Err(ContextError::ArtifactUnavailable { .. })
+        ));
+        // Host contract: cached AssembledContexts pinning the invalidated
+        // generation must be dropped by the host (the store cannot reach
+        // into host-held clones). The assembly output itself is inert data;
+        // only re-resolution is gated, and it is gated here.
     }
 
     // --- AIQ-11 injection-defense negative evidence ---
