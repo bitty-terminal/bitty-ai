@@ -444,6 +444,17 @@ impl<P: ModelProvider> Agent<P> {
         self.session.cancel();
     }
 
+    /// Honored-cancellation count (AI-0140, `MP-7`).
+    ///
+    /// Read-only view of [`AgentSession::cancel_count`]: the session owns
+    /// cancel state, so it owns the count and this delegate never mutates.
+    /// Counts first-honored `Active` -> `Canceled` transitions only;
+    /// idempotent repeats never inflate it.
+    #[must_use]
+    pub fn cancel_count(&self) -> u64 {
+        self.session.cancel_count()
+    }
+
     /// Bound session handle (shares cancellation and lifecycle).
     #[must_use]
     pub fn session(&self) -> &AgentSession {

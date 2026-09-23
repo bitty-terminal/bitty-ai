@@ -275,11 +275,17 @@ struct SessionInner {
     level: Cell<AgentLevel>,
     generation: Cell<u64>,
     state: Cell<SessionState>,
+    /// Honored cancellations (`MP-7`, AI-0140). Incremented only by the
+    /// `Active` -> `Canceled` transition in [`AgentSession::cancel`], so
+    /// idempotent repeats and cancels on terminal sessions never inflate it.
+    /// Shared across clones like the state itself; with the terminal state
+    /// machine the value is 0 (never canceled) or 1 (canceled once).
+    cancel_count: Cell<u64>,
 }
 
 /// One agent session. Clones share identity and lifecycle: `cancel`,
 /// `elevate`, `rotate_generation`, and `finish` are visible through every
-/// handle.
+/// handle, as is the [`AgentSession::cancel_count`] metric (AI-0140).
 ///
 /// # Single-threaded contract (`!Send`)
 ///
@@ -333,6 +339,7 @@ impl AgentSession {
             level: Cell::new(AgentLevel::Inspect),
             generation: Cell::new(1),
             state: Cell::new(SessionState::Active),
+            cancel_count: Cell::new(0),
         }))
     }
 
@@ -378,12 +385,30 @@ impl AgentSession {
         self.0.state.get() == SessionState::Canceled
     }
 
+    /// Number of honored cancellations (AI-0140, `MP-7`).
+    ///
+    /// Counts first-honored `Active` -> `Canceled` transitions only: 0 while
+    /// never canceled, 1 once canceled. Idempotent repeats (cancel on an
+    /// already-`Canceled` session) and cancel attempts on terminal
+    /// `Completed`/`Failed` sessions do not inflate the count. Shared across
+    /// clones: canceling through one handle is visible through every other
+    /// handle, including this count (single-agent scope; two-waiter shared
+    /// work is out of scope for v0.1).
+    #[must_use]
+    pub fn cancel_count(&self) -> u64 {
+        self.0.cancel_count.get()
+    }
+
     /// Request cancellation. Idempotent: only `Active` transitions; terminal
     /// states are kept, so one waiter's cancel never rewrites another
     /// waiter's completed outcome (`MP-7`).
+    ///
+    /// The first honored transition also increments the
+    /// [`AgentSession::cancel_count`] metric; repeats are no-ops.
     pub fn cancel(&self) {
         if self.0.state.get() == SessionState::Active {
             self.0.state.set(SessionState::Canceled);
+            self.0.cancel_count.set(self.0.cancel_count.get() + 1);
         }
     }
 
