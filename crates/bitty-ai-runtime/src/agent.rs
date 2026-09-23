@@ -487,7 +487,11 @@ impl<P: ModelProvider> Agent<P> {
     /// Cancellation returns [`ExecOutcome::Canceled`] (or
     /// [`ExecOutcome::Unknown`] when dispatched effects are unreconciled);
     /// budget, validation, and authorization failures return
-    /// [`ExecOutcome::Failed`] with no dispatch of their own. The cost fuse
+    /// [`ExecOutcome::Failed`] with no dispatch of their own. A
+    /// provider-reported [`ProviderError::Unknown`](crate::provider::ProviderError::Unknown)
+    /// returns [`ExecOutcome::Unknown`] with a synthetic reconcilable
+    /// attribution instead: the session stays `Active` for
+    /// reconcile-before-retry, never a blind retry (`MP-7`, AIQ-59). The cost fuse
     /// ([`AgentError::CostCeilingExceeded`]) is the exception to the
     /// `Failed`-means-terminal rule: it returns `Failed` with the session
     /// left `Active` for reconcile-and-retry, like `Unknown`/cancel, with no
@@ -631,6 +635,17 @@ impl<P: ModelProvider> Agent<P> {
             };
             let turn = match self.provider.complete(&turn_request) {
                 Ok(turn) => turn,
+                // AI-0134: a provider-reported `Unknown` means the effect may
+                // have happened but acknowledgement was lost. It takes the
+                // turn-outcome branch to `ExecOutcome::Unknown` with
+                // reconciler keying (a synthetic `Unknown` attribution the
+                // standard `reconcile_unknown` protocol resolves), never the
+                // `fail()` path: the session stays `Active` for
+                // reconcile-before-retry (`MP-7`, AIQ-59). Every other
+                // provider error still fails closed below.
+                Err(ProviderError::Unknown { provider, reason }) => {
+                    return self.provider_unknown(provider, reason);
+                }
                 Err(error) => return self.fail(error.into()),
             };
             // Cost fuse: accumulate estimated cost for this round, then stop
@@ -1003,6 +1018,62 @@ impl<P: ModelProvider> Agent<P> {
             reason: format!("{reason} (tool {})", bound_reason(&tool)),
             dispatched: self.executions.len(),
         }
+    }
+
+    /// Record a provider-reported `Unknown` as a reconcilable turn outcome
+    /// (AI-0134).
+    ///
+    /// The provider signals that a model-side effect (for example a billable
+    /// generation) may have happened without acknowledgement. There is no
+    /// tool dispatch to attribute, so this mints a fresh [`ExecutionId`] and
+    /// records a synthetic [`ToolStatus::Unknown`] entry keyed by the bounded
+    /// provider id; the standard [`Agent::reconcile_unknown`] protocol
+    /// resolves it by that id, exactly like a tool `Unknown`, and the next
+    /// turn's admission carry preserves the lookup in `pending_unknown`.
+    /// The `tool` attribution therefore names the owning provider, not a
+    /// registered tool: the execution id disambiguates, never the name.
+    ///
+    /// Fail-closed properties (security-sensitive, `MP-7`, AIQ-59):
+    ///
+    /// - The session stays `Active` for reconcile-and-retry; it is never
+    ///   marked failed here (escalation still fails it) and never completed.
+    /// - No retry is attempted: this returns after the single failed
+    ///   `complete` call, performs no provider round, no tool dispatch, and
+    ///   no fallback advance (`fallback_directive` keeps mapping
+    ///   [`ProviderError::Unknown`] to `Stop`).
+    /// - Retry eligibility is never implicitly granted: the caller must
+    ///   reconcile the minted id (status inspection or user direction)
+    ///   before deciding whether a retry is a new submission at all, and
+    ///   exactly-once stays open (no claim is made).
+    fn provider_unknown(&mut self, provider: String, reason: String) -> ExecOutcome {
+        // AI-RUN-008: both strings are host-supplied and reach the attributed
+        // record plus the outbound `Unknown` reason; bound and scrub them so
+        // the stored status and the status text stay single-line,
+        // display-safe, and within the shared reason bound.
+        let provider = bound_reason(&provider);
+        let reason = bound_reason(&reason);
+        // The per-turn attribution vector stays bounded by
+        // `MAX_EXECUTIONS_PER_AGENT` even for synthetic entries: a turn that
+        // already filled it fails closed rather than dropping attribution.
+        if self.executions.len() >= MAX_EXECUTIONS_PER_AGENT {
+            return self.fail(
+                ToolError::CallLimitExceeded {
+                    limit: MAX_EXECUTIONS_PER_AGENT,
+                }
+                .into(),
+            );
+        }
+        let execution_id = self.ids.execution();
+        self.executions.push(ExecutionRecord {
+            execution_id,
+            tool: provider.clone(),
+            status: ToolStatus::Unknown { reason },
+            result_disposition: ResultDisposition::Accepted,
+        });
+        self.unknown(
+            "provider effect uncertain; reconcile before retry",
+            provider,
+        )
     }
 
     /// Reconcile one `Unknown` execution: bounded status queries with
