@@ -61,6 +61,7 @@ pub mod fingerprint;
 pub mod prompt;
 pub mod provider;
 pub mod reconcile;
+pub mod secret;
 pub mod selection;
 pub mod session;
 pub mod stream;
@@ -129,6 +130,7 @@ pub use reconcile::{
     ReconcileConfig, ReconcileOutcome, ReconcileStatus, UnknownEscalation, UnknownReconciler,
     reconcile_delay_ms,
 };
+pub use secret::{MAX_SECRET_LEN, SECRET_REDACTED, SecretError, SecretField};
 pub use selection::{
     FallbackDirective, MAX_ALIAS_CANDIDATES, MAX_ALIASES, MAX_MODEL_NAME_LEN,
     MAX_REGISTERED_MODELS, ModelAlias, ModelRef, ModelRegistration, ProviderRegistry,
