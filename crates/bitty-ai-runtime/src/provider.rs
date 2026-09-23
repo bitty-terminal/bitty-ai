@@ -441,7 +441,12 @@ pub struct TurnRequest {
     /// Tool Bus names validated against tool consent (`MP-5`).
     pub tools: Vec<String>,
     /// Per-turn context ceiling in bytes; excess fails with
-    /// [`ProviderError::BudgetExceeded`] before provider I/O (`MP-5`).
+    /// [`ProviderError::BudgetExceeded`] before provider I/O (`MP-5`). The
+    /// agent resolves the value against the model window before dispatch
+    /// (see [`crate::agent::AgentConfig::effective_budget_bytes`]):
+    /// `min(configured, window_tokens * 4)` with unknown (`0`/absent)
+    /// passthrough, so the field carries the effective bound, not the raw
+    /// configured ceiling.
     pub budget_bytes: usize,
     /// Caller deadline in milliseconds from `now_ms` (`MP-8`).
     pub timeout_ms: u64,

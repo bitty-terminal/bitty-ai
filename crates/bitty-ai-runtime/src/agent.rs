@@ -21,8 +21,8 @@
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use crate::context::{
-    ArtifactStore, AssembledContent, ContextError, ContextRecord, ContextRequest, RecordBody,
-    StableId, assemble,
+    ArtifactStore, AssembledContent, BYTES_PER_TOKEN_ESTIMATE, ContextError, ContextRecord,
+    ContextRequest, RecordBody, StableId, assemble,
 };
 use crate::provider::{
     DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, Message, ModelProvider,
@@ -72,7 +72,22 @@ pub struct AgentConfig {
     /// allowance, and the per-call bus counter stays as defense in depth.
     pub max_tool_calls_per_turn: usize,
     /// Context byte budget for turn assembly (`CP-5` candidate default).
+    ///
+    /// The turn's effective budget (see [`AgentConfig::effective_budget_bytes`])
+    /// further limits this ceiling by the model context window when the host
+    /// supplies one: `min(context_budget_bytes, window_tokens * 4)`. An
+    /// unknown window (`0` or absent) keeps this ceiling unchanged.
+    /// Freshness beyond `collected_at_ms` stays unenforced (out of scope).
     pub context_budget_bytes: usize,
+    /// Context window in tokens for the model addressed by
+    /// [`Agent::run_turn`] (`None` = unknown, the default). Mirrors
+    /// [`crate::selection::SelectedModel::context_window_tokens`] at wiring
+    /// time: the agent holds no registry, so the host copies the selected
+    /// registration's window here (a stale copy only changes the byte bound
+    /// the run enforces locally). `0` means unknown and is treated exactly
+    /// like `None` (unknown-passthrough, never a fabricated default).
+    /// Freshness beyond `collected_at_ms` stays unenforced (out of scope).
+    pub context_window_tokens: Option<u32>,
     /// Provider timeout per round in milliseconds (`MP-8`).
     pub provider_timeout_ms: u64,
     /// Per-turn cost ceiling in relative routing units (see
@@ -119,6 +134,7 @@ impl Default for AgentConfig {
             max_rounds: DEFAULT_MAX_ROUNDS,
             max_tool_calls_per_turn: MAX_TOOL_CALLS_PER_TURN,
             context_budget_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
+            context_window_tokens: None,
             provider_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             max_turn_cost: None,
             input_cost_weight: 1,
@@ -140,6 +156,30 @@ impl AgentConfig {
             max_unknown_retries: self.max_unknown_retries,
             base_delay_ms: self.unknown_reconcile_base_delay_ms,
             max_delay_ms: self.unknown_reconcile_max_delay_ms,
+        }
+    }
+
+    /// Effective per-turn byte budget: the configured
+    /// [`AgentConfig::context_budget_bytes`] ceiling limited by the model
+    /// window (`min(configured, window_tokens * 4)`). The token-to-byte
+    /// conversion reuses the documented
+    /// [`crate::context::BYTES_PER_TOKEN_ESTIMATE`] skeleton heuristic, and
+    /// the product saturates rather than wrapping. An unknown window
+    /// (`None` or `0`, mirroring
+    /// [`crate::selection::ModelRegistration::context_window_tokens`])
+    /// keeps the configured ceiling unchanged: unknown-passthrough, never a
+    /// fabricated default.
+    #[must_use]
+    pub fn effective_budget_bytes(&self) -> usize {
+        let window_bound = match self.context_window_tokens {
+            Some(tokens) if tokens > 0 => {
+                Some((tokens as usize).saturating_mul(BYTES_PER_TOKEN_ESTIMATE))
+            }
+            _ => None,
+        };
+        match window_bound {
+            Some(bound) => self.context_budget_bytes.min(bound),
+            None => self.context_budget_bytes,
         }
     }
 }
@@ -539,9 +579,10 @@ impl<P: ModelProvider> Agent<P> {
                 error: AgentError::Session(SessionError::AlreadyTerminated { state }),
             };
         }
+        let effective_budget = self.config.effective_budget_bytes();
         let request = ContextRequest {
             max_tokens: None,
-            max_bytes: Some(self.config.context_budget_bytes as u64),
+            max_bytes: Some(effective_budget as u64),
             current_generation: self.session.generation(),
         };
         let assembled = match assemble(seed_records, &mut self.artifacts, &request) {
@@ -628,7 +669,7 @@ impl<P: ModelProvider> Agent<P> {
                 messages: messages.clone(),
                 context_refs: context_refs.clone(),
                 tools: tool_names.clone(),
-                budget_bytes: self.config.context_budget_bytes,
+                budget_bytes: effective_budget,
                 timeout_ms: self.config.provider_timeout_ms,
                 now_ms,
                 sampling: None,
