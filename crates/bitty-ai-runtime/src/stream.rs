@@ -247,6 +247,166 @@ impl StreamSink for VecSink {
     }
 }
 
+/// Default capacity of a [`BoundedSink`] in chunks (`MP-6`).
+///
+/// 64 chunks at the 64 KiB fragment bound is at most 4 MiB of retained
+/// fragment bytes: large enough for a full logical-turn head (system prompt
+/// layers plus project snapshot text) without shedding, small enough to stay
+/// a bounded queue under the RC-10 sharing budget.
+pub const DEFAULT_BOUNDED_SINK_CAPACITY: usize = 64;
+
+/// Turn-scoped stream handle (`MP-6`, `RS-5`).
+///
+/// Names one emission stream of one logical turn: the `(agent, handle,
+/// generation)` triple in [`StreamAttribution`] disambiguates it. The id is
+/// a process-local handle minted by the caller (for example via
+/// [`crate::session::IdIssuer`]); it carries no authority and is never
+/// persisted as a stable external id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamHandle(pub u64);
+
+/// Per-emission attribution key: which agent, which stream, which session
+/// generation produced the chunk (`MP-6`).
+///
+/// The triple disambiguates streams across agents sharing a process and
+/// across generation rotations of one session: a rotated generation never
+/// reuses a stale handle's accounting. Attribution is metadata only; it
+/// grants no capability and widens no authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamAttribution {
+    /// Agent object that owns the emission.
+    pub agent: crate::session::AgentInstanceId,
+    /// Stream this chunk was emitted on.
+    pub handle: StreamHandle,
+    /// Session generation at emission time.
+    pub generation: u64,
+}
+
+/// Acknowledgement for one accepted chunk (`MP-6`).
+///
+/// Emission is synchronous in this skeleton: `emit` returning `Ok` means the
+/// chunk is accepted, so the ack is the observable record of that fact. It
+/// carries the accepted sequence position plus the running totals, making
+/// delivery explicit and testable instead of implied by a silent push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamAck {
+    /// Attribution of the accepted chunk.
+    pub attribution: StreamAttribution,
+    /// Accepted chunk count after this accept (1-based position).
+    pub accepted: u64,
+    /// Shed count at accept time (stays put when nothing shed).
+    pub shed: u64,
+}
+
+/// Bounded sink with shed-oldest backpressure and a countable shed metric
+/// (`MP-6`, `RS-5`).
+///
+/// At capacity, the oldest retained chunk is shed to admit the new one and
+/// the shed counter increments: no silent loss, every shed is observable via
+/// [`BoundedSink::shed_count`]. [`VecSink`] stays the unbounded sink for
+/// tests and headless runs; this type is the bounded policy for live paths.
+#[derive(Debug)]
+pub struct BoundedSink {
+    attribution: StreamAttribution,
+    capacity: usize,
+    chunks: Vec<StreamChunk>,
+    accepted: u64,
+    shed: u64,
+}
+
+impl BoundedSink {
+    /// Construct a bounded sink for one stream with an explicit capacity.
+    ///
+    /// A zero capacity would shed every chunk it accepts; it is normalized
+    /// to 1 so the sink always retains the newest chunk.
+    #[must_use]
+    pub fn with_capacity(attribution: StreamAttribution, capacity: usize) -> Self {
+        Self {
+            attribution,
+            capacity: capacity.max(1),
+            chunks: Vec::new(),
+            accepted: 0,
+            shed: 0,
+        }
+    }
+
+    /// Construct a bounded sink with [`DEFAULT_BOUNDED_SINK_CAPACITY`].
+    #[must_use]
+    pub fn new(attribution: StreamAttribution) -> Self {
+        Self::with_capacity(attribution, DEFAULT_BOUNDED_SINK_CAPACITY)
+    }
+
+    /// Attribution key of this stream.
+    #[must_use]
+    pub fn attribution(&self) -> StreamAttribution {
+        self.attribution
+    }
+
+    /// Chunk capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Accepted-chunk count (includes shed chunks: every accept is acked).
+    #[must_use]
+    pub fn accepted_count(&self) -> u64 {
+        self.accepted
+    }
+
+    /// Shed-chunk count (0 when nothing was shed: no silent loss).
+    #[must_use]
+    pub fn shed_count(&self) -> u64 {
+        self.shed
+    }
+
+    /// Accept one chunk, shedding the oldest when at capacity.
+    ///
+    /// Validation runs before any mutation: a misframed or oversized chunk
+    /// is rejected with [`StreamError`] and changes neither the retained
+    /// chunks nor either counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamError`] for oversized or misframed chunks; the sink
+    /// state is unchanged on error.
+    pub fn emit_attributed(&mut self, chunk: StreamChunk) -> Result<StreamAck, StreamError> {
+        validate_chunk(&chunk)?;
+        if self.chunks.len() >= self.capacity {
+            self.chunks.remove(0);
+            self.shed += 1;
+        }
+        self.chunks.push(chunk);
+        self.accepted += 1;
+        Ok(StreamAck {
+            attribution: self.attribution,
+            accepted: self.accepted,
+            shed: self.shed,
+        })
+    }
+
+    /// Retained chunks in emission order (oldest first).
+    #[must_use]
+    pub fn chunks(&self) -> &[StreamChunk] {
+        &self.chunks
+    }
+
+    /// Whether no chunk is retained (shed chunks still count as accepted).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// Concatenated fragment bytes of retained chunks in emission order.
+    #[must_use]
+    pub fn concatenated_bytes(&self) -> Vec<u8> {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.fragment.bytes.iter().copied())
+            .collect()
+    }
+}
+
 /// Split UTF-8 text into fragments of at most [`MAX_FRAGMENT_BYTES`] bytes
 /// without splitting a code point. Returns an empty vector for empty text.
 #[must_use]
@@ -337,6 +497,127 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::session::{AgentInstanceId, IdIssuer};
+
+    fn attribution(handle_value: u64, generation: u64) -> StreamAttribution {
+        StreamAttribution {
+            agent: AgentInstanceId(7),
+            handle: StreamHandle(handle_value),
+            generation,
+        }
+    }
+
+    fn chunk(seq: u32, total: u32, text: &str) -> StreamChunk {
+        StreamChunk {
+            seq,
+            total,
+            is_final: seq + 1 == total,
+            fragment: Fragment::markdown(text.as_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn bounded_sink_accepts_under_capacity_with_zero_shed_and_acks() {
+        let key = attribution(1, 1);
+        let mut sink = BoundedSink::with_capacity(key, 4);
+        let ack = sink
+            .emit_attributed(chunk(0, 2, "a"))
+            .expect("first chunk accepts");
+        assert_eq!(
+            ack,
+            StreamAck {
+                attribution: key,
+                accepted: 1,
+                shed: 0,
+            }
+        );
+        let ack = sink
+            .emit_attributed(chunk(1, 2, "b"))
+            .expect("second chunk accepts");
+        assert_eq!(ack.accepted, 2);
+        assert_eq!(ack.shed, 0);
+        assert_eq!(sink.accepted_count(), 2);
+        assert_eq!(sink.shed_count(), 0);
+        assert_eq!(sink.chunks().len(), 2);
+        assert_eq!(sink.concatenated_bytes(), b"ab");
+    }
+
+    #[test]
+    fn bounded_sink_sheds_oldest_with_countable_metric() {
+        let key = attribution(1, 1);
+        let mut sink = BoundedSink::with_capacity(key, 2);
+        sink.emit_attributed(chunk(0, 4, "a")).expect("accepts");
+        sink.emit_attributed(chunk(1, 4, "b")).expect("accepts");
+        let ack = sink.emit_attributed(chunk(2, 4, "c")).expect("accepts");
+        // No silent loss: the shed is counted on the ack and the counter.
+        assert_eq!(ack.accepted, 3);
+        assert_eq!(ack.shed, 1);
+        assert_eq!(ack.attribution, key);
+        assert_eq!(sink.shed_count(), 1);
+        assert_eq!(sink.accepted_count(), 3);
+        // Oldest-first retention: "a" shed, "b" then "c" retained.
+        assert_eq!(sink.concatenated_bytes(), b"bc");
+        let ack = sink.emit_attributed(chunk(3, 4, "d")).expect("accepts");
+        assert_eq!(ack.shed, 2);
+        assert_eq!(sink.shed_count(), 2);
+        assert_eq!(sink.concatenated_bytes(), b"cd");
+    }
+
+    #[test]
+    fn bounded_sink_validation_rejects_without_mutation() {
+        let key = attribution(1, 1);
+        let mut sink = BoundedSink::with_capacity(key, 2);
+        sink.emit_attributed(chunk(0, 1, "a")).expect("accepts");
+        let bad = StreamChunk {
+            seq: 0,
+            total: 2,
+            is_final: true,
+            fragment: Fragment::markdown(b"hi".to_vec()),
+        };
+        assert!(matches!(
+            sink.emit_attributed(bad),
+            Err(StreamError::InvalidFraming { .. })
+        ));
+        // Rejection changes neither retained chunks nor either counter.
+        assert_eq!(sink.accepted_count(), 1);
+        assert_eq!(sink.shed_count(), 0);
+        assert_eq!(sink.concatenated_bytes(), b"a");
+    }
+
+    #[test]
+    fn attribution_triple_disambiguates_handle_and_generation() {
+        let first = StreamAttribution {
+            agent: AgentInstanceId(1),
+            handle: StreamHandle(1),
+            generation: 1,
+        };
+        let rotated = StreamAttribution {
+            generation: 2,
+            ..first
+        };
+        let other_handle = StreamAttribution {
+            handle: StreamHandle(2),
+            ..first
+        };
+        assert_ne!(first, rotated);
+        assert_ne!(first, other_handle);
+        // Handles mint from the shared id issuer without colliding.
+        let mut issuer = IdIssuer::default();
+        let first_id = issuer.session();
+        let second_id = issuer.session();
+        assert_ne!(first_id, second_id);
+    }
+
+    #[test]
+    fn zero_capacity_normalizes_to_newest_retained() {
+        let key = attribution(9, 3);
+        let mut sink = BoundedSink::with_capacity(key, 0);
+        assert_eq!(sink.capacity(), 1);
+        sink.emit_attributed(chunk(0, 2, "a")).expect("accepts");
+        sink.emit_attributed(chunk(1, 2, "b")).expect("accepts");
+        assert_eq!(sink.shed_count(), 1);
+        assert_eq!(sink.concatenated_bytes(), b"b");
+    }
 
     #[test]
     fn framing_must_match_seq_total() {

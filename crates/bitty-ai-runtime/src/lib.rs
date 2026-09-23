@@ -140,7 +140,8 @@ pub use session::{
     IdIssuer, RunId, SessionError, SessionId, SessionState,
 };
 pub use stream::{
-    Fragment, FragmentKind, StreamChunk, StreamError, StreamSink, VecSink, emit_fragments,
+    BoundedSink, DEFAULT_BOUNDED_SINK_CAPACITY, Fragment, FragmentKind, StreamAck,
+    StreamAttribution, StreamChunk, StreamError, StreamHandle, StreamSink, VecSink, emit_fragments,
     fragment_text, validate_chunk,
 };
 pub use tool::{
