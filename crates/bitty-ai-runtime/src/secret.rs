@@ -424,11 +424,13 @@ mod tests {
     }
 
     /// Assert a seeded secret value appears nowhere in a diagnostic
-    /// surface (`MP-10`, `P0-AC-026`).
+    /// surface (`MP-10`, `P0-AC-026`). The failure message names only the
+    /// label, never the surface: echoing the surface into the test log
+    /// would itself place a leak candidate on a log path.
     fn assert_secret_absent(label: &str, surface: &str, secret: &str) {
         assert!(
             !surface.contains(secret),
-            "seeded secret leaked into {label}: {surface:?}"
+            "seeded secret leaked into {label}"
         );
     }
 
