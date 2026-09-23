@@ -109,6 +109,17 @@ pub const MIN_MAX_TOKENS: u32 = 1;
 /// selection fails closed with `SelectionError::NoCandidate` when they are
 /// required. End-to-end multimodal I/O is a beyond-v0.1 design owned by the
 /// 033 follow-up.
+///
+/// v0.1 freeze (AI-0135, Issue #261): closed-vocabulary enforcement is
+/// deferred. The spec vocabulary is text/streaming/tool-use/vision
+/// (`docs/providers/provider-plugin-boundary.md`); this enum additionally
+/// carries `ImageInput`/`AudioInput`/`AudioOutput`/`VideoInput` (routing
+/// vocabulary only, never advertised, selection fails closed when required)
+/// and `Reasoning` (`MP-2` routing bit only). Mapping: `Text` covers `text`,
+/// `Streaming` covers `streaming`, `ToolUse` covers `tool-use`,
+/// `ImageInput` narrows `vision` to image input; audio/video/reasoning have
+/// no spec counterpart. No host-side closed-vocabulary rejection is pinned
+/// for v0.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelCapability {
     /// Plain text completion.
@@ -131,6 +142,18 @@ pub enum ModelCapability {
 }
 
 /// One registry-known model (`MP-2` descriptor, skeleton subset).
+///
+/// v0.1 freeze (AI-0135, Issue #261): the descriptor is exactly
+/// `name` (as referenced by [`TurnRequest::model`]) plus `capabilities`.
+/// Deferred past v0.1: the full `MP-2` shape from
+/// `docs/providers/provider-plugin-boundary.md` (`provider_id`
+/// bounded `owner.name`, transport kind, `context_window`, `cost_marks`,
+/// `privacy_class` of `local-only`/`network-minimized`/`upload-notice`,
+/// unknown-field fail-closed). Routing metadata that exists today
+/// (`provider_id`, `context_window_tokens`, cost weights) lives on
+/// [`crate::selection::ModelRegistration`], not on this descriptor, and
+/// bridging stays host-side via
+/// [`crate::selection::ModelRegistration::snapshot_from`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDescriptor {
     /// Model name as referenced by [`TurnRequest::model`].
@@ -777,6 +800,35 @@ fn check_sampling(request: &TurnRequest) -> Result<(), ProviderError> {
 }
 
 /// Deterministic model-provider boundary.
+///
+/// v0.1 freeze (AI-0135, Issue #261): the trait surface is exactly
+/// `provider_id` (identity accessor, validated at construction) plus
+/// `list_models` / `complete` (registry snapshot / one synchronous turn)
+/// plus the test-observability pair `scripted_turns_remaining` /
+/// `complete_calls`. Explicitly deferred as trait operations:
+/// `capabilities` (capability matching lives in `crate::selection` over
+/// descriptor snapshots, never by name alone), `stream` (chunked
+/// `seq`/`total`/`final` streaming lives in `crate::stream`, observed at
+/// chunk boundaries), and `cancel` (cancellation lives on
+/// `AgentSession`/`Agent::cancel`, idempotent and terminal-state preserving
+/// per `MP-7`). Sampling-matrix pinning is deferred: [`TurnRequest`]
+/// carries the full validated `MP-5` contract while the slice
+/// `LocalProvider` maps only `temperature`/`top_p`/`frequency_penalty`/
+/// `presence_penalty`/`seed`/`max_tokens`/`stop` and refuses `top_k`/
+/// `repetition_penalty`/`min_p`/`response_format`/`reasoning` with
+/// `UnsupportedSampling` before I/O.
+///
+/// LocalProvider promotion bar (out of slice, all required before any
+/// promotion): trait gains `capabilities` / `stream` (`StreamHandle`
+/// `seq`/`total`/`final` framing) / `cancel` (`MP-7` idempotent) as trait
+/// ops; descriptor gains `provider_id` (bounded `owner.name`), transport
+/// kind, `context_window`, `cost_marks`, `privacy_class` (`local-only`)
+/// with unknown-field fail-closed; sampling matrix pinned to mapped
+/// (`temperature`, `top_p`, `frequency_penalty`, `presence_penalty`,
+/// `seed`, `max_tokens`, `stop`) versus refused (`top_k`,
+/// `repetition_penalty`, `min_p`, `response_format`, `reasoning`) with no
+/// silent defaulting; advertised capabilities match the backend (no
+/// `Streaming`/`ToolUse` claim without support).
 pub trait ModelProvider {
     /// Registry owner/name of this provider (validated at construction).
     fn provider_id(&self) -> &str;
