@@ -600,6 +600,19 @@ impl ProviderRegistry {
 
 /// One selection request: required capabilities plus optional narrowing.
 /// Every field is a filter; narrowing never widens the requirement set.
+///
+/// v0.1 freeze (AI-0135, Issue #261): capability mapping mirrors
+/// [`ModelCapability`](crate::provider::ModelCapability);
+/// closed-vocabulary enforcement is deferred. The spec vocabulary is
+/// text/streaming/tool-use/vision
+/// (`docs/providers/provider-plugin-boundary.md`); the code enum additionally
+/// carries `ImageInput`/`AudioInput`/`AudioOutput`/`VideoInput` (routing
+/// vocabulary only, never advertised, selection fails closed with
+/// [`SelectionError::NoCandidate`] when required) and `Reasoning` (`MP-2`
+/// routing bit only). Mapping: `Text` covers `text`, `Streaming` covers
+/// `streaming`, `ToolUse` covers `tool-use`, `ImageInput` narrows `vision`
+/// to image input; audio/video/reasoning have no spec counterpart. No
+/// host-side closed-vocabulary rejection is pinned for v0.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectRequest {
     /// Required capabilities: every candidate must advertise all of them.
