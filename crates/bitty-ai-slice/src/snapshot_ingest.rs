@@ -438,9 +438,14 @@ pub enum CompiledTurnIngestError {
         index: usize,
     },
     /// A layer pins a generation other than the assembly generation.
-    /// Carries generations only, never content.
+    /// Carries generations only, never content. Only DELTA layers carry a
+    /// generation pin, so `index` is always a delta index; the PROJECT text
+    /// binds its generation through the digest instead.
     StaleLayer {
-        /// Index into the supplied delta texts (`usize::MAX` for PROJECT).
+        /// Index into the supplied delta texts.
+        /// (`usize::MAX` was reserved for PROJECT in an earlier draft; the
+        /// PROJECT text binds generation through the digest, so only delta
+        /// indices are ever emitted.)
         index: usize,
         /// Generation pinned by the layer.
         actual: u64,
@@ -590,11 +595,17 @@ pub fn ingest_compiled_turn(
         return Err(CompiledTurnIngestError::BadProjectMarker);
     }
     // Digest binding for PROJECT text (`project-snapshot/1 <summary>
-    // full-digest <hex>`): the text must embed the summary's digest prefix
-    // (`digest <prefix12>`, same rule as `prompt_snapshot_with_project`)
-    // AND end with `full-digest <digest>` carrying the supplied digest
-    // verbatim. Either half failing means the text does not belong to this
-    // digest.
+    // full-digest <hex>`): the text must end with `full-digest <digest>`
+    // carrying the supplied digest verbatim. The summary's digest prefix
+    // (`digest <prefix12>`) is additionally required to be present, so a
+    // text that merely appends a stolen digest without the matching summary
+    // still fails: strip the full tail first, then require the prefix in
+    // the remainder.
+    let full_tail = format!("full-digest {}", request.project_digest);
+    let without_full = request
+        .project_text
+        .strip_suffix(&full_tail)
+        .ok_or(CompiledTurnIngestError::ProjectDigestMismatch)?;
     let prefix_tail = format!(
         "digest {}",
         request
@@ -602,8 +613,7 @@ pub fn ingest_compiled_turn(
             .get(..SNAPSHOT_DIGEST_PREFIX_LEN)
             .unwrap_or("")
     );
-    let full_tail = format!("full-digest {}", request.project_digest);
-    if !request.project_text.contains(&prefix_tail) || !request.project_text.ends_with(&full_tail) {
+    if !without_full.contains(&prefix_tail) {
         return Err(CompiledTurnIngestError::ProjectDigestMismatch);
     }
     // PROJECT generation pin: the compiler renders no generation on the

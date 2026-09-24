@@ -140,6 +140,19 @@ fn bad_markers_fail_closed() {
 }
 
 #[test]
+fn forged_digest_appendage_without_summary_prefix_fails() {
+    // Advisory probe from review (PX-0554): a text that appends a stolen
+    // digest without the matching summary prefix must fail. Strip the
+    // full tail first, then require the prefix in the remainder.
+    let digest = digest_of(PROJECT_DIGEST);
+    let forged = format!("project-snapshot/1 evil summary full-digest {digest}");
+    let mut store = ArtifactStore::new();
+    let error = ingest_compiled_turn(&request(&forged, &digest, &[], 1), &mut store)
+        .expect_err("forged appendage must fail");
+    assert_eq!(error, CompiledTurnIngestError::ProjectDigestMismatch);
+}
+
+#[test]
 fn truncation_marker_tail_compiles_as_inert_delta() {
     let project = digest_of(PROJECT_TEXT);
     let digest = digest_of(PROJECT_DIGEST);
