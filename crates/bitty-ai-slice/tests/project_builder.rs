@@ -8,8 +8,8 @@
 
 use bitty_ai_runtime::{ArtifactStore, ContextPriority, PromptLayer, assemble_prompt};
 use bitty_ai_slice::{
-    ProjectLayerError, RefreshAuthorization, SNAPSHOT_PROVIDER, SnapshotIngestRequest,
-    ingest_snapshot, prompt_snapshot_with_project, snapshot_digest_hex,
+    ProjectLayerError, RefreshAuthorization, SNAPSHOT_LAYER_MARKER, SNAPSHOT_PROVIDER,
+    SnapshotIngestRequest, ingest_snapshot, prompt_snapshot_with_project, snapshot_digest_hex,
 };
 
 fn snapshot_bytes(revision: &str) -> Vec<u8> {
@@ -68,7 +68,7 @@ fn builder_fills_project_layer_from_raw_ingested_record() {
         .find(|section| section.layer == PromptLayer::Project)
         .expect("project section present");
     assert_eq!(
-        project.text.matches("project-snapshot/1").count(),
+        project.text.matches(SNAPSHOT_LAYER_MARKER).count(),
         1,
         "marker rendered exactly once: {}",
         project.text

@@ -15,8 +15,8 @@ use bitty_ai_runtime::{
     CacheKey, CacheScope, LayerInput, PromptLayer, PromptSnapshot, assemble_prompt,
 };
 use bitty_ai_slice::{
-    RefreshAuthorization, SnapshotIngestRequest, ingest_snapshot, project_layer_text,
-    snapshot_digest_hex,
+    RefreshAuthorization, SNAPSHOT_LAYER_MARKER, SnapshotIngestRequest, ingest_snapshot,
+    project_layer_text, snapshot_digest_hex,
 };
 
 /// Minimal synthetic ProjectSnapshot v1 JSON with a variable revision.
@@ -114,7 +114,10 @@ fn project_text_is_stable_prefixed_and_bounded() {
     let bytes = snapshot_bytes("abc123");
     let digest = snapshot_digest_hex(&bytes);
     let text = ingest_project_text(&bytes, &digest, 1);
-    assert!(text.starts_with("project-snapshot/1 "), "{text}");
+    assert!(
+        text.starts_with(&format!("{SNAPSHOT_LAYER_MARKER} ")),
+        "{text}"
+    );
     assert!(text.contains(&digest), "full digest embedded: {text}");
     assert!(
         text.len() < bitty_ai_runtime::MAX_LAYER_TEXT_BYTES,
