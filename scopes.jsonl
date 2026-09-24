@@ -29,3 +29,4 @@
 {"created_at":"2026-09-18T20:30:48.732657754+00:00","id":"01M2V3DVWWM9F0J9NFP4THSS6P","kind":"include","pattern":"crates/bitty-ai-slice/src/journal_prototype.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2V3DVVXGCZR3Y2AR64RM2GP"}
 {"created_at":"2026-09-19T06:39:50.353834006+00:00","id":"01M2W6912HWJNTZHGWMRRABSCZ","kind":"include","pattern":".gitignore","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2W68YFP1YE7R7A2RCJM8QNV"}
 {"created_at":"2026-09-19T06:39:50.432715774+00:00","id":"01M2W691508X9XDW0BDCD7FDZM","kind":"include","pattern":"repo.toml","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M2W68YFP1YE7R7A2RCJM8QNV"}
+{"created_at":"2026-09-22T12:24:56.668404584+00:00","id":"01M34H732W6ARYCWMZ803KWNGE","kind":"include","pattern":"crates/bitty-ai-slice/tests/snapshot_delta.rs","project_id":"01M2DGG52V0TY9M4DW39P2AWZ8","task_id":"01M34GBYF8MWD1T0R9NN8J4D02"}
