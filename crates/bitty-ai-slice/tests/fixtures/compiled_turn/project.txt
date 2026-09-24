@@ -1,0 +1,1 @@
+project-snapshot/1 project snapshot 'ai-0141-demo' rev abc123 units 1 entrypoints 1 deps 2 digest 70e9b6a7f9cb full-digest 70e9b6a7f9cb06bef886e5ddfd8706cb84d8a237666116aa352ff9d0f728d309

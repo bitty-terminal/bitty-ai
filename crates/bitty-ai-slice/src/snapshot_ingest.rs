@@ -364,6 +364,323 @@ pub fn snapshot_digest_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Stable marker prefixing every compiler-produced DELTA layer text (see the
+/// context-compiler `delta/1` contract, EXP-0006 Promote). The ingest path
+/// gates on it so a hand-written delta can never silently fill a DELTA slot.
+pub const COMPILED_DELTA_MARKER: &str = "delta/1";
+/// Delta provider carried by ingested compiler DELTA records.
+///
+/// Mirrors the established AI-0123 delta pattern (host-collected deltas are
+/// `diagnostics` records constructed directly, never via snapshot ingest):
+/// compiler deltas are host-collected observations, trusted like any other
+/// host delta, and assembled alongside the pinned project snapshot.
+pub const COMPILED_DELTA_PROVIDER: &str = "diagnostics";
+
+/// One host-supplied compiled-turn ingestion request.
+///
+/// The host owns all byte assembly: it runs the context-compiler
+/// out-of-process (standalone binary, Promoted EXP-0006 contract), captures
+/// the PROJECT layer text plus its full digest and the DELTA layer texts,
+/// assigns record identity (`project_record_id`, `delta_record_id_stem`,
+/// `owner`, `collected_at_ms`, priorities), and authorizes the refresh
+/// ([`RefreshAuthorization`]). This helper verifies and adapts; it never
+/// re-acquires bytes from anywhere else.
+///
+/// Pure bytes-in/records-out: no process spawning, no filesystem, no
+/// network, no caching. The generation pin is enforced per layer text: every
+/// layer carrying a generation other than the assembly generation fails the
+/// whole turn closed before any record is built.
+#[derive(Debug, Clone)]
+pub struct CompiledTurnIngestRequest<'a> {
+    /// PROJECT layer text exactly as the compiler emitted it
+    /// (`project-snapshot/1 <summary> full-digest <hex>`).
+    pub project_text: &'a str,
+    /// Full digest the PROJECT text was rendered against (digest-prefix
+    /// binding, same rule as [`prompt_snapshot_with_project`]).
+    pub project_digest: &'a str,
+    /// DELTA layer texts exactly as the compiler emitted them
+    /// (`delta/1 <id> gen <n> authority <a> [supersedes <t>] <text>`).
+    pub delta_texts: &'a [&'a str],
+    /// Assembly generation: every layer text must pin this generation.
+    pub generation: u64,
+    /// Host-assigned turn-scoped project record id (non-empty, unique per
+    /// assembly).
+    pub project_record_id: &'a str,
+    /// Stem for delta record ids (`{stem}-{index}`); must be non-empty.
+    pub delta_record_id_stem: &'a str,
+    /// Runtime [`StableId`] owner head (for example `"term-1"`).
+    pub owner: &'a str,
+    /// Caller-supplied collection timestamp (`CP-3`, `CP-7`).
+    pub collected_at_ms: u64,
+    /// Host-assigned truncation priority for the project record.
+    pub project_priority: ContextPriority,
+    /// Host-assigned truncation priority for delta records.
+    pub delta_priority: ContextPriority,
+    /// Explicit per-invocation refresh authorization (no refresh without it;
+    /// its generation becomes every record's generation).
+    pub refresh: RefreshAuthorization,
+}
+
+/// Compiled-turn ingestion failures. Every variant fails closed with no
+/// records, so no unverified compiler output can reach context assembly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompiledTurnIngestError {
+    /// PROJECT text was empty.
+    EmptyProjectText,
+    /// PROJECT text lacks the single `project-snapshot/1` marker prefix.
+    BadProjectMarker,
+    /// PROJECT text digest does not bind to the supplied full digest.
+    ProjectDigestMismatch,
+    /// A DELTA text lacks the `delta/1` marker or its generation pin.
+    /// Carries the delta index, never content.
+    BadDelta {
+        /// Index into the supplied delta texts.
+        index: usize,
+    },
+    /// A layer pins a generation other than the assembly generation.
+    /// Carries generations only, never content.
+    StaleLayer {
+        /// Index into the supplied delta texts (`usize::MAX` for PROJECT).
+        index: usize,
+        /// Generation pinned by the layer.
+        actual: u64,
+        /// Assembly generation demanded.
+        current: u64,
+    },
+    /// Host-assigned record identity was empty (caller bug).
+    EmptyRecordId,
+    /// Record or store bound rejected the adaptation. The store is unchanged:
+    /// all validation runs before any store mutation.
+    Context(ContextError),
+}
+
+impl Display for CompiledTurnIngestError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::EmptyProjectText => write!(f, "missing compiled project layer"),
+            Self::BadProjectMarker => write!(f, "compiled project layer lacks its marker"),
+            Self::ProjectDigestMismatch => {
+                write!(f, "compiled project layer digest does not match")
+            }
+            Self::BadDelta { index } => {
+                write!(f, "compiled delta {index} lacks its marker or pin")
+            }
+            Self::StaleLayer {
+                index,
+                actual,
+                current,
+            } => write!(
+                f,
+                "compiled layer {index} pins generation {actual}, assembly is {current}"
+            ),
+            Self::EmptyRecordId => write!(f, "missing compiled record id"),
+            Self::Context(error) => write!(f, "compiled record rejected: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompiledTurnIngestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Context(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<ContextError> for CompiledTurnIngestError {
+    fn from(error: ContextError) -> Self {
+        Self::Context(error)
+    }
+}
+
+/// Parse the generation pinned by one DELTA layer text
+/// (`delta/1 <id> gen <n> ...`). Returns `None` when the shape is absent.
+fn parse_delta_generation(text: &str) -> Option<u64> {
+    let after_marker = text.strip_prefix(COMPILED_DELTA_MARKER)?.trim_start();
+    let gen_pos = after_marker.find("gen ")?;
+    after_marker[gen_pos + 4..]
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Shared per-layer build inputs for [`layer_record`] (keeps the helper
+/// under the argument-count lint while the call sites stay explicit).
+struct LayerBuild<'a> {
+    id: String,
+    provider: &'a str,
+    summary: String,
+    text: &'a str,
+    owner: &'a StableId,
+    priority: ContextPriority,
+}
+
+/// Build one record from verified layer text with the shared body policy:
+/// small texts stay inline, larger ones externalize through the single
+/// store mutation point. All validation must run before the first call.
+fn layer_record(
+    build: LayerBuild<'_>,
+    generation: u64,
+    collected_at_ms: u64,
+    store: &mut ArtifactStore,
+) -> Result<ContextRecord, CompiledTurnIngestError> {
+    let body = if build.text.len() <= MAX_RECORD_BODY_BYTES {
+        RecordBody::Inline(build.text.as_bytes().to_vec())
+    } else {
+        RecordBody::Artifact(store.store(build.text.as_bytes().to_vec(), generation)?)
+    };
+    let record = ContextRecord {
+        id: build.id,
+        provider: build.provider.to_owned(),
+        owner: build.owner.clone(),
+        generation,
+        collected_at_ms,
+        priority: build.priority,
+        summary: build.summary,
+        body,
+        supersedes: None,
+        is_untrusted_surface: false,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+/// Ingest one compiler-produced turn into runtime [`ContextRecord`]s.
+///
+/// Verifies the PROJECT text (marker exactly once at the front plus
+/// digest-prefix binding, same rule as [`prompt_snapshot_with_project`])
+/// and every DELTA text (marker prefix plus generation pin — stale fails
+/// the whole turn closed), then builds one project record plus one record
+/// per delta through the shared summary/body policy. The PROJECT text
+/// itself is the project record summary (verbatim, like
+/// [`project_layer_text`]); each delta summary is its layer text verbatim.
+///
+/// Trust follows the established pattern: the PROJECT record is the
+/// snapshot-backed project observation (`provider "project"`, untrusted
+/// surface, AIQ-11 clamp applies at assembly); DELTA records are
+/// host-collected observations (`provider "diagnostics"`, trusted, like the
+/// AI-0123 delta pattern). Compiler output is bytes-in like psnap bytes-in:
+/// verified, never interpreted.
+///
+/// Atomicity: every validation that can fail runs before the first store
+/// mutation, so a failure leaves the store unchanged.
+///
+/// # Errors
+///
+/// Returns [`CompiledTurnIngestError`] for empty/mis-marked PROJECT text,
+/// digest mismatch, mis-marked or stale DELTA texts, empty record ids, or
+/// runtime record/store bound refusals. No partial records on any path.
+pub fn ingest_compiled_turn(
+    request: &CompiledTurnIngestRequest<'_>,
+    store: &mut ArtifactStore,
+) -> Result<Vec<ContextRecord>, CompiledTurnIngestError> {
+    if request.project_text.is_empty() {
+        return Err(CompiledTurnIngestError::EmptyProjectText);
+    }
+    if request.project_record_id.is_empty() || request.delta_record_id_stem.is_empty() {
+        return Err(CompiledTurnIngestError::EmptyRecordId);
+    }
+    // PROJECT marker exactly once, at the front: a hand-written or foreign
+    // text can never silently occupy the PROJECT slot.
+    if !request.project_text.starts_with(SNAPSHOT_LAYER_MARKER)
+        || request.project_text.matches(SNAPSHOT_LAYER_MARKER).count() != 1
+    {
+        return Err(CompiledTurnIngestError::BadProjectMarker);
+    }
+    // Digest binding for PROJECT text (`project-snapshot/1 <summary>
+    // full-digest <hex>`): the text must embed the summary's digest prefix
+    // (`digest <prefix12>`, same rule as `prompt_snapshot_with_project`)
+    // AND end with `full-digest <digest>` carrying the supplied digest
+    // verbatim. Either half failing means the text does not belong to this
+    // digest.
+    let prefix_tail = format!(
+        "digest {}",
+        request
+            .project_digest
+            .get(..SNAPSHOT_DIGEST_PREFIX_LEN)
+            .unwrap_or("")
+    );
+    let full_tail = format!("full-digest {}", request.project_digest);
+    if !request.project_text.contains(&prefix_tail) || !request.project_text.ends_with(&full_tail) {
+        return Err(CompiledTurnIngestError::ProjectDigestMismatch);
+    }
+    // PROJECT generation pin: the compiler renders no generation on the
+    // PROJECT text, so the binding is the digest itself — the digest was
+    // produced from the generation-pinned snapshot, and a rotated snapshot
+    // changes the digest, which fails the binding above. No separate pin.
+    let _ = request.generation;
+    // Validate every DELTA text before building anything.
+    for (index, text) in request.delta_texts.iter().enumerate() {
+        if !text.starts_with(COMPILED_DELTA_MARKER) {
+            return Err(CompiledTurnIngestError::BadDelta { index });
+        }
+        let actual =
+            parse_delta_generation(text).ok_or(CompiledTurnIngestError::BadDelta { index })?;
+        if actual != request.generation {
+            return Err(CompiledTurnIngestError::StaleLayer {
+                index,
+                actual,
+                current: request.generation,
+            });
+        }
+    }
+    if request.project_text.len() > MAX_SUMMARY_BYTES {
+        return Err(CompiledTurnIngestError::Context(
+            ContextError::SummaryTooLarge {
+                limit: MAX_SUMMARY_BYTES,
+                actual: request.project_text.len(),
+            },
+        ));
+    }
+    for text in request.delta_texts {
+        if text.len() > MAX_SUMMARY_BYTES {
+            return Err(CompiledTurnIngestError::Context(
+                ContextError::SummaryTooLarge {
+                    limit: MAX_SUMMARY_BYTES,
+                    actual: text.len(),
+                },
+            ));
+        }
+    }
+    let owner = StableId::new(request.owner)?;
+    let generation = request.refresh.generation();
+    let mut records = Vec::with_capacity(request.delta_texts.len() + 1);
+    let project = layer_record(
+        LayerBuild {
+            id: request.project_record_id.to_owned(),
+            provider: SNAPSHOT_PROVIDER,
+            summary: request.project_text.to_owned(),
+            text: request.project_text,
+            owner: &owner,
+            priority: request.project_priority,
+        },
+        generation,
+        request.collected_at_ms,
+        store,
+    )?;
+    let mut project = project;
+    project.is_untrusted_surface = true;
+    records.push(project);
+    for (index, text) in request.delta_texts.iter().enumerate() {
+        records.push(layer_record(
+            LayerBuild {
+                id: format!("{}-{index}", request.delta_record_id_stem),
+                provider: COMPILED_DELTA_PROVIDER,
+                summary: (*text).to_owned(),
+                text,
+                owner: &owner,
+                priority: request.delta_priority,
+            },
+            generation,
+            request.collected_at_ms,
+            store,
+        )?);
+    }
+    Ok(records)
+}
+
 /// Render the PROJECT-layer prompt text for a verified snapshot digest.
 ///
 /// Cache affinity (AIQ-12/AIQ-13): the PROJECT layer of the prompt stable

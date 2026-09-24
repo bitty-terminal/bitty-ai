@@ -72,8 +72,10 @@ pub use harness::{
 pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
 pub use snapshot_ingest::{
-    ProjectLayerError, RefreshAuthorization, RefreshError, RefreshLedger,
-    SNAPSHOT_CANONICALIZATION_VERSION, SNAPSHOT_DIGEST_PREFIX_LEN, SNAPSHOT_LAYER_MARKER,
-    SNAPSHOT_PROVIDER, SNAPSHOT_SCHEMA_VERSION, SnapshotIngestError, SnapshotIngestRequest,
-    ingest_snapshot, project_layer_text, prompt_snapshot_with_project, snapshot_digest_hex,
+    COMPILED_DELTA_MARKER, COMPILED_DELTA_PROVIDER, CompiledTurnIngestError,
+    CompiledTurnIngestRequest, ProjectLayerError, RefreshAuthorization, RefreshError,
+    RefreshLedger, SNAPSHOT_CANONICALIZATION_VERSION, SNAPSHOT_DIGEST_PREFIX_LEN,
+    SNAPSHOT_LAYER_MARKER, SNAPSHOT_PROVIDER, SNAPSHOT_SCHEMA_VERSION, SnapshotIngestError,
+    SnapshotIngestRequest, ingest_compiled_turn, ingest_snapshot, project_layer_text,
+    prompt_snapshot_with_project, snapshot_digest_hex,
 };
