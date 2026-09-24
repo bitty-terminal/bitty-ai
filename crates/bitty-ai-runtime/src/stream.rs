@@ -407,6 +407,25 @@ impl BoundedSink {
     }
 }
 
+impl StreamSink for BoundedSink {
+    /// Validate, shed-oldest, and count exactly as
+    /// [`BoundedSink::emit_attributed`].
+    ///
+    /// The trait signature returns no [`StreamAck`]: the ack surfaces through
+    /// the accessor counters observable after the call —
+    /// [`BoundedSink::accepted_count`] is the ack's `accepted` and
+    /// [`BoundedSink::shed_count`] is the ack's `shed`. Use
+    /// [`BoundedSink::emit_attributed`] when the ack value itself is needed.
+    fn emit(&mut self, chunk: StreamChunk) -> Result<(), StreamError> {
+        self.emit_attributed(chunk).map(|_| ())
+    }
+
+    /// Retained chunks in emission order (oldest first).
+    fn chunks(&self) -> &[StreamChunk] {
+        &self.chunks
+    }
+}
+
 /// Split UTF-8 text into fragments of at most [`MAX_FRAGMENT_BYTES`] bytes
 /// without splitting a code point. Returns an empty vector for empty text.
 #[must_use]
@@ -450,6 +469,13 @@ pub fn fragment_text(kind: FragmentKind, text: &str) -> Vec<Fragment> {
 /// (`sink.emit`) can request it while accepting the last fragment: without
 /// the post-delivery check a batch whose final callback cancelled would be
 /// reported as complete, disagreeing with the session's terminal state.
+///
+/// `emit_fragments` targets any [`StreamSink`], including [`BoundedSink`]
+/// through its trait impl; the bounded shed-oldest policy therefore applies
+/// at the live-sink edge wherever a bounded sink is passed. [`VecSink`] stays
+/// the `emit_fragments` target in tests and headless runs because fragment
+/// emission there is pre-assembly and intentionally unbounded — deferred by
+/// design, not by omission.
 ///
 /// # Errors
 ///
@@ -815,5 +841,82 @@ mod tests {
             .collect();
         assert_eq!(joined, text.as_bytes());
         assert!(sink.chunks().last().expect("last chunk").is_final);
+    }
+
+    #[test]
+    fn bounded_sink_emits_through_trait_object() {
+        // AI-0143: the bounded policy is reachable from the emission path —
+        // a bounded sink driven as `&mut dyn StreamSink` validates and
+        // retains exactly like `emit_attributed`, with `chunks` returning
+        // the retained chunks.
+        let key = attribution(5, 1);
+        let mut sink = BoundedSink::with_capacity(key, 4);
+        {
+            let trait_sink: &mut dyn StreamSink = &mut sink;
+            trait_sink.emit(chunk(0, 2, "a")).expect("accepts");
+            trait_sink.emit(chunk(1, 2, "b")).expect("accepts");
+        }
+        assert_eq!(sink.accepted_count(), 2);
+        assert_eq!(sink.shed_count(), 0);
+        let retained: Vec<&[u8]> = sink
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.fragment.bytes.as_slice())
+            .collect();
+        assert_eq!(retained, vec![b"a".as_slice(), b"b".as_slice()]);
+        // Rejection through the trait leaves counters untouched.
+        let bad = StreamChunk {
+            seq: 0,
+            total: 2,
+            is_final: true,
+            fragment: Fragment::markdown(b"hi".to_vec()),
+        };
+        {
+            let trait_sink: &mut dyn StreamSink = &mut sink;
+            assert!(matches!(
+                trait_sink.emit(bad),
+                Err(StreamError::InvalidFraming { .. })
+            ));
+        }
+        assert_eq!(sink.accepted_count(), 2);
+        assert_eq!(sink.shed_count(), 0);
+    }
+
+    #[test]
+    fn bounded_sink_shed_counting_through_trait() {
+        // AI-0143: shed-oldest runs through the trait path; counters stay
+        // observable after each trait `emit`.
+        let key = attribution(6, 1);
+        let mut sink = BoundedSink::with_capacity(key, 2);
+        {
+            let trait_sink: &mut dyn StreamSink = &mut sink;
+            trait_sink.emit(chunk(0, 4, "a")).expect("accepts");
+            trait_sink.emit(chunk(1, 4, "b")).expect("accepts");
+            trait_sink.emit(chunk(2, 4, "c")).expect("accepts");
+        }
+        assert_eq!(sink.accepted_count(), 3);
+        assert_eq!(sink.shed_count(), 1);
+        assert_eq!(sink.concatenated_bytes(), b"bc");
+    }
+
+    #[test]
+    fn bounded_sink_trait_emit_matches_attributed_ack() {
+        // AI-0143: ack equivalence — the trait path advances the same
+        // counters an `emit_attributed` ack would report, so the ack is
+        // observable as counter state after a trait `emit`.
+        let key = attribution(7, 2);
+        let mut via_trait = BoundedSink::with_capacity(key, 2);
+        let mut via_attributed = BoundedSink::with_capacity(key, 2);
+        for (seq, text) in [(0, "a"), (1, "b"), (2, "c")] {
+            StreamSink::emit(&mut via_trait, chunk(seq, 4, text)).expect("accepts");
+            let ack = via_attributed
+                .emit_attributed(chunk(seq, 4, text))
+                .expect("accepts");
+            assert_eq!(via_trait.accepted_count(), ack.accepted);
+            assert_eq!(via_trait.shed_count(), ack.shed);
+        }
+        assert_eq!(via_trait.accepted_count(), 3);
+        assert_eq!(via_trait.shed_count(), 1);
+        assert_eq!(via_trait.chunks(), via_attributed.chunks());
     }
 }
