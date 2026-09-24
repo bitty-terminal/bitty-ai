@@ -697,9 +697,8 @@ pub fn ingest_compiled_turn(
 /// prefix carries this text, so the prefix-cache key warms exactly when the
 /// snapshot digest is unchanged and misses exactly when it changes. The text
 /// is the L0 summary verbatim — one rendering, two consumers — prefixed with
-/// a stable `project-snapshot/1` marker so the layer is self-describing and
+/// the stable [`SNAPSHOT_LAYER_MARKER`] so the layer is self-describing and
 /// distinguishable from hand-written project text.
-///
 /// Inputs are untrusted snapshot data carried as inert text (the prompt
 /// assembler never interprets layer bytes): the full digest hex is embedded
 /// so any snapshot change alters this text byte-for-byte, which is precisely
@@ -707,15 +706,17 @@ pub fn ingest_compiled_turn(
 /// output always fits layer-text bounds for real snapshots (the summary is
 /// far below `MAX_LAYER_TEXT_BYTES`; oversized results fail closed at
 /// assembly, never silently truncated here).
+///
+/// Stable marker prefixing every snapshot-backed PROJECT layer text. The
+/// marker is a self-describing prefix rendered here and asserted by
+/// `debug_assert` in [`prompt_snapshot_with_project`]; the acceptance gate
+/// is the provider-plus-digest binding, not this marker.
+pub const SNAPSHOT_LAYER_MARKER: &str = "project-snapshot/1";
+
 #[must_use]
 pub fn project_layer_text(summary: &str, full_digest: &str) -> String {
-    format!("project-snapshot/1 {summary} full-digest {full_digest}")
+    format!("{SNAPSHOT_LAYER_MARKER} {summary} full-digest {full_digest}")
 }
-
-/// Stable marker prefixing every snapshot-backed PROJECT layer text (see
-/// [`project_layer_text`]). The builder gates on it so a non-snapshot record
-/// can never silently fill the PROJECT layer.
-pub const SNAPSHOT_LAYER_MARKER: &str = "project-snapshot/1";
 
 /// Errors building a prompt snapshot with a snapshot-backed PROJECT layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
