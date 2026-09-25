@@ -38,8 +38,9 @@
 use std::hash::{Hash, Hasher};
 
 use bitty_ai_runtime::{
-    CacheKey, CacheKeyError, CacheScope, LayerInput, MAX_CANONICAL_BYTES, PromptLayer,
-    PromptSnapshot, assemble_prompt, common_prefix_len,
+    AssembledPrompt, CacheKey, CacheKeyError, CacheScope, LayerInput, MAX_CANONICAL_BYTES,
+    PromptError, PromptLayer, PromptSnapshot, SUPPORTED_SKILL_VERSIONS, assemble_prompt,
+    common_prefix_len,
 };
 
 /// Deterministic FNV-1a-64, test-side re-computation of the keying digest.
@@ -101,6 +102,17 @@ fn canonical_bytes_with_texts(user_text: &str, project_text: &str, turn_text: &s
         .expect("test snapshot assembles")
         .canonical_bytes()
         .to_vec()
+}
+
+fn assemble_skills(source: &str) -> AssembledPrompt {
+    let layer = LayerInput::skills_from_str(source).expect("valid skill registry");
+    let snapshot =
+        PromptSnapshot::new("bitty-core-prompt@1", vec![layer]).expect("valid skills snapshot");
+    assemble_prompt(&snapshot).expect("skills snapshot assembles")
+}
+
+fn single_skill_source(fragment: &str, fields: &str) -> String {
+    format!("version = 1\n---\nname = alpha\nversion = 1\n{fields}text:\n{fragment}\n")
 }
 
 /// Test-only deterministic hasher: proves equal keys hash equal without
@@ -272,6 +284,81 @@ fn stable_region_change_breaks_key_inside_hashed_region() {
         base_key.stable_prefix_hash, changed_key.stable_prefix_hash,
         "stable-region change must move the digest"
     );
+}
+
+#[test]
+fn skill_version_only_change_has_no_valid_renderable_pair() {
+    assert_eq!(SUPPORTED_SKILL_VERSIONS, &["1"]);
+    let valid = assemble_skills(&single_skill_source("same fragment", ""));
+    let valid_key = session_key("bitty-fake", "fake-chat", valid.canonical_bytes());
+    assert_eq!(
+        valid.section_text(PromptLayer::SkillsProfile),
+        "same fragment"
+    );
+    assert!(valid_key.prefix_len > 0);
+
+    let bumped = single_skill_source("same fragment", "")
+        .replace("name = alpha\nversion = 1", "name = alpha\nversion = 2");
+    assert!(matches!(
+        LayerInput::skills_from_str(&bumped),
+        Err(PromptError::UnsupportedSkillVersion { version }) if version == "2"
+    ));
+}
+
+#[test]
+fn skill_fragment_change_breaks_stable_prefix_and_cache_key() {
+    let left = assemble_skills(&single_skill_source("fragment alpha", ""));
+    let right = assemble_skills(&single_skill_source("fragment bravo", ""));
+    assert_ne!(
+        left.section_text(PromptLayer::SkillsProfile).as_bytes(),
+        right.section_text(PromptLayer::SkillsProfile).as_bytes()
+    );
+    assert_ne!(left.canonical_bytes(), right.canonical_bytes());
+
+    let left_key = session_key("bitty-fake", "fake-chat", left.canonical_bytes());
+    let right_key = session_key("bitty-fake", "fake-chat", right.canonical_bytes());
+    assert_eq!(left_key.prefix_len, right_key.prefix_len);
+    assert_ne!(left_key.stable_prefix_hash, right_key.stable_prefix_hash);
+    assert_ne!(left_key, right_key);
+}
+
+#[test]
+fn skill_policy_fields_render_after_stable_prefix_and_conflicts_fail_closed() {
+    let left = assemble_skills(&single_skill_source(
+        "shared fragment",
+        "allow_tool = tool_a\ndeny_tool = tool_b\nscope = workspace.read\ndirective.tone = terse\n",
+    ));
+    let right = assemble_skills(&single_skill_source(
+        "shared fragment",
+        "allow_tool = tool_c\ndeny_tool = tool_d\nscope = terminal.read\ndirective.tone = casual\n",
+    ));
+    assert_eq!(
+        left.section_text(PromptLayer::SkillsProfile),
+        right.section_text(PromptLayer::SkillsProfile)
+    );
+    assert_ne!(left.canonical_bytes(), right.canonical_bytes());
+
+    let left_key = session_key("bitty-fake", "fake-chat", left.canonical_bytes());
+    let right_key = session_key("bitty-fake", "fake-chat", right.canonical_bytes());
+    assert_eq!(left_key.prefix_len, right_key.prefix_len);
+    assert_eq!(left_key.stable_prefix_hash, right_key.stable_prefix_hash);
+    assert_eq!(left_key, right_key);
+
+    let conflict = concat!(
+        "version = 1\n",
+        "---\n",
+        "name = alpha\n",
+        "version = 1\n",
+        "directive.tone = concise\n",
+        "---\n",
+        "name = beta\n",
+        "version = 1\n",
+        "directive.tone = casual\n",
+    );
+    assert!(matches!(
+        LayerInput::skills_from_str(conflict),
+        Err(PromptError::UnresolvableConflict { key, .. }) if key == "tone"
+    ));
 }
 
 #[test]
