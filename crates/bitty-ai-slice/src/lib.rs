@@ -53,6 +53,7 @@
 
 pub mod bridge;
 pub mod chat_stream;
+pub mod content_store;
 pub mod error;
 pub mod facade;
 pub mod fake_host;
@@ -67,6 +68,9 @@ pub mod snapshot_ingest;
 pub use bridge::{HostPeer, IpcBridge};
 pub use chat_stream::{
     ChatCompletionStreamParser, ChatStreamDelta, ChatStreamError, MAX_STREAM_TOOL_CALLS,
+};
+pub use content_store::{
+    Checkpoint, CheckpointDraft, ContentHash, ContentStore, ContentStoreError, Rationale,
 };
 pub use error::SliceError;
 pub use facade::{AiEngine, AiSnapshotEngine, AiStreamSession, FacadeError};

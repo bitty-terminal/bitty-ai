@@ -21,6 +21,7 @@ bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "cfeffa2d8e
 # extraction (`serde_json`) for the version gate and the L0 summary. None of
 # these cross the runtime boundary: `bitty-ai-runtime` stays std-only.
 hex = { version = "=0.4.3" }
+serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151" }
 sha2 = { version = "=0.11.0" }
 # R6 journal prototype (AI-0049, experimental, slice-only). `bundled` compiles

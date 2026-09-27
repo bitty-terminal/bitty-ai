@@ -25,6 +25,8 @@ pub enum FacadeError {
     Snapshot(SnapshotIngestError),
     /// Transactional journal error.
     Journal(JournalError),
+    /// Content-addressed store or checkpoint error.
+    Store(String),
     /// Prompt layer assembly or validation error.
     Prompt(PromptError),
     /// Context or payload budget ceiling exceeded.
@@ -42,6 +44,7 @@ impl fmt::Display for FacadeError {
             Self::Stream(err) => write!(f, "streaming error: {err}"),
             Self::Snapshot(err) => write!(f, "snapshot error: {err}"),
             Self::Journal(err) => write!(f, "journal error: {err}"),
+            Self::Store(err) => write!(f, "content store error: {err}"),
             Self::Prompt(err) => write!(f, "prompt error: {err}"),
             Self::BudgetExceeded { limit, actual } => {
                 write!(f, "budget ceiling exceeded: {actual} bytes > {limit} bytes")
@@ -67,6 +70,12 @@ impl From<SnapshotIngestError> for FacadeError {
 impl From<JournalError> for FacadeError {
     fn from(err: JournalError) -> Self {
         Self::Journal(err)
+    }
+}
+
+impl From<crate::content_store::ContentStoreError> for FacadeError {
+    fn from(err: crate::content_store::ContentStoreError) -> Self {
+        Self::Store(err.to_string())
     }
 }
 
@@ -230,6 +239,19 @@ impl AiEngine {
     /// Open a transactional SQLite journal at the specified path.
     pub fn open_journal(path: impl AsRef<Path>) -> Result<Journal, FacadeError> {
         Journal::open(path.as_ref()).map_err(FacadeError::Journal)
+    }
+
+    /// Open a transactional content store at the specified path.
+    pub fn open_content_store(
+        path: impl AsRef<Path>,
+    ) -> Result<crate::content_store::ContentStore, FacadeError> {
+        crate::content_store::ContentStore::open(path).map_err(FacadeError::from)
+    }
+
+    /// Open an in-memory transactional content store.
+    pub fn open_in_memory_content_store() -> Result<crate::content_store::ContentStore, FacadeError>
+    {
+        crate::content_store::ContentStore::open_in_memory().map_err(FacadeError::from)
     }
 
     /// Create a new project snapshot ingestion engine.
