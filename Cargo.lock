@@ -18,6 +18,7 @@ version = "0.0.1"
 dependencies = [
  "bitty-ai-runtime",
  "bitty-ipc",
+ "bitty-network-api",
  "hex",
  "rusqlite",
  "serde_json",
@@ -28,6 +29,11 @@ dependencies = [
 name = "bitty-ipc"
 version = "0.0.20"
 source = "git+https://github.com/bitty-terminal/bitty?rev=cfeffa2d8e1387029850940af2b64877dbfbe25f#cfeffa2d8e1387029850940af2b64877dbfbe25f"
+
+[[package]]
+name = "bitty-network-api"
+version = "0.1.0"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=f3c313244667e5dca910b4f7cd8e9d9447dce9a7#f3c313244667e5dca910b4f7cd8e9d9447dce9a7"
 
 [[package]]
 name = "block-buffer"

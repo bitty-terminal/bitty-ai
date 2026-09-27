@@ -59,6 +59,7 @@ pub mod harness;
 pub mod journal_prototype;
 pub mod live_host;
 pub mod local_provider;
+pub mod network_adapter;
 pub mod snapshot_ingest;
 
 pub use bridge::{HostPeer, IpcBridge};
@@ -71,6 +72,9 @@ pub use harness::{
 };
 pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
+pub use network_adapter::{
+    AdapterError, NetworkConsumerAdapter, NetworkConsumerAdapterConfig, RecordingNetworkService,
+};
 pub use snapshot_ingest::{
     COMPILED_DELTA_MARKER, COMPILED_DELTA_PROVIDER, CompiledTurnIngestError,
     CompiledTurnIngestRequest, ProjectLayerError, RefreshAuthorization, RefreshError,
