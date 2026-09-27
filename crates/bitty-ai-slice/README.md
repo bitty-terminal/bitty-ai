@@ -60,6 +60,8 @@ context_compiler   Three-zone context compiler, Merkle context tree, and multi-t
 action_protocol    Standardized action, intent, outcome protocol and auto-spillover (AI-0166): typed intent validation, ContentStore blob spillover, bounded preview generation, and observation formatting
 fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker, dense seq, and a caller-bindable reassembly identity
 facade     Unified engine facade (AI-0161): AiEngine, AiStreamSession, AiSnapshotEngine converging streaming, context, snapshot, store, and task wheels
+wheel_kernel   Unified runtime orchestrator (AI-0167): coordinates ContentStore, TaskEngine, ContextTree, ActionEngine, streaming, and three-zone context compilation under budget
+wheel_bridge   Boundary plane bridge (AI-0167): zero-unsafe JSON-RPC command dispatch for Lua plugins and host IPC integration
 ```
 
 ## Dependencies

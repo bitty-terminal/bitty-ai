@@ -289,7 +289,7 @@ impl fmt::Display for TaskStatus {
 }
 
 /// Specification for creating a new task in the DAG.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDraft {
     /// Unique task identifier.
     pub id: TaskId,

@@ -33,6 +33,8 @@ pub enum FacadeError {
     Compiler(String),
     /// Action protocol or auto-spillover error.
     Action(String),
+    /// WheelKernel orchestrator error.
+    Wheel(String),
     /// Prompt layer assembly or validation error.
     Prompt(PromptError),
     /// Context or payload budget ceiling exceeded.
@@ -54,6 +56,7 @@ impl fmt::Display for FacadeError {
             Self::TaskDag(err) => write!(f, "task engine error: {err}"),
             Self::Compiler(err) => write!(f, "compiler error: {err}"),
             Self::Action(err) => write!(f, "action error: {err}"),
+            Self::Wheel(err) => write!(f, "wheel kernel error: {err}"),
             Self::Prompt(err) => write!(f, "prompt error: {err}"),
             Self::BudgetExceeded { limit, actual } => {
                 write!(f, "budget ceiling exceeded: {actual} bytes > {limit} bytes")
@@ -334,5 +337,29 @@ impl AiEngine {
     #[must_use]
     pub fn new_snapshot_engine() -> AiSnapshotEngine {
         AiSnapshotEngine::new()
+    }
+
+    /// Open a persistent WheelKernel orchestrator backed by a SQLite database at `path`.
+    pub fn open_wheel_kernel(
+        path: impl AsRef<Path>,
+    ) -> Result<crate::wheel_kernel::WheelKernel, FacadeError> {
+        crate::wheel_kernel::WheelKernel::open(path)
+    }
+
+    /// Open an in-memory WheelKernel orchestrator.
+    pub fn open_in_memory_wheel_kernel() -> Result<crate::wheel_kernel::WheelKernel, FacadeError> {
+        crate::wheel_kernel::WheelKernel::open_in_memory()
+    }
+
+    /// Open a persistent WheelBridge boundary backed by a SQLite database at `path`.
+    pub fn open_wheel_bridge(
+        path: impl AsRef<Path>,
+    ) -> Result<crate::wheel_bridge::WheelBridge, FacadeError> {
+        crate::wheel_bridge::WheelBridge::open(path)
+    }
+
+    /// Open an in-memory WheelBridge boundary.
+    pub fn open_in_memory_wheel_bridge() -> Result<crate::wheel_bridge::WheelBridge, FacadeError> {
+        crate::wheel_bridge::WheelBridge::open_in_memory()
     }
 }

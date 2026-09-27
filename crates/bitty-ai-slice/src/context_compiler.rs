@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::content_store::{Checkpoint, ContentHash};
 use crate::task_dag::TaskNode;
@@ -268,26 +267,28 @@ impl ContextTree {
         self.entries.values()
     }
 
-    /// Calculate the deterministic Merkle digest [`ContentHash`] of this tree.
-    ///
-    /// Serializes entries in sorted order with canonical length prefixing:
-    /// `tree:v1\0` + `[entry_name_len, entry_name, hash, kind, size_bytes]`.
+    /// Generate the deterministic canonical byte representation of this Merkle context tree.
     #[must_use]
-    pub fn digest(&self) -> ContentHash {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tree:v1\0");
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree:v1\0");
 
         for entry in self.entries.values() {
             let name_bytes = entry.name.as_bytes();
-            hasher.update((name_bytes.len() as u32).to_be_bytes());
-            hasher.update(name_bytes);
-            hasher.update(entry.hash.as_bytes());
-            hasher.update([entry.kind.as_u8()]);
-            hasher.update((entry.size_bytes as u64).to_be_bytes());
+            bytes.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(name_bytes);
+            bytes.extend_from_slice(entry.hash.as_bytes());
+            bytes.push(entry.kind.as_u8());
+            bytes.extend_from_slice(&(entry.size_bytes as u64).to_be_bytes());
         }
 
-        let raw: [u8; 32] = hasher.finalize().into();
-        ContentHash::from_bytes(raw)
+        bytes
+    }
+
+    /// Calculate the deterministic Merkle digest [`ContentHash`] of this tree.
+    #[must_use]
+    pub fn digest(&self) -> ContentHash {
+        ContentHash::compute(&self.canonical_bytes())
     }
 
     /// Compute the difference between `self` (base) and `target`.
@@ -392,7 +393,7 @@ impl ContextTree {
 }
 
 /// Budget configuration controlling multi-tier context compilation thresholds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerBudgetConfig {
     /// Maximum allowed aggregate context size in bytes.
     pub max_total_bytes: usize,
@@ -416,7 +417,7 @@ impl Default for CompilerBudgetConfig {
 }
 
 /// Compiled context ready for model dispatch, detailing per-zone buffers and metrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledContext {
     /// Zone 1: Byte-stable prefix (system prompt, tools, rules).
     pub zone1_prefix: String,
