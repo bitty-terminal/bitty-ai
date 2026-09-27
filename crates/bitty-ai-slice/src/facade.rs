@@ -29,6 +29,8 @@ pub enum FacadeError {
     Store(String),
     /// Task DAG and control plane error.
     TaskDag(String),
+    /// Context compiler or Merkle tree error.
+    Compiler(String),
     /// Prompt layer assembly or validation error.
     Prompt(PromptError),
     /// Context or payload budget ceiling exceeded.
@@ -48,6 +50,7 @@ impl fmt::Display for FacadeError {
             Self::Journal(err) => write!(f, "journal error: {err}"),
             Self::Store(err) => write!(f, "content store error: {err}"),
             Self::TaskDag(err) => write!(f, "task engine error: {err}"),
+            Self::Compiler(err) => write!(f, "compiler error: {err}"),
             Self::Prompt(err) => write!(f, "prompt error: {err}"),
             Self::BudgetExceeded { limit, actual } => {
                 write!(f, "budget ceiling exceeded: {actual} bytes > {limit} bytes")
@@ -85,6 +88,12 @@ impl From<crate::content_store::ContentStoreError> for FacadeError {
 impl From<crate::task_dag::TaskEngineError> for FacadeError {
     fn from(err: crate::task_dag::TaskEngineError) -> Self {
         Self::TaskDag(err.to_string())
+    }
+}
+
+impl From<crate::context_compiler::CompilerError> for FacadeError {
+    fn from(err: crate::context_compiler::CompilerError) -> Self {
+        Self::Compiler(err.to_string())
     }
 }
 
@@ -273,6 +282,14 @@ impl AiEngine {
     /// Open an in-memory Task DAG SQLite database.
     pub fn open_in_memory_task_engine() -> Result<crate::task_dag::TaskEngine, FacadeError> {
         crate::task_dag::TaskEngine::open_in_memory().map_err(FacadeError::from)
+    }
+
+    /// Compile structured cognitive state and dynamic turns into a cached, three-zone context.
+    pub fn compile_context(
+        compiler: &crate::context_compiler::ContextCompiler,
+        budget: &crate::context_compiler::CompilerBudgetConfig,
+    ) -> Result<crate::context_compiler::CompiledContext, FacadeError> {
+        compiler.compile(budget).map_err(FacadeError::from)
     }
 
     /// Create a new project snapshot ingestion engine.
