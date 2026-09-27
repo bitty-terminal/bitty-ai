@@ -561,6 +561,16 @@ impl TaskEngine {
             return Ok(());
         }
 
+        // Forbid adding prerequisites to a task that has already started or completed
+        let dep_node = self.get_task(dependent_id)?;
+        if dep_node.status == TaskStatus::Running || dep_node.status.is_terminal() {
+            return Err(TaskEngineError::InvalidStatusTransition {
+                task_id: dependent_id.clone(),
+                from: dep_node.status,
+                to: TaskStatus::Pending,
+            });
+        }
+
         // Cycle check: can we reach prerequisite_id starting from dependent_id?
         if let Some(cycle) = self.find_path(dependent_id, prerequisite_id)? {
             let mut full_cycle = cycle;
@@ -579,7 +589,6 @@ impl TaskEngine {
 
         // Re-evaluate dependent task status
         let prereq_node = self.get_task(prerequisite_id)?;
-        let dep_node = self.get_task(dependent_id)?;
 
         if dep_node.status == TaskStatus::Ready {
             if matches!(
@@ -627,20 +636,30 @@ impl TaskEngine {
         }
 
         let new_generation = task.generation + 1;
-        self.conn.execute(
+        let rows = self.conn.execute(
             r#"
             UPDATE tasks
             SET status = ?1, assigned_agent = ?2, generation = ?3, updated_at_ms = ?4
-            WHERE task_id = ?5
+            WHERE task_id = ?5 AND status = 'ready' AND generation = ?6
             "#,
             params![
                 TaskStatus::Running.as_str(),
                 agent_id,
                 new_generation as i64,
                 now_ms as i64,
-                task_id.as_str()
+                task_id.as_str(),
+                task.generation as i64,
             ],
         )?;
+
+        if rows == 0 {
+            let current = self.get_task(task_id)?;
+            return Err(TaskEngineError::InvalidStatusTransition {
+                task_id: task_id.clone(),
+                from: current.status,
+                to: TaskStatus::Running,
+            });
+        }
 
         Ok(new_generation)
     }
@@ -678,20 +697,37 @@ impl TaskEngine {
         let checkpoint_str = checkpoint.as_ref().map(|h| h.to_string());
 
         let tx = self.conn.transaction()?;
-        {
+        let rows = {
             let mut stmt = tx.prepare(
                 r#"
                 UPDATE tasks
                 SET status = ?1, checkpoint = ?2, updated_at_ms = ?3
-                WHERE task_id = ?4
+                WHERE task_id = ?4 AND status = 'running' AND generation = ?5
                 "#,
             )?;
             stmt.execute(params![
                 TaskStatus::Succeeded.as_str(),
                 checkpoint_str,
                 now_ms as i64,
-                task_id.as_str()
-            ])?;
+                task_id.as_str(),
+                generation as i64,
+            ])?
+        };
+
+        if rows == 0 {
+            let current = Self::query_task_on_conn(&tx, task_id)?;
+            if current.generation != generation {
+                return Err(TaskEngineError::StaleGeneration {
+                    task_id: task_id.clone(),
+                    expected: current.generation,
+                    found: generation,
+                });
+            }
+            return Err(TaskEngineError::InvalidStatusTransition {
+                task_id: task_id.clone(),
+                from: current.status,
+                to: TaskStatus::Succeeded,
+            });
         }
 
         // Cascade readiness check for downstream dependents
@@ -745,9 +781,9 @@ impl TaskEngine {
 
     /// Record task execution failure with a diagnostic reason.
     ///
-    /// Validates generation token for running tasks. Cascades [`TaskStatus::Blocked`]
-    /// to any downstream dependent tasks currently in [`TaskStatus::Pending`] or
-    /// [`TaskStatus::Ready`].
+    /// Validates generation token for running tasks. Transitively cascades [`TaskStatus::Blocked`]
+    /// across the entire downstream dependency graph for tasks currently in [`TaskStatus::Pending`]
+    /// or [`TaskStatus::Ready`].
     pub fn fail_task(
         &mut self,
         task_id: &TaskId,
@@ -781,37 +817,41 @@ impl TaskEngine {
         }
 
         let tx = self.conn.transaction()?;
-        {
+        let rows = {
             let mut stmt = tx.prepare(
                 r#"
                 UPDATE tasks
                 SET status = ?1, failure_reason = ?2, updated_at_ms = ?3
-                WHERE task_id = ?4
+                WHERE task_id = ?4 AND status = 'running' AND generation = ?5
                 "#,
             )?;
             stmt.execute(params![
                 TaskStatus::Failed.as_str(),
                 reason,
                 now_ms as i64,
-                task_id.as_str()
-            ])?;
+                task_id.as_str(),
+                generation as i64,
+            ])?
+        };
+
+        if rows == 0 {
+            let current = Self::query_task_on_conn(&tx, task_id)?;
+            if current.generation != generation {
+                return Err(TaskEngineError::StaleGeneration {
+                    task_id: task_id.clone(),
+                    expected: current.generation,
+                    found: generation,
+                });
+            }
+            return Err(TaskEngineError::InvalidStatusTransition {
+                task_id: task_id.clone(),
+                from: current.status,
+                to: TaskStatus::Failed,
+            });
         }
 
-        // Cascade block to dependents
-        let dependents = Self::query_dependents_on_conn(&tx, task_id)?;
-        for dep_id in dependents {
-            let dep_node = Self::query_task_on_conn(&tx, &dep_id)?;
-            if matches!(dep_node.status, TaskStatus::Pending | TaskStatus::Ready) {
-                let mut stmt = tx.prepare(
-                    "UPDATE tasks SET status = ?1, updated_at_ms = ?2 WHERE task_id = ?3",
-                )?;
-                stmt.execute(params![
-                    TaskStatus::Blocked.as_str(),
-                    now_ms as i64,
-                    dep_id.as_str()
-                ])?;
-            }
-        }
+        // Transitive cascade block to all downstream dependents
+        Self::cascade_block_downstream_on_conn(&tx, task_id, now_ms)?;
 
         tx.commit()?;
         self.get_task(task_id)
@@ -819,7 +859,7 @@ impl TaskEngine {
 
     /// Cancel a task prior to or during execution.
     ///
-    /// Bumps generation to fence off any in-flight workers. Cascades [`TaskStatus::Blocked`]
+    /// Bumps generation to fence off any in-flight workers. Transitively cascades [`TaskStatus::Blocked`]
     /// to all downstream dependents.
     pub fn cancel_task(
         &mut self,
@@ -837,40 +877,77 @@ impl TaskEngine {
 
         let new_generation = task.generation + 1;
         let tx = self.conn.transaction()?;
-        {
+        let rows = {
             let mut stmt = tx.prepare(
                 r#"
                 UPDATE tasks
                 SET status = ?1, generation = ?2, updated_at_ms = ?3
-                WHERE task_id = ?4
+                WHERE task_id = ?4 AND status NOT IN ('succeeded', 'failed', 'cancelled')
                 "#,
             )?;
             stmt.execute(params![
                 TaskStatus::Cancelled.as_str(),
                 new_generation as i64,
                 now_ms as i64,
-                task_id.as_str()
-            ])?;
+                task_id.as_str(),
+            ])?
+        };
+
+        if rows == 0 {
+            let current = Self::query_task_on_conn(&tx, task_id)?;
+            return Err(TaskEngineError::InvalidStatusTransition {
+                task_id: task_id.clone(),
+                from: current.status,
+                to: TaskStatus::Cancelled,
+            });
         }
 
-        // Cascade block to dependents
-        let dependents = Self::query_dependents_on_conn(&tx, task_id)?;
-        for dep_id in dependents {
-            let dep_node = Self::query_task_on_conn(&tx, &dep_id)?;
-            if matches!(dep_node.status, TaskStatus::Pending | TaskStatus::Ready) {
+        // Transitive cascade block to all downstream dependents
+        Self::cascade_block_downstream_on_conn(&tx, task_id, now_ms)?;
+
+        tx.commit()?;
+        self.get_task(task_id)
+    }
+
+    /// Internal helper: recursively cascade [`TaskStatus::Blocked`] to all downstream
+    /// transitive dependents using BFS within the active transaction.
+    fn cascade_block_downstream_on_conn(
+        tx: &rusqlite::Transaction<'_>,
+        root_id: &TaskId,
+        now_ms: u64,
+    ) -> Result<(), TaskEngineError> {
+        let mut visited: HashSet<TaskId> = HashSet::new();
+        let mut queue: VecDeque<TaskId> = VecDeque::new();
+
+        let initial_dependents = Self::query_dependents_on_conn(tx, root_id)?;
+        for dep in initial_dependents {
+            if visited.insert(dep.clone()) {
+                queue.push_back(dep);
+            }
+        }
+
+        while let Some(curr_id) = queue.pop_front() {
+            let node = Self::query_task_on_conn(tx, &curr_id)?;
+            if matches!(node.status, TaskStatus::Pending | TaskStatus::Ready) {
                 let mut stmt = tx.prepare(
                     "UPDATE tasks SET status = ?1, updated_at_ms = ?2 WHERE task_id = ?3",
                 )?;
                 stmt.execute(params![
                     TaskStatus::Blocked.as_str(),
                     now_ms as i64,
-                    dep_id.as_str()
+                    curr_id.as_str()
                 ])?;
+
+                let next_dependents = Self::query_dependents_on_conn(tx, &curr_id)?;
+                for next_dep in next_dependents {
+                    if visited.insert(next_dep.clone()) {
+                        queue.push_back(next_dep);
+                    }
+                }
             }
         }
 
-        tx.commit()?;
-        self.get_task(task_id)
+        Ok(())
     }
 
     /// Retry a failed or cancelled task.

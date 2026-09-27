@@ -440,3 +440,113 @@ fn facade_and_sqlite_persistence() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_dir_all(&temp_dir);
     Ok(())
 }
+
+#[test]
+fn transitive_cascade_blocking_across_multi_hop_chain() -> Result<(), TaskEngineError> {
+    let mut engine = TaskEngine::open_in_memory()?;
+
+    // Chain: A -> B -> C -> D
+    let a_id = TaskId::new("chain-a")?;
+    let b_id = TaskId::new("chain-b")?;
+    let c_id = TaskId::new("chain-c")?;
+    let d_id = TaskId::new("chain-d")?;
+
+    engine.create_task(
+        TaskDraft {
+            id: a_id.clone(),
+            title: "A".to_string(),
+            description: "".to_string(),
+            priority: 0,
+            dependencies: vec![],
+        },
+        1000,
+    )?;
+    engine.create_task(
+        TaskDraft {
+            id: b_id.clone(),
+            title: "B".to_string(),
+            description: "".to_string(),
+            priority: 0,
+            dependencies: vec![a_id.clone()],
+        },
+        1010,
+    )?;
+    engine.create_task(
+        TaskDraft {
+            id: c_id.clone(),
+            title: "C".to_string(),
+            description: "".to_string(),
+            priority: 0,
+            dependencies: vec![b_id.clone()],
+        },
+        1020,
+    )?;
+    engine.create_task(
+        TaskDraft {
+            id: d_id.clone(),
+            title: "D".to_string(),
+            description: "".to_string(),
+            priority: 0,
+            dependencies: vec![c_id.clone()],
+        },
+        1030,
+    )?;
+
+    // Initially A is Ready, B, C, D are Pending
+    assert_eq!(engine.get_task(&a_id)?.status, TaskStatus::Ready);
+    assert_eq!(engine.get_task(&b_id)?.status, TaskStatus::Pending);
+    assert_eq!(engine.get_task(&c_id)?.status, TaskStatus::Pending);
+    assert_eq!(engine.get_task(&d_id)?.status, TaskStatus::Pending);
+
+    // Cancel A
+    engine.cancel_task(&a_id, 1040)?;
+
+    // Entire downstream chain (B, C, D) must be transitively Blocked!
+    assert_eq!(engine.get_task(&a_id)?.status, TaskStatus::Cancelled);
+    assert_eq!(engine.get_task(&b_id)?.status, TaskStatus::Blocked);
+    assert_eq!(engine.get_task(&c_id)?.status, TaskStatus::Blocked);
+    assert_eq!(engine.get_task(&d_id)?.status, TaskStatus::Blocked);
+
+    Ok(())
+}
+
+#[test]
+fn running_or_terminal_task_rejects_new_dependency() -> Result<(), TaskEngineError> {
+    let mut engine = TaskEngine::open_in_memory()?;
+
+    let t1 = TaskId::new("task-1")?;
+    let t2 = TaskId::new("task-2")?;
+
+    engine.create_task(
+        TaskDraft {
+            id: t1.clone(),
+            title: "1".to_string(),
+            description: "".to_string(),
+            priority: 0,
+            dependencies: vec![],
+        },
+        1000,
+    )?;
+    engine.create_task(
+        TaskDraft {
+            id: t2.clone(),
+            title: "2".to_string(),
+            description: "".to_string(),
+            priority: 0,
+            dependencies: vec![],
+        },
+        1010,
+    )?;
+
+    // t1 is running
+    engine.assign_task(&t1, "agent-1", 1020)?;
+
+    // Cannot add dependency to running task t1
+    let err = engine.add_dependency(&t2, &t1);
+    assert!(matches!(
+        err,
+        Err(TaskEngineError::InvalidStatusTransition { .. })
+    ));
+
+    Ok(())
+}
