@@ -64,6 +64,7 @@ pub mod live_host;
 pub mod local_provider;
 pub mod network_adapter;
 pub mod snapshot_ingest;
+pub mod task_dag;
 
 pub use bridge::{HostPeer, IpcBridge};
 pub use chat_stream::{
@@ -93,3 +94,4 @@ pub use snapshot_ingest::{
     SnapshotIngestRequest, ingest_compiled_turn, ingest_snapshot, project_layer_text,
     prompt_snapshot_with_project, snapshot_digest_hex,
 };
+pub use task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskStatus};
