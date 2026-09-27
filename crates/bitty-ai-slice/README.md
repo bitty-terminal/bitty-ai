@@ -55,6 +55,7 @@ live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via a
 local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, one monotonic request deadline (AI-CTX-005), and bounded fail-closed JSON
 journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite journal with deletion tombstones, bounded fields, and fail-closed corruption handling (no FTS5, no scheduler, caller-supplied timestamps)
 fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker, dense seq, and a caller-bindable reassembly identity
+facade     Unified engine facade (AI-0161): AiEngine, AiStreamSession, AiSnapshotEngine converging streaming, context, snapshot, and journal wheels
 ```
 
 ## Dependencies
@@ -223,13 +224,16 @@ cargo test -p bitty-ai-slice
   fail-closed, garbage-file corruption fail-closed (file untouched),
   incompatible-schema fail-closed (rows preserved), and single-writer
   rejection until the first writer closes.
+- `tests/facade.rs` (4 tests): unified facade capabilities covering incremental
+  streaming with fragmentation handling and sink piping, prompt assembly,
+  snapshot verification/ingestion, and SQLite journal operations.
 
 ## Examples
 
 - `examples/live_chat.rs` (AI-0160): Live chat completion streaming CLI runner.
   Connects to OpenRouter or compatible endpoints, reads streamed byte chunks,
-  drives `ChatCompletionStreamParser`, and pipes text fragments to a runtime
-  `StreamSink` with real-time typewriter output.
+  drives `AiStreamSession`, and pipes text fragments to a runtime `StreamSink`
+  with real-time typewriter output.
 
   ```bash
   export OPENROUTER_API_KEY="sk-or-v1-..."

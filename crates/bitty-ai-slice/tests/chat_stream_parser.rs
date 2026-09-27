@@ -114,3 +114,20 @@ fn malformed_json_fails_closed() {
         other => panic!("expected JsonParse error, got {other:?}"),
     }
 }
+
+#[test]
+fn reject_excessive_tool_call_index_fail_closed() {
+    let mut parser = ChatCompletionStreamParser::new();
+
+    let malicious_chunk = b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":4294967295,\"function\":{\"name\":\"exploit\"}}]}}]}\n\n";
+
+    let err = parser
+        .feed(malicious_chunk)
+        .expect_err("should reject out of range index");
+    match err {
+        ChatStreamError::JsonParse(msg) => {
+            assert!(msg.contains("tool call index out of range"));
+        }
+        other => panic!("expected JsonParse error, got {other:?}"),
+    }
+}
