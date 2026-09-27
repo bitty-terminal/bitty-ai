@@ -55,8 +55,9 @@ live_host  LiveBittyHost adapter delegating to the real bitty-ipc services via a
 local_provider  Experiment (AI-0042): localhost-only LocalProvider speaking to a local Ollama/OpenAI-compatible endpoint over std TcpStream with loopback enforcement, mandatory timeouts, one monotonic request deadline (AI-CTX-005), and bounded fail-closed JSON
 journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite journal with deletion tombstones, bounded fields, and fail-closed corruption handling (no FTS5, no scheduler, caller-supplied timestamps)
 content_store      Content-addressed blob store, Rationale protocol, and Checkpoint DAG engine (AI-0162): deduplicating immutable blob storage, structured intent/observation records, and content-addressed commits
+task_dag           Graph-theoretic Task DAG engine and control plane (AI-0164): Pueue-inspired task lifecycle, cycle detection, topological sorting, generation fencing, and SQLite persistence
 fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker, dense seq, and a caller-bindable reassembly identity
-facade     Unified engine facade (AI-0161): AiEngine, AiStreamSession, AiSnapshotEngine converging streaming, context, snapshot, and journal wheels
+facade     Unified engine facade (AI-0161): AiEngine, AiStreamSession, AiSnapshotEngine converging streaming, context, snapshot, store, and task wheels
 ```
 
 ## Dependencies

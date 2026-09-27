@@ -27,6 +27,8 @@ pub enum FacadeError {
     Journal(JournalError),
     /// Content-addressed store or checkpoint error.
     Store(String),
+    /// Task DAG and control plane error.
+    TaskDag(String),
     /// Prompt layer assembly or validation error.
     Prompt(PromptError),
     /// Context or payload budget ceiling exceeded.
@@ -45,6 +47,7 @@ impl fmt::Display for FacadeError {
             Self::Snapshot(err) => write!(f, "snapshot error: {err}"),
             Self::Journal(err) => write!(f, "journal error: {err}"),
             Self::Store(err) => write!(f, "content store error: {err}"),
+            Self::TaskDag(err) => write!(f, "task engine error: {err}"),
             Self::Prompt(err) => write!(f, "prompt error: {err}"),
             Self::BudgetExceeded { limit, actual } => {
                 write!(f, "budget ceiling exceeded: {actual} bytes > {limit} bytes")
@@ -76,6 +79,12 @@ impl From<JournalError> for FacadeError {
 impl From<crate::content_store::ContentStoreError> for FacadeError {
     fn from(err: crate::content_store::ContentStoreError) -> Self {
         Self::Store(err.to_string())
+    }
+}
+
+impl From<crate::task_dag::TaskEngineError> for FacadeError {
+    fn from(err: crate::task_dag::TaskEngineError) -> Self {
+        Self::TaskDag(err.to_string())
     }
 }
 
@@ -252,6 +261,18 @@ impl AiEngine {
     pub fn open_in_memory_content_store() -> Result<crate::content_store::ContentStore, FacadeError>
     {
         crate::content_store::ContentStore::open_in_memory().map_err(FacadeError::from)
+    }
+
+    /// Open a persistent Task DAG SQLite database at the specified path.
+    pub fn open_task_engine(
+        path: impl AsRef<Path>,
+    ) -> Result<crate::task_dag::TaskEngine, FacadeError> {
+        crate::task_dag::TaskEngine::open(path).map_err(FacadeError::from)
+    }
+
+    /// Open an in-memory Task DAG SQLite database.
+    pub fn open_in_memory_task_engine() -> Result<crate::task_dag::TaskEngine, FacadeError> {
+        crate::task_dag::TaskEngine::open_in_memory().map_err(FacadeError::from)
     }
 
     /// Create a new project snapshot ingestion engine.
