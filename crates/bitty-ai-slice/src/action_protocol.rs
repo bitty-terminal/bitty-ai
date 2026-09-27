@@ -556,14 +556,18 @@ impl ActionEngine {
             return raw.to_string();
         }
 
-        // Half for head, half for tail
-        let half = max_bytes / 2;
+        // Reserve space for the marker so the complete preview stays bounded.
+        let marker_budget = format!("\n[... skipped {} bytes ...]\n", raw.len()).len();
+        if max_bytes <= marker_budget {
+            return Self::truncate_head_utf8(raw, max_bytes).to_string();
+        }
+        let half = (max_bytes - marker_budget) / 2;
         let head = Self::truncate_head_utf8(raw, half);
         let tail = Self::truncate_tail_utf8(raw, half);
 
         let skipped = raw.len().saturating_sub(head.len() + tail.len());
 
-        let mut out = String::with_capacity(head.len() + tail.len() + 64);
+        let mut out = String::with_capacity(head.len() + tail.len() + marker_budget);
         out.push_str(head.trim_end());
         out.push_str(&format!("\n[... skipped {skipped} bytes ...]\n"));
         out.push_str(tail.trim_start());

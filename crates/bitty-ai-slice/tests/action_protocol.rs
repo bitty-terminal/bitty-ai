@@ -186,7 +186,7 @@ fn auto_spillover_for_large_payload() {
     // Verify preview snippet has bounded length and contains truncation notice
     let preview = outcome.stdout.text();
     assert!(preview.contains("[... skipped "));
-    assert!(preview.len() <= 200); // Bounded preview
+    assert!(preview.len() <= 100);
 }
 
 #[test]
@@ -195,11 +195,12 @@ fn utf8_character_boundary_preview_safety() {
         .to_string()
         .repeat(50); // Large multibyte UTF-8 string
 
-    let preview = ActionEngine::generate_preview(&raw, 40);
+    let preview = ActionEngine::generate_preview(&raw, 80);
 
-    // Verify string does not panic on UTF-8 char boundary and contains marker
+    // Verify string does not panic on UTF-8 char boundary, contains marker, and strictly respects budget
     assert!(preview.contains("[... skipped "));
     assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    assert!(preview.len() <= 80);
 }
 
 #[test]
