@@ -54,6 +54,7 @@
 pub mod bridge;
 pub mod chat_stream;
 pub mod content_store;
+pub mod context_compiler;
 pub mod error;
 pub mod facade;
 pub mod fake_host;
@@ -72,6 +73,10 @@ pub use chat_stream::{
 };
 pub use content_store::{
     Checkpoint, CheckpointDraft, ContentHash, ContentStore, ContentStoreError, Rationale,
+};
+pub use context_compiler::{
+    CompiledContext, CompilerBudgetConfig, CompilerError, ContextCompiler, ContextTree, EntryKind,
+    SlotConflict, TreeDiff, TreeEntry, TreeMergeResult,
 };
 pub use error::SliceError;
 pub use facade::{AiEngine, AiSnapshotEngine, AiStreamSession, FacadeError};
