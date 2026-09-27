@@ -27,3 +27,7 @@ sha2 = { version = "=0.11.0" }
 # vendored SQLite 3.53.2; default features off drops the wasm-only subtree and
 # the statement cache. Dependency review: PX-0298 on AI-0049.
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+# AI-0156 transport-adapter prototype (slice-only): bitty-network-api consumer
+# vocabulary for TurnRequest mapping into Request with budget_bytes, timeout_ms,
+# and secret redaction.
+bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "f3c313244667e5dca910b4f7cd8e9d9447dce9a7" }
