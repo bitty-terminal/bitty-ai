@@ -64,6 +64,7 @@ pub mod reconcile;
 pub mod secret;
 pub mod selection;
 pub mod session;
+pub mod sse;
 pub mod stream;
 pub mod tool;
 
@@ -141,6 +142,7 @@ pub use session::{
     AgentInstanceId, AgentLevel, AgentSession, DenyAllElevations, ElevationGrant, ExecutionId,
     IdIssuer, RunId, SessionError, SessionId, SessionState,
 };
+pub use sse::{MAX_SSE_EVENT_BYTES, MAX_SSE_LINE_BYTES, SseError, SseEvent, SseParser};
 pub use stream::{
     BoundedSink, DEFAULT_BOUNDED_SINK_CAPACITY, Fragment, FragmentKind, StreamAck,
     StreamAttribution, StreamChunk, StreamError, StreamHandle, StreamSink, VecSink, emit_fragments,
