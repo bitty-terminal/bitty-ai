@@ -464,7 +464,7 @@ fn map_network_error(
             timeout_ms: requested_timeout_ms,
             latency_ms: after.as_millis() as u64,
         },
-        NetworkError::Budget { limit_bytes } => ProviderError::Transport {
+        NetworkError::Budget { limit_bytes } => ProviderError::Unknown {
             provider: provider_id.to_owned(),
             reason: format!("network body budget exceeded: limit was {limit_bytes} bytes"),
         },
@@ -779,13 +779,17 @@ mod tests {
 
         // 4. Budget
         let err4 = adapter.complete(&req).unwrap_err();
-        match err4 {
-            ProviderError::Transport { provider, reason } => {
+        match &err4 {
+            ProviderError::Unknown { provider, reason } => {
                 assert_eq!(provider, "test-provider");
                 assert!(reason.contains("network body budget exceeded"));
             }
-            other => panic!("expected Transport, got {other:?}"),
+            other => panic!("expected Unknown, got {other:?}"),
         }
+        assert_eq!(
+            bitty_ai_runtime::selection::fallback_directive(&err4),
+            bitty_ai_runtime::selection::FallbackDirective::Stop
+        );
     }
 
     #[test]
