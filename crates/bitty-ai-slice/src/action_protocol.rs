@@ -252,6 +252,12 @@ pub enum ActionPayload {
 }
 
 impl ActionPayload {
+    /// Check whether this payload is stored inline.
+    #[must_use]
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+
     /// Check whether this payload was spilled to content storage.
     #[must_use]
     pub fn is_spilled(&self) -> bool {
@@ -384,7 +390,7 @@ impl ActionOutcome {
 }
 
 /// Configuration governing payload auto-spillover.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpilloverConfig {
     /// Maximum payload size in bytes to retain inline (default 4096).
     pub max_inline_bytes: usize,

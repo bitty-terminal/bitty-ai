@@ -67,6 +67,8 @@ pub mod local_provider;
 pub mod network_adapter;
 pub mod snapshot_ingest;
 pub mod task_dag;
+pub mod wheel_bridge;
+pub mod wheel_kernel;
 
 pub use action_protocol::{
     Action, ActionEngine, ActionError, ActionIntent, ActionOutcome, ActionPayload, BlobPointer,
@@ -105,3 +107,5 @@ pub use snapshot_ingest::{
     prompt_snapshot_with_project, snapshot_digest_hex,
 };
 pub use task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskStatus};
+pub use wheel_bridge::{BridgeResponse, WheelBridge};
+pub use wheel_kernel::{MAX_RECENT_ACTIONS, WheelKernel};

@@ -741,6 +741,38 @@ impl ContentStore {
         Ok(stmt.exists(params![hash_hex])?)
     }
 
+    /// Update or create multiple named references atomically within a single SQLite transaction.
+    pub fn update_refs_atomic(
+        &mut self,
+        refs: &[(&str, &ContentHash)],
+        updated_at_ms: u64,
+    ) -> Result<(), ContentStoreError> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        for (name, target) in refs {
+            Self::validate_ref_name(name)?;
+            if !self.has_checkpoint(target)? {
+                return Err(ContentStoreError::MissingTarget(**target));
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+        for (name, target) in refs {
+            let target_hex = target.to_hex();
+            tx.execute(
+                "INSERT INTO refs (name, target_hash, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET target_hash = excluded.target_hash, updated_at_ms = excluded.updated_at_ms",
+                params![name, target_hex, updated_at_ms as i64],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+
     /// Update or create a named reference (e.g. "HEAD", "heads/main", "tags/v1").
     pub fn update_ref(
         &mut self,
@@ -748,21 +780,7 @@ impl ContentStore {
         target: &ContentHash,
         updated_at_ms: u64,
     ) -> Result<(), ContentStoreError> {
-        Self::validate_ref_name(name)?;
-
-        if !self.has_checkpoint(target)? {
-            return Err(ContentStoreError::MissingTarget(*target));
-        }
-
-        let target_hex = target.to_hex();
-        self.conn.execute(
-            "INSERT INTO refs (name, target_hash, updated_at_ms)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET target_hash = excluded.target_hash, updated_at_ms = excluded.updated_at_ms",
-            params![name, target_hex, updated_at_ms as i64],
-        )?;
-
-        Ok(())
+        self.update_refs_atomic(&[(name, target)], updated_at_ms)
     }
 
     /// Get the target checkpoint hash of a named reference.

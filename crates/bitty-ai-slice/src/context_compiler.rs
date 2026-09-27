@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::content_store::{Checkpoint, ContentHash};
 use crate::task_dag::TaskNode;
@@ -60,6 +59,8 @@ pub enum CompilerError {
     InvalidSlotName(String),
     /// Slot was not found in the context tree.
     SlotNotFound(String),
+    /// Context tree binary payload is corrupted or has an invalid structure.
+    CorruptedTree(String),
     /// JSON serialization or deserialization failure.
     Serialization(serde_json::Error),
 }
@@ -84,6 +85,7 @@ impl fmt::Display for CompilerError {
             }
             Self::InvalidSlotName(name) => write!(f, "invalid slot name: {name:?}"),
             Self::SlotNotFound(name) => write!(f, "context slot '{name}' not found"),
+            Self::CorruptedTree(msg) => write!(f, "corrupted context tree: {msg}"),
             Self::Serialization(err) => write!(f, "serialization error: {err}"),
         }
     }
@@ -268,26 +270,95 @@ impl ContextTree {
         self.entries.values()
     }
 
-    /// Calculate the deterministic Merkle digest [`ContentHash`] of this tree.
-    ///
-    /// Serializes entries in sorted order with canonical length prefixing:
-    /// `tree:v1\0` + `[entry_name_len, entry_name, hash, kind, size_bytes]`.
+    /// Generate the deterministic canonical byte representation of this Merkle context tree.
     #[must_use]
-    pub fn digest(&self) -> ContentHash {
-        let mut hasher = Sha256::new();
-        hasher.update(b"tree:v1\0");
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"tree:v1\0");
 
         for entry in self.entries.values() {
             let name_bytes = entry.name.as_bytes();
-            hasher.update((name_bytes.len() as u32).to_be_bytes());
-            hasher.update(name_bytes);
-            hasher.update(entry.hash.as_bytes());
-            hasher.update([entry.kind.as_u8()]);
-            hasher.update((entry.size_bytes as u64).to_be_bytes());
+            bytes.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(name_bytes);
+            bytes.extend_from_slice(entry.hash.as_bytes());
+            bytes.push(entry.kind.as_u8());
+            bytes.extend_from_slice(&(entry.size_bytes as u64).to_be_bytes());
         }
 
-        let raw: [u8; 32] = hasher.finalize().into();
-        ContentHash::from_bytes(raw)
+        bytes
+    }
+
+    /// Parse and reconstruct a [`ContextTree`] from its canonical byte representation.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CompilerError> {
+        const MAGIC: &[u8] = b"tree:v1\0";
+        if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
+            return Err(CompilerError::CorruptedTree(
+                "invalid context tree magic header".to_string(),
+            ));
+        }
+
+        let mut offset = MAGIC.len();
+        let mut entries = BTreeMap::new();
+
+        while offset < bytes.len() {
+            if offset + 4 > bytes.len() {
+                return Err(CompilerError::CorruptedTree(
+                    "unexpected EOF reading slot name length".to_string(),
+                ));
+            }
+            let name_len = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            let entry_len = name_len + 32 + 1 + 8;
+            if offset + entry_len > bytes.len() {
+                return Err(CompilerError::CorruptedTree(
+                    "unexpected EOF reading tree entry payload".to_string(),
+                ));
+            }
+
+            let name_str = std::str::from_utf8(&bytes[offset..offset + name_len]).map_err(|e| {
+                CompilerError::CorruptedTree(format!("invalid UTF-8 in slot name: {e}"))
+            })?;
+            offset += name_len;
+
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+            let hash = ContentHash::from_bytes(hash_bytes);
+            offset += 32;
+
+            let kind_byte = bytes[offset];
+            offset += 1;
+            let kind = match kind_byte {
+                1 => EntryKind::Blob,
+                2 => EntryKind::Tree,
+                other => {
+                    return Err(CompilerError::CorruptedTree(format!(
+                        "unknown entry kind tag: {other}"
+                    )));
+                }
+            };
+
+            let mut size_arr = [0u8; 8];
+            size_arr.copy_from_slice(&bytes[offset..offset + 8]);
+            let size_bytes = u64::from_be_bytes(size_arr) as usize;
+            offset += 8;
+
+            let entry = TreeEntry::new(name_str, hash, kind, size_bytes)?;
+            entries.insert(entry.name.clone(), entry);
+        }
+
+        Ok(Self { entries })
+    }
+
+    /// Calculate the deterministic Merkle digest [`ContentHash`] of this tree.
+    #[must_use]
+    pub fn digest(&self) -> ContentHash {
+        ContentHash::compute(&self.canonical_bytes())
     }
 
     /// Compute the difference between `self` (base) and `target`.
@@ -392,7 +463,7 @@ impl ContextTree {
 }
 
 /// Budget configuration controlling multi-tier context compilation thresholds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilerBudgetConfig {
     /// Maximum allowed aggregate context size in bytes.
     pub max_total_bytes: usize,
@@ -416,7 +487,7 @@ impl Default for CompilerBudgetConfig {
 }
 
 /// Compiled context ready for model dispatch, detailing per-zone buffers and metrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledContext {
     /// Zone 1: Byte-stable prefix (system prompt, tools, rules).
     pub zone1_prefix: String,
