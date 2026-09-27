@@ -22,9 +22,7 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 
-use bitty_ai_runtime::StreamSink;
-use bitty_ai_runtime::stream::VecSink;
-use bitty_ai_slice::{ChatCompletionStreamParser, ChatStreamDelta};
+use bitty_ai_slice::{AiStreamSession, ChatStreamDelta};
 
 const DEFAULT_MODEL: &str = "deepseek/deepseek-chat";
 const DEFAULT_PROMPT: &str = "Explain what Server-Sent Events (SSE) are and why they are useful for LLM streaming in 2 concise sentences.";
@@ -100,9 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .take()
         .ok_or("Failed to capture child stdout")?;
 
-    let mut parser = ChatCompletionStreamParser::new();
-    let mut sink = VecSink::new();
-    let mut seq = 0;
+    let mut session = AiStreamSession::new();
     let mut buffer = [0u8; 128]; // Small buffer to exercise incremental byte feeding
 
     loop {
@@ -111,11 +107,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        let deltas = parser.feed(&buffer[..n])?;
+        let deltas = session.feed_chunk(&buffer[..n])?;
         for delta in &deltas {
             match delta {
                 ChatStreamDelta::Content(text) => {
-                    parser.pipe_to_sink(delta, &mut sink, &mut seq)?;
                     print!("{text}");
                     io::stdout().flush()?;
                 }
@@ -125,13 +120,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         io::stdout().flush()?;
                     }
                 }
-                ChatStreamDelta::Finished { reason } => {
-                    // Stream finished signal
-                    let _ = reason;
-                }
-                ChatStreamDelta::Usage(_) => {
-                    // Final token usage stats
-                }
+                ChatStreamDelta::Finished { .. } | ChatStreamDelta::Usage(_) => {}
             }
         }
     }
@@ -145,12 +134,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("\nWarning: curl process exited with status: {status}. {err_msg}");
     }
 
-    let turn = parser.finish()?;
+    let chunk_count = session.chunks().len();
+    let turn = session.finish()?;
 
     println!("\n");
     println!("------------------------------------------------------------");
     println!("Stream Summary:");
-    println!("  Retained Sink Chunks: {}", sink.chunks().len());
+    println!("  Retained Sink Chunks: {chunk_count}");
     println!("  Total Emitted Bytes:  {}", turn.text.len());
     println!("  Prompt Tokens:        {}", turn.usage.input_tokens);
     println!("  Completion Tokens:    {}", turn.usage.output_tokens);
