@@ -315,3 +315,91 @@ fn facade_engine_content_store() {
         .expect("put blob via facade store");
     assert!(store.has_blob(&hash).expect("has blob"));
 }
+
+#[test]
+fn unambiguous_canonical_hashing_prevents_field_injection() {
+    // Attempt delimiter injection: draft1 embeds a newline and fake field prefix in task_id
+    let draft1 = CheckpointDraft {
+        parents: Vec::new(),
+        task_id: "AI-100\nagent_id:injected_agent".to_string(),
+        agent_id: "original_agent".to_string(),
+        rationale: Rationale::new("Intent 1", "Action 1"),
+        tree_hash: None,
+        summary: "Summary 1".to_string(),
+        timestamp_ms: 1000,
+    };
+
+    let draft2 = CheckpointDraft {
+        parents: Vec::new(),
+        task_id: "AI-100".to_string(),
+        agent_id: "injected_agent\noriginal_agent".to_string(),
+        rationale: Rationale::new("Intent 1", "Action 1"),
+        tree_hash: None,
+        summary: "Summary 1".to_string(),
+        timestamp_ms: 1000,
+    };
+
+    let hash1 = draft1.canonical_hash().expect("hash1");
+    let hash2 = draft2.canonical_hash().expect("hash2");
+    assert_ne!(
+        hash1, hash2,
+        "Length-prefixed encoding must prevent field injection collisions"
+    );
+}
+
+#[test]
+fn corrupt_checkpoint_detection_on_sqlite_tamper() {
+    let scratch_dir = std::path::PathBuf::from("/tmp/bitty");
+    std::fs::create_dir_all(&scratch_dir).ok();
+    let db_path = scratch_dir.join(format!(
+        "test_corrupt_cp_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    {
+        let mut store = ContentStore::open(&db_path).expect("open store file");
+        let cp = store
+            .commit_checkpoint(CheckpointDraft {
+                parents: Vec::new(),
+                task_id: "AI-0162".to_string(),
+                agent_id: "agent-1".to_string(),
+                rationale: Rationale::new("Original intent", "Original action"),
+                tree_hash: None,
+                summary: "Clean checkpoint".to_string(),
+                timestamp_ms: 5000,
+            })
+            .expect("commit clean cp");
+
+        // Verify clean retrieval succeeds
+        let retrieved = store
+            .get_checkpoint(&cp.id)
+            .expect("get clean cp")
+            .expect("cp exists");
+        assert_eq!(retrieved.id, cp.id);
+
+        // Directly tamper with SQLite row without updating primary key hash
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw conn");
+        conn.execute(
+            "UPDATE checkpoints SET summary = ?1 WHERE hash = ?2",
+            rusqlite::params!["Tampered summary", cp.id.to_hex()],
+        )
+        .expect("tamper row");
+
+        // Verify get_checkpoint fails closed with CorruptCheckpoint
+        let err = store
+            .get_checkpoint(&cp.id)
+            .expect_err("must detect corruption");
+        match err {
+            ContentStoreError::CorruptCheckpoint { expected, found } => {
+                assert_eq!(expected, cp.id);
+                assert_ne!(found, expected);
+            }
+            other => panic!("expected CorruptCheckpoint, got: {other:?}"),
+        }
+    }
+
+    let _ = std::fs::remove_file(&db_path);
+}

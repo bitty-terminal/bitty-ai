@@ -54,6 +54,11 @@ pub enum ContentStoreError {
         expected: ContentHash,
         found: ContentHash,
     },
+    /// Retrieved checkpoint failed integrity verification against its expected content hash.
+    CorruptCheckpoint {
+        expected: ContentHash,
+        found: ContentHash,
+    },
     /// A referenced parent checkpoint does not exist in the store.
     MissingParent(ContentHash),
     /// A referenced context tree blob does not exist in the store.
@@ -82,6 +87,12 @@ impl fmt::Display for ContentStoreError {
                 write!(
                     f,
                     "blob data corrupt: expected hash {expected}, found {found}"
+                )
+            }
+            Self::CorruptCheckpoint { expected, found } => {
+                write!(
+                    f,
+                    "checkpoint data corrupt: expected hash {expected}, found {found}"
                 )
             }
             Self::MissingParent(hash) => {
@@ -361,6 +372,9 @@ pub struct CheckpointDraft {
 
 impl CheckpointDraft {
     /// Compute the deterministic canonical digest for this checkpoint draft.
+    ///
+    /// Uses length-prefixed field encoding to guarantee unambiguous canonical hashing,
+    /// preventing delimiter-collision vulnerabilities across draft fields.
     pub fn canonical_hash(&self) -> Result<ContentHash, ContentStoreError> {
         let rationale_json = serde_json::to_string(&self.rationale)?;
 
@@ -374,17 +388,26 @@ impl CheckpointDraft {
             .join(",");
 
         let tree_hex = self.tree_hash.as_ref().map(ContentHash::to_hex);
+        let tree_str = tree_hex.as_deref().unwrap_or("");
+        let ts_str = self.timestamp_ms.to_string();
 
-        let manifest = format!(
-            "checkpoint:v1\nparents:{parents_str}\ntask_id:{}\nagent_id:{}\ntree_hash:{}\nsummary:{}\ntimestamp_ms:{}\nrationale:{rationale_json}\n",
-            self.task_id,
-            self.agent_id,
-            tree_hex.as_deref().unwrap_or(""),
-            self.summary,
-            self.timestamp_ms
-        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"checkpoint:v2\0");
+        for field in [
+            parents_str.as_bytes(),
+            self.task_id.as_bytes(),
+            self.agent_id.as_bytes(),
+            tree_str.as_bytes(),
+            self.summary.as_bytes(),
+            ts_str.as_bytes(),
+            rationale_json.as_bytes(),
+        ] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field);
+        }
 
-        Ok(ContentHash::compute(manifest.as_bytes()))
+        let digest: [u8; 32] = hasher.finalize().into();
+        Ok(ContentHash::from_bytes(digest))
     }
 }
 
@@ -488,7 +511,7 @@ impl ContentStore {
 
         if !exists {
             self.conn.execute(
-                "INSERT INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
                 params![hash_hex, data.len() as i64, data, created_at_ms as i64],
             )?;
         }
@@ -589,34 +612,17 @@ impl ContentStore {
             }
         }
 
-        let rationale_json = serde_json::to_string(&draft.rationale)?;
-        let parents_json = serde_json::to_string(&draft.parents)?;
-        let tree_hex = draft.tree_hash.as_ref().map(ContentHash::to_hex);
-
-        let mut sorted_parents = draft.parents.clone();
-        sorted_parents.sort_unstable();
-        let parents_str = sorted_parents
-            .iter()
-            .map(ContentHash::to_hex)
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let manifest = format!(
-            "checkpoint:v1\nparents:{parents_str}\ntask_id:{}\nagent_id:{}\ntree_hash:{}\nsummary:{}\ntimestamp_ms:{}\nrationale:{rationale_json}\n",
-            draft.task_id,
-            draft.agent_id,
-            tree_hex.as_deref().unwrap_or(""),
-            draft.summary,
-            draft.timestamp_ms
-        );
-
-        let id = ContentHash::compute(manifest.as_bytes());
+        let id = draft.canonical_hash()?;
         let id_hex = id.to_hex();
 
         // Idempotent commit: if checkpoint hash already exists, return it
         if !self.has_checkpoint(&id)? {
+            let rationale_json = serde_json::to_string(&draft.rationale)?;
+            let parents_json = serde_json::to_string(&draft.parents)?;
+            let tree_hex = draft.tree_hash.as_ref().map(ContentHash::to_hex);
+
             self.conn.execute(
-                "INSERT INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
+                "INSERT OR IGNORE INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id_hex,
@@ -693,8 +699,7 @@ impl ContentStore {
                     None => None,
                 };
 
-                Ok(Some(Checkpoint {
-                    id: *hash,
+                let draft = CheckpointDraft {
                     parents,
                     task_id,
                     agent_id,
@@ -702,6 +707,25 @@ impl ContentStore {
                     tree_hash,
                     summary,
                     timestamp_ms: created_at_ms as u64,
+                };
+
+                let computed_hash = draft.canonical_hash()?;
+                if computed_hash != *hash {
+                    return Err(ContentStoreError::CorruptCheckpoint {
+                        expected: *hash,
+                        found: computed_hash,
+                    });
+                }
+
+                Ok(Some(Checkpoint {
+                    id: *hash,
+                    parents: draft.parents,
+                    task_id: draft.task_id,
+                    agent_id: draft.agent_id,
+                    rationale: draft.rationale,
+                    tree_hash: draft.tree_hash,
+                    summary: draft.summary,
+                    timestamp_ms: draft.timestamp_ms,
                 }))
             }
             None => Ok(None),
