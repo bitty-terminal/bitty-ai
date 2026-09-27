@@ -65,7 +65,9 @@ pub mod network_adapter;
 pub mod snapshot_ingest;
 
 pub use bridge::{HostPeer, IpcBridge};
-pub use chat_stream::{ChatCompletionStreamParser, ChatStreamDelta, ChatStreamError};
+pub use chat_stream::{
+    ChatCompletionStreamParser, ChatStreamDelta, ChatStreamError, MAX_STREAM_TOOL_CALLS,
+};
 pub use error::SliceError;
 pub use facade::{AiEngine, AiSnapshotEngine, AiStreamSession, FacadeError};
 pub use fake_host::{BittyHost, FakeHost};

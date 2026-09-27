@@ -36,6 +36,9 @@ pub enum ChatStreamDelta {
     Usage(ProviderUsage),
 }
 
+/// Maximum tool call index admitted during stream processing (prevents unbounded accumulator growth).
+pub const MAX_STREAM_TOOL_CALLS: usize = 128;
+
 /// Errors returned during chat stream processing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatStreamError {
@@ -165,7 +168,15 @@ impl ChatCompletionStreamParser {
             .and_then(|t| t.as_array())
         {
             for tc in tool_calls {
-                let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let raw_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                let index = usize::try_from(raw_index)
+                    .ok()
+                    .filter(|&i| i < MAX_STREAM_TOOL_CALLS)
+                    .ok_or_else(|| {
+                        ChatStreamError::JsonParse(format!(
+                            "tool call index out of range: {raw_index} (max {MAX_STREAM_TOOL_CALLS})"
+                        ))
+                    })?;
                 let id = tc.get("id").and_then(|s| s.as_str()).map(str::to_owned);
                 let name = tc
                     .pointer("/function/name")
