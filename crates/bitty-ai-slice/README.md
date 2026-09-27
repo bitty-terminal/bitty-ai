@@ -223,3 +223,15 @@ cargo test -p bitty-ai-slice
   fail-closed, garbage-file corruption fail-closed (file untouched),
   incompatible-schema fail-closed (rows preserved), and single-writer
   rejection until the first writer closes.
+
+## Examples
+
+- `examples/live_chat.rs` (AI-0160): Live chat completion streaming CLI runner.
+  Connects to OpenRouter or compatible endpoints, reads streamed byte chunks,
+  drives `ChatCompletionStreamParser`, and pipes text fragments to a runtime
+  `StreamSink` with real-time typewriter output.
+
+  ```bash
+  export OPENROUTER_API_KEY="sk-or-v1-..."
+  cargo run -p bitty-ai-slice --example live_chat -- "Say hello from Bitty!"
+  ```
