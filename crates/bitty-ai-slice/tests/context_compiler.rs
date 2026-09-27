@@ -378,4 +378,17 @@ fn facade_compile_context_integration() {
     assert_eq!(compiled.pruned_slots.len(), 0);
     assert_eq!(compiled.summarized_checkpoints, 0);
     assert!(!compiled.truncated_tail);
+    assert_eq!(compiled.to_prompt_string().len(), compiled.total_bytes);
+}
+
+#[test]
+fn prompt_string_length_matches_total_bytes() {
+    let mut compiler = ContextCompiler::new();
+    compiler.system_prompt = "Instructions".to_string();
+    compiler.turn_prompt = "Prompt".to_string();
+
+    let budget = CompilerBudgetConfig::default();
+    let compiled = compiler.compile(&budget).unwrap();
+    let prompt_str = compiled.to_prompt_string();
+    assert_eq!(prompt_str.len(), compiled.total_bytes);
 }

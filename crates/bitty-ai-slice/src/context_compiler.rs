@@ -575,8 +575,11 @@ impl ContextCompiler {
             turn_text.push('\n');
         }
 
+        let separator_bytes = usize::from(!z1.is_empty()) + usize::from(!z2.is_empty());
         let current_z3_len = obs_text.len() + turn_text.len();
-        let remaining_total_budget = budget.max_total_bytes.saturating_sub(z1.len() + z2.len());
+        let remaining_total_budget = budget
+            .max_total_bytes
+            .saturating_sub(z1.len() + z2.len() + separator_bytes);
         let effective_z3_max = budget.max_zone3_bytes.min(remaining_total_budget);
 
         if current_z3_len <= effective_z3_max {
@@ -607,7 +610,7 @@ impl ContextCompiler {
             }
         }
 
-        let total_bytes = z1.len() + z2.len() + z3.len();
+        let total_bytes = z1.len() + z2.len() + z3.len() + separator_bytes;
         if total_bytes > budget.max_total_bytes {
             return Err(CompilerError::TotalBudgetExceeded {
                 size: total_bytes,
