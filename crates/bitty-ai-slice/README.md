@@ -57,6 +57,7 @@ journal_prototype  Experiment (AI-0049): append-ordered single-writer SQLite jou
 content_store      Content-addressed blob store, Rationale protocol, and Checkpoint DAG engine (AI-0162): deduplicating immutable blob storage, structured intent/observation records, and content-addressed commits
 task_dag           Graph-theoretic Task DAG engine and control plane (AI-0164): Pueue-inspired task lifecycle, cycle detection, topological sorting, generation fencing, and SQLite persistence
 context_compiler   Three-zone context compiler, Merkle context tree, and multi-tier budget pipeline (AI-0165): prefix-cache optimization, deterministic tree digests, 3-way slot merge, and multi-tier pruning
+action_protocol    Standardized action, intent, outcome protocol and auto-spillover (AI-0166): typed intent validation, ContentStore blob spillover, bounded preview generation, and observation formatting
 fragment_transport  Runtime-to-transport pre-split (AI-0066, AI-0070): 64 KiB runtime fragments -> <=16 KiB parts at code-point boundaries with a continuation marker, dense seq, and a caller-bindable reassembly identity
 facade     Unified engine facade (AI-0161): AiEngine, AiStreamSession, AiSnapshotEngine converging streaming, context, snapshot, store, and task wheels
 ```
