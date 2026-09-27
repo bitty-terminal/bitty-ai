@@ -76,6 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut child = Command::new("curl")
         .arg("-s")
+        .arg("--fail-with-body")
         .arg("-N") // unbuffered for SSE streaming
         .arg("-X")
         .arg("POST")
@@ -131,7 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         if let Some(mut stderr) = child.stderr.take() {
             let _ = stderr.read_to_string(&mut err_msg);
         }
-        eprintln!("\nWarning: curl process exited with status: {status}. {err_msg}");
+        return Err(format!("curl process exited with status {status}. {err_msg}").into());
     }
 
     let chunk_count = session.chunks().len();
