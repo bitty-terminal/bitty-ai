@@ -51,6 +51,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod action_protocol;
 pub mod bridge;
 pub mod chat_stream;
 pub mod content_store;
@@ -67,6 +68,10 @@ pub mod network_adapter;
 pub mod snapshot_ingest;
 pub mod task_dag;
 
+pub use action_protocol::{
+    Action, ActionEngine, ActionError, ActionIntent, ActionOutcome, ActionPayload, BlobPointer,
+    BlobSink, InMemoryBlobSink, SpilloverConfig,
+};
 pub use bridge::{HostPeer, IpcBridge};
 pub use chat_stream::{
     ChatCompletionStreamParser, ChatStreamDelta, ChatStreamError, MAX_STREAM_TOOL_CALLS,

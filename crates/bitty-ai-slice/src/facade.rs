@@ -31,6 +31,8 @@ pub enum FacadeError {
     TaskDag(String),
     /// Context compiler or Merkle tree error.
     Compiler(String),
+    /// Action protocol or auto-spillover error.
+    Action(String),
     /// Prompt layer assembly or validation error.
     Prompt(PromptError),
     /// Context or payload budget ceiling exceeded.
@@ -51,6 +53,7 @@ impl fmt::Display for FacadeError {
             Self::Store(err) => write!(f, "content store error: {err}"),
             Self::TaskDag(err) => write!(f, "task engine error: {err}"),
             Self::Compiler(err) => write!(f, "compiler error: {err}"),
+            Self::Action(err) => write!(f, "action error: {err}"),
             Self::Prompt(err) => write!(f, "prompt error: {err}"),
             Self::BudgetExceeded { limit, actual } => {
                 write!(f, "budget ceiling exceeded: {actual} bytes > {limit} bytes")
@@ -94,6 +97,12 @@ impl From<crate::task_dag::TaskEngineError> for FacadeError {
 impl From<crate::context_compiler::CompilerError> for FacadeError {
     fn from(err: crate::context_compiler::CompilerError) -> Self {
         Self::Compiler(err.to_string())
+    }
+}
+
+impl From<crate::action_protocol::ActionError> for FacadeError {
+    fn from(err: crate::action_protocol::ActionError) -> Self {
+        Self::Action(err.to_string())
     }
 }
 
@@ -290,6 +299,35 @@ impl AiEngine {
         budget: &crate::context_compiler::CompilerBudgetConfig,
     ) -> Result<crate::context_compiler::CompiledContext, FacadeError> {
         compiler.compile(budget).map_err(FacadeError::from)
+    }
+
+    /// Process an executed action turn into a structured [`ActionOutcome`],
+    /// automatically spilling oversized payloads into the provided content store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_action_outcome(
+        config: &crate::action_protocol::SpilloverConfig,
+        action_id: impl Into<String>,
+        success: bool,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+        raw_stdout: &str,
+        raw_stderr: &str,
+        store: &mut crate::content_store::ContentStore,
+        timestamp_ms: u64,
+    ) -> Result<crate::action_protocol::ActionOutcome, FacadeError> {
+        let engine = crate::action_protocol::ActionEngine::new(config.clone());
+        engine
+            .process_outcome(
+                action_id,
+                success,
+                exit_code,
+                duration_ms,
+                raw_stdout,
+                raw_stderr,
+                store,
+                timestamp_ms,
+            )
+            .map_err(FacadeError::from)
     }
 
     /// Create a new project snapshot ingestion engine.
