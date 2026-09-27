@@ -166,8 +166,18 @@ impl From<rusqlite::Error> for TaskEngineError {
 ///
 /// Must be 1 to 128 characters, containing only ASCII alphanumeric characters,
 /// hyphens, underscores, dots, or forward slashes, without leading/trailing dots or slashes.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TaskId(String);
+
+impl<'de> Deserialize<'de> for TaskId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
 
 impl TaskId {
     /// Construct and validate a new [`TaskId`].

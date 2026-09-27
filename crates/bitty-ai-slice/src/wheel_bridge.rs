@@ -389,10 +389,18 @@ impl WheelBridge {
                     .get("success")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let exit_code = payload
-                    .get("exit_code")
-                    .and_then(|v| v.as_i64())
-                    .map(|c| c as i32);
+                let exit_code = match payload.get("exit_code") {
+                    Some(v) if v.is_number() => {
+                        let c = v.as_i64().ok_or_else(|| {
+                            "'exit_code' is outside valid integer range".to_string()
+                        })?;
+                        let c32 = i32::try_from(c).map_err(|_| {
+                            "'exit_code' exceeds valid 32-bit signed integer range".to_string()
+                        })?;
+                        Some(c32)
+                    }
+                    _ => None,
+                };
                 let duration_ms = payload
                     .get("duration_ms")
                     .and_then(|v| v.as_u64())

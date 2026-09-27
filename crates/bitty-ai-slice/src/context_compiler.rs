@@ -59,6 +59,8 @@ pub enum CompilerError {
     InvalidSlotName(String),
     /// Slot was not found in the context tree.
     SlotNotFound(String),
+    /// Context tree binary payload is corrupted or has an invalid structure.
+    CorruptedTree(String),
     /// JSON serialization or deserialization failure.
     Serialization(serde_json::Error),
 }
@@ -83,6 +85,7 @@ impl fmt::Display for CompilerError {
             }
             Self::InvalidSlotName(name) => write!(f, "invalid slot name: {name:?}"),
             Self::SlotNotFound(name) => write!(f, "context slot '{name}' not found"),
+            Self::CorruptedTree(msg) => write!(f, "corrupted context tree: {msg}"),
             Self::Serialization(err) => write!(f, "serialization error: {err}"),
         }
     }
@@ -283,6 +286,73 @@ impl ContextTree {
         }
 
         bytes
+    }
+
+    /// Parse and reconstruct a [`ContextTree`] from its canonical byte representation.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CompilerError> {
+        const MAGIC: &[u8] = b"tree:v1\0";
+        if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
+            return Err(CompilerError::CorruptedTree(
+                "invalid context tree magic header".to_string(),
+            ));
+        }
+
+        let mut offset = MAGIC.len();
+        let mut entries = BTreeMap::new();
+
+        while offset < bytes.len() {
+            if offset + 4 > bytes.len() {
+                return Err(CompilerError::CorruptedTree(
+                    "unexpected EOF reading slot name length".to_string(),
+                ));
+            }
+            let name_len = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            let entry_len = name_len + 32 + 1 + 8;
+            if offset + entry_len > bytes.len() {
+                return Err(CompilerError::CorruptedTree(
+                    "unexpected EOF reading tree entry payload".to_string(),
+                ));
+            }
+
+            let name_str = std::str::from_utf8(&bytes[offset..offset + name_len]).map_err(|e| {
+                CompilerError::CorruptedTree(format!("invalid UTF-8 in slot name: {e}"))
+            })?;
+            offset += name_len;
+
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+            let hash = ContentHash::from_bytes(hash_bytes);
+            offset += 32;
+
+            let kind_byte = bytes[offset];
+            offset += 1;
+            let kind = match kind_byte {
+                1 => EntryKind::Blob,
+                2 => EntryKind::Tree,
+                other => {
+                    return Err(CompilerError::CorruptedTree(format!(
+                        "unknown entry kind tag: {other}"
+                    )));
+                }
+            };
+
+            let mut size_arr = [0u8; 8];
+            size_arr.copy_from_slice(&bytes[offset..offset + 8]);
+            let size_bytes = u64::from_be_bytes(size_arr) as usize;
+            offset += 8;
+
+            let entry = TreeEntry::new(name_str, hash, kind, size_bytes)?;
+            entries.insert(entry.name.clone(), entry);
+        }
+
+        Ok(Self { entries })
     }
 
     /// Calculate the deterministic Merkle digest [`ContentHash`] of this tree.

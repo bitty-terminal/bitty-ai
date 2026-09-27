@@ -221,4 +221,30 @@ fn test_bridge_error_handling() {
             .unwrap()
             .contains("missing or invalid 'id' field")
     );
+
+    // Invalid TaskId deserialization rejected
+    let invalid_task_payload = serde_json::json!({
+        "draft": {
+            "id": "/invalid/starting/slash",
+            "title": "Title",
+            "description": "Desc",
+            "priority": 1,
+            "dependencies": []
+        },
+        "now_ms": 1000
+    });
+    let resp_str = bridge.dispatch("task.create", &invalid_task_payload.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(!resp.success);
+    assert!(resp.error.unwrap().contains("invalid"));
+
+    // Action record with exit_code exceeding i32 range rejected
+    let out_of_range_action = serde_json::json!({
+        "action_id": "act-invalid-exit",
+        "exit_code": 9_999_999_999_i64
+    });
+    let resp_str = bridge.dispatch("action.record", &out_of_range_action.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(!resp.success);
+    assert!(resp.error.unwrap().contains("32-bit"));
 }

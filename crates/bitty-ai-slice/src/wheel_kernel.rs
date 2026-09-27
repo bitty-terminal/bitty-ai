@@ -52,13 +52,34 @@ impl WheelKernel {
         let content_store = ContentStore::open(path.as_ref()).map_err(FacadeError::from)?;
         let task_engine = TaskEngine::open(path.as_ref()).map_err(FacadeError::from)?;
         let head_checkpoint = content_store.get_ref("HEAD").map_err(FacadeError::from)?;
+        let mut active_tree = ContextTree::new();
+        if let Some(ref head_hash) = head_checkpoint {
+            if let Some(checkpoint) = content_store
+                .get_checkpoint(head_hash)
+                .map_err(FacadeError::from)?
+            {
+                if let Some(ref tree_hash) = checkpoint.tree_hash {
+                    if let Some(blob_bytes) = content_store
+                        .get_blob(tree_hash)
+                        .map_err(FacadeError::from)?
+                    {
+                        active_tree =
+                            ContextTree::from_canonical_bytes(&blob_bytes).map_err(|e| {
+                                FacadeError::Wheel(format!(
+                                    "failed to decode active context tree: {e}"
+                                ))
+                            })?;
+                    }
+                }
+            }
+        }
 
         let action_engine = ActionEngine::new(spillover_config.clone());
 
         Ok(Self {
             content_store,
             task_engine,
-            active_tree: ContextTree::new(),
+            active_tree,
             action_engine,
             spillover_config,
             budget_config,
@@ -296,13 +317,14 @@ impl WheelKernel {
             .commit_checkpoint(draft)
             .map_err(FacadeError::from)?;
 
+        let mut refs_to_update = Vec::with_capacity(2);
         if let Some(b) = branch {
-            self.content_store
-                .update_ref(b, &checkpoint.id, now_ms)
-                .map_err(FacadeError::from)?;
+            refs_to_update.push((b, &checkpoint.id));
         }
+        refs_to_update.push(("HEAD", &checkpoint.id));
+
         self.content_store
-            .update_ref("HEAD", &checkpoint.id, now_ms)
+            .update_refs_atomic(&refs_to_update, now_ms)
             .map_err(FacadeError::from)?;
         self.head_checkpoint = Some(checkpoint.id);
 

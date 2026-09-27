@@ -320,6 +320,13 @@ fn test_kernel_persistence_across_reopen() {
         let history = kernel.log(5).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].rationale.why, "Persist");
+
+        // Merkle context tree slot restored from HEAD checkpoint blob
+        let slot = kernel
+            .get_slot("data.txt")
+            .unwrap()
+            .expect("slot restored on reopen");
+        assert_eq!(slot.as_slice(), b"durable payload");
     }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
