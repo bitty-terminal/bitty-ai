@@ -13,7 +13,7 @@ use bitty_ai_runtime::provider::ProviderTurn;
 use bitty_ai_runtime::stream::{StreamChunk, StreamSink, VecSink};
 
 use crate::chat_stream::{ChatCompletionStreamParser, ChatStreamDelta, ChatStreamError};
-use crate::journal_prototype::Journal;
+use crate::journal_prototype::{Journal, JournalError};
 use crate::snapshot_ingest::{SnapshotIngestError, SnapshotIngestRequest, ingest_snapshot};
 
 /// Unified error enum for the [`AiEngine`] facade.
@@ -24,7 +24,7 @@ pub enum FacadeError {
     /// Project snapshot ingestion or verification error.
     Snapshot(SnapshotIngestError),
     /// Transactional journal error.
-    Journal(String),
+    Journal(JournalError),
     /// Prompt layer assembly or validation error.
     Prompt(PromptError),
     /// Context or payload budget ceiling exceeded.
@@ -41,7 +41,7 @@ impl fmt::Display for FacadeError {
         match self {
             Self::Stream(err) => write!(f, "streaming error: {err}"),
             Self::Snapshot(err) => write!(f, "snapshot error: {err}"),
-            Self::Journal(msg) => write!(f, "journal error: {msg}"),
+            Self::Journal(err) => write!(f, "journal error: {err}"),
             Self::Prompt(err) => write!(f, "prompt error: {err}"),
             Self::BudgetExceeded { limit, actual } => {
                 write!(f, "budget ceiling exceeded: {actual} bytes > {limit} bytes")
@@ -61,6 +61,12 @@ impl From<ChatStreamError> for FacadeError {
 impl From<SnapshotIngestError> for FacadeError {
     fn from(err: SnapshotIngestError) -> Self {
         Self::Snapshot(err)
+    }
+}
+
+impl From<JournalError> for FacadeError {
+    fn from(err: JournalError) -> Self {
+        Self::Journal(err)
     }
 }
 
@@ -122,13 +128,25 @@ impl AiStreamSession {
         Ok(deltas)
     }
 
+    fn drain_eof_to_sink(&mut self) -> Result<(), FacadeError> {
+        let eof_deltas = self.parser.drain_eof().map_err(FacadeError::Stream)?;
+        for delta in &eof_deltas {
+            self.parser
+                .pipe_to_sink(delta, self.sink.as_mut(), &mut self.seq)
+                .map_err(FacadeError::Stream)?;
+        }
+        Ok(())
+    }
+
     /// Finalize the stream and obtain the consolidated [`ProviderTurn`].
-    pub fn finish(self) -> Result<ProviderTurn, FacadeError> {
+    pub fn finish(mut self) -> Result<ProviderTurn, FacadeError> {
+        self.drain_eof_to_sink()?;
         self.parser.finish().map_err(FacadeError::Stream)
     }
 
     /// Finalize the stream and obtain both the [`ProviderTurn`] and the underlying [`StreamSink`].
-    pub fn finish_with_sink(self) -> Result<(ProviderTurn, Box<dyn StreamSink>), FacadeError> {
+    pub fn finish_with_sink(mut self) -> Result<(ProviderTurn, Box<dyn StreamSink>), FacadeError> {
+        self.drain_eof_to_sink()?;
         let turn = self.parser.finish().map_err(FacadeError::Stream)?;
         Ok((turn, self.sink))
     }
@@ -211,7 +229,7 @@ impl AiEngine {
 
     /// Open a transactional SQLite journal at the specified path.
     pub fn open_journal(path: impl AsRef<Path>) -> Result<Journal, FacadeError> {
-        Journal::open(path.as_ref()).map_err(|e| FacadeError::Journal(e.to_string()))
+        Journal::open(path.as_ref()).map_err(FacadeError::Journal)
     }
 
     /// Create a new project snapshot ingestion engine.

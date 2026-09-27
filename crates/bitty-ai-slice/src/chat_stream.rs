@@ -115,111 +115,130 @@ impl ChatCompletionStreamParser {
         let mut deltas = Vec::new();
 
         for event in events {
-            if event.is_done() {
-                self.finished = true;
-                continue;
-            }
-
-            let data_str = event.data.trim();
-            if data_str.is_empty() {
-                continue;
-            }
-
-            let json: serde_json::Value = serde_json::from_str(data_str)
-                .map_err(|e| ChatStreamError::JsonParse(format!("{e}: '{data_str}'")))?;
-
-            // Extract content text delta
-            if let Some(content) = json
-                .pointer("/choices/0/delta/content")
-                .and_then(|c| c.as_str())
-            {
-                if !content.is_empty() {
-                    self.accumulated_text.push_str(content);
-                    deltas.push(ChatStreamDelta::Content(content.to_owned()));
-                }
-            }
-
-            // Extract tool call deltas
-            if let Some(tool_calls) = json
-                .pointer("/choices/0/delta/tool_calls")
-                .and_then(|t| t.as_array())
-            {
-                for tc in tool_calls {
-                    let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                    let id = tc.get("id").and_then(|s| s.as_str()).map(str::to_owned);
-                    let name = tc
-                        .pointer("/function/name")
-                        .and_then(|n| n.as_str())
-                        .map(str::to_owned);
-                    let arguments = tc
-                        .pointer("/function/arguments")
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-
-                    // Ensure accumulator exists for this index
-                    while self.accumulated_tool_calls.len() <= index {
-                        self.accumulated_tool_calls.push(ToolCallAccumulator {
-                            _index: self.accumulated_tool_calls.len(),
-                            id: None,
-                            name: String::new(),
-                            arguments: String::new(),
-                        });
-                    }
-
-                    let acc = &mut self.accumulated_tool_calls[index];
-                    if let Some(ref call_id) = id {
-                        acc.id = Some(call_id.clone());
-                    }
-                    if let Some(ref fn_name) = name {
-                        acc.name.push_str(fn_name);
-                    }
-                    if !arguments.is_empty() {
-                        acc.arguments.push_str(&arguments);
-                    }
-
-                    deltas.push(ChatStreamDelta::ToolCall {
-                        index,
-                        id,
-                        name,
-                        arguments,
-                    });
-                }
-            }
-
-            // Extract finish reason
-            if let Some(finish_reason) = json
-                .pointer("/choices/0/finish_reason")
-                .and_then(|r| r.as_str())
-            {
-                self.finished = true;
-                deltas.push(ChatStreamDelta::Finished {
-                    reason: finish_reason.to_owned(),
-                });
-            }
-
-            // Extract usage report
-            if let Some(usage_obj) = json.get("usage") {
-                let input_tokens = usage_obj
-                    .get("prompt_tokens")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0);
-                let output_tokens = usage_obj
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0);
-                let usage = ProviderUsage {
-                    input_tokens,
-                    output_tokens,
-                };
-                self.usage = Some(usage);
-                deltas.push(ChatStreamDelta::Usage(usage));
-            }
+            self.process_event(&event, &mut deltas)?;
         }
 
         Ok(deltas)
+    }
+
+    /// Drain any remaining unterminated event from the SSE parser at EOF and emit deltas.
+    pub fn drain_eof(&mut self) -> Result<Vec<ChatStreamDelta>, ChatStreamError> {
+        let mut deltas = Vec::new();
+        if let Some(event) = self.sse.finish()? {
+            self.process_event(&event, &mut deltas)?;
+        }
+        Ok(deltas)
+    }
+
+    fn process_event(
+        &mut self,
+        event: &bitty_ai_runtime::sse::SseEvent,
+        deltas: &mut Vec<ChatStreamDelta>,
+    ) -> Result<(), ChatStreamError> {
+        if event.is_done() {
+            self.finished = true;
+            return Ok(());
+        }
+
+        let data_str = event.data.trim();
+        if data_str.is_empty() {
+            return Ok(());
+        }
+
+        let json: serde_json::Value = serde_json::from_str(data_str)
+            .map_err(|e| ChatStreamError::JsonParse(format!("{e}: '{data_str}'")))?;
+
+        // Extract content text delta
+        if let Some(content) = json
+            .pointer("/choices/0/delta/content")
+            .and_then(|c| c.as_str())
+        {
+            if !content.is_empty() {
+                self.accumulated_text.push_str(content);
+                deltas.push(ChatStreamDelta::Content(content.to_owned()));
+            }
+        }
+
+        // Extract tool call deltas
+        if let Some(tool_calls) = json
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(|t| t.as_array())
+        {
+            for tc in tool_calls {
+                let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let id = tc.get("id").and_then(|s| s.as_str()).map(str::to_owned);
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned);
+                let arguments = tc
+                    .pointer("/function/arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+
+                // Ensure accumulator exists for this index
+                while self.accumulated_tool_calls.len() <= index {
+                    self.accumulated_tool_calls.push(ToolCallAccumulator {
+                        _index: self.accumulated_tool_calls.len(),
+                        id: None,
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                }
+
+                let acc = &mut self.accumulated_tool_calls[index];
+                if let Some(ref call_id) = id {
+                    acc.id = Some(call_id.clone());
+                }
+                if let Some(ref fn_name) = name {
+                    acc.name.push_str(fn_name);
+                }
+                if !arguments.is_empty() {
+                    acc.arguments.push_str(&arguments);
+                }
+
+                deltas.push(ChatStreamDelta::ToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                });
+            }
+        }
+
+        // Extract finish reason
+        if let Some(finish_reason) = json
+            .pointer("/choices/0/finish_reason")
+            .and_then(|r| r.as_str())
+        {
+            self.finished = true;
+            deltas.push(ChatStreamDelta::Finished {
+                reason: finish_reason.to_owned(),
+            });
+        }
+
+        // Extract usage report
+        if let Some(usage_obj) = json.get("usage") {
+            let input_tokens = usage_obj
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0);
+            let output_tokens = usage_obj
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0);
+            let usage = ProviderUsage {
+                input_tokens,
+                output_tokens,
+            };
+            self.usage = Some(usage);
+            deltas.push(ChatStreamDelta::Usage(usage));
+        }
+
+        Ok(())
     }
 
     /// Pipe a single content delta to a [`StreamSink`] as a sequenced Markdown [`Fragment`].
@@ -245,22 +264,7 @@ impl ChatCompletionStreamParser {
 
     /// Finalize stream processing and construct the consolidated [`ProviderTurn`].
     pub fn finish(mut self) -> Result<ProviderTurn, ChatStreamError> {
-        // Drain any unterminated event from the SSE parser
-        if let Some(event) = self.sse.finish()? {
-            if !event.is_done() {
-                let data_str = event.data.trim();
-                if !data_str.is_empty() {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                        if let Some(content) = json
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|c| c.as_str())
-                        {
-                            self.accumulated_text.push_str(content);
-                        }
-                    }
-                }
-            }
-        }
+        let _ = self.drain_eof()?;
 
         let mut tool_calls = Vec::new();
         for acc in self.accumulated_tool_calls {

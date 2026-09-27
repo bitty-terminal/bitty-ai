@@ -30,6 +30,28 @@ fn stream_session_drives_incremental_chunks_and_pipes_to_sink() {
 }
 
 #[test]
+fn stream_session_pipes_eof_flushed_content_to_sink_without_trailing_newline() {
+    let mut session = AiEngine::new_stream_session();
+
+    // Stream ends abruptly without the second newline delimiter
+    let stream_bytes =
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"Incomplete delimiter\"}}]}\n";
+
+    let deltas = session
+        .feed_chunk(stream_bytes)
+        .expect("feed chunk success");
+    assert!(deltas.is_empty(), "event is buffered in SSE parser");
+
+    let (turn, sink) = session.finish_with_sink().expect("finish stream");
+    assert_eq!(turn.text, "Incomplete delimiter");
+    assert_eq!(sink.chunks().len(), 1);
+    assert_eq!(
+        String::from_utf8_lossy(&sink.chunks()[0].fragment.bytes),
+        "Incomplete delimiter"
+    );
+}
+
+#[test]
 fn engine_assembles_canonical_prompt_layers() {
     let snapshot = PromptSnapshot {
         core_version: "bitty-core-prompt@1".to_owned(),
