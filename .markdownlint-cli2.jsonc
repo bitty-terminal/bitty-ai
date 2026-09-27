@@ -8,6 +8,7 @@
   },
   "globs": ["**/*.md"],
   "ignores": [
+    "**/node_modules/**",
     "node_modules",
     "target",
     "dist",
@@ -15,5 +16,7 @@
     "site",
     ".worktrees",
     "docs",
+    "plugins",
+    "recording",
   ],
 }
