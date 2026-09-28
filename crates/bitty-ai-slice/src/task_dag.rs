@@ -340,6 +340,50 @@ pub struct TaskNode {
     pub updated_at_ms: u64,
 }
 
+/// An enriched view of a task record in the DAG including its inlined prerequisite dependencies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskView {
+    /// Inner task node metadata.
+    #[serde(flatten)]
+    pub task: TaskNode,
+    /// Prerequisite task IDs that must succeed before this task becomes ready.
+    pub dependencies: Vec<TaskId>,
+}
+
+impl TaskView {
+    /// Create a new task view from a task node and its dependencies.
+    #[must_use]
+    pub fn new(task: TaskNode, dependencies: Vec<TaskId>) -> Self {
+        Self { task, dependencies }
+    }
+
+    /// Access the underlying task node.
+    #[must_use]
+    pub fn task(&self) -> &TaskNode {
+        &self.task
+    }
+
+    /// Access the prerequisite dependencies.
+    #[must_use]
+    pub fn dependencies(&self) -> &[TaskId] {
+        &self.dependencies
+    }
+
+    /// Consume the view and return the task node and its dependencies.
+    #[must_use]
+    pub fn into_parts(self) -> (TaskNode, Vec<TaskId>) {
+        (self.task, self.dependencies)
+    }
+}
+
+impl std::ops::Deref for TaskView {
+    type Target = TaskNode;
+
+    fn deref(&self) -> &Self::Target {
+        &self.task
+    }
+}
+
 /// Persistent, transactional Task DAG engine.
 pub struct TaskEngine {
     conn: Connection,
@@ -1116,6 +1160,49 @@ impl TaskEngine {
             tasks.push(r?);
         }
         Ok(tasks)
+    }
+
+    /// Retrieve an enriched view of a task including its inlined prerequisite dependencies.
+    pub fn get_task_view(&self, id: &TaskId) -> Result<TaskView, TaskEngineError> {
+        let task = self.get_task(id)?;
+        let dependencies = Self::query_prerequisites_on_conn(&self.conn, id)?;
+        Ok(TaskView::new(task, dependencies))
+    }
+
+    /// List all tasks in the store with their inlined prerequisite dependencies.
+    ///
+    /// Executes in O(|V| + |E|) time using a single query on tasks and a single query
+    /// on dependencies, avoiding N+1 round trips.
+    pub fn list_task_views(&self) -> Result<Vec<TaskView>, TaskEngineError> {
+        let tasks = self.list_tasks()?;
+        if tasks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut deps_map: HashMap<TaskId, Vec<TaskId>> = HashMap::with_capacity(tasks.len());
+        let mut stmt = self.conn.prepare(
+            "SELECT prerequisite_id, dependent_id FROM task_dependencies ORDER BY prerequisite_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for r in rows {
+            let (prereq_str, dep_str) = r?;
+            if let (Ok(prereq), Ok(dep)) = (TaskId::new(&prereq_str), TaskId::new(&dep_str)) {
+                deps_map.entry(dep).or_default().push(prereq);
+            }
+        }
+
+        let views = tasks
+            .into_iter()
+            .map(|task| {
+                let dependencies = deps_map.remove(&task.id).unwrap_or_default();
+                TaskView::new(task, dependencies)
+            })
+            .collect();
+
+        Ok(views)
     }
 
     /// Retrieve direct prerequisite task IDs for a task.

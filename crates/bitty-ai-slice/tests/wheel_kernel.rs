@@ -331,3 +331,55 @@ fn test_kernel_persistence_across_reopen() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_kernel_task_view_dependencies() {
+    let mut kernel = WheelKernel::open_in_memory().expect("kernel opens");
+
+    let t1 = TaskId::new("kernel-task-a").unwrap();
+    let t2 = TaskId::new("kernel-task-b").unwrap();
+
+    kernel
+        .create_task(
+            TaskDraft {
+                id: t1.clone(),
+                title: "Task A".to_string(),
+                description: "".to_string(),
+                priority: 10,
+                dependencies: vec![],
+            },
+            1000,
+        )
+        .unwrap();
+
+    kernel
+        .create_task(
+            TaskDraft {
+                id: t2.clone(),
+                title: "Task B".to_string(),
+                description: "".to_string(),
+                priority: 5,
+                dependencies: vec![t1.clone()],
+            },
+            1010,
+        )
+        .unwrap();
+
+    let view_a = kernel.get_task_view(&t1).unwrap().expect("view A exists");
+    assert_eq!(view_a.id, t1);
+    assert!(view_a.dependencies.is_empty());
+
+    let view_b = kernel.get_task_view(&t2).unwrap().expect("view B exists");
+    assert_eq!(view_b.id, t2);
+    assert_eq!(view_b.dependencies, vec![t1.clone()]);
+
+    let views = kernel.list_task_views().unwrap();
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0].id, t1);
+    assert!(views[0].dependencies.is_empty());
+    assert_eq!(views[1].id, t2);
+    assert_eq!(views[1].dependencies, vec![t1]);
+
+    let non_existent = TaskId::new("unknown-id").unwrap();
+    assert!(kernel.get_task_view(&non_existent).unwrap().is_none());
+}

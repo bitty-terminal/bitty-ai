@@ -248,3 +248,130 @@ fn test_bridge_error_handling() {
     assert!(!resp.success);
     assert!(resp.error.unwrap().contains("32-bit"));
 }
+
+#[test]
+fn test_bridge_task_dependencies_inlined() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+
+    // 1. Create root task (empty dependencies)
+    let create_root = serde_json::json!({
+        "id": "bridge-root",
+        "title": "Root Task",
+        "description": "Scaffolding",
+        "priority": 10,
+        "dependencies": [],
+        "now_ms": 1000
+    });
+    let resp_str = bridge.dispatch("task.create", &create_root.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+
+    // 2. Create child task 1
+    let create_child1 = serde_json::json!({
+        "id": "bridge-child-1",
+        "title": "Child Task 1",
+        "description": "Depends on root",
+        "priority": 5,
+        "dependencies": ["bridge-root"],
+        "now_ms": 1010
+    });
+    let resp_str = bridge.dispatch("task.create", &create_child1.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+
+    // 3. Create child task 2
+    let create_child2 = serde_json::json!({
+        "id": "bridge-child-2",
+        "title": "Child Task 2",
+        "description": "Depends on root",
+        "priority": 5,
+        "dependencies": ["bridge-root"],
+        "now_ms": 1020
+    });
+    let resp_str = bridge.dispatch("task.create", &create_child2.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+
+    // 4. Create join leaf task (depends on child 1 and child 2)
+    let create_leaf = serde_json::json!({
+        "id": "bridge-leaf",
+        "title": "Leaf Task",
+        "description": "Diamond join",
+        "priority": 1,
+        "dependencies": ["bridge-child-1", "bridge-child-2"],
+        "now_ms": 1030
+    });
+    let resp_str = bridge.dispatch("task.create", &create_leaf.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+
+    // 5. Query task.get for root
+    let get_root = serde_json::json!({ "id": "bridge-root" });
+    let resp_str = bridge.dispatch("task.get", &get_root.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+    let root_data = resp.data.unwrap();
+    assert_eq!(root_data["id"], "bridge-root");
+    assert_eq!(root_data["title"], "Root Task");
+    assert_eq!(root_data["status"], "ready");
+    assert_eq!(root_data["dependencies"], serde_json::json!([]));
+
+    // 6. Query task.get for leaf (inlined multiple dependencies)
+    let get_leaf = serde_json::json!({ "id": "bridge-leaf" });
+    let resp_str = bridge.dispatch("task.get", &get_leaf.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+    let leaf_data = resp.data.unwrap();
+    assert_eq!(leaf_data["id"], "bridge-leaf");
+    assert_eq!(leaf_data["status"], "pending");
+    assert_eq!(
+        leaf_data["dependencies"],
+        serde_json::json!(["bridge-child-1", "bridge-child-2"])
+    );
+
+    // 7. Query task.get_view alias
+    let resp_str = bridge.dispatch("task.get_view", &get_leaf.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+    assert_eq!(
+        resp.data.unwrap()["dependencies"],
+        serde_json::json!(["bridge-child-1", "bridge-child-2"])
+    );
+
+    // 8. Query task.get for nonexistent task -> returns data: null
+    let get_missing = serde_json::json!({ "id": "nonexistent" });
+    let resp_str = bridge.dispatch("task.get", &get_missing.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+    assert!(resp.data.is_none() || resp.data.unwrap().is_null());
+
+    // 9. Query task.list -> all tasks have dependencies inlined
+    let resp_str = bridge.dispatch("task.list", "{}");
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+    let list = resp.data.unwrap();
+    let tasks = list.as_array().expect("array of tasks");
+    assert_eq!(tasks.len(), 4);
+
+    assert_eq!(tasks[0]["id"], "bridge-root");
+    assert_eq!(tasks[0]["dependencies"], serde_json::json!([]));
+
+    assert_eq!(tasks[1]["id"], "bridge-child-1");
+    assert_eq!(tasks[1]["dependencies"], serde_json::json!(["bridge-root"]));
+
+    assert_eq!(tasks[2]["id"], "bridge-child-2");
+    assert_eq!(tasks[2]["dependencies"], serde_json::json!(["bridge-root"]));
+
+    assert_eq!(tasks[3]["id"], "bridge-leaf");
+    assert_eq!(
+        tasks[3]["dependencies"],
+        serde_json::json!(["bridge-child-1", "bridge-child-2"])
+    );
+
+    // 10. Query task.list_views alias
+    let resp_str = bridge.dispatch("task.list_views", "{}");
+    let resp: BridgeResponse = serde_json::from_str(&resp_str).unwrap();
+    assert!(resp.success);
+    let views_list = resp.data.unwrap();
+    assert_eq!(views_list.as_array().unwrap().len(), 4);
+}

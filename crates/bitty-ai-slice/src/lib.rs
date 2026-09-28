@@ -106,6 +106,8 @@ pub use snapshot_ingest::{
     SnapshotIngestRequest, ingest_compiled_turn, ingest_snapshot, project_layer_text,
     prompt_snapshot_with_project, snapshot_digest_hex,
 };
-pub use task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskStatus};
+pub use task_dag::{
+    TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskStatus, TaskView,
+};
 pub use wheel_bridge::{BridgeResponse, WheelBridge};
 pub use wheel_kernel::{MAX_RECENT_ACTIONS, WheelKernel};

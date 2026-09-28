@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use bitty_ai_slice::{
-    AiEngine, ContentHash, TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskStatus,
+    AiEngine, ContentHash, TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskStatus, TaskView,
 };
 
 #[test]
@@ -546,6 +546,115 @@ fn running_or_terminal_task_rejects_new_dependency() -> Result<(), TaskEngineErr
     assert!(matches!(
         err,
         Err(TaskEngineError::InvalidStatusTransition { .. })
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn task_view_dependencies_inlining_and_serde() -> Result<(), TaskEngineError> {
+    let mut engine = TaskEngine::open_in_memory()?;
+
+    let t1 = TaskId::new("task-root")?;
+    let t2 = TaskId::new("task-mid-a")?;
+    let t3 = TaskId::new("task-mid-b")?;
+    let t4 = TaskId::new("task-leaf")?;
+
+    engine.create_task(
+        TaskDraft {
+            id: t1.clone(),
+            title: "Root".to_string(),
+            description: "No deps".to_string(),
+            priority: 10,
+            dependencies: vec![],
+        },
+        1000,
+    )?;
+
+    engine.create_task(
+        TaskDraft {
+            id: t2.clone(),
+            title: "Mid A".to_string(),
+            description: "Depends on root".to_string(),
+            priority: 5,
+            dependencies: vec![t1.clone()],
+        },
+        1010,
+    )?;
+
+    engine.create_task(
+        TaskDraft {
+            id: t3.clone(),
+            title: "Mid B".to_string(),
+            description: "Depends on root".to_string(),
+            priority: 5,
+            dependencies: vec![t1.clone()],
+        },
+        1020,
+    )?;
+
+    engine.create_task(
+        TaskDraft {
+            id: t4.clone(),
+            title: "Leaf".to_string(),
+            description: "Diamond join".to_string(),
+            priority: 1,
+            dependencies: vec![t2.clone(), t3.clone()],
+        },
+        1030,
+    )?;
+
+    // 1. Single task view retrieval (get_task_view)
+    let view_root = engine.get_task_view(&t1)?;
+    assert_eq!(view_root.id, t1);
+    assert_eq!(view_root.title, "Root");
+    assert_eq!(view_root.status, TaskStatus::Ready);
+    assert!(view_root.dependencies.is_empty());
+    assert_eq!(view_root.dependencies(), &[]);
+
+    let view_leaf = engine.get_task_view(&t4)?;
+    assert_eq!(view_leaf.id, t4);
+    assert_eq!(view_leaf.title, "Leaf");
+    assert_eq!(view_leaf.status, TaskStatus::Pending);
+    assert_eq!(view_leaf.dependencies, vec![t2.clone(), t3.clone()]);
+
+    // 2. Deref semantics
+    let inner_ref: &bitty_ai_slice::TaskNode = &view_leaf;
+    assert_eq!(inner_ref.priority, 1);
+    assert_eq!(view_leaf.created_at_ms, 1030);
+
+    // 3. Batch list retrieval (list_task_views)
+    let views = engine.list_task_views()?;
+    assert_eq!(views.len(), 4);
+    assert_eq!(views[0].id, t1);
+    assert!(views[0].dependencies.is_empty());
+    assert_eq!(views[1].id, t2);
+    assert_eq!(views[1].dependencies, vec![t1.clone()]);
+    assert_eq!(views[2].id, t3);
+    assert_eq!(views[2].dependencies, vec![t1.clone()]);
+    assert_eq!(views[3].id, t4);
+    assert_eq!(views[3].dependencies, vec![t2.clone(), t3.clone()]);
+
+    // 4. JSON Serialization & Deserialization round-trip
+    let json_val = serde_json::to_value(&view_leaf).expect("serialize TaskView to Value");
+    assert_eq!(json_val["id"], "task-leaf");
+    assert_eq!(json_val["title"], "Leaf");
+    assert_eq!(json_val["status"], "pending");
+    assert_eq!(json_val["priority"], 1);
+    assert_eq!(
+        json_val["dependencies"],
+        serde_json::json!(["task-mid-a", "task-mid-b"])
+    );
+
+    let roundtrip: TaskView =
+        serde_json::from_value(json_val).expect("deserialize TaskView from Value");
+    assert_eq!(roundtrip, view_leaf);
+
+    // 5. Non-existent task returns TaskNotFound
+    let non_existent = TaskId::new("does-not-exist")?;
+    assert!(matches!(
+        engine.get_task_view(&non_existent),
+        Err(TaskEngineError::TaskNotFound(_))
     ));
 
     Ok(())
