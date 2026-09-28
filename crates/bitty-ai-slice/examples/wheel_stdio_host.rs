@@ -68,7 +68,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut bridge = match db_path {
         Some(ref path) => {
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
             }
             eprintln!(
                 "[wheel-stdio-host] Opened persistent database at {}",
@@ -95,7 +97,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("[wheel-stdio-host] Error reading stdin: {e}");
-                break;
+                return Err(Box::new(e));
             }
         };
 
