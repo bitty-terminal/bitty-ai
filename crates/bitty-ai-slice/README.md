@@ -233,6 +233,25 @@ cargo test -p bitty-ai-slice
 - `tests/facade.rs` (4 tests): unified facade capabilities covering incremental
   streaming with fragmentation handling and sink piping, prompt assembly,
   snapshot verification/ingestion, and SQLite journal operations.
+- `tests/content_store.rs` (8 tests): content-addressed blob store, structured
+  `Rationale` intent/observation protocol, commit DAG chaining, reference
+  management, DAG log traversal, and lowest common ancestor (`merge_base`)
+  calculation.
+- `tests/task_dag.rs` (12 tests): graph-theoretic task DAG engine, lifecycle state
+  machine, monotonic generation fencing, cascade readiness, cycle detection,
+  Kahn's topological sort, inlined `TaskView` dependency batch retrieval, flexible
+  JSON deserialization, and SQLite persistence.
+- `tests/context_compiler.rs` (9 tests): three-zone context compiler, canonical
+  Merkle context tree hashing (`tree:v1\0`), 3-way semantic slot merging with
+  conflict detection, prefix cache key stability, and multi-tier budget reduction.
+- `tests/action_protocol.rs` (6 tests): standardized action intent and outcome
+  protocol, content-addressed auto-spillover (> 4 KiB), bounded UTF-8 preview
+  generation, and Zone 3 structured observation formatting.
+- `tests/wheel_kernel.rs` (9 tests): unified WheelKernel orchestrator coordinating
+  content store, task engine, Merkle context tree, action auto-spillover pipeline,
+  and three-zone context compiler within atomic SQLite transactions.
+- `tests/wheel_bridge.rs` (7 tests): safe zero-unsafe JSON-RPC command dispatch over
+  byte buffers for Lua plugin and stdio host integration.
 
 ## Examples
 
@@ -244,4 +263,14 @@ cargo test -p bitty-ai-slice
   ```bash
   export OPENROUTER_API_KEY="sk-or-v1-..."
   cargo run -p bitty-ai-slice --example live_chat -- "Say hello from Bitty!"
+  ```
+
+- `examples/wheel_stdio_host.rs` (AI-0170): Line-delimited JSON-RPC stdio host runner
+  for `WheelBridge`. Exposes the full WheelKernel over stdin/stdout with optional
+  persistent SQLite database (`--db <path>`) or in-memory ephemeral store, dual-format
+  command parsing, stderr-isolated diagnostic logging, and resilient `deserialize_task_deps`
+  deserialization.
+
+  ```bash
+  cargo run -p bitty-ai-slice --example wheel_stdio_host -- --db wheel.db
   ```
