@@ -659,3 +659,39 @@ fn task_view_dependencies_inlining_and_serde() -> Result<(), TaskEngineError> {
 
     Ok(())
 }
+
+#[test]
+fn task_draft_and_view_flexible_deserialization() {
+    // 1. Minimal JSON with only id and title
+    let minimal = r#"{"id": "t1", "title": "Minimal Task"}"#;
+    let draft1: TaskDraft = serde_json::from_str(minimal).expect("deserialize minimal TaskDraft");
+    assert_eq!(draft1.id.as_str(), "t1");
+    assert_eq!(draft1.title, "Minimal Task");
+    assert_eq!(draft1.description, "");
+    assert_eq!(draft1.priority, 0);
+    assert!(draft1.dependencies.is_empty());
+
+    // 2. Empty map for dependencies (e.g. Lua `{}` serialization)
+    let lua_empty_map = r#"{"id": "t2", "title": "Lua Task", "dependencies": {}}"#;
+    let draft2: TaskDraft =
+        serde_json::from_str(lua_empty_map).expect("deserialize Lua empty table TaskDraft");
+    assert_eq!(draft2.id.as_str(), "t2");
+    assert!(draft2.dependencies.is_empty());
+
+    // 3. Explicit sequence
+    let seq_deps = r#"{"id": "t3", "title": "Seq Task", "dependencies": ["t1", "t2"]}"#;
+    let draft3: TaskDraft = serde_json::from_str(seq_deps).expect("deserialize sequence TaskDraft");
+    assert_eq!(draft3.dependencies.len(), 2);
+    assert_eq!(draft3.dependencies[0].as_str(), "t1");
+    assert_eq!(draft3.dependencies[1].as_str(), "t2");
+
+    // 4. Null dependencies
+    let null_deps = r#"{"id": "t4", "title": "Null Task", "dependencies": null}"#;
+    let draft4: TaskDraft = serde_json::from_str(null_deps).expect("deserialize null TaskDraft");
+    assert!(draft4.dependencies.is_empty());
+
+    // 5. Non-empty map for dependencies fails closed
+    let non_empty_map = r#"{"id": "t5", "title": "Invalid Task", "dependencies": {"key": "val"}}"#;
+    let res: Result<TaskDraft, _> = serde_json::from_str(non_empty_map);
+    assert!(res.is_err());
+}
