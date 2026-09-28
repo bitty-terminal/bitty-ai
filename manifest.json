@@ -4,10 +4,10 @@
   "carryctx_version": "0.11.6",
   "schema_version": 18,
   "project_id": "01M2DGG52V0TY9M4DW39P2AWZ8",
-  "export_id": "01M3KX3VDEFJNT70YBJXDWN04Z",
-  "created_at": "2026-09-28T11:41:29.902726573+00:00",
+  "export_id": "01M3KZG1TJM3NENV6EGBARK9Q3",
+  "created_at": "2026-09-28T12:23:06.834866736+00:00",
   "parents": [
-    "01M3KX03XH276699KG2CJYWJHG"
+    "01M3KX3VDEFJNT70YBJXDWN04Z"
   ],
   "sequences": {
     "display_id_AI": 172,
@@ -23,7 +23,7 @@
     "checkpoint_corrections": 0,
     "checkpoints": 314,
     "decisions": 4,
-    "events": 3886,
+    "events": 3887,
     "graph_edges": 106,
     "graph_nodes": 48,
     "handoffs": 0,
