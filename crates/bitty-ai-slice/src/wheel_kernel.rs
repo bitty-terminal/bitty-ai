@@ -15,7 +15,7 @@ use crate::context_compiler::{
     CompiledContext, CompilerBudgetConfig, ContextCompiler, ContextTree, EntryKind, TreeEntry,
 };
 use crate::facade::{AiStreamSession, FacadeError};
-use crate::task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode};
+use crate::task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskView};
 
 /// Maximum retained uncollapsed action outcomes in memory for Zone 3 compilation (64).
 pub const MAX_RECENT_ACTIONS: usize = 64;
@@ -140,6 +140,22 @@ impl WheelKernel {
     /// List all tasks currently managed in the DAG.
     pub fn list_tasks(&self) -> Result<Vec<TaskNode>, FacadeError> {
         self.task_engine.list_tasks().map_err(FacadeError::from)
+    }
+
+    /// Retrieve an enriched view of a task including its inlined prerequisite dependencies.
+    pub fn get_task_view(&self, id: &TaskId) -> Result<Option<TaskView>, FacadeError> {
+        match self.task_engine.get_task_view(id) {
+            Ok(view) => Ok(Some(view)),
+            Err(TaskEngineError::TaskNotFound(_)) => Ok(None),
+            Err(e) => Err(FacadeError::from(e)),
+        }
+    }
+
+    /// List all tasks currently managed in the DAG with inlined prerequisite dependencies.
+    pub fn list_task_views(&self) -> Result<Vec<TaskView>, FacadeError> {
+        self.task_engine
+            .list_task_views()
+            .map_err(FacadeError::from)
     }
 
     /// Set or clear the active task driving Zone 2 compilation.

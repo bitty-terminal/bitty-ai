@@ -147,17 +147,17 @@ impl WheelBridge {
                     .map_err(|e| e.to_string())?;
                 serde_json::to_value(task).map_err(|e| e.to_string())
             }
-            "task.get" => {
+            "task.get" | "task.get_view" => {
                 let id_str = payload
                     .get("id")
                     .and_then(|v| v.as_str())
                     .ok_or("missing or invalid 'id' field")?;
                 let id = TaskId::new(id_str).map_err(|e| e.to_string())?;
-                let task = self.kernel.get_task(&id).map_err(|e| e.to_string())?;
+                let task = self.kernel.get_task_view(&id).map_err(|e| e.to_string())?;
                 serde_json::to_value(task).map_err(|e| e.to_string())
             }
-            "task.list" => {
-                let tasks = self.kernel.list_tasks().map_err(|e| e.to_string())?;
+            "task.list" | "task.list_views" => {
+                let tasks = self.kernel.list_task_views().map_err(|e| e.to_string())?;
                 serde_json::to_value(tasks).map_err(|e| e.to_string())
             }
             "task.set_active" => {
