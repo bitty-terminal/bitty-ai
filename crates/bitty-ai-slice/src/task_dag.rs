@@ -14,6 +14,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::content_store::ContentHash;
@@ -298,6 +299,61 @@ impl fmt::Display for TaskStatus {
     }
 }
 
+fn deserialize_task_deps<'de, D>(deserializer: D) -> Result<Vec<TaskId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TaskDepsVisitor;
+
+    impl<'de> Visitor<'de> for TaskDepsVisitor {
+        type Value = Vec<TaskId>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a sequence of task IDs, an empty map, or null")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some(elem) = seq.next_element()? {
+                list.push(elem);
+            }
+            Ok(list)
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let entry: Option<(String, de::IgnoredAny)> = map.next_entry()?;
+            if let Some((key, _)) = entry {
+                return Err(de::Error::custom(format!(
+                    "expected empty map or sequence for dependencies, found map with key '{key}'"
+                )));
+            }
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    deserializer.deserialize_any(TaskDepsVisitor)
+}
+
 /// Specification for creating a new task in the DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDraft {
@@ -306,10 +362,13 @@ pub struct TaskDraft {
     /// Short descriptive title.
     pub title: String,
     /// Detailed description or acceptance criteria.
+    #[serde(default)]
     pub description: String,
     /// Scheduling priority (higher values are executed earlier).
+    #[serde(default)]
     pub priority: i32,
     /// Initial prerequisite task IDs.
+    #[serde(default, deserialize_with = "deserialize_task_deps")]
     pub dependencies: Vec<TaskId>,
 }
 
@@ -347,6 +406,7 @@ pub struct TaskView {
     #[serde(flatten)]
     pub task: TaskNode,
     /// Prerequisite task IDs that must succeed before this task becomes ready.
+    #[serde(default, deserialize_with = "deserialize_task_deps")]
     pub dependencies: Vec<TaskId>,
 }
 
