@@ -250,7 +250,7 @@ cargo test -p bitty-ai-slice
 - `tests/wheel_kernel.rs` (9 tests): unified WheelKernel orchestrator coordinating
   content store, task engine, Merkle context tree, action auto-spillover pipeline,
   and three-zone context compiler within atomic SQLite transactions.
-- `tests/wheel_bridge.rs` (7 tests): safe zero-unsafe JSON-RPC command dispatch over
+- `tests/wheel_bridge.rs` (7 tests): safe zero-unsafe command dispatch over
   byte buffers for Lua plugin and stdio host integration.
 
 ## Examples
@@ -265,11 +265,12 @@ cargo test -p bitty-ai-slice
   cargo run -p bitty-ai-slice --example live_chat -- "Say hello from Bitty!"
   ```
 
-- `examples/wheel_stdio_host.rs` (AI-0170): Line-delimited JSON-RPC stdio host runner
-  for `WheelBridge`. Exposes the full WheelKernel over stdin/stdout with optional
-  persistent SQLite database (`--db <path>`) or in-memory ephemeral store, dual-format
-  command parsing, stderr-isolated diagnostic logging, and resilient `deserialize_task_deps`
-  deserialization.
+- `examples/wheel_stdio_host.rs` (AI-0170): Line-delimited command/payload stdio
+  host runner for `WheelBridge`. Exposes the full WheelKernel over stdin/stdout with
+  optional persistent SQLite database (`--db <path>`) or in-memory ephemeral store,
+  dual-format command parsing (`{"command": "...", "payload": ...}` or space-delimited
+  `command payload_json`), stderr-isolated diagnostic logging, and resilient
+  `deserialize_task_deps` deserialization.
 
   ```bash
   cargo run -p bitty-ai-slice --example wheel_stdio_host -- --db wheel.db
