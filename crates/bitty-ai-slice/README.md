@@ -48,6 +48,7 @@ decide no open register entry.
 
 ```text
 bridge     Generic host boundary composing real bitty-ipc primitives; protocol-identity -> client_id binding rule; unknown methods fail closed
+ai_contrib AI capability registration (CTX-0916 S6, AI-0172): AI family/ceiling contributions against the Core typed catalogs plus the canonical provider-credential adapter; registered at LiveBittyHost construction
 error      Typed fail-closed slice errors (unsupported method, consent, budget and bound violations)
 fake_host  Deterministic FakeHost double mirroring bitty dispatch, consent, and result shapes (BII-09)
 harness    Fixtures adapting real IPC snapshots to real runtime inputs with scripted provider
@@ -72,6 +73,14 @@ wheel_bridge   Boundary plane bridge (AI-0167): zero-unsafe JSON-RPC command dis
   checkout with `just pin-drift` (`scripts/pin-drift.sh`); it is local-only by
   default and documents the bump checklist in its header. It is intentionally
   excluded from `just check`, which must not require network access.
+- `bitty-package` and `bitty-plugin-host` via pinned Git revision
+  (`271d662ba7445f0c963d86f01df63a75bcd81fa1`, the CTX-0916 S5 merge) for the
+  `ai_contrib` registration (AI-0172, DEC-0100): the slice contributes the AI
+  capability families, role ceilings, and provider-credential adapter against
+  the real Core typed catalogs. `bitty-ai-runtime` stays std-only.
+  `bitty-plugin-host` transitively pulls `bitty-lua` (hence the `phodopus` Git
+  source allowlisted in `deny.toml`) plus `ed25519-dalek`, `vte`, and
+  `miniz_oxide` from crates.io.
 - `rusqlite` `=0.40.2`, `default-features = false`, `features = ["bundled"]`,
   for the `journal_prototype` experiment only. The dependency review (AI-0049
   PX-0298) covers supply-chain breadth, MIT licensing, Rust 1.85 fit, and
@@ -88,8 +97,12 @@ Swapping hosts is mechanical: replace the construction site only; callers
 keep calling the same trait methods.
 
 Live wiring is explicitly out of scope here: the harness path contains no
-code that connects to a real terminal, process, PTY, socket, or network peer
-(no `std::process`, async runtime, or IPC transport). `LiveBittyHost` carries
+code that connects to a real terminal, PTY, socket, or network peer (no
+async runtime or IPC transport). Process spawn appears in exactly one
+bounded path: the `ai_contrib` credential-command runner (CTX-0916 S6,
+AI-0172), a direct shell-free spawn with null stdin, discarded stderr, and
+a 4096-byte output cap whose errors quote program names only.
+`LiveBittyHost` carries
 only an injectable provider seam (`fn` pointers), server-evaluated scopes, and
 the real consent ledger; tests use canned providers as mapping proof and claim
 no live data. Every operation takes caller-supplied `now_ms`. The
@@ -202,6 +215,11 @@ cargo test -p bitty-ai-slice
 - `tests/host_conformance.rs` (shared, FakeHost + LiveBittyHost): dispatch
   prefix order, consent attribution, and `ExecutionResult`/`Unknown`
   reconcile semantics against the real `bitty-ipc` shapes.
+- `tests/ai_registration.rs` (4 tests, AI-0172): CTX-0916 S6 registration —
+  AI family registration with exact polarity and negatives, Commander /
+  Implementer ceiling contributions with Tester / Reviewer leak-freedom, the
+  provider-credential exclusive-or / narrow-only / names-only semantics, and
+  the `from_binding` extension-load wiring proof.
 - `tests/pinned_surface.rs` (6 tests): the pinned `bitty-ipc` contract the
   mirror relies on (`AI-0081` window `be6e63c` -> `cfeffa2`): set-based
   `validate_wire_version` plus `negotiate_wire_version` selection and
