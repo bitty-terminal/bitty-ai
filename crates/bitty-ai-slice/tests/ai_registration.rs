@@ -385,6 +385,66 @@ fn provider_credential_exclusive_or_narrow_only() {
     assert!(check_provider_override(&base, &renamed).is_err());
 }
 
+// ── credential runner hardening (CodeRabbit CWE-400, PR #320) ───────────────
+// Unix-only: needs `sh` plus `head`/`yes`/`printf`. The runner itself is
+// portable; only the fixture commands are platform-specific.
+
+#[cfg(unix)]
+#[test]
+fn credential_cmd_discards_stderr_and_caps_stdout() {
+    use bitty_ai_slice::MAX_CREDENTIAL_CMD_OUTPUT_BYTES;
+    use bitty_plugin_host::PluginError;
+
+    // 1 MiB of stderr with a small stdout succeeds: stderr is discarded at
+    // the OS level, so volume there can neither block the child past pipe
+    // capacity nor linger in memory. (Retaining stderr, as before, would
+    // deadlock here with the parent blocked reading stdout.)
+    let quiet = execute_credential_cmd(
+        "sh",
+        &[
+            "-c".to_string(),
+            "head -c 1048576 /dev/zero >&2; printf ok-value".to_string(),
+        ],
+    )
+    .expect("stderr must be discarded");
+    assert_eq!(quiet, "ok-value");
+
+    // Exact-bound stdout (4096 bytes, no NULs) is accepted whole.
+    let exact = execute_credential_cmd("sh", &["-c".to_string(), "printf '%4096s' x".to_string()])
+        .expect("cap-sized output must pass");
+    assert_eq!(exact.len(), MAX_CREDENTIAL_CMD_OUTPUT_BYTES);
+
+    // Oversized stdout (8 KiB of marker lines) denies bounded: at most
+    // cap-plus-one bytes are ever retained, and the diagnostic quotes the
+    // program only — no payload bytes leak into the error.
+    let err = execute_credential_cmd(
+        "sh",
+        &[
+            "-c".to_string(),
+            "yes CREDENTIAL-MARKER | head -c 8192".to_string(),
+        ],
+    )
+    .expect_err("oversize stdout must deny");
+    let text = err.to_string();
+    match err {
+        PluginError::LimitExceeded {
+            field,
+            limit,
+            actual,
+        } => {
+            assert_eq!(field, "api_key_cmd.output");
+            assert_eq!(limit, MAX_CREDENTIAL_CMD_OUTPUT_BYTES);
+            assert_eq!(actual, MAX_CREDENTIAL_CMD_OUTPUT_BYTES + 1);
+        }
+        other => panic!("expected LimitExceeded, got {other}"),
+    }
+    assert!(text.contains("api_key_cmd"), "{text}");
+    assert!(
+        !text.contains("CREDENTIAL-MARKER"),
+        "payload leaked: {text}"
+    );
+}
+
 // ── wiring: from_binding carries the AI extension set (Q1) ───────────────────
 
 #[test]

@@ -470,40 +470,71 @@ pub fn resolve_provider_credential_live(
 
 /// Execute a credential command and return its output value.
 ///
-/// Same shell-free, bounded, names-only discipline as the Core secret-tier
-/// runner: direct spawn, null stdin, discarded stderr, one trailing
-/// newline stripped, empty/NUL/non-UTF-8/oversize/non-zero-spawn
-/// results deny. Errors quote `program` only. This is the one bounded-spawn
-/// path in the slice (mirroring how `local_provider` is the one socket path).
+/// Shell-free, bounded, names-only discipline: direct spawn, null stdin,
+/// OS-discarded stderr, stdout read with a cap, one trailing newline
+/// stripped, empty/NUL/non-UTF-8/oversize/non-zero-spawn results deny.
+/// Errors quote `program` only. This is the one bounded-spawn path in the
+/// slice (mirroring how `local_provider` is the one socket path).
+///
+/// Hardening delta versus the Core source this adapter was moved from
+/// (`bitty-plugin-host/src/provider_credential.rs` at `271d662b`, which
+/// shares the shape): Core's `Command::output()` pipes stderr into memory
+/// unbounded and checks the stdout cap only after the child exits. Here
+/// stderr is `Stdio::null` — helper diagnostics, which may echo secret
+/// material, are never buffered, logged, or retained — and stdout is read
+/// capped at [`MAX_CREDENTIAL_CMD_OUTPUT_BYTES`] plus one probe byte, so at
+/// most that much is ever retained; an oversize report therefore carries
+/// `actual` of cap-plus-one rather than the true stream size.
 ///
 /// # Errors
 ///
 /// Returns a registry error when the program fails to spawn, exits non-zero,
-/// or produces empty/NUL/non-UTF-8 output, or a limit error past
+/// or produces empty/NUL/non-UTF-8/unreadable output, or a limit error past
 /// [`MAX_CREDENTIAL_CMD_OUTPUT_BYTES`].
 pub fn execute_credential_cmd(program: &str, args: &[String]) -> Result<String, PluginError> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
-    let output = Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|err| {
             PluginError::registry(format!("api_key_cmd '{program}' failed to spawn: {err}"))
         })?;
-    if !output.status.success() {
+    let mut stdout = Vec::new();
+    let read = child.stdout.take().map(|pipe| {
+        pipe.take(MAX_CREDENTIAL_CMD_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut stdout)
+    });
+    if !matches!(read, Some(Ok(_))) {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' exited with {status}",
-            status = output.status
+            "api_key_cmd '{program}' output unreadable"
         )));
     }
-    let stdout = output.stdout;
     if stdout.len() > MAX_CREDENTIAL_CMD_OUTPUT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err(PluginError::LimitExceeded {
             field: "api_key_cmd.output".to_string(),
             limit: MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
             actual: stdout.len(),
         });
     }
+    let status = child.wait().map_err(|err| {
+        PluginError::registry(format!("api_key_cmd '{program}' wait failed: {err}"))
+    })?;
+    if !status.success() {
+        return Err(PluginError::registry(format!(
+            "api_key_cmd '{program}' exited with {status}"
+        )));
+    }
+    // The capped read above retains at most cap-plus-one bytes and the
+    // oversize arm already returned, so `stdout` is in-bounds here; the
+    // remaining checks (NUL, UTF-8, strip, empty) are unchanged from Core.
     if stdout.contains(&0) {
         return Err(PluginError::registry(format!(
             "api_key_cmd '{program}' output must not contain NUL bytes"
