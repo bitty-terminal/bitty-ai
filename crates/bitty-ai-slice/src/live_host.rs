@@ -131,9 +131,12 @@ use bitty_ipc::tool_dispatch::{
     MAX_TOOL_CLIENT_ID_BYTES, ToolDispatchService, ToolExecution, ToolProvider, ToolRequest,
     ToolSpec,
 };
+use bitty_package::CapabilityCatalog;
+use bitty_plugin_host::RoleCeilingCatalog;
 
 use bitty_ai_runtime::bridge::IdentityBridge;
 
+use crate::ai_contrib::register_ai_families;
 use crate::bridge::wire_client_id;
 use crate::error::SliceError;
 use crate::fake_host::BittyHost;
@@ -145,6 +148,14 @@ use crate::fake_host::BittyHost;
 /// injectable transport seam: canned `fn` pointers in tests, host-wired
 /// providers in a future deployment. There is no socket, process, network,
 /// clock, or secret in this type.
+///
+/// The host also carries the AI extension contribution to the Core typed
+/// catalogs (CTX-0916 S6, [`crate::ai_contrib`]): the `capabilities` catalog
+/// is the Core seed plus the registered `ai` / `mcp` / `agent` families, and
+/// the `ceilings` catalog is the Core seed plus the Commander
+/// (`ai`/`mcp`/`agent`) and Implementer (`agent`) contributions. Both are
+/// registered at construction, before any grant parse, authorization, or
+/// tool registration.
 #[derive(Debug)]
 pub struct LiveBittyHost {
     client_id: String,
@@ -153,6 +164,8 @@ pub struct LiveBittyHost {
     snapshots: SnapshotService,
     tools: ToolDispatchService,
     executions: ExecutionService,
+    capabilities: CapabilityCatalog,
+    ceilings: RoleCeilingCatalog,
 }
 
 impl LiveBittyHost {
@@ -168,12 +181,21 @@ impl LiveBittyHost {
     /// Tool providers are registered per tool via [`Self::register_tool`];
     /// the tool table starts empty (unknown tools fail closed).
     ///
+    /// The AI extension set ([`crate::ai_contrib::register_ai_families`]) is
+    /// registered against fresh Core catalogs before any host state exists;
+    /// a rejected contribution fails construction closed
+    /// ([`SliceError::ExtensionRejected`]).
+    ///
     /// # Errors
     ///
     /// Returns [`SliceError::Ipc`] when `client_id` is empty or exceeds the
     /// host client bound (mirrors the dispatch client checks in
     /// `tool_dispatch.rs:564` and `execution.rs:1047`; both bounds derive
     /// from the same scoped-id ceiling).
+    ///
+    /// Returns [`SliceError::ExtensionRejected`] when the AI extension
+    /// contribution is rejected (catalog drift or double registration; the
+    /// fixed contribution table always registers against a fresh Core seed).
     pub fn new(
         client_id: impl Into<String>,
         granted: ScopeSet,
@@ -197,6 +219,9 @@ impl LiveBittyHost {
             Some(provider) => SnapshotService::with_defaults(provider),
             None => SnapshotService::new(),
         };
+        let mut capabilities = CapabilityCatalog::core();
+        let mut ceilings = RoleCeilingCatalog::core();
+        register_ai_families(&mut capabilities, &mut ceilings)?;
         Ok(Self {
             client_id,
             granted,
@@ -204,17 +229,29 @@ impl LiveBittyHost {
             snapshots,
             tools: ToolDispatchService::new(),
             executions: ExecutionService::with_provider(execution_provider),
+            capabilities,
+            ceilings,
         })
     }
 
     /// Construct a live host whose client identity is derived from the bound
     /// protocol principal of `identity` (`AI-0065`).
     ///
+    /// This is the extension-load entry point (CTX-0916 S6, Q1): product
+    /// callers enter here, and construction performs the AI capability and
+    /// ceiling registration ([`Self::new`]) before any grant parse,
+    /// authorization, or tool registration, so no host exists without its
+    /// AI extension set.
+    ///
     /// # Errors
     ///
     /// Returns the failures of [`wire_client_id`]: an unbound identity or an
     /// over-long derived id is refused before any host state exists (no
-    /// consent ledger, snapshot table, tool registry, or execution store).
+    /// consent ledger, snapshot table, tool registry, execution store, or
+    /// Core catalog contribution).
+    ///
+    /// Returns the failures of [`Self::new`] (client bound or rejected AI
+    /// extension contribution).
     pub fn from_binding(
         identity: &IdentityBridge,
         granted: ScopeSet,
@@ -287,6 +324,21 @@ impl LiveBittyHost {
     #[must_use]
     pub fn snapshot_method_count(&self) -> usize {
         self.snapshots.method_count()
+    }
+
+    /// AI-extended capability catalog: the Core seed plus the registered
+    /// `ai` / `mcp` / `agent` families (CTX-0916 S6).
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilityCatalog {
+        &self.capabilities
+    }
+
+    /// AI-extended role ceilings: the Core seed plus the Commander
+    /// (`ai`/`mcp`/`agent`) and Implementer (`agent`) contributions
+    /// (CTX-0916 S6).
+    #[must_use]
+    pub fn ceilings(&self) -> &RoleCeilingCatalog {
+        &self.ceilings
     }
 
     /// Register one tool declaration with its host provider (mirrors

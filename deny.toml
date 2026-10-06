@@ -49,4 +49,13 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
   "https://github.com/bitty-terminal/bitty",
   "https://github.com/bitty-terminal/bitty-network",
+  # CTX-0916 S6 (AI-0172): `bitty-plugin-host` pulls `bitty-lua`, which
+  # consumes the `phodopus` Lua VM by Git revision (MIT OR CC0-1.0, both in
+  # the license allow list above).
+  "https://github.com/bitty-terminal/phodopus",
+  # Same task: `kyren/gc-arena` is phodopus's own rev-pinned transitive dep
+  # (arena backing for the Lua GC, rev 5a7534b — same rev the bitty repo
+  # allowlists), not bitty-ai's choice. Named URL only, never a blanket git
+  # allow, so any further new git source still fails loudly.
+  "https://github.com/kyren/gc-arena",
 ]

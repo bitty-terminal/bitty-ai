@@ -16,6 +16,13 @@ workspace = true
 [dependencies]
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "cfeffa2d8e1387029850940af2b64877dbfbe25f" }
+# CTX-0916 S6 registration (AI-0172, DEC-0100): the slice contributes the AI
+# capability families, role ceilings, and provider-credential adapter against
+# the real Core typed catalogs. Pinned to the S5 merge rev `271d662b`
+# (full SHA below, same convention as the `bitty-ipc` pin above).
+# `bitty-ai-runtime` stays std-only; only the slice takes this dependency.
+bitty-package = { git = "https://github.com/bitty-terminal/bitty", rev = "271d662ba7445f0c963d86f01df63a75bcd81fa1" }
+bitty-plugin-host = { git = "https://github.com/bitty-terminal/bitty", rev = "271d662ba7445f0c963d86f01df63a75bcd81fa1" }
 # AI-0121 snapshot-ingest experiment (slice-only): maintained SHA-256 (`sha2`)
 # plus lowercase hex (`hex`) for digest verification, and minimal field
 # extraction (`serde_json`) for the version gate and the L0 summary. None of

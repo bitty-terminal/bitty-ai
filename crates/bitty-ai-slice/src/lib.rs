@@ -52,6 +52,7 @@
 #![deny(unsafe_code)]
 
 pub mod action_protocol;
+pub mod ai_contrib;
 pub mod bridge;
 pub mod chat_stream;
 pub mod content_store;
@@ -73,6 +74,13 @@ pub mod wheel_kernel;
 pub use action_protocol::{
     Action, ActionEngine, ActionError, ActionIntent, ActionOutcome, ActionPayload, BlobPointer,
     BlobSink, InMemoryBlobSink, SpilloverConfig,
+};
+pub use ai_contrib::{
+    AI_FAMILY_CONTRIBUTIONS, AI_ROLE_CEILINGS, AiFamilyContribution, AiHeadContribution,
+    AiRoleCeiling, MAX_CREDENTIAL_CMD_OUTPUT_BYTES, ProviderCredentialConfig,
+    check_provider_override, execute_credential_cmd, register_ai_capabilities,
+    register_ai_ceilings, register_ai_families, resolve_provider_credential,
+    resolve_provider_credential_live,
 };
 pub use bridge::{HostPeer, IpcBridge};
 pub use chat_stream::{

@@ -40,6 +40,9 @@ pub enum SliceError {
         limit: usize,
         actual: usize,
     },
+    /// An AI extension contribution was rejected at the extension-load path
+    /// (CTX-0916 S6 registration against the Core typed catalogs).
+    ExtensionRejected { reason: String },
 }
 
 impl fmt::Display for SliceError {
@@ -87,6 +90,9 @@ impl fmt::Display for SliceError {
                 f,
                 "provider bound exceeded for {field}: limit {limit} bytes, got {actual}"
             ),
+            Self::ExtensionRejected { reason } => {
+                write!(f, "extension contribution rejected: {reason}")
+            }
         }
     }
 }
