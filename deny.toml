@@ -53,4 +53,9 @@ allow-git = [
   # consumes the `phodopus` Lua VM by Git revision (MIT OR CC0-1.0, both in
   # the license allow list above).
   "https://github.com/bitty-terminal/phodopus",
+  # Same task: `kyren/gc-arena` is phodopus's own rev-pinned transitive dep
+  # (arena backing for the Lua GC, rev 5a7534b — same rev the bitty repo
+  # allowlists), not bitty-ai's choice. Named URL only, never a blanket git
+  # allow, so any further new git source still fails loudly.
+  "https://github.com/kyren/gc-arena",
 ]
