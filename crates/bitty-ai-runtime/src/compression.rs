@@ -392,6 +392,17 @@ pub struct SummarizeInput {
     pub untrusted_sources: usize,
     /// Caller-supplied timestamp carried for determinism.
     pub now_ms: u64,
+    /// Prior compaction summary carried as inert context (rolling summary).
+    /// Bounded like all summaries: at most [`MAX_SUMMARY_BYTES`] bytes;
+    /// over-bound seeds fail the compaction closed before any summarizer
+    /// contact. The legacy [`compress_records_at`] path always observes
+    /// `None`; the selective-compaction driver ([`compact_selective`])
+    /// seeds the first head span from the host config and rolls each span
+    /// summary into the next span's input. Like every summary, this text
+    /// lands in the dynamic turn region only; stable prompt layers are
+    /// untouched, so the [`CacheKey`](crate::cache_key::CacheKey) stable
+    /// prefix is preserved.
+    pub previous_summary: Option<String>,
 }
 
 /// Host-provided summarization seam. The runtime defines this shape and
@@ -714,8 +725,8 @@ fn validate_ranges(record_count: usize, ranges: &[SpanRange]) -> Result<(), Comp
 /// # Errors
 ///
 /// Fails closed (no partial view) on invalid records, invalid ranges, span
-/// id collisions, exhausted/failing summarizers, over-bound summaries, or
-/// span-count overflow.
+/// id collisions, exhausted/failing summarizers, empty or whitespace-only
+/// summaries, over-bound summaries, or span-count overflow.
 pub fn compress_records(
     records: &[ContextRecord],
     ranges: &[SpanRange],
@@ -735,8 +746,8 @@ pub fn compress_records(
 /// # Errors
 ///
 /// Fails closed (no partial view) on generation mismatch, invalid records,
-/// invalid ranges, span id collisions, exhausted/failing summarizers,
-/// over-bound summaries, or span-count overflow.
+/// invalid ranges, span id collisions, exhausted/failing summarizers, empty
+/// or whitespace-only summaries, over-bound summaries, or span-count overflow.
 pub fn compress_records_at(
     records: &[ContextRecord],
     ranges: &[SpanRange],
@@ -744,6 +755,46 @@ pub fn compress_records_at(
     tags: &RetentionTags,
     now_ms: u64,
     current_generation: Option<u64>,
+) -> Result<CompressedView, CompressionError> {
+    compress_ranges_impl(
+        records,
+        ranges,
+        summarizer,
+        tags,
+        now_ms,
+        current_generation,
+        PreviousMode::Absent,
+    )
+}
+
+/// Previous-summary threading for span inputs (private to this module).
+///
+/// The legacy [`compress_records_at`] path uses [`PreviousMode::Absent`]:
+/// every [`SummarizeInput`] carries `previous_summary: None`, exactly as
+/// before. The selective-compaction driver uses [`PreviousMode::Chain`]:
+/// the first span carries the host seed and each later span carries the
+/// prior span's summary (rolling chain), so later spans summarize with
+/// earlier results in view. Threading is deterministic for a given input
+/// plus `now_ms` (no clock, no threads); summaries still land in the
+/// dynamic turn region only, stable layers untouched.
+#[derive(Debug, Clone)]
+enum PreviousMode {
+    /// Legacy path: every span input carries `previous_summary: None`.
+    Absent,
+    /// Selective-compaction path: the first span carries the host seed
+    /// (itself `None` when the host holds no prior summary); each later
+    /// span carries the prior span's summary.
+    Chain(Option<String>),
+}
+
+fn compress_ranges_impl(
+    records: &[ContextRecord],
+    ranges: &[SpanRange],
+    summarizer: &dyn Summarizer,
+    tags: &RetentionTags,
+    now_ms: u64,
+    current_generation: Option<u64>,
+    previous: PreviousMode,
 ) -> Result<CompressedView, CompressionError> {
     if records.len() > MAX_CONTEXT_RECORDS {
         return Err(CompressionError::Context(ContextError::TooManyRecords {
@@ -774,6 +825,14 @@ pub fn compress_records_at(
 
     let mut spans: Vec<CompressedSpan> = Vec::with_capacity(ranges.len());
     let mut synthetic: Vec<ContextRecord> = Vec::with_capacity(ranges.len());
+    // `None` = legacy mode (every span observes `previous_summary: None`);
+    // `Some(next)` = driver mode, where `next` is the `previous_summary`
+    // for the upcoming span (host seed first, then the rolling prior
+    // summary).
+    let mut next_previous: Option<Option<String>> = match previous {
+        PreviousMode::Absent => None,
+        PreviousMode::Chain(seed) => Some(seed),
+    };
     for (span_index, range) in ranges.iter().enumerate() {
         let span_id = format!("cmp-{span_index:04}");
         if span_id.len() > MAX_SPAN_ID_LEN {
@@ -802,8 +861,17 @@ pub fn compress_records_at(
             total_source_bytes,
             untrusted_sources,
             now_ms,
+            previous_summary: next_previous.clone().flatten(),
         };
         let summary = summarizer.summarize(&input)?;
+        if summary.trim().is_empty() {
+            return Err(CompressionError::SummarizerFailed {
+                reason: format!("summarizer returned empty text for span {span_id}"),
+            });
+        }
+        if next_previous.is_some() {
+            next_previous = Some(Some(summary.clone()));
+        }
         if summary.len() > MAX_SUMMARY_BYTES {
             return Err(CompressionError::SummaryTooLarge {
                 limit: MAX_SUMMARY_BYTES,
@@ -873,6 +941,408 @@ pub fn compress_records_at(
         tombstones: Vec::new(),
         tags: tags.clone(),
     })
+}
+
+// --- L2 selective-compaction slice (AI-0177) ---
+//
+// Minimal trigger plus head/recent selection on top of the prototype above:
+// the host sizes a reserve ([`effective_reserve_bytes`]), tests pressure
+// with [`should_compact`], splits head from tail with
+// [`select_compaction_window`], and runs one pass with [`compact_selective`].
+// Every item is fail-closed, deterministic for a given input plus `now_ms`
+// (no clock, no threads, no async), std-only, and cache-safe: summaries
+// land in the dynamic turn region only, stable prompt layers untouched.
+
+/// Floor for the compaction reserve: the reserve never drops below 16 KiB,
+/// so small windows still keep headroom for one turn of growth.
+///
+/// Fail-closed: a floor (not a ceiling) — see [`effective_reserve_bytes`].
+/// Deterministic constant input (no clock). Cache placement: the reserve
+/// only sizes the trigger; summaries still land in the dynamic turn region,
+/// stable layers untouched.
+pub const DEFAULT_RESERVE_BYTES: usize = 16 * 1024;
+/// Numerator of the reserve fraction: the reserve is 15% of the window
+/// (`RESERVE_FRACTION_NUMERATOR / RESERVE_FRACTION_DENOMINATOR`), floored by
+/// [`DEFAULT_RESERVE_BYTES`]. See [`effective_reserve_bytes`].
+///
+/// Fail-closed, deterministic constant input (no clock). Cache placement: as
+/// for [`DEFAULT_RESERVE_BYTES`].
+pub const RESERVE_FRACTION_NUMERATOR: usize = 15;
+/// Denominator of the reserve fraction (see [`RESERVE_FRACTION_NUMERATOR`]).
+///
+/// Fail-closed, deterministic constant input (no clock). Cache placement: as
+/// for [`DEFAULT_RESERVE_BYTES`].
+pub const RESERVE_FRACTION_DENOMINATOR: usize = 100;
+/// Default tail-protection budget: the recent tail keeps roughly the newest
+/// 20 KiB verbatim (plus at least [`MIN_KEEP_RECORDS`], plus every
+/// protected id). See [`select_compaction_window`].
+///
+/// Fail-closed: a budget (never a target to fill). Deterministic constant
+/// input (no clock). Cache placement: the kept tail feeds the dynamic turn
+/// region; stable layers untouched.
+pub const DEFAULT_KEEP_RECENT_BYTES: usize = 20 * 1024;
+/// Minimum records always kept in the recent tail, even when
+/// `keep_recent_bytes` is zero. Guarantees the newest turn survives
+/// compaction. See [`select_compaction_window`].
+///
+/// Fail-closed: a lower bound on retention. Deterministic constant input
+/// (no clock). Cache placement: as for [`DEFAULT_KEEP_RECENT_BYTES`].
+pub const MIN_KEEP_RECORDS: usize = 1;
+
+/// Effective compaction reserve for `window` bytes: the larger of 15% of
+/// the window and [`DEFAULT_RESERVE_BYTES`], clamped strictly below
+/// `window`.
+///
+/// Fail-closed: a zero window yields `0` (no reserve without a window), and
+/// tiny windows clamp to `window - 1` rather than overflowing the budget
+/// they protect. Saturating arithmetic throughout, so pathological windows
+/// (`usize::MAX`) cannot overflow or panic. Deterministic: a pure function
+/// of `window` (no clock; the caller supplies `now_ms` where timestamps
+/// are needed). Cache placement: the reserve only sizes the trigger;
+/// summaries still land in the dynamic turn region, stable layers untouched.
+#[must_use]
+pub fn effective_reserve_bytes(window: usize) -> usize {
+    if window == 0 {
+        return 0;
+    }
+    let fraction = window.saturating_mul(RESERVE_FRACTION_NUMERATOR) / RESERVE_FRACTION_DENOMINATOR;
+    let reserve = fraction.max(DEFAULT_RESERVE_BYTES);
+    reserve.min(window.saturating_sub(1))
+}
+
+/// Compaction trigger: true exactly when `used + reserve` exceeds `window`.
+///
+/// Fail-closed: any zero input (`used`, `window`, or `reserve`) reports
+/// `false` (no pressure without a measured load, a window, and a reserve),
+/// and the sum uses saturating arithmetic so pathological inputs cannot
+/// overflow or panic. Boundary-exact: equality with `window` is `false`,
+/// one byte over is `true`. Deterministic: a pure function of its inputs
+/// (no clock). Cache placement: the trigger only decides *whether* to
+/// compact; summaries still land in the dynamic turn region, stable layers
+/// untouched.
+#[must_use]
+pub fn should_compact(used: usize, window: usize, reserve: usize) -> bool {
+    if used == 0 || window == 0 || reserve == 0 {
+        return false;
+    }
+    used.saturating_add(reserve) > window
+}
+
+/// Selected compaction window: head (compact) and recent (keep) index sets
+/// into the caller's record slice. Both lists hold caller-slice indices in
+/// ascending caller order, partition the input (every index appears exactly
+/// once), and are built by a deterministic linear scan (no `HashMap`, no
+/// clock). See [`select_compaction_window`].
+///
+/// Fail-closed: an empty head is a valid selection meaning "do not call the
+/// summarizer" (reported as [`CompactionOutcome::NoOp`] by
+/// [`compact_selective`]), never an error. Cache placement: the head is
+/// summarized into the dynamic turn region; the recent tail stays verbatim;
+/// stable layers untouched either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionWindow {
+    /// Indices to compact, in ascending caller order.
+    pub head: Vec<usize>,
+    /// Indices to keep verbatim, in ascending caller order.
+    pub recent: Vec<usize>,
+}
+
+/// Split `records` into a compact-head and a keep-recent tail.
+///
+/// Procedure: validate every record first (fail closed, reusing the
+/// admission rules — record count bound, [`ContextRecord::validate`], and
+/// the duplicate-id refusal mirroring [`crate::context::assemble`]); then
+/// apply the generation gate (`current_generation`, when `Some`) to every
+/// record BEFORE selection, mirroring the assemble-time `StaleGeneration`
+/// refusal so stale contributions cannot hide behind fresh summary
+/// metadata; then walk backwards (newest first) accumulating
+/// [`ContextRecord::footprint_bytes`] into `recent` until both
+/// `keep_recent_bytes` is met AND at least [`MIN_KEEP_RECORDS`] are kept.
+/// Every `protected_ids` member is force-included in `recent` regardless of
+/// budget (unknown ids, naming no record, are ignored); `head` is the rest
+/// in caller order.
+///
+/// Fail-closed: any invalid, duplicate, over-bound, or stale record rejects
+/// the whole selection with no partial window; an empty head is still
+/// `Ok` (it means "do not call the summarizer", never an error).
+/// Deterministic for a given input (linear scan, no `HashMap`, no clock;
+/// the caller supplies `now_ms` where timestamps are needed). Cache
+/// placement: selection only partitions indices — summaries derived from
+/// the head land in the dynamic turn region, stable layers untouched.
+///
+/// # Errors
+///
+/// Returns [`CompressionError`] for too many records, invalid records,
+/// duplicate record ids, or generation mismatch.
+pub fn select_compaction_window(
+    records: &[ContextRecord],
+    keep_recent_bytes: usize,
+    protected_ids: &[&str],
+    current_generation: Option<u64>,
+) -> Result<CompactionWindow, CompressionError> {
+    if records.len() > MAX_CONTEXT_RECORDS {
+        return Err(CompressionError::Context(ContextError::TooManyRecords {
+            limit: MAX_CONTEXT_RECORDS,
+        }));
+    }
+    for record in records {
+        record.validate()?;
+    }
+    // Duplicate turn-scoped ids would make head/recent unattributable;
+    // mirror the assemble-time refusal with a linear scan (no HashMap;
+    // at most MAX_CONTEXT_RECORDS entries, so the quadratic scan is trivial).
+    for (index, record) in records.iter().enumerate() {
+        for prior in &records[..index] {
+            if prior.id == record.id {
+                return Err(CompressionError::Context(ContextError::DuplicateRecordId {
+                    id: record.id.clone(),
+                }));
+            }
+        }
+    }
+    if let Some(current) = current_generation {
+        // Generation gate BEFORE selection: every record must carry the
+        // current generation, checked before any partitioning and long
+        // before any summarizer contact.
+        for record in records {
+            if record.generation != current {
+                return Err(CompressionError::Context(ContextError::StaleGeneration {
+                    id: record.id.clone(),
+                    actual: record.generation,
+                    current,
+                }));
+            }
+        }
+    }
+
+    // Newest-first accumulation into the recent tail. Stops only when both
+    // the byte budget is met AND at least MIN_KEEP_RECORDS are kept;
+    // protected members join regardless of budget. Both accumulators grow
+    // monotonically, so the stop condition, once true, stays true for all
+    // older records (which then fall into the head unless protected).
+    let mut recent_descending: Vec<usize> = Vec::with_capacity(records.len());
+    let mut kept_bytes: usize = 0;
+    for (index, record) in records.iter().enumerate().rev() {
+        let protected = protected_ids.contains(&record.id.as_str());
+        let budget_met =
+            recent_descending.len() >= MIN_KEEP_RECORDS && kept_bytes >= keep_recent_bytes;
+        if !protected && budget_met {
+            continue;
+        }
+        recent_descending.push(index);
+        kept_bytes = kept_bytes.saturating_add(record.footprint_bytes());
+    }
+    recent_descending.reverse();
+    let recent = recent_descending;
+    // Head is the complement in caller order (two-pointer merge over the
+    // ascending recent list: linear, deterministic, no HashMap).
+    let mut head: Vec<usize> = Vec::new();
+    let mut cursor = 0usize;
+    for index in 0..records.len() {
+        if cursor < recent.len() && recent[cursor] == index {
+            cursor += 1;
+        } else {
+            head.push(index);
+        }
+    }
+    Ok(CompactionWindow { head, recent })
+}
+
+/// Host-owned budgets for one [`compact_selective`] pass.
+///
+/// Fail-closed: every bound here is enforced before any summarizer contact
+/// (over-bound `previous_summary` and doomed windows report
+/// [`CompactionOutcome::Failed`]). Deterministic: plain data, no clock —
+/// timestamps still arrive via the caller-supplied `now_ms` argument.
+/// Cache placement: compaction writes summaries into the dynamic turn
+/// region only; stable prompt layers are untouched, so the
+/// [`CacheKey`](crate::cache_key::CacheKey) stable prefix is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectiveCompactionConfig {
+    /// Host context window in bytes. Sizes the doomed-call guard: when the
+    /// head footprint plus [`MAX_SUMMARY_BYTES`] cannot fit, the pass
+    /// reports [`CompactionOutcome::Failed`] without contacting the
+    /// summarizer.
+    pub window_bytes: usize,
+    /// Tail-protection budget kept verbatim (see [`select_compaction_window`]).
+    pub keep_recent_bytes: usize,
+    /// Turn-scoped record ids that always survive in the recent tail,
+    /// regardless of budget. Ids naming no record are ignored.
+    pub protected_ids: Vec<String>,
+    /// Generation gate applied to every record before selection (`None` =
+    /// no gate, preserving the legacy behavior for callers that do not
+    /// track generations).
+    pub current_generation: Option<u64>,
+    /// Prior compaction summary threaded into the first head span's
+    /// [`SummarizeInput`]; later head spans carry the rolling prior summary.
+    /// Bounded like all summaries ([`MAX_SUMMARY_BYTES`]); over-bound seeds
+    /// fail the pass closed.
+    pub previous_summary: Option<String>,
+}
+
+impl SelectiveCompactionConfig {
+    /// Minimal config for `window_bytes`: default tail budget, no protected
+    /// ids, no generation gate, no previous summary.
+    #[must_use]
+    pub fn new(window_bytes: usize) -> Self {
+        Self {
+            window_bytes,
+            keep_recent_bytes: DEFAULT_KEEP_RECENT_BYTES,
+            protected_ids: Vec::new(),
+            current_generation: None,
+            previous_summary: None,
+        }
+    }
+}
+
+/// Outcome of one [`compact_selective`] pass. Total: every failure mode
+/// maps to `Failed` with a host-readable reason — a partial view is never
+/// returned and the recent tail is never disturbed.
+///
+/// Fail-closed by construction. Deterministic for a given input plus
+/// `now_ms` (no clock, no threads, no async). Cache placement: `Compacted`
+/// summaries land in the dynamic turn region only (synthetic records feed
+/// the Runtime/Turn layer); stable layers untouched, so the
+/// [`CacheKey`](crate::cache_key::CacheKey) stable prefix is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    /// Head spans summarized: `span_count` summaries were produced (one per
+    /// contiguous head run). The compressed view itself is host-visible via
+    /// the normal [`CompressedView`] path; the outcome reports the count.
+    Compacted {
+        /// Number of summary spans produced.
+        span_count: usize,
+    },
+    /// Nothing to compact (empty head): the summarizer was not contacted.
+    NoOp,
+    /// Fail-closed refusal with a host-readable reason (invalid input,
+    /// stale generation, over-bound seed, doomed window, summarizer
+    /// failure, or compression refusal). The summarizer may have been
+    /// contacted (compression-time refusal) or not (pre-check refusal);
+    /// either way no partial result is returned.
+    Failed {
+        /// Why the pass refused.
+        reason: String,
+    },
+}
+
+/// Run one selective-compaction pass over `records`.
+///
+/// Procedure (all fail-closed, deterministic for a given input plus
+/// `now_ms`):
+///
+/// 1. [`select_compaction_window`] over `records` with the config's tail
+///    budget, protected ids, and generation gate. Any refusal becomes
+///    [`CompactionOutcome::Failed`] — the summarizer is never contacted.
+/// 2. Empty head becomes [`CompactionOutcome::NoOp`] — the summarizer is
+///    never contacted ("do not call the summarizer", never an error).
+/// 3. A `previous_summary` longer than [`MAX_SUMMARY_BYTES`] becomes
+///    `Failed` — the summarizer is never contacted.
+/// 4. Doomed-call guard: when the head footprint (summed with saturating
+///    math) plus [`MAX_SUMMARY_BYTES`] exceeds `config.window_bytes`,
+///    report `Failed` without contacting the summarizer — even a perfect
+///    summary cannot fit the window, so the call is refused rather than
+///    wasted.
+/// 5. Otherwise compress each maximal contiguous head run (protected-gap
+///    records pass through verbatim, so protection survives compression)
+///    through the shared compression core: the first span carries the
+///    host `previous_summary`, later spans carry the rolling prior summary.
+///    Success reports `Compacted` with the span count; any refusal reports
+///    `Failed` with the underlying reason.
+///
+/// Provenance and retention inherit unchanged from the shared core:
+/// untrusted-surface OR-marking, minimum effective priority, no
+/// `supersedes` links, most-restrictive retention class, and
+/// `source_deadline_ms` anchored at the minimum source `collected_at_ms`.
+///
+/// Cache placement: summaries land in the dynamic turn region only
+/// (synthetic records feed the Runtime/Turn layer); stable prompt layers
+/// are untouched, so the [`CacheKey`](crate::cache_key::CacheKey) stable
+/// prefix is preserved.
+pub fn compact_selective(
+    records: &[ContextRecord],
+    config: &SelectiveCompactionConfig,
+    summarizer: &dyn Summarizer,
+    tags: &RetentionTags,
+    now_ms: u64,
+) -> CompactionOutcome {
+    let protected: Vec<&str> = config.protected_ids.iter().map(String::as_str).collect();
+    let window = match select_compaction_window(
+        records,
+        config.keep_recent_bytes,
+        &protected,
+        config.current_generation,
+    ) {
+        Ok(window) => window,
+        Err(error) => {
+            return CompactionOutcome::Failed {
+                reason: error.to_string(),
+            };
+        }
+    };
+    if window.head.is_empty() {
+        return CompactionOutcome::NoOp;
+    }
+    if let Some(previous) = config.previous_summary.as_ref() {
+        if previous.len() > MAX_SUMMARY_BYTES {
+            return CompactionOutcome::Failed {
+                reason: CompressionError::SummaryTooLarge {
+                    limit: MAX_SUMMARY_BYTES,
+                    actual: previous.len(),
+                }
+                .to_string(),
+            };
+        }
+    }
+    let head_bytes: usize = window.head.iter().fold(0usize, |total, index| {
+        total.saturating_add(records[*index].footprint_bytes())
+    });
+    let window_bytes = config.window_bytes;
+    if head_bytes.saturating_add(MAX_SUMMARY_BYTES) > window_bytes {
+        return CompactionOutcome::Failed {
+            reason: format!(
+                "compaction doomed: head {head_bytes} bytes plus {MAX_SUMMARY_BYTES} byte summary bound exceeds {window_bytes} byte window"
+            ),
+        };
+    }
+    // Group head indices (ascending) into maximal contiguous runs: one span
+    // per run, so protected-gap records between runs pass through verbatim.
+    let mut ranges: Vec<SpanRange> = Vec::with_capacity(window.head.len());
+    let mut run_start = window.head[0];
+    let mut run_end = run_start + 1;
+    for index in window.head.iter().skip(1) {
+        if *index == run_end {
+            run_end += 1;
+        } else {
+            ranges.push(SpanRange {
+                start: run_start,
+                end: run_end,
+            });
+            run_start = *index;
+            run_end = run_start + 1;
+        }
+    }
+    ranges.push(SpanRange {
+        start: run_start,
+        end: run_end,
+    });
+    let seed = PreviousMode::Chain(config.previous_summary.clone());
+    match compress_ranges_impl(
+        records,
+        &ranges,
+        summarizer,
+        tags,
+        now_ms,
+        config.current_generation,
+        seed,
+    ) {
+        Ok(view) => CompactionOutcome::Compacted {
+            span_count: view.len(),
+        },
+        Err(error) => CompactionOutcome::Failed {
+            reason: error.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
