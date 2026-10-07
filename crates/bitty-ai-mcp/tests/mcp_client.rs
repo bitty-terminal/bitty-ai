@@ -1,7 +1,8 @@
 //! Hermetic offline acceptance for `bitty-ai-mcp` (AI-0179).
 //!
 //! No network, no registry, no wall-clock policy time: process spawns use
-//! `/bin/sh` and `/bin/sleep` fixtures (spawn tests are Unix-gated),
+//! `python3 -u` (fake MCP server) and `/bin/sleep` + `/bin/sh -c` one-shot
+//! helper fixtures (spawn tests are Unix-gated),
 //! policy decisions take caller `now_ms`, and wall clock appears only where
 //! a deadline is itself under test. Covers: frame cap probe, malformed-line
 //! drop, no-tools-capability refusal, sanitize/collision/64-byte cap,
@@ -319,8 +320,11 @@ mod unix {
     fn fixture_config(allowlist: Vec<String>) -> McpServerConfig {
         McpServerConfig {
             id: "fixture".to_owned(),
-            command: "/bin/sh".to_owned(),
-            args: vec![fixture("fake_mcp_server.sh")],
+            // python3 -u: unbuffered stdio, so fixture replies flush
+            // immediately on every host (POSIX sh printf may block-buffer
+            // pipes, e.g. dash on CI, stalling the handshake).
+            command: "python3".to_owned(),
+            args: vec!["-u".to_owned(), fixture("fake_mcp_server.py")],
             env_refs: Vec::new(),
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             timeout_ms: 10_000,
