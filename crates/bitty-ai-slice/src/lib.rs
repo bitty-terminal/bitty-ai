@@ -77,10 +77,10 @@ pub use action_protocol::{
 };
 pub use ai_contrib::{
     AI_FAMILY_CONTRIBUTIONS, AI_ROLE_CEILINGS, AiFamilyContribution, AiHeadContribution,
-    AiRoleCeiling, MAX_CREDENTIAL_CMD_OUTPUT_BYTES, ProviderCredentialConfig,
-    check_provider_override, execute_credential_cmd, register_ai_capabilities,
-    register_ai_ceilings, register_ai_families, resolve_provider_credential,
-    resolve_provider_credential_live,
+    AiRoleCeiling, CREDENTIAL_CMD_TIMEOUT, MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
+    ProviderCredentialConfig, check_provider_override, execute_credential_cmd,
+    register_ai_capabilities, register_ai_ceilings, register_ai_families,
+    resolve_provider_credential, resolve_provider_credential_live,
 };
 pub use bridge::{HostPeer, IpcBridge};
 pub use chat_stream::{

@@ -8,18 +8,21 @@
 //! `271d662b`); these tests prove the ai-loaded side restores AI authority
 //! additively with Core defaults unchanged.
 //!
-//! Deterministic: no wall clock, no network, no filesystem; the credential
-//! command runner is exercised through missing-program and refusal paths
-//! only, never a live spawn.
+//! Deterministic: no network, no filesystem; the credential command runner
+//! is exercised through missing-program and refusal paths plus bounded live
+//! spawns (`sh` with `head`/`yes`/`printf`/`sleep` fixtures) for the output
+//! cap and the execution deadline — wall clock only where the deadline
+//! itself is under test.
 
 use std::collections::BTreeMap;
 
 use bitty_ai_runtime::bridge::{IdentityBridge, ProtocolAgentId};
 use bitty_ai_runtime::session::AgentInstanceId;
 use bitty_ai_slice::{
-    AI_FAMILY_CONTRIBUTIONS, AI_ROLE_CEILINGS, LiveBittyHost, ProviderCredentialConfig,
-    check_provider_override, execute_credential_cmd, register_ai_capabilities,
-    register_ai_ceilings, register_ai_families, resolve_provider_credential,
+    AI_FAMILY_CONTRIBUTIONS, AI_ROLE_CEILINGS, CREDENTIAL_CMD_TIMEOUT, LiveBittyHost,
+    ProviderCredentialConfig, check_provider_override, execute_credential_cmd,
+    register_ai_capabilities, register_ai_ceilings, register_ai_families,
+    resolve_provider_credential,
 };
 use bitty_ipc::error::IpcError;
 use bitty_ipc::execution::{EffectState, ExecutionRequest, ExecutionStatus, RawExecutionOutput};
@@ -444,6 +447,132 @@ fn credential_cmd_discards_stderr_and_caps_stdout() {
         "payload leaked: {text}"
     );
 }
+
+// ── credential runner deadline (AI-0173) ────────────────────────────────────
+// Unix-only: needs `sh` plus `sleep`. Unlike the refusal paths above this
+// test live-spawns a hanging helper and measures wall clock — the deadline
+// is the behavior under test, so timing here is inherent, not incidental.
+
+#[cfg(unix)]
+#[test]
+fn credential_cmd_times_out_and_reaps_hanging_helper() {
+    use std::time::{Duration, Instant};
+
+    use bitty_plugin_host::PluginError;
+
+    // `exec` keeps the helper single-process (no shell parent left to
+    // orphan): killing the direct child ends the sleep. The marker lets
+    // the reap check below identify exactly this helper's processes.
+    let marker = "AI0173-timeout-probe";
+    let started = Instant::now();
+    let err = execute_credential_cmd(
+        "sh",
+        &["-c".to_string(), format!("exec sleep 30 # {marker}")],
+    )
+    .expect_err("hanging helper must deny at the deadline");
+    let elapsed = started.elapsed();
+
+    // Names-only timeout denial in a registry error: the program is named,
+    // helper payload (here the marker) never enters the diagnostic.
+    match &err {
+        PluginError::Registry { .. } => {}
+        other => panic!("expected registry timeout, got {other}"),
+    }
+    let text = err.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(text.contains("'sh'"), "{text}");
+    assert!(!text.contains(marker), "payload leaked: {text}");
+
+    // Prompt: the 30s helper resolves at ~the deadline, far short of its
+    // own lifetime. The lower bound tolerates poll granularity, the upper
+    // a loaded CI host.
+    assert!(
+        elapsed >= CREDENTIAL_CMD_TIMEOUT - Duration::from_secs(1),
+        "returned before the deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < CREDENTIAL_CMD_TIMEOUT + Duration::from_secs(10),
+        "deadline not honored: {elapsed:?}"
+    );
+
+    // Reaped: no child of this process may still carry the marker —
+    // neither running nor zombie (`wait` reaps synchronously, so only a
+    // persistent stray fails; Linux-only, needs /proc).
+    assert_no_marker_child(marker);
+
+    // Same denial through the resolve path: a Cmd credential over a
+    // hanging helper resolves to the timeout error.
+    let hanging = CredentialRef::from_cmd(
+        "sh",
+        vec![
+            "-c".to_string(),
+            format!("exec sleep 30 # {marker}-resolve"),
+        ],
+    )
+    .expect("valid cmd");
+    let hanging_cfg = ProviderCredentialConfig::new(None, Some(hanging)).expect("valid");
+    let err = resolve_provider_credential(&hanging_cfg, |_| None)
+        .expect_err("hanging Cmd credential must deny at the deadline");
+    let text = err.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(text.contains("'sh'"), "{text}");
+    assert!(!text.contains(marker), "payload leaked: {text}");
+    assert_no_marker_child(marker);
+}
+
+/// Fail if any child of this process still carries `marker` in its command
+/// line, or lingers as a zombie. Only a stray persisting past a grace
+/// window fails, so a parallel test's transient child cannot flake this.
+#[cfg(target_os = "linux")]
+fn assert_no_marker_child(marker: &str) {
+    use std::time::{Duration, Instant};
+
+    let me = std::process::id().to_string();
+    let grace = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut strays = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let pid = entry.file_name().to_string_lossy().into_owned();
+                if pid.parse::<u32>().is_err() {
+                    continue;
+                }
+                // Ancestry via /proc/<pid>/stat (`pid (comm) state ppid
+                // ...`): split after the last ')' since comm may itself
+                // contain parentheses.
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                let Some(after) = stat.rsplit_once(')') else {
+                    continue;
+                };
+                let mut fields = after.1.split_whitespace();
+                let state = fields.next().unwrap_or("");
+                let ppid = fields.next().unwrap_or("");
+                if ppid != me {
+                    continue;
+                }
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let cmdline = String::from_utf8_lossy(&cmdline);
+                // Zombies have an empty cmdline, so match those by state
+                // and live children by the marker they must carry.
+                if cmdline.contains(marker) || state == "Z" {
+                    strays.push(format!("{pid}:{state}:{cmdline}"));
+                }
+            }
+        }
+        if strays.is_empty() {
+            return;
+        }
+        if Instant::now() >= grace {
+            panic!("unreaped helper children: {strays:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Non-Linux Unix has no /proc scan here; the timeout assertions above
+/// still run.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn assert_no_marker_child(_marker: &str) {}
 
 // ── wiring: from_binding carries the AI extension set (Q1) ───────────────────
 
