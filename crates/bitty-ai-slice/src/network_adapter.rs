@@ -519,11 +519,17 @@ fn check_supported_sampling(params: &SamplingParams) -> Result<(), ProviderError
 /// Whether `content_type` authorizes the 2xx JSON parse path.
 ///
 /// Accepts `application/json` (case-insensitive, optionally with `; ...`
-/// parameters, e.g. `application/json; charset=utf-8`), mirroring
-/// `local_provider::is_json_content_type`.
+/// parameters, e.g. `application/json; charset=utf-8`). The media type is
+/// compared exactly (portion before the first `;`, trimmed), so suffixed
+/// types such as `application/json-seq` are rejected. This is stricter than
+/// `local_provider::is_json_content_type` (substring match); the divergence
+/// is intentional fail-closed parsing on the network path.
 fn is_json_content_type(content_type: Option<&str>) -> bool {
     match content_type {
-        Some(value) => value.to_ascii_lowercase().contains("application/json"),
+        Some(value) => value
+            .split(';')
+            .next()
+            .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json")),
         None => false,
     }
 }
@@ -1321,6 +1327,13 @@ mod tests {
             headers: Vec::new(),
             body: b"{}".to_vec(),
         });
+        // 200 with a suffixed media type must not parse (CodeRabbit #325:
+        // substring matching would accept `application/json-seq`).
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json-seq".to_owned())],
+            body: b"\x1e{\"choices\":[]}\n".to_vec(),
+        });
         // 200 with JSON parameters on the content type still parses.
         let ok_body = serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": "Parametric."}}],
@@ -1357,6 +1370,12 @@ mod tests {
 
         let err_missing = adapter.complete(&req).unwrap_err();
         assert!(matches!(err_missing, ProviderError::Transport { .. }));
+
+        let err_seq = adapter.complete(&req).unwrap_err();
+        assert!(
+            matches!(err_seq, ProviderError::Transport { .. }),
+            "suffixed media type must fail closed, got {err_seq:?}"
+        );
 
         let turn = adapter.complete(&req).expect("JSON with parameters parses");
         assert_eq!(turn.text, "Parametric.");
