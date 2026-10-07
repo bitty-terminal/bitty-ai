@@ -70,10 +70,12 @@
 //! Registration is pure and bounded (3 families, 7 heads, 4 ceiling rows);
 //! credential resolution reads through an injected environment lookup and one
 //! bounded, shell-free command runner (direct spawn, null stdin, discarded
-//! stderr, [`MAX_CREDENTIAL_CMD_OUTPUT_BYTES`] cap). Diagnostics quote
+//! stderr, [`MAX_CREDENTIAL_CMD_OUTPUT_BYTES`] cap,
+//! [`CREDENTIAL_CMD_TIMEOUT`] deadline). Diagnostics quote
 //! reference names only — values never enter an error, log, or audit detail.
 
 use std::fmt;
+use std::time::Duration;
 
 use bitty_package::CapabilityCatalog;
 use bitty_plugin_host::{
@@ -86,6 +88,20 @@ use crate::error::SliceError;
 // Re-export the Core output bound so the adapter and its callers cannot drift
 // from the host store ceiling the moved semantic was reviewed against.
 pub use bitty_plugin_host::MAX_CREDENTIAL_CMD_OUTPUT_BYTES;
+
+/// Deadline bounding one credential-helper execution (AI-0173).
+///
+/// Covers stdout collection *and* process completion together from just
+/// after spawn: a helper that hangs silently, dribbles output forever, or
+/// exits without closing stdout resolves to a names-only timeout error
+/// instead of blocking the caller without bound. Core has no equivalent
+/// (`Command::output()` there waits unbounded); this bound is owned here.
+pub const CREDENTIAL_CMD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting for a credential helper: small enough that
+/// deadline overshoot stays negligible against [`CREDENTIAL_CMD_TIMEOUT`],
+/// large enough to avoid a hot spin on `try_wait`/`try_recv`.
+const CREDENTIAL_CMD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 // ── AI family contributions (M1/M2/M3, H1–H7, P1/P2) ─────────────────────────
 
@@ -486,14 +502,25 @@ pub fn resolve_provider_credential_live(
 /// most that much is ever retained; an oversize report therefore carries
 /// `actual` of cap-plus-one rather than the true stream size.
 ///
+/// Deadline delta (AI-0173): Core waits for the helper unbounded. Here a
+/// single [`CREDENTIAL_CMD_TIMEOUT`] deadline from just after spawn covers
+/// stdout collection *and* process completion together — stdout drains on a
+/// worker thread while the caller polls the reader handoff and `try_wait`,
+/// so a silent hang, an endless dribble, or an exit without pipe close all
+/// resolve on time. Past the deadline the child is killed and reaped and a
+/// names-only timeout error is returned (no output bytes in diagnostics).
+///
 /// # Errors
 ///
 /// Returns a registry error when the program fails to spawn, exits non-zero,
-/// or produces empty/NUL/non-UTF-8/unreadable output, or a limit error past
+/// exceeds [`CREDENTIAL_CMD_TIMEOUT`], or produces empty/NUL/non-UTF-8/
+/// unreadable output, or a limit error past
 /// [`MAX_CREDENTIAL_CMD_OUTPUT_BYTES`].
 pub fn execute_credential_cmd(program: &str, args: &[String]) -> Result<String, PluginError> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::sync::mpsc;
+    use std::time::Instant;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -503,56 +530,136 @@ pub fn execute_credential_cmd(program: &str, args: &[String]) -> Result<String, 
         .map_err(|err| {
             PluginError::registry(format!("api_key_cmd '{program}' failed to spawn: {err}"))
         })?;
-    let mut stdout = Vec::new();
-    let read = child.stdout.take().map(|pipe| {
-        pipe.take(MAX_CREDENTIAL_CMD_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut stdout)
-    });
-    if !matches!(read, Some(Ok(_))) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' output unreadable"
-        )));
-    }
-    if stdout.len() > MAX_CREDENTIAL_CMD_OUTPUT_BYTES {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(PluginError::LimitExceeded {
-            field: "api_key_cmd.output".to_string(),
-            limit: MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
-            actual: stdout.len(),
-        });
-    }
-    let status = child.wait().map_err(|err| {
-        PluginError::registry(format!("api_key_cmd '{program}' wait failed: {err}"))
-    })?;
-    if !status.success() {
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' exited with {status}"
-        )));
-    }
-    // The capped read above retains at most cap-plus-one bytes and the
-    // oversize arm already returned, so `stdout` is in-bounds here; the
-    // remaining checks (NUL, UTF-8, strip, empty) are unchanged from Core.
-    if stdout.contains(&0) {
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' output must not contain NUL bytes"
-        )));
-    }
-    let mut text = String::from_utf8(stdout).map_err(|_| {
-        PluginError::registry(format!("api_key_cmd '{program}' output is not UTF-8"))
-    })?;
-    if text.ends_with('\n') {
-        text.pop();
-        if text.ends_with('\r') {
-            text.pop();
+    let pipe = match child.stdout.take() {
+        Some(pipe) => pipe,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PluginError::registry(format!(
+                "api_key_cmd '{program}' output unreadable"
+            )));
         }
+    };
+    // Drain stdout on a worker thread so a voluminous helper can never fill
+    // the pipe while the caller waits for exit, and a silent helper can
+    // never wedge the caller in the read. The cap-plus-one probe is
+    // unchanged: at most that much is ever retained.
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = Vec::new();
+        let read = pipe
+            .take(MAX_CREDENTIAL_CMD_OUTPUT_BYTES as u64 + 1)
+            .read_to_end(&mut stdout);
+        let _ = done_tx.send((read, stdout));
+    });
+    let deadline = Instant::now() + CREDENTIAL_CMD_TIMEOUT;
+    let mut output: Option<(std::io::Result<usize>, Vec<u8>)> = None;
+    let mut status: Option<ExitStatus> = None;
+    loop {
+        if output.is_none() {
+            match done_rx.try_recv() {
+                Ok(done) => output = Some(done),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Reader thread died without delivering: same
+                    // unreadable denial as a failed sequential read.
+                    if status.is_none() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Err(PluginError::registry(format!(
+                        "api_key_cmd '{program}' output unreadable"
+                    )));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) => status = Some(exit),
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(PluginError::registry(format!(
+                        "api_key_cmd '{program}' wait failed: {err}"
+                    )));
+                }
+            }
+        }
+        // Validate arrived output; once it is readable and in-bounds, the
+        // known exit status decides between parse and nonzero-exit denial.
+        // Fall-through means at least one side is still pending (or full
+        // output arrived while the helper stays alive with the pipe
+        // closed): keep polling until the deadline below.
+        let completed: Option<ExitStatus> = match output.as_ref() {
+            Some((read, stdout)) => {
+                if read.is_err() {
+                    if status.is_none() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Err(PluginError::registry(format!(
+                        "api_key_cmd '{program}' output unreadable"
+                    )));
+                }
+                if stdout.len() > MAX_CREDENTIAL_CMD_OUTPUT_BYTES {
+                    if status.is_none() {
+                        // Still producing past the probe byte: stop and
+                        // reap before denying, as the sequential shape did.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    return Err(PluginError::LimitExceeded {
+                        field: "api_key_cmd.output".to_string(),
+                        limit: MAX_CREDENTIAL_CMD_OUTPUT_BYTES,
+                        actual: stdout.len(),
+                    });
+                }
+                status
+            }
+            None => None,
+        };
+        if let Some(exit) = completed {
+            if !exit.success() {
+                return Err(PluginError::registry(format!(
+                    "api_key_cmd '{program}' exited with {exit}"
+                )));
+            }
+            let (_, stdout) = output.take().expect("output validated present");
+            // The capped read above retains at most cap-plus-one bytes and
+            // the oversize arm already returned, so `stdout` is in-bounds
+            // here; the remaining checks (NUL, UTF-8, strip, empty) are
+            // unchanged from Core.
+            if stdout.contains(&0) {
+                return Err(PluginError::registry(format!(
+                    "api_key_cmd '{program}' output must not contain NUL bytes"
+                )));
+            }
+            let mut text = String::from_utf8(stdout).map_err(|_| {
+                PluginError::registry(format!("api_key_cmd '{program}' output is not UTF-8"))
+            })?;
+            if text.ends_with('\n') {
+                text.pop();
+                if text.ends_with('\r') {
+                    text.pop();
+                }
+            }
+            if text.is_empty() {
+                return Err(PluginError::registry(format!(
+                    "api_key_cmd '{program}' produced empty output"
+                )));
+            }
+            return Ok(text);
+        }
+        if Instant::now() >= deadline {
+            if status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Names-only: the program, never helper output bytes.
+            return Err(PluginError::registry(format!(
+                "api_key_cmd '{program}' timed out after {}s",
+                CREDENTIAL_CMD_TIMEOUT.as_secs()
+            )));
+        }
+        std::thread::sleep(CREDENTIAL_CMD_POLL_INTERVAL);
     }
-    if text.is_empty() {
-        return Err(PluginError::registry(format!(
-            "api_key_cmd '{program}' produced empty output"
-        )));
-    }
-    Ok(text)
 }
