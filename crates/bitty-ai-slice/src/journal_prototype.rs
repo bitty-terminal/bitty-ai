@@ -2,7 +2,7 @@
 //!
 //! **Prototype, not a product path.** This module is implementation evidence
 //! for the draft R6 persistence profile
-//! (`docs/specifications/persistence-profile-r6.md`): one append-ordered
+//! (`docs/architecture/persistence-profile-r6.md`): one append-ordered
 //! journal over a transactional store with exactly one writer, where logical
 //! append order never overrides deletion. It is re-exported by nothing,
 //! wired into no production path, and decides none of AIQ-51 through AIQ-5C:

@@ -11,7 +11,7 @@
 //! Provider registry implementation and all model I/O belong on the AI helper
 //! side (this crate, staging toward a `bitty-ai-host` helper behind scoped
 //! IPC), per the draft disposition of `MP-1` versus `BA-2`/`BA-3` in
-//! `docs/specifications/execution-ownership-r1.md`: `BA-2` (Agent versus AI
+//! `docs/architecture/execution-ownership-r1.md`: `BA-2` (Agent versus AI
 //! split) and `BA-3` (bridge process model) win on placement.
 //!
 //! Red line: `bitty-agent` performs no model selection, no model I/O, and no

@@ -41,7 +41,7 @@ monotonic request deadline (AI-CTX-005), and a caller-supplied, redacted key;
 `journal_prototype` (AI-0049) persists an append-ordered single-writer journal
 through SQLite in a caller-supplied database file. The journal module is a
 prototype for the draft R6 persistence profile
-(`docs/specifications/persistence-profile-r6.md`); both are evidence only and
+(`docs/architecture/persistence-profile-r6.md`); both are evidence only and
 decide no open register entry.
 
 ## Modules
