@@ -9,7 +9,11 @@
 //!   - `SecretField::expose_for_adapter()` injects bearer authorization strictly
 //!     at the host adapter edge, without retaining secret material in
 //!     configurations, errors, traces, or debug outputs.
-//! - Enforces pre-I/O context-budget, model, and timeout gates before any network call.
+//! - Enforces pre-I/O context-budget, model, timeout, sampling, and capability
+//!   gates before any network call. The capability gate defaults to
+//!   deny-all (offline-first): `capability.check_request(&net_req)` runs
+//!   after request construction and before any socket work, so a denied or
+//!   offline capability fails closed with zero service calls.
 //! - Maps typed [`bitty_network_api::NetworkError`] outcomes to typed [`ProviderError`]s.
 
 use std::fmt;
@@ -19,12 +23,15 @@ use std::time::Duration;
 use bitty_ai_runtime::prompt::MAX_CANONICAL_BYTES;
 use bitty_ai_runtime::provider::{
     MAX_REQUEST_TIMEOUT_MS, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
-    ProviderUsage, Role, ToolCallRequest, TurnRequest, validate_provider_id, validate_sampling,
+    ProviderUsage, Role, SamplingParams, ToolCallRequest, TurnRequest, validate_provider_id,
+    validate_sampling,
 };
 use bitty_ai_runtime::secret::SecretField;
 use bitty_ai_runtime::selection::validate_model_name;
 use bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES;
-use bitty_network_api::{NetworkError, NetworkService, Request, Response, WebSocketRequest};
+use bitty_network_api::{
+    NetworkCapability, NetworkError, NetworkService, Request, Response, WebSocketRequest,
+};
 
 /// Adapter configuration errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +73,9 @@ pub struct NetworkConsumerAdapterConfig {
     pub extra_headers: Vec<(String, String)>,
     /// Model descriptors declared by this adapter.
     pub models: Vec<ModelDescriptor>,
+    /// Network capability allowlist enforced pre-I/O via
+    /// `capability.check_request(&net_req)` (offline-first: deny-all default).
+    pub capability: NetworkCapability,
 }
 
 impl NetworkConsumerAdapterConfig {
@@ -102,6 +112,7 @@ impl NetworkConsumerAdapterConfig {
             api_key: None,
             extra_headers: Vec::new(),
             models: vec![default_descriptor],
+            capability: NetworkCapability::offline(),
         })
     }
 
@@ -125,6 +136,17 @@ impl NetworkConsumerAdapterConfig {
         self.models = models;
         self
     }
+
+    /// Grant the network capability allowlist enforced pre-I/O.
+    ///
+    /// The default is deny-all ([`NetworkCapability::offline`]): every
+    /// endpoint stays unreachable until the caller grants its domain (e.g.
+    /// `NetworkCapability::offline().with_domain("api.example.com")`).
+    #[must_use]
+    pub fn with_capability(mut self, capability: NetworkCapability) -> Self {
+        self.capability = capability;
+        self
+    }
 }
 
 impl fmt::Debug for NetworkConsumerAdapterConfig {
@@ -137,6 +159,7 @@ impl fmt::Debug for NetworkConsumerAdapterConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("extra_headers_count", &self.extra_headers.len())
             .field("models", &self.models)
+            .field("capability", &self.capability)
             .finish()
     }
 }
@@ -209,9 +232,13 @@ impl<S: NetworkService> ModelProvider for NetworkConsumerAdapter<S> {
             });
         }
 
-        // Pre-I/O Gate 3: Sampling validation
+        // Pre-I/O Gate 3: Sampling validation (range) plus backend support.
+        // Validation support does not imply backend support: a valid
+        // declaration still refuses before any I/O when this adapter has no
+        // explicit mapping for it (mirrors `local_provider`).
         if let Some(ref params) = request.sampling {
             validate_sampling(params)?;
+            check_supported_sampling(params)?;
         }
 
         // Pre-I/O Gate 4: Unknown model rejection
@@ -264,6 +291,19 @@ impl<S: NetworkService> ModelProvider for NetworkConsumerAdapter<S> {
             net_req = net_req.with_header("authorization", format!("Bearer {token_str}"));
         }
 
+        // Pre-I/O Gate 6: Capability allowlist (host, port, method) enforced
+        // after request construction and before any socket work. A denied or
+        // offline capability fails closed here with zero service calls; the
+        // denial reuses the typed transport-error mapping below.
+        if let Err(denial) = self.config.capability.check_request(&net_req) {
+            return Err(map_network_error(
+                &self.config.provider_id,
+                denial,
+                request.timeout_ms,
+                request.budget_bytes,
+            ));
+        }
+
         // Execute request through NetworkService
         self.complete_calls += 1;
         let response = match self.service.request(&net_req) {
@@ -278,7 +318,18 @@ impl<S: NetworkService> ModelProvider for NetworkConsumerAdapter<S> {
             }
         };
 
-        // Handle HTTP response statuses
+        // Handle HTTP response statuses.
+        //
+        // Status mapping table (pinned by tests):
+        // | status              | ProviderError   |
+        // |---------------------|-----------------|
+        // | 401, 403            | Auth            |
+        // | 429                 | RateLimited     |
+        // | 404, 503            | ModelUnavailable|
+        // | other non-2xx       | Transport       |
+        //
+        // `Retry-After` (seconds, per HTTP) converts to ms when present on a
+        // 429; an absent or unparseable value yields `retry_after_ms: None`.
         if response.status == 401 || response.status == 403 {
             return Err(ProviderError::Auth {
                 provider: self.config.provider_id.clone(),
@@ -308,6 +359,18 @@ impl<S: NetworkService> ModelProvider for NetworkConsumerAdapter<S> {
             });
         }
 
+        // The 2xx parse path expects a JSON body: the response
+        // `Content-Type` must be `application/json` (case-insensitive,
+        // parameters such as `; charset=utf-8` allowed, mirroring
+        // `local_provider`). Anything else fails closed instead of parsing
+        // an untrusted non-JSON body as model output.
+        if !is_json_content_type(response.header("content-type")) {
+            return Err(ProviderError::Transport {
+                provider: self.config.provider_id.clone(),
+                reason: "response content-type is not application/json".to_owned(),
+            });
+        }
+
         // Response body ceiling check (single-fragment ceiling from stream module)
         if response.body.len() > MAX_FRAGMENT_BYTES {
             return Err(ProviderError::Transport {
@@ -319,7 +382,7 @@ impl<S: NetworkService> ModelProvider for NetworkConsumerAdapter<S> {
         }
 
         // Parse JSON response body
-        parse_response_body(&self.config.provider_id, &response.body)
+        parse_response_body(&self.config.provider_id, &response)
     }
 
     fn scripted_turns_remaining(&self) -> usize {
@@ -331,6 +394,32 @@ impl<S: NetworkService> ModelProvider for NetworkConsumerAdapter<S> {
     }
 }
 
+/// Build the OpenAI-compatible chat body plus mapped sampling.
+///
+/// `Role::Tool` observations are folded into `user` messages with a `[tool] `
+/// prefix (aligned with `local_provider`), so no tool protocol is required
+/// and the untrusted surface stays labeled in the text itself.
+///
+/// Sampling mapped-field table (mirrors `local_provider`; only `Some`
+/// fields emit, absent stays absent and is never defaulted):
+/// | `SamplingParams` field | body field          | carried |
+/// |------------------------|---------------------|---------|
+/// | `temperature`          | `"temperature"`     | yes     |
+/// | `top_p`                | `"top_p"`           | yes     |
+/// | `frequency_penalty`    | `"frequency_penalty"`| yes    |
+/// | `presence_penalty`     | `"presence_penalty"`| yes     |
+/// | `seed`                 | `"seed"`            | yes     |
+/// | `max_tokens`           | `"max_tokens"`      | yes     |
+/// | `stop`                 | `"stop"`            | yes     |
+/// | `top_k`                | —                   | no (rejected: `UnsupportedSampling`) |
+/// | `repetition_penalty`   | —                   | no (rejected: `UnsupportedSampling`) |
+/// | `min_p`                | —                   | no (rejected: `UnsupportedSampling`) |
+/// | `response_format`      | —                   | no (rejected: `UnsupportedSampling`) |
+/// | `reasoning`            | —                   | no (rejected: `UnsupportedSampling`) |
+///
+/// `max_tokens` is the declared completion-token field for the backend to
+/// interpret; it is not client-side enforcement, and the separate
+/// response-byte ceiling is an unrelated transport bound.
 fn build_request_body(model: &str, request: &TurnRequest) -> Result<Vec<u8>, ProviderError> {
     let mut message_list = Vec::with_capacity(request.messages.len());
     for msg in &request.messages {
@@ -339,9 +428,16 @@ fn build_request_body(model: &str, request: &TurnRequest) -> Result<Vec<u8>, Pro
             Role::Assistant => "assistant",
             Role::Tool => "user",
         };
+        // `[tool] ` prefix keeps tool observations labeled in the text
+        // itself (aligned with `local_provider`); see `role_name` there.
+        let content = if matches!(msg.role, Role::Tool) {
+            format!("[tool] {}", msg.content)
+        } else {
+            msg.content.clone()
+        };
         message_list.push(serde_json::json!({
             "role": role_str,
-            "content": msg.content,
+            "content": content,
         }));
     }
 
@@ -362,8 +458,26 @@ fn build_request_body(model: &str, request: &TurnRequest) -> Result<Vec<u8>, Pro
         if let Some(top_p) = sampling.top_p {
             payload.insert("top_p".to_owned(), serde_json::json!(top_p));
         }
+        if let Some(frequency_penalty) = sampling.frequency_penalty {
+            payload.insert(
+                "frequency_penalty".to_owned(),
+                serde_json::json!(frequency_penalty),
+            );
+        }
+        if let Some(presence_penalty) = sampling.presence_penalty {
+            payload.insert(
+                "presence_penalty".to_owned(),
+                serde_json::json!(presence_penalty),
+            );
+        }
+        if let Some(seed) = sampling.seed {
+            payload.insert("seed".to_owned(), serde_json::json!(seed));
+        }
         if let Some(max_tokens) = sampling.max_tokens {
             payload.insert("max_tokens".to_owned(), serde_json::json!(max_tokens));
+        }
+        if let Some(ref stop) = sampling.stop {
+            payload.insert("stop".to_owned(), serde_json::json!(stop));
         }
     }
 
@@ -373,9 +487,59 @@ fn build_request_body(model: &str, request: &TurnRequest) -> Result<Vec<u8>, Pro
     })
 }
 
-fn parse_response_body(provider_id: &str, body: &[u8]) -> Result<ProviderTurn, ProviderError> {
+/// Reject declared sampling fields this adapter does not carry.
+///
+/// Mirrors `local_provider::check_supported_sampling`: validation support
+/// does not imply backend support, so a valid declaration still refuses
+/// before any I/O when the backend has no explicit mapping for it. The
+/// label is a static field name, never caller input.
+fn check_supported_sampling(params: &SamplingParams) -> Result<(), ProviderError> {
+    if params.top_k.is_some() {
+        return Err(ProviderError::UnsupportedSampling { field: "top_k" });
+    }
+    if params.repetition_penalty.is_some() {
+        return Err(ProviderError::UnsupportedSampling {
+            field: "repetition_penalty",
+        });
+    }
+    if params.min_p.is_some() {
+        return Err(ProviderError::UnsupportedSampling { field: "min_p" });
+    }
+    if params.response_format.is_some() {
+        return Err(ProviderError::UnsupportedSampling {
+            field: "response_format",
+        });
+    }
+    if params.reasoning.is_some() {
+        return Err(ProviderError::UnsupportedSampling { field: "reasoning" });
+    }
+    Ok(())
+}
+
+/// Whether `content_type` authorizes the 2xx JSON parse path.
+///
+/// Accepts `application/json` (case-insensitive, optionally with `; ...`
+/// parameters, e.g. `application/json; charset=utf-8`). The media type is
+/// compared exactly (portion before the first `;`, trimmed), so suffixed
+/// types such as `application/json-seq` are rejected. This is stricter than
+/// `local_provider::is_json_content_type` (substring match); the divergence
+/// is intentional fail-closed parsing on the network path.
+fn is_json_content_type(content_type: Option<&str>) -> bool {
+    match content_type {
+        Some(value) => value
+            .split(';')
+            .next()
+            .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json")),
+        None => false,
+    }
+}
+
+fn parse_response_body(
+    provider_id: &str,
+    response: &Response,
+) -> Result<ProviderTurn, ProviderError> {
     let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| ProviderError::Transport {
+        serde_json::from_slice(&response.body).map_err(|e| ProviderError::Transport {
             provider: provider_id.to_owned(),
             reason: format!("failed to parse response JSON: {e}"),
         })?;
@@ -445,6 +609,25 @@ fn parse_response_body(provider_id: &str, body: &[u8]) -> Result<ProviderTurn, P
     })
 }
 
+/// Map one [`NetworkError`] onto the provider taxonomy (no new kinds).
+///
+/// Mapping table:
+/// | `NetworkError`      | `ProviderError`                          |
+/// |---------------------|--------------------------------------------|
+/// | `Offline`           | `Transport` ("network offline")            |
+/// | `Denied { domain }` | `Transport` ("network access denied ...")|
+/// | `Timeout { after }` | `Timeout` (caller timeout + observed ms) |
+/// | `Budget`            | `Unknown` (transfer budget, MP-7)          |
+/// | `CountBudget`       | `Unknown` (transfer budget, MP-7)          |
+/// | `Tls { reason }`    | `Transport` ("network tls refused: ...")   |
+///
+/// Transfer budgets (`Budget`, `CountBudget`) never map to
+/// [`ProviderError::BudgetExceeded`]: that variant stays context-only
+/// (`CP-5`, the pre-I/O caller-budget gate in `complete`). A transfer
+/// budget fires post-send — the request may have been applied while the
+/// acknowledgement was withheld — so both map to [`ProviderError::Unknown`]
+/// (`MP-7`, reconcile before retry, never blind fallback). `Unknown` is
+/// reserved for exactly this post-send truncation shape.
 fn map_network_error(
     provider_id: &str,
     err: NetworkError,
@@ -468,9 +651,9 @@ fn map_network_error(
             provider: provider_id.to_owned(),
             reason: format!("network body budget exceeded: limit was {limit_bytes} bytes"),
         },
-        NetworkError::CountBudget { limit_items } => ProviderError::Transport {
+        NetworkError::CountBudget { limit_items } => ProviderError::Unknown {
             provider: provider_id.to_owned(),
-            reason: format!("network count budget exceeded: {limit_items}"),
+            reason: format!("network count budget exceeded: limit was {limit_items} items"),
         },
         NetworkError::Tls { reason } => ProviderError::Transport {
             provider: provider_id.to_owned(),
@@ -558,6 +741,7 @@ impl NetworkService for RecordingNetworkService {
 mod tests {
     use super::*;
     use bitty_ai_runtime::provider::Message;
+    use bitty_ai_runtime::{ReasoningConfig, ResponseFormat};
 
     fn sample_turn_request(model: &str, budget: usize, timeout_ms: u64) -> TurnRequest {
         TurnRequest {
@@ -602,7 +786,8 @@ mod tests {
             "test-model",
             "https://api.example.com/v1/chat/completions",
         )
-        .unwrap();
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         let mut adapter = NetworkConsumerAdapter::new(config, service);
         let turn_req = sample_turn_request("test-model", 4096, 7500);
@@ -627,7 +812,8 @@ mod tests {
             "test-model",
             "https://api.example.com/v1/chat/completions",
         )
-        .unwrap();
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         let mut adapter = NetworkConsumerAdapter::new(config, service);
         // Turn request with message exceeding budget
@@ -653,7 +839,8 @@ mod tests {
             "test-model",
             "https://api.example.com/v1/chat/completions",
         )
-        .unwrap();
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         let mut adapter = NetworkConsumerAdapter::new(config, service);
 
@@ -684,7 +871,8 @@ mod tests {
             "https://api.example.com/v1/chat/completions",
         )
         .unwrap()
-        .with_api_key(secret);
+        .with_api_key(secret)
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         // Adapter Debug check: secret value MUST NOT leak
         let adapter_debug = format!("{config:?}");
@@ -717,6 +905,15 @@ mod tests {
         let req_debug = format!("{recorded:?}");
         assert!(!req_debug.contains("canary"));
         assert!(req_debug.contains("[redacted]"));
+
+        // Error-path redaction: the response queue is now drained, so the
+        // next turn fails with a transport error whose Display/Debug must
+        // also carry no secret material.
+        let err = adapter.complete(&turn_req).unwrap_err();
+        let err_display = format!("{err}");
+        let err_debug = format!("{err:?}");
+        assert!(!err_display.contains("canary"));
+        assert!(!err_debug.contains("canary"));
     }
 
     #[test]
@@ -734,13 +931,16 @@ mod tests {
         });
         // 4. Budget
         service.queue_error(NetworkError::Budget { limit_bytes: 4096 });
+        // 5. CountBudget
+        service.queue_error(NetworkError::CountBudget { limit_items: 8 });
 
         let config = NetworkConsumerAdapterConfig::new(
             "test-provider",
             "test-model",
             "https://api.example.com/v1/chat/completions",
         )
-        .unwrap();
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         let mut adapter = NetworkConsumerAdapter::new(config, service);
         let req = sample_turn_request("test-model", 4096, 5000);
@@ -790,6 +990,23 @@ mod tests {
             bitty_ai_runtime::selection::fallback_directive(&err4),
             bitty_ai_runtime::selection::FallbackDirective::Stop
         );
+
+        // 5. CountBudget: same post-send truncation shape as Budget, so the
+        // same Unknown mapping (never BudgetExceeded, which stays
+        // context-only per CP-5).
+        let err5 = adapter.complete(&req).unwrap_err();
+        match &err5 {
+            ProviderError::Unknown { provider, reason } => {
+                assert_eq!(provider, "test-provider");
+                assert!(reason.contains("network count budget exceeded"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        assert!(!matches!(err5, ProviderError::BudgetExceeded { .. }));
+        assert_eq!(
+            bitty_ai_runtime::selection::fallback_directive(&err5),
+            bitty_ai_runtime::selection::FallbackDirective::Stop
+        );
     }
 
     #[test]
@@ -819,7 +1036,8 @@ mod tests {
             "test-model",
             "https://api.example.com/v1/chat/completions",
         )
-        .unwrap();
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         let mut adapter = NetworkConsumerAdapter::new(config, service);
         let req = sample_turn_request("test-model", 4096, 5000);
@@ -884,7 +1102,8 @@ mod tests {
             "test-model",
             "https://api.example.com/v1/chat/completions",
         )
-        .unwrap();
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
 
         let mut adapter = NetworkConsumerAdapter::new(config, service);
         let req = sample_turn_request("test-model", 4096, 5000);
@@ -897,5 +1116,268 @@ mod tests {
             std::str::from_utf8(&turn.tool_calls[0].arguments).unwrap(),
             "{\"location\":\"Paris\"}"
         );
+    }
+
+    fn blank_sampling() -> SamplingParams {
+        SamplingParams {
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            min_p: None,
+            seed: None,
+            max_tokens: None,
+            stop: None,
+            response_format: None,
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn capability_gate_defaults_offline_and_fails_closed_with_zero_calls() {
+        let service = RecordingNetworkService::new();
+        service.queue_response(sample_openai_response("Must never send."));
+
+        // No capability grant: the deny-all default refuses before any I/O.
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap();
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+        let err = adapter.complete(&req).unwrap_err();
+        match err {
+            ProviderError::Transport { provider, reason } => {
+                assert_eq!(provider, "test-provider");
+                assert_eq!(reason, "network offline");
+            }
+            other => panic!("expected offline Transport, got {other:?}"),
+        }
+        assert_eq!(adapter.service().recorded_count(), 0);
+        assert_eq!(adapter.complete_calls(), 0);
+    }
+
+    #[test]
+    fn capability_gate_denied_domain_fails_closed_with_zero_calls() {
+        let service = RecordingNetworkService::new();
+        service.queue_response(sample_openai_response("Must never send."));
+
+        // Grant covers another domain only, so this endpoint is denied.
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("other.example"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+        let err = adapter.complete(&req).unwrap_err();
+        match err {
+            ProviderError::Transport { provider, reason } => {
+                assert_eq!(provider, "test-provider");
+                assert!(reason.contains("api.example.com"));
+            }
+            other => panic!("expected denied Transport, got {other:?}"),
+        }
+        assert_eq!(adapter.service().recorded_count(), 0);
+        assert_eq!(adapter.complete_calls(), 0);
+    }
+
+    #[test]
+    fn unsupported_sampling_fields_fail_closed_pre_io() {
+        let mut top_k = blank_sampling();
+        top_k.top_k = Some(40);
+        let mut repetition = blank_sampling();
+        repetition.repetition_penalty = Some(1.1);
+        let mut min_p = blank_sampling();
+        min_p.min_p = Some(0.05);
+        let mut response_format = blank_sampling();
+        response_format.response_format = Some(ResponseFormat::JsonObject);
+        let mut reasoning = blank_sampling();
+        reasoning.reasoning = Some(ReasoningConfig {
+            effort: None,
+            max_tokens: None,
+            exclude: false,
+        });
+        let cases = [
+            (top_k, "top_k"),
+            (repetition, "repetition_penalty"),
+            (min_p, "min_p"),
+            (response_format, "response_format"),
+            (reasoning, "reasoning"),
+        ];
+
+        let service = RecordingNetworkService::new();
+        service.queue_response(sample_openai_response("Must never send."));
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        for (sampling, field) in cases {
+            let mut req = sample_turn_request("test-model", 4096, 5000);
+            req.sampling = Some(sampling);
+            let err = adapter.complete(&req).unwrap_err();
+            assert_eq!(err, ProviderError::UnsupportedSampling { field });
+            assert_eq!(
+                bitty_ai_runtime::selection::fallback_directive(&err),
+                bitty_ai_runtime::selection::FallbackDirective::Stop
+            );
+        }
+        assert_eq!(adapter.service().recorded_count(), 0);
+        assert_eq!(adapter.complete_calls(), 0);
+    }
+
+    #[test]
+    fn supported_sampling_fields_map_into_body() {
+        let service = RecordingNetworkService::new();
+        service.queue_response(sample_openai_response("Mapped."));
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let mut req = sample_turn_request("test-model", 4096, 5000);
+        let mut sampling = blank_sampling();
+        sampling.temperature = Some(0.7);
+        sampling.top_p = Some(0.9);
+        sampling.frequency_penalty = Some(0.1);
+        sampling.presence_penalty = Some(0.2);
+        sampling.seed = Some(42);
+        sampling.max_tokens = Some(128);
+        sampling.stop = Some(vec!["END".to_owned()]);
+        req.sampling = Some(sampling);
+
+        let turn = adapter.complete(&req).expect("mapped sampling succeeds");
+        assert_eq!(turn.text, "Mapped.");
+
+        let recorded = adapter.service().last_request().expect("recorded request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&recorded.body).expect("request body is JSON");
+        assert_eq!(body["temperature"], serde_json::json!(0.7));
+        assert_eq!(body["top_p"], serde_json::json!(0.9));
+        assert_eq!(body["frequency_penalty"], serde_json::json!(0.1));
+        assert_eq!(body["presence_penalty"], serde_json::json!(0.2));
+        assert_eq!(body["seed"], serde_json::json!(42));
+        assert_eq!(body["max_tokens"], serde_json::json!(128));
+        assert_eq!(body["stop"], serde_json::json!(["END"]));
+    }
+
+    #[test]
+    fn tool_role_folds_into_user_with_prefix() {
+        let service = RecordingNetworkService::new();
+        service.queue_response(sample_openai_response("Observed."));
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let mut req = sample_turn_request("test-model", 4096, 5000);
+        req.messages.push(Message::tool("file contents here"));
+
+        let turn = adapter.complete(&req).expect("tool message succeeds");
+        assert_eq!(turn.text, "Observed.");
+
+        let recorded = adapter.service().last_request().expect("recorded request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&recorded.body).expect("request body is JSON");
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], serde_json::json!("user"));
+        assert_eq!(
+            messages[1]["content"],
+            serde_json::json!("[tool] file contents here")
+        );
+    }
+
+    #[test]
+    fn non_json_content_type_fails_closed_on_2xx() {
+        let service = RecordingNetworkService::new();
+        // 200 with a non-JSON content type must not parse.
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+            body: b"plain text, not model output".to_vec(),
+        });
+        // 200 with no content type at all must not parse either.
+        service.queue_response(Response {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{}".to_vec(),
+        });
+        // 200 with a suffixed media type must not parse (CodeRabbit #325:
+        // substring matching would accept `application/json-seq`).
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json-seq".to_owned())],
+            body: b"\x1e{\"choices\":[]}\n".to_vec(),
+        });
+        // 200 with JSON parameters on the content type still parses.
+        let ok_body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "Parametric."}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        });
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![(
+                "content-type".to_owned(),
+                "application/json; charset=utf-8".to_owned(),
+            )],
+            body: serde_json::to_vec(&ok_body).unwrap(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        let err_plain = adapter.complete(&req).unwrap_err();
+        match err_plain {
+            ProviderError::Transport { provider, reason } => {
+                assert_eq!(provider, "test-provider");
+                assert_eq!(reason, "response content-type is not application/json");
+            }
+            other => panic!("expected content-type Transport, got {other:?}"),
+        }
+
+        let err_missing = adapter.complete(&req).unwrap_err();
+        assert!(matches!(err_missing, ProviderError::Transport { .. }));
+
+        let err_seq = adapter.complete(&req).unwrap_err();
+        assert!(
+            matches!(err_seq, ProviderError::Transport { .. }),
+            "suffixed media type must fail closed, got {err_seq:?}"
+        );
+
+        let turn = adapter.complete(&req).expect("JSON with parameters parses");
+        assert_eq!(turn.text, "Parametric.");
     }
 }
