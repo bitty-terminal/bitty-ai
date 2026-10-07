@@ -8,7 +8,7 @@
 //! `bitty-ipc` services, so only the construction site changes; callers keep
 //! calling the same trait methods.
 //!
-//! [bii09]: https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/bitty-side-integration-input.md
+//! [bii09]: https://github.com/bitty-terminal/bitty-ai-docs/blob/main/integration/bitty-side-integration-input.md
 //!
 //! ## Read-only mirror of merged `bitty` shapes
 //!

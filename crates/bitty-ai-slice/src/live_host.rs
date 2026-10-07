@@ -9,7 +9,7 @@
 //! Dispatch prefix order, consent attribution, and `Unknown` reconcile/resolve
 //! semantics therefore hold by construction, not by mirrored steps.
 //!
-//! [bii09]: https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/bitty-side-integration-input.md
+//! [bii09]: https://github.com/bitty-terminal/bitty-ai-docs/blob/main/integration/bitty-side-integration-input.md
 //!
 //! ## Direction basis (input only, not accepted architecture)
 //!
