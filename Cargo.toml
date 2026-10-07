@@ -5,6 +5,8 @@ members = [
   "crates/bitty-ai-slice",
   # Deterministic single-agent runtime skeleton (AI-0009). Std only.
   "crates/bitty-ai-runtime",
+  # Hand-rolled sync stdio MCP client (AI-0179). Std plus path dep only.
+  "crates/bitty-ai-mcp",
   # Future crates:
   # - crates/bitty-ai-model-provider
   # - crates/bitty-ai-context-provider

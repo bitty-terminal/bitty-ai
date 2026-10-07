@@ -1,0 +1,20 @@
+[package]
+name = "bitty-ai-mcp"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Hand-rolled sync stdio MCP client (AI-0179, draft scope)"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only path dependency on the sibling runtime crate for the ToolSpec bounds
+# and the ToolExecutor / ConsentLedger seams. No external crates, no async
+# runtime, no JSON crate: the wire encoding is hand-rolled in `json.rs`.
+bitty-ai-runtime = { path = "../bitty-ai-runtime" }
