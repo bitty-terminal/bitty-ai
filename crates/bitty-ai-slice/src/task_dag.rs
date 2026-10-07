@@ -10,9 +10,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -615,6 +617,77 @@ fn task_map_busy(err: rusqlite::Error) -> TaskEngineError {
     }
 }
 
+/// Bounded SQLite header probe for standalone task opens: only the first 16
+/// bytes are ever read, so the check costs O(1) memory on any file size.
+fn check_task_magic(path: &Path) -> Result<(), TaskEngineError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(TaskEngineError::Corrupt {
+                detail: format!("unreadable database file: {e}"),
+            });
+        }
+    };
+    let mut header = [0u8; 16];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) => {
+                return Err(TaskEngineError::Corrupt {
+                    detail: format!("unreadable database file: {e}"),
+                });
+            }
+        }
+    }
+    if read == 0 {
+        return Ok(());
+    }
+    if read < 16 || header != *b"SQLite format 3\0" {
+        return Err(TaskEngineError::Corrupt {
+            detail: "file is not a SQLite database".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Durable pragma profile for task connections (WAL, FULL, FK ON, EXCLUSIVE),
+/// sharing the content-store timeout by construction.
+fn apply_task_pragmas(conn: &Connection) -> Result<(), TaskEngineError> {
+    conn.busy_timeout(Duration::from_millis(
+        crate::content_store::DURABLE_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(task_map_busy)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA locking_mode = EXCLUSIVE;",
+    )
+    .map_err(task_map_busy)?;
+    Ok(())
+}
+
+/// Claim the single-writer lock on a standalone open.
+///
+/// `CREATE TABLE IF NOT EXISTS` is read-only when the schema already exists,
+/// so the EXCLUSIVE locking mode alone takes no lock until the first real
+/// write. This zero-timeout `BEGIN EXCLUSIVE` probe takes the lock at open:
+/// a second open while the first lives fails fast with
+/// [`TaskEngineError::WriterBusy`]. Steady state restores the nonzero profile
+/// timeout only after the claim succeeds.
+fn claim_task_writer(conn: &Connection) -> Result<(), TaskEngineError> {
+    conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")
+        .map_err(task_map_busy)?;
+    conn.busy_timeout(Duration::from_millis(
+        crate::content_store::DURABLE_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(task_map_busy)?;
+    Ok(())
+}
+
 impl TaskEngine {
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, TaskEngineError> {
         self.conn.lock().map_err(|_| TaskEngineError::Corrupt {
@@ -626,10 +699,27 @@ impl TaskEngine {
     ///
     /// Applies the durable pragma profile shared with
     /// `crate::content_store` (WAL, FULL, FK ON, nonzero busy timeout,
-    /// EXCLUSIVE single-writer).
+    /// EXCLUSIVE single-writer). The file header is magic-checked, the task
+    /// schema is admitted (foreign or partial shapes fail closed), and the
+    /// single-writer lock is claimed before returning, so a second open while
+    /// the first lives fails with [`TaskEngineError::WriterBusy`]. The busy
+    /// timeout stays zero through admission and init and restores the nonzero
+    /// profile timeout only after the writer claim succeeds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
+        let path = path.as_ref();
+        check_task_magic(path)?;
         let conn = Connection::open(path).map_err(task_map_busy)?;
-        Self::from_connection(conn)
+        conn.busy_timeout(Duration::ZERO).map_err(task_map_busy)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(task_map_busy)?;
+        admit_task_or_init(&conn)?;
+        apply_task_pragmas(&conn)?;
+        conn.busy_timeout(Duration::ZERO).map_err(task_map_busy)?;
+        conn.execute_batch(TASK_SCHEMA).map_err(task_map_busy)?;
+        claim_task_writer(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Open a durable task engine (formal path, same profile as `Self::open`).
@@ -657,19 +747,11 @@ impl TaskEngine {
     /// Initialize tables and indexes on an open connection.
     ///
     /// Applies the same durable pragma profile as the content store (WAL,
-    /// FULL, FK ON, nonzero busy timeout, EXCLUSIVE single-writer); values
-    /// must match `crate::content_store::DURABLE_BUSY_TIMEOUT_MS`.
+    /// FULL, FK ON, nonzero busy timeout, EXCLUSIVE single-writer) via
+    /// [`apply_task_pragmas`]; the timeout value is
+    /// `crate::content_store::DURABLE_BUSY_TIMEOUT_MS` by construction.
     fn from_connection(conn: Connection) -> Result<Self, TaskEngineError> {
-        use std::time::Duration;
-        conn.busy_timeout(Duration::from_millis(5000))
-            .map_err(task_map_busy)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             PRAGMA foreign_keys = ON;
-             PRAGMA locking_mode = EXCLUSIVE;",
-        )
-        .map_err(task_map_busy)?;
+        apply_task_pragmas(&conn)?;
         conn.execute_batch(TASK_SCHEMA).map_err(task_map_busy)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

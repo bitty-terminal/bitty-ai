@@ -307,8 +307,16 @@ fn expired_source_deadline_is_typed_absence_never_resurrected() {
             ephemeral_ttl_ms: Some(5 * 60 * 1000),
         };
         let expired = reloaded.apply_retention(&policy, 10_000_000);
-        assert!(expired.contains(&reloaded.tombstones[0].clone()) || !expired.is_empty());
+        // Exact expired id: the span whose source deadline is past the
+        // Ephemeral TTL. (Both sources sit inside the span range, so the view
+        // holds no passthrough records for them: the only record is the
+        // span's synthetic summary, dropped with its span.)
         let span_id = view.spans[0].span_id.clone();
+        assert_eq!(
+            expired,
+            vec![span_id.clone()],
+            "only the expired span id may expire"
+        );
         let err = reloaded
             .resolve_summary(&span_id)
             .expect_err("expired span must be absent");
@@ -326,6 +334,66 @@ fn expired_source_deadline_is_typed_absence_never_resurrected() {
             "expired span never resurrected"
         );
         assert!(reread.resolve_summary(&span_id).is_err());
+        // Tombstoned bodies stay deleted: no expired id may reload with a
+        // payload, even though its bytes were on disk before tombstoning.
+        // Here that means the stripped synthetic summary record is gone.
+        for id in &expired {
+            assert!(
+                !reread.records.iter().any(|record| &record.id == id),
+                "expired id {id} resurrected with payload bytes"
+            );
+        }
+        assert!(
+            reread.records.is_empty(),
+            "the expired synthetic record must be stripped from the image"
+        );
+        drop(store);
+        // The bytes must be gone from the disk image itself, not merely
+        // filtered at load: the persisted records_json carries no expired id.
+        {
+            let raw = rusqlite::Connection::open(&comp_path).expect("raw probe");
+            let image: String = raw
+                .query_row(
+                    "SELECT value FROM compaction_meta WHERE key = 'records_json'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("records_json present");
+            for id in &expired {
+                assert!(
+                    !image.contains(id.as_str()),
+                    "expired id {id} still persisted on disk"
+                );
+            }
+            // Tombstoned spans are purged from the spans table itself, not
+            // merely filtered at load: no span row may reference an expired
+            // source, and the expired span row must be gone.
+            let span_rows: Vec<(String, String)> = {
+                let mut stmt = raw
+                    .prepare("SELECT span_id, source_ids_json FROM compaction_spans")
+                    .expect("spans probe");
+                stmt.query_map([], |row| {
+                    let span_id: String = row.get(0)?;
+                    let source_json: String = row.get(1)?;
+                    Ok((span_id, source_json))
+                })
+                .expect("span rows")
+                .map(|row| row.expect("span row"))
+                .collect()
+            };
+            assert!(
+                !span_rows.iter().any(|(sid, _)| sid == &span_id),
+                "expired span row still persisted on disk"
+            );
+            for id in &expired {
+                assert!(
+                    !span_rows
+                        .iter()
+                        .any(|(_, sources)| sources.contains(id.as_str())),
+                    "expired id {id} still referenced by a span row on disk"
+                );
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

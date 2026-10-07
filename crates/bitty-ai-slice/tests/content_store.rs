@@ -431,16 +431,12 @@ fn durable_pragmas_unified_on_open() {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .expect("journal_mode");
         assert_eq!(journal.to_lowercase(), "wal");
-        let sync: String = raw
-            .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
-            .map(|v| v.to_string())
-            .expect("synchronous");
-        // FULL = 2
-        assert_eq!(sync, "2");
-        let fk: i64 = raw
-            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-            .expect("fk");
-        assert_eq!(fk, 1);
+        // NOTE: `synchronous` and `foreign_keys` are per-connection state,
+        // not file-persisted settings, so they cannot be asserted on this
+        // fresh probe connection (it only shows build defaults). They are
+        // covered on the applying connection itself by the
+        // `durable_profile_tests::pragmas_apply_on_the_same_connection`
+        // unit test in `src/content_store.rs`.
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

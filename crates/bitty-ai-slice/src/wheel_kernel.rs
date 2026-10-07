@@ -77,15 +77,18 @@ impl WheelKernel {
         crate::content_store::check_sqlite_magic(path).map_err(FacadeError::from)?;
         let conn = Connection::open(path)
             .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
-        conn.busy_timeout(Duration::from_millis(
-            crate::content_store::DURABLE_BUSY_TIMEOUT_MS,
-        ))
-        .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
+        // Fail-fast admission: the busy timeout stays zero until the writer
+        // claim succeeds, so a second open while the first lives returns
+        // promptly instead of waiting out the steady-state timeout.
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
         crate::content_store::admit_or_init(&conn).map_err(FacadeError::from)?;
         crate::task_dag::admit_task_or_init(&conn).map_err(FacadeError::from)?;
         crate::content_store::apply_durable_pragmas(&conn).map_err(FacadeError::from)?;
+        conn.busy_timeout(Duration::ZERO)
+            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
         crate::content_store::init_content_schema(&conn).map_err(FacadeError::from)?;
         {
             use crate::task_dag::TASK_SCHEMA;

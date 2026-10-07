@@ -34,12 +34,24 @@
 //!
 //! ## Bounds (reused semantics)
 //!
-//! - Span count per view: [`MAX_SPANS`] (32).
+//! - Span count per view: [`MAX_SPANS`] (32), enforced on write and on load.
 //! - Span id length: [`MAX_SPAN_ID_LEN`] (64).
+//! - Span sources: at most [`MAX_CONTEXT_RECORDS`] ids per span, each
+//!   non-empty and at most [`MAX_TOMBSTONE_ID_LEN`] bytes.
 //! - Summary text (span summaries and `previous_summary`):
 //!   runtime [`MAX_SUMMARY_BYTES`] (4 KiB, the summarizer output bound).
 //! - Record bodies: inline only; artifact references fail closed (their bytes
 //!   live in the in-memory [`ArtifactStore`], not here).
+//! - Record count per view: [`MAX_CONTEXT_RECORDS`] (128), enforced on write
+//!   and on load.
+//! - Stored `records_json` image: at most [`MAX_RECORDS_JSON_BYTES`] (8 MiB),
+//!   size-checked before parsing on load. Tombstoned records are stripped
+//!   from the image on write and filtered on load, so absence metadata never
+//!   carries payload bytes.
+//! - Tombstones: at most [`MAX_STORED_TOMBSTONES`] ids (each non-empty, at
+//!   most [`MAX_TOMBSTONE_ID_LEN`] bytes), enforced on the merged total on
+//!   write and on load. The load-time retain filter hashes the tombstone set,
+//!   so the pass costs O(spans x sources) lookups within the caps above.
 //!
 //! ## Fail-closed rules
 //!
@@ -54,7 +66,9 @@
 //! Same durable profile as the content store (WAL, FULL, FK ON, nonzero busy
 //! timeout 5 s, EXCLUSIVE single-writer); see `content_store` docs.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -62,7 +76,8 @@ use bitty_ai_runtime::compression::{
     CompressedSpan, CompressedView, MAX_SPAN_ID_LEN, MAX_SPANS, RetentionClass, RetentionTags,
 };
 use bitty_ai_runtime::context::{
-    ContextPriority, ContextRecord, MAX_SUMMARY_BYTES as RUNTIME_MAX_SUMMARY, RecordBody, StableId,
+    ContextPriority, ContextRecord, MAX_CONTEXT_RECORDS, MAX_SUMMARY_BYTES as RUNTIME_MAX_SUMMARY,
+    RecordBody, StableId,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -70,6 +85,23 @@ use crate::content_store::DURABLE_BUSY_TIMEOUT_MS;
 
 /// Durable profile marker stored in `compaction_meta.profile`.
 pub const COMPACTION_PROFILE: &str = "durable-v1";
+
+/// Maximum stored tombstone ids, enforced on write and on load.
+///
+/// Tombstones merge monotonically (never removed), so an explicit fail-closed
+/// cap keeps the tombstone table, the in-memory set, and the span/record
+/// retain filters bounded. `4096 * 128 B` ids stay well under one megabyte.
+pub const MAX_STORED_TOMBSTONES: usize = 4096;
+
+/// Maximum bytes for one tombstone id, enforced on write and on load.
+pub const MAX_TOMBSTONE_ID_LEN: usize = 128;
+
+/// Maximum stored `records_json` bytes, checked before parsing on load.
+///
+/// A valid view holds at most [`MAX_CONTEXT_RECORDS`] records with inline
+/// bodies bounded by the runtime record-body limit; 8 MiB covers that worst
+/// case with headroom while keeping a hostile file from exhausting memory.
+pub const MAX_RECORDS_JSON_BYTES: usize = 8 * 1024 * 1024;
 
 /// Typed fail-closed durability failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,8 +171,10 @@ impl From<rusqlite::Error> for DurabilityError {
 }
 
 fn check_magic(path: &Path) -> Result<(), DurabilityError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    // Bounded header probe: only the first 16 bytes are ever read, so the
+    // check costs O(1) memory no matter how large the database grows.
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             return Err(DurabilityError::Corrupt {
@@ -148,10 +182,23 @@ fn check_magic(path: &Path) -> Result<(), DurabilityError> {
             });
         }
     };
-    if bytes.is_empty() {
+    let mut header = [0u8; 16];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) => {
+                return Err(DurabilityError::Corrupt {
+                    detail: format!("unreadable database file: {e}"),
+                });
+            }
+        }
+    }
+    if read == 0 {
         return Ok(());
     }
-    if bytes.len() < 16 || &bytes[..16] != b"SQLite format 3\0" {
+    if read < 16 || header != *b"SQLite format 3\0" {
         return Err(DurabilityError::Corrupt {
             detail: "file is not a SQLite database".to_owned(),
         });
@@ -370,15 +417,20 @@ pub struct CompactionStore {
 
 impl CompactionStore {
     /// Open (or create) the compaction database at `path` and claim the single-writer lock.
+    ///
+    /// The busy timeout stays zero through admission and schema init so a
+    /// second open while the first lives fails fast with
+    /// [`DurabilityError::WriterBusy`]; steady state restores the nonzero
+    /// profile timeout only after the writer claim succeeds.
     pub fn open(path: &Path) -> Result<Self, DurabilityError> {
         check_magic(path)?;
         let conn = Connection::open(path).map_err(map_storage)?;
-        conn.busy_timeout(Duration::from_millis(DURABLE_BUSY_TIMEOUT_MS))
-            .map_err(map_storage)?;
+        conn.busy_timeout(Duration::ZERO).map_err(map_storage)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(map_storage)?;
         admit_or_init(&conn)?;
         apply_pragmas(&conn)?;
+        conn.busy_timeout(Duration::ZERO).map_err(map_storage)?;
         conn.execute_batch(COMPACTION_SCHEMA).map_err(map_storage)?;
         verify_profile(&conn)?;
         claim_writer(&conn)?;
@@ -408,13 +460,23 @@ impl CompactionStore {
     /// Fails closed (nothing written) on bound violations or generation
     /// mismatch against the stored `generation` marker. Tombstones in the
     /// view are merged into the stored set (never removed); spans are
-    /// replaced wholesale for the recorded view.
+    /// replaced wholesale for the recorded view. Records whose ids are
+    /// tombstoned are stripped before persisting, so deleted or expired
+    /// payload bytes never reach the disk image.
     pub fn record_view(&mut self, view: &CompressedView) -> Result<(), DurabilityError> {
         if view.spans.len() > MAX_SPANS {
             return Err(DurabilityError::Storage {
                 detail: format!(
                     "compressed span count {} exceeds limit {MAX_SPANS}",
                     view.spans.len()
+                ),
+            });
+        }
+        if view.tombstones.len() > MAX_STORED_TOMBSTONES {
+            return Err(DurabilityError::Storage {
+                detail: format!(
+                    "tombstone count {} exceeds limit {MAX_STORED_TOMBSTONES}",
+                    view.tombstones.len()
                 ),
             });
         }
@@ -433,25 +495,71 @@ impl CompactionStore {
                     ),
                 });
             }
+            if span.source_ids.len() > MAX_CONTEXT_RECORDS {
+                return Err(DurabilityError::Storage {
+                    detail: format!(
+                        "span {} source count {} exceeds limit {MAX_CONTEXT_RECORDS}",
+                        span.span_id,
+                        span.source_ids.len()
+                    ),
+                });
+            }
+            for source in &span.source_ids {
+                if source.is_empty() || source.len() > MAX_TOMBSTONE_ID_LEN {
+                    return Err(DurabilityError::Corrupt {
+                        detail: format!("span {} source id violates length bound", span.span_id),
+                    });
+                }
+            }
         }
-        // Generation fence: the view's max record generation must match the
-        // stored marker when one is set; otherwise refuse without writing.
-        let view_generation = view.records.iter().map(|r| r.generation).max().unwrap_or(0);
+        for id in &view.tombstones {
+            if id.is_empty() || id.len() > MAX_TOMBSTONE_ID_LEN {
+                return Err(DurabilityError::Storage {
+                    detail: "tombstone id violates bound".to_owned(),
+                });
+            }
+        }
+        // Strip tombstoned records up front: absence wins over payload, so
+        // deleted or expired bodies never reach the disk image.
+        let tomb_set: HashSet<&str> = view.tombstones.iter().map(String::as_str).collect();
+        let live_records: Vec<ContextRecord> = view
+            .records
+            .iter()
+            .filter(|record| !tomb_set.contains(record.id.as_str()))
+            .cloned()
+            .collect();
+        if live_records.len() > MAX_CONTEXT_RECORDS {
+            return Err(DurabilityError::Storage {
+                detail: format!(
+                    "record count {} exceeds limit {MAX_CONTEXT_RECORDS}",
+                    live_records.len()
+                ),
+            });
+        }
+        // Generation fence: the live view's max record generation must match
+        // the stored marker when one is set; otherwise refuse without writing.
+        let view_generation = live_records.iter().map(|r| r.generation).max().unwrap_or(0);
         if let Some(stored) = self.get_generation_inner()? {
-            if stored != view_generation && !view.records.is_empty() {
+            if stored != view_generation && !live_records.is_empty() {
                 return Err(DurabilityError::StaleGeneration {
                     expected: stored,
                     found: view_generation,
                 });
             }
         }
-        let records_json = serialize_records(&view.records)?;
-        let tags_json = serialize_tags(view)?;
+        let stored_view = CompressedView {
+            records: live_records,
+            spans: view.spans.clone(),
+            tombstones: view.tombstones.clone(),
+            tags: view.tags.clone(),
+        };
+        let records_json = serialize_records(&stored_view.records)?;
+        let tags_json = serialize_tags(&stored_view)?;
 
         let tx = self.conn.transaction().map_err(map_storage)?;
         tx.execute("DELETE FROM compaction_spans", [])
             .map_err(map_storage)?;
-        for span in &view.spans {
+        for span in &stored_view.spans {
             let source_json =
                 serde_json::to_string(&span.source_ids).map_err(|e| DurabilityError::Storage {
                     detail: format!("span source_ids serialization: {e}"),
@@ -472,17 +580,26 @@ impl CompactionStore {
             )
             .map_err(map_storage)?;
         }
-        for id in &view.tombstones {
-            if id.len() > 128 {
-                return Err(DurabilityError::Storage {
-                    detail: "tombstone id exceeds 128-byte bound".to_owned(),
-                });
-            }
+        for id in &stored_view.tombstones {
             tx.execute(
                 "INSERT OR IGNORE INTO compaction_tombstones (id) VALUES (?1)",
                 params![id],
             )
             .map_err(map_storage)?;
+        }
+        // The tombstone set merges monotonically, so enforce the cap on the
+        // merged total: roll back (drop the transaction uncommitted) on exceed.
+        let merged_tombstones: i64 = tx
+            .query_row("SELECT COUNT(*) FROM compaction_tombstones", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_storage)?;
+        if merged_tombstones > MAX_STORED_TOMBSTONES as i64 {
+            return Err(DurabilityError::Storage {
+                detail: format!(
+                    "merged tombstone count {merged_tombstones} exceeds limit {MAX_STORED_TOMBSTONES}"
+                ),
+            });
         }
         tx.execute(
             "INSERT OR REPLACE INTO compaction_meta (key, value) VALUES ('records_json', ?1)",
@@ -494,7 +611,7 @@ impl CompactionStore {
             params![tags_json],
         )
         .map_err(map_storage)?;
-        if view.records.is_empty() {
+        if stored_view.records.is_empty() {
             // Keep an existing generation marker when recording an empty view
             // (tombstone-only update); otherwise set it from the view.
         } else {
@@ -511,8 +628,28 @@ impl CompactionStore {
     /// Reload the recorded view (spans, tombstones, tags, records).
     ///
     /// Never contacts a summarizer: summaries come from storage verbatim.
-    /// Tombstoned spans stay tombstoned (never resurrected).
+    /// Tombstoned spans stay tombstoned (never resurrected), and tombstoned
+    /// or expired records never come back with payload bytes: records whose
+    /// ids are tombstoned are dropped on load, and the tombstone appliers
+    /// strip them from the persisted image so they do not survive on disk.
+    ///
+    /// Fail-closed load bounds: more than [`MAX_SPANS`] stored spans, more
+    /// than [`MAX_STORED_TOMBSTONES`] tombstones, a `records_json` image
+    /// larger than [`MAX_RECORDS_JSON_BYTES`], more than
+    /// [`MAX_CONTEXT_RECORDS`] stored records, or any out-of-bound
+    /// id/summary field yields [`DurabilityError::Corrupt`].
     pub fn load_view(&self) -> Result<CompressedView, DurabilityError> {
+        let span_rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM compaction_spans", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_storage)?;
+        if span_rows > MAX_SPANS as i64 {
+            return Err(DurabilityError::Corrupt {
+                detail: format!("stored span count {span_rows} exceeds limit {MAX_SPANS}"),
+            });
+        }
         let mut stmt = self
             .conn
             .prepare(
@@ -537,9 +674,9 @@ impl CompactionStore {
         for row in rows {
             let (span_id, source_json, summary, retention, deadline, created, untrusted) =
                 row.map_err(map_storage)?;
-            if span_id.len() > MAX_SPAN_ID_LEN {
+            if span_id.is_empty() || span_id.len() > MAX_SPAN_ID_LEN {
                 return Err(DurabilityError::Corrupt {
-                    detail: "stored span id exceeds bound".to_owned(),
+                    detail: "stored span id violates bound".to_owned(),
                 });
             }
             if summary.len() > RUNTIME_MAX_SUMMARY {
@@ -547,10 +684,27 @@ impl CompactionStore {
                     detail: "stored span summary exceeds bound".to_owned(),
                 });
             }
+            if source_json.len() > MAX_RECORDS_JSON_BYTES {
+                return Err(DurabilityError::Corrupt {
+                    detail: "stored source_ids_json exceeds bound".to_owned(),
+                });
+            }
             let source_ids: Vec<String> =
                 serde_json::from_str(&source_json).map_err(|e| DurabilityError::Corrupt {
                     detail: format!("stored source_ids_json malformed: {e}"),
                 })?;
+            if source_ids.len() > MAX_CONTEXT_RECORDS {
+                return Err(DurabilityError::Corrupt {
+                    detail: "stored span source count exceeds bound".to_owned(),
+                });
+            }
+            for source in &source_ids {
+                if source.is_empty() || source.len() > MAX_TOMBSTONE_ID_LEN {
+                    return Err(DurabilityError::Corrupt {
+                        detail: "stored span source id violates bound".to_owned(),
+                    });
+                }
+            }
             spans.push(CompressedSpan {
                 span_id,
                 source_ids,
@@ -559,6 +713,19 @@ impl CompactionStore {
                 retention: retention_from_str(&retention)?,
                 source_deadline_ms: deadline as u64,
                 created_at_ms: created as u64,
+            });
+        }
+        let tombstone_rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM compaction_tombstones", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_storage)?;
+        if tombstone_rows > MAX_STORED_TOMBSTONES as i64 {
+            return Err(DurabilityError::Corrupt {
+                detail: format!(
+                    "stored tombstone count {tombstone_rows} exceeds limit {MAX_STORED_TOMBSTONES}"
+                ),
             });
         }
         let mut tstmt = self
@@ -570,20 +737,35 @@ impl CompactionStore {
             .map_err(map_storage)?;
         let mut tombstones = Vec::new();
         for row in trows {
-            tombstones.push(row.map_err(map_storage)?);
+            let id: String = row.map_err(map_storage)?;
+            if id.is_empty() || id.len() > MAX_TOMBSTONE_ID_LEN {
+                return Err(DurabilityError::Corrupt {
+                    detail: "stored tombstone id violates bound".to_owned(),
+                });
+            }
+            tombstones.push(id);
         }
         // Drop spans killed by tombstones (deletion propagation survives reload):
         // a tombstoned span id or any tombstoned source id invalidates the span.
+        // The tombstone set is hashed, so the filter costs O(spans x sources)
+        // hash lookups; both dimensions are capped above (MAX_SPANS spans of at
+        // most MAX_CONTEXT_RECORDS sources over at most MAX_STORED_TOMBSTONES
+        // ids), keeping the pass trivially cheap.
+        let tomb_set: HashSet<&str> = tombstones.iter().map(String::as_str).collect();
         spans.retain(|span| {
-            if tombstones.iter().any(|id| id == &span.span_id) {
+            if tomb_set.contains(span.span_id.as_str()) {
                 return false;
             }
             !span
                 .source_ids
                 .iter()
-                .any(|source| tombstones.iter().any(|id| id == source))
+                .any(|source| tomb_set.contains(source.as_str()))
         });
-        let records = self.load_records_inner()?;
+        let mut records = self.load_records_inner()?;
+        // Absence wins over payload: tombstoned or expired ids (expired ids
+        // reach the store as tombstones) never reload with body bytes, even
+        // if an older image still carries them.
+        records.retain(|record| !tomb_set.contains(record.id.as_str()));
         let tags = self.load_tags_inner()?;
         Ok(CompressedView {
             records,
@@ -594,6 +776,26 @@ impl CompactionStore {
     }
 
     fn load_records_inner(&self) -> Result<Vec<ContextRecord>, DurabilityError> {
+        // Check the image size in SQL first so a hostile records_json cannot
+        // force an unbounded allocation before the cap is enforced.
+        let byte_len: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT LENGTH(value) FROM compaction_meta WHERE key = 'records_json'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_storage)?;
+        if let Some(len) = byte_len {
+            if len > MAX_RECORDS_JSON_BYTES as i64 {
+                return Err(DurabilityError::Corrupt {
+                    detail: format!(
+                        "stored records_json {len} bytes exceeds limit {MAX_RECORDS_JSON_BYTES}"
+                    ),
+                });
+            }
+        }
         let raw: Option<String> = self
             .conn
             .query_row(
@@ -606,7 +808,16 @@ impl CompactionStore {
         let Some(json) = raw else {
             return Ok(Vec::new());
         };
-        deserialize_records(&json)
+        let records = deserialize_records(&json)?;
+        if records.len() > MAX_CONTEXT_RECORDS {
+            return Err(DurabilityError::Corrupt {
+                detail: format!(
+                    "stored record count {} exceeds limit {MAX_CONTEXT_RECORDS}",
+                    records.len()
+                ),
+            });
+        }
+        Ok(records)
     }
 
     fn load_tags_inner(&self) -> Result<RetentionTags, DurabilityError> {
@@ -634,13 +845,17 @@ impl CompactionStore {
     }
 
     /// Persist tombstones (idempotent merge; first write wins per id set).
+    ///
+    /// Records whose ids are tombstoned are stripped from the persisted
+    /// `records_json` image in the same transaction, so deleted or expired
+    /// payload bytes stop surviving on disk the moment absence is recorded.
     pub fn add_tombstones(&mut self, ids: &[&str]) -> Result<(), DurabilityError> {
         if ids.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction().map_err(map_storage)?;
         for id in ids {
-            if id.len() > 128 || id.is_empty() {
+            if id.is_empty() || id.len() > MAX_TOMBSTONE_ID_LEN {
                 return Err(DurabilityError::Storage {
                     detail: "tombstone id violates bound".to_owned(),
                 });
@@ -648,6 +863,96 @@ impl CompactionStore {
             tx.execute(
                 "INSERT OR IGNORE INTO compaction_tombstones (id) VALUES (?1)",
                 params![id],
+            )
+            .map_err(map_storage)?;
+        }
+        // Enforce the cap on the merged total; dropping the transaction
+        // uncommitted rolls everything back.
+        let merged_tombstones: i64 = tx
+            .query_row("SELECT COUNT(*) FROM compaction_tombstones", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_storage)?;
+        if merged_tombstones > MAX_STORED_TOMBSTONES as i64 {
+            return Err(DurabilityError::Storage {
+                detail: format!(
+                    "merged tombstone count {merged_tombstones} exceeds limit {MAX_STORED_TOMBSTONES}"
+                ),
+            });
+        }
+        // Strip newly absent records from the persisted image: absence wins
+        // over payload, so no tombstoned body survives on disk.
+        let tombed: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM compaction_tombstones")
+                .map_err(map_storage)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_storage)?;
+            let mut all = Vec::new();
+            for row in rows {
+                all.push(row.map_err(map_storage)?);
+            }
+            all
+        };
+        let tomb_set: HashSet<&str> = tombed.iter().map(String::as_str).collect();
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM compaction_meta WHERE key = 'records_json'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_storage)?;
+        if let Some(json) = raw {
+            let mut records = deserialize_records(&json)?;
+            let kept = records.len();
+            records.retain(|record| !tomb_set.contains(record.id.as_str()));
+            if records.len() != kept {
+                let stripped = serialize_records(&records)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO compaction_meta (key, value) VALUES ('records_json', ?1)",
+                    params![stripped],
+                )
+                .map_err(map_storage)?;
+            }
+        }
+        // Purge spans derived from newly absent sources: source-delete kills
+        // the derived span, so a tombstoned source must not leave its summary
+        // readable in the spans table (forensic resurrection). Span rows are
+        // bounded (MAX_SPANS enforced on write and load), so the scan is O(1).
+        let doomed: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT span_id, source_ids_json FROM compaction_spans")
+                .map_err(map_storage)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let span_id: String = row.get(0)?;
+                    let source_json: String = row.get(1)?;
+                    Ok((span_id, source_json))
+                })
+                .map_err(map_storage)?;
+            let mut doomed = Vec::new();
+            for row in rows {
+                let (span_id, source_json) = row.map_err(map_storage)?;
+                let source_ids: Vec<String> =
+                    serde_json::from_str(&source_json).map_err(|e| DurabilityError::Corrupt {
+                        detail: format!("stored source_ids_json malformed: {e}"),
+                    })?;
+                if tomb_set.contains(span_id.as_str())
+                    || source_ids
+                        .iter()
+                        .any(|source| tomb_set.contains(source.as_str()))
+                {
+                    doomed.push(span_id);
+                }
+            }
+            doomed
+        };
+        for span_id in &doomed {
+            tx.execute(
+                "DELETE FROM compaction_spans WHERE span_id = ?1",
+                params![span_id],
             )
             .map_err(map_storage)?;
         }
@@ -869,11 +1174,12 @@ fn deserialize_records(json: &str) -> Result<Vec<ContextRecord>, DurabilityError
         let is_untrusted_surface = item
             .get("is_untrusted_surface")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let supersedes = item
-            .get("supersedes")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
+            .ok_or_else(|| corrupt("is_untrusted_surface missing or not a boolean".to_owned()))?;
+        let supersedes = match item.get("supersedes") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(corrupt("supersedes malformed".to_owned())),
+        };
         let body = item
             .get("body")
             .ok_or_else(|| corrupt("body missing".to_owned()))?;

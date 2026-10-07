@@ -45,6 +45,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -558,8 +559,10 @@ fn map_busy(err: rusqlite::Error) -> ContentStoreError {
 }
 
 pub(crate) fn check_sqlite_magic(path: &Path) -> Result<(), ContentStoreError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    // Bounded header probe: only the first 16 bytes are ever read, so the
+    // check costs O(1) memory no matter how large the database grows.
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             return Err(ContentStoreError::Corrupt {
@@ -567,10 +570,23 @@ pub(crate) fn check_sqlite_magic(path: &Path) -> Result<(), ContentStoreError> {
             });
         }
     };
-    if bytes.is_empty() {
+    let mut header = [0u8; 16];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) => {
+                return Err(ContentStoreError::Corrupt {
+                    detail: format!("unreadable database file: {e}"),
+                });
+            }
+        }
+    }
+    if read == 0 {
         return Ok(());
     }
-    if bytes.len() < 16 || &bytes[..16] != b"SQLite format 3\0" {
+    if read < 16 || header != *b"SQLite format 3\0" {
         return Err(ContentStoreError::Corrupt {
             detail: "file is not a SQLite database".to_owned(),
         });
@@ -691,10 +707,15 @@ pub(crate) fn admit_or_init(conn: &Connection) -> Result<(), ContentStoreError> 
         return Ok(());
     }
     // durable_meta is created alongside the other tables; a store missing
-    // only it is a pre-0178 database (migration path: init adds it).
+    // only it is a pre-0178 database (migration path: init adds it). The
+    // surviving tables are still shape-checked first so a wrong-column
+    // legacy table fails closed at admission instead of at first query.
     let missing_meta_only =
         present.len() == 3 && !present.contains(&"durable_meta") && present.contains(&"blobs");
     if missing_meta_only {
+        for table in ["blobs", "checkpoints", "refs"] {
+            verify_content_table_shape(conn, table)?;
+        }
         return Ok(());
     }
     if present.len() != EXPECTED.len() {
@@ -784,18 +805,21 @@ impl ContentStore {
     /// Applies the durable pragma profile, admits the store (new files are
     /// initialized; complete stores are verified; partial, occupied, or
     /// foreign stores fail with [`ContentStoreError::Corrupt`] unchanged),
-    /// and claims the single-writer lock.
+    /// and claims the single-writer lock. The busy timeout stays zero through
+    /// admission and schema init so a second open while the first lives fails
+    /// fast with [`ContentStoreError::WriterBusy`]; steady state restores the
+    /// nonzero profile timeout only after the writer claim succeeds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
         let path = path.as_ref();
         check_sqlite_magic(path)?;
         let conn = Connection::open(path).map_err(map_busy)?;
-        conn.busy_timeout(Duration::from_millis(DURABLE_BUSY_TIMEOUT_MS))
-            .map_err(map_busy)?;
+        conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
         // Non-mutating gate: foreign_keys is per-connection state.
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(map_busy)?;
         admit_or_init(&conn)?;
         apply_durable_pragmas(&conn)?;
+        conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
         init_content_schema(&conn)?;
         verify_profile(&conn)?;
         claim_writer_fast(&conn)?;
@@ -1469,5 +1493,43 @@ impl ContentStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod durable_profile_tests {
+    use super::*;
+
+    /// `PRAGMA synchronous` and `PRAGMA foreign_keys` are per-connection
+    /// state, so they must be asserted on the same connection that applied
+    /// them (a fresh connection only shows build defaults).
+    #[test]
+    fn pragmas_apply_on_the_same_connection() {
+        // A temp file (not memory): in-memory databases cannot use WAL, so
+        // journal_mode would read back "memory" regardless of the request.
+        let dir = std::env::temp_dir().join(format!(
+            "bitty_test_profile_{}_{}",
+            std::process::id(),
+            "same-conn"
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("profile.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = Connection::open(&db_path).expect("open");
+        apply_durable_pragmas(&conn).expect("pragmas");
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(journal.to_lowercase(), "wal");
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous");
+        assert_eq!(synchronous, 2, "synchronous must be FULL");
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys");
+        assert_eq!(foreign_keys, 1, "foreign_keys must be ON");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
