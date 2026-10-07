@@ -1206,12 +1206,17 @@ impl SelectiveCompactionConfig {
 /// [`CacheKey`](crate::cache_key::CacheKey) stable prefix is preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionOutcome {
-    /// Head spans summarized: `span_count` summaries were produced (one per
-    /// contiguous head run). The compressed view itself is host-visible via
-    /// the normal [`CompressedView`] path; the outcome reports the count.
+    /// Head spans summarized: one [`CompressedSpan`] per contiguous head
+    /// run. The `view` carries the assembly-ready records (synthetic
+    /// `cmp-NNNN` summaries at their span's first-source position plus
+    /// verbatim passthrough) so the host can replace the head and chain a
+    /// follow-up pass via `view.records`; `span_count` is a convenience
+    /// equal to `view.len()`.
     Compacted {
-        /// Number of summary spans produced.
+        /// Number of summary spans produced (equals `view.len()`).
         span_count: usize,
+        /// Compressed view with synthetic records and span metadata.
+        view: CompressedView,
     },
     /// Nothing to compact (empty head): the summarizer was not contacted.
     NoOp,
@@ -1247,8 +1252,8 @@ pub enum CompactionOutcome {
 ///    records pass through verbatim, so protection survives compression)
 ///    through the shared compression core: the first span carries the
 ///    host `previous_summary`, later spans carry the rolling prior summary.
-///    Success reports `Compacted` with the span count; any refusal reports
-///    `Failed` with the underlying reason.
+///    Success reports `Compacted` with the span count and the compressed
+///    view; any refusal reports `Failed` with the underlying reason.
 ///
 /// Provenance and retention inherit unchanged from the shared core:
 /// untrusted-surface OR-marking, minimum effective priority, no
@@ -1336,9 +1341,10 @@ pub fn compact_selective(
         config.current_generation,
         seed,
     ) {
-        Ok(view) => CompactionOutcome::Compacted {
-            span_count: view.len(),
-        },
+        Ok(view) => {
+            let span_count = view.len();
+            CompactionOutcome::Compacted { span_count, view }
+        }
         Err(error) => CompactionOutcome::Failed {
             reason: error.to_string(),
         },

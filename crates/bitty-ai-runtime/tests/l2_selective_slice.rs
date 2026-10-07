@@ -27,13 +27,13 @@
 use std::cell::RefCell;
 
 use bitty_ai_runtime::{
-    CacheKey, CacheScope, CompactionOutcome, CompressionError, ContextError, ContextPriority,
-    ContextRecord, DEFAULT_KEEP_RECENT_BYTES, DEFAULT_RESERVE_BYTES, FakeSummarizer, LayerInput,
-    MAX_SUMMARY_BYTES, MIN_KEEP_RECORDS, PromptLayer, PromptSnapshot, RESERVE_FRACTION_DENOMINATOR,
-    RESERVE_FRACTION_NUMERATOR, RecordBody, RetentionClass, RetentionTags,
-    SelectiveCompactionConfig, SpanRange, StableId, SummarizeInput, Summarizer, assemble_prompt,
-    compact_selective, compress_records, effective_reserve_bytes, select_compaction_window,
-    should_compact,
+    ArtifactStore, CacheKey, CacheScope, CompactionOutcome, CompressionError, ContextError,
+    ContextPriority, ContextRecord, ContextRequest, DEFAULT_KEEP_RECENT_BYTES,
+    DEFAULT_RESERVE_BYTES, FakeSummarizer, LayerInput, MAX_SUMMARY_BYTES, MIN_KEEP_RECORDS,
+    PromptLayer, PromptSnapshot, RESERVE_FRACTION_DENOMINATOR, RESERVE_FRACTION_NUMERATOR,
+    RecordBody, RetentionClass, RetentionTags, SelectiveCompactionConfig, SpanRange, StableId,
+    SummarizeInput, Summarizer, assemble, assemble_prompt, compact_selective, compress_records,
+    effective_reserve_bytes, select_compaction_window, should_compact,
 };
 
 /// One record with an exact footprint of `summary_len + body_len` bytes.
@@ -468,8 +468,42 @@ fn roomy_window_compacts_head_and_reports_span_count() {
     tight.keep_recent_bytes = 150;
     let host = RecordingSummarizer::new(&["head summary"]);
     let outcome = compact_selective(&records, &tight, &host, &RetentionTags::new(), 500);
-    assert_eq!(outcome, CompactionOutcome::Compacted { span_count: 1 });
+    let CompactionOutcome::Compacted { span_count, view } = outcome else {
+        panic!("expected Compacted, got: {outcome:?}");
+    };
+    assert_eq!(span_count, 1);
+    assert_eq!(
+        span_count,
+        view.len(),
+        "span_count is convenience for view.len()"
+    );
+    assert_eq!(view.spans.len(), 1);
+    assert_eq!(view.spans[0].span_id, "cmp-0000");
+    assert_eq!(view.spans[0].summary, "head summary");
+    assert_eq!(
+        view.spans[0].source_ids,
+        vec!["r0".to_owned(), "r1".to_owned()]
+    );
+    let ids: Vec<&str> = view
+        .records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["cmp-0000", "r2", "r3"],
+        "synthetic summary sits at its span position, tail passes through"
+    );
+    assert_eq!(view.records[0].summary, "head summary");
     assert_eq!(host.calls(), 1);
+    // The returned view is assembly-ready and chains into a follow-up pass.
+    let request = ContextRequest {
+        max_tokens: None,
+        max_bytes: Some(8_192),
+        current_generation: 1,
+    };
+    let mut store = ArtifactStore::new();
+    assemble(&view.records, &mut store, &request).expect("view.records feeds assemble");
 }
 
 // --- Previous-summary plumbing ---
@@ -491,7 +525,15 @@ fn previous_summary_seed_reaches_first_span_and_rolls_forward() {
 
     let host = RecordingSummarizer::new(&["sum-a", "sum-b"]);
     let outcome = compact_selective(&records, &chained, &host, &RetentionTags::new(), 500);
-    assert_eq!(outcome, CompactionOutcome::Compacted { span_count: 2 });
+    let CompactionOutcome::Compacted { span_count, view } = outcome else {
+        panic!("expected Compacted, got: {outcome:?}");
+    };
+    assert_eq!(span_count, 2);
+    assert_eq!(
+        span_count,
+        view.len(),
+        "span_count is convenience for view.len()"
+    );
     assert_eq!(host.calls(), 2);
     let seen = host.seen.borrow();
     assert_eq!(seen[0].previous_summary.as_deref(), Some("prior work"));
@@ -502,6 +544,31 @@ fn previous_summary_seed_reaches_first_span_and_rolls_forward() {
     );
     assert_eq!(seen[0].source_ids, vec!["r0".to_owned()]);
     assert_eq!(seen[1].source_ids, vec!["r2".to_owned()]);
+    drop(seen);
+    // Span summaries equal the rolling chain outputs.
+    assert_eq!(view.spans.len(), 2);
+    assert_eq!(view.spans[0].span_id, "cmp-0000");
+    assert_eq!(view.spans[1].span_id, "cmp-0001");
+    assert_eq!(view.spans[0].summary, "sum-a");
+    assert_eq!(view.spans[1].summary, "sum-b");
+    let ids: Vec<&str> = view
+        .records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["cmp-0000", "p", "cmp-0001", "r3"],
+        "synthetics sit at span positions, protected gap passes through"
+    );
+    // The returned view is assembly-ready and chains into a follow-up pass.
+    let request = ContextRequest {
+        max_tokens: None,
+        max_bytes: Some(8_192),
+        current_generation: 1,
+    };
+    let mut store = ArtifactStore::new();
+    assemble(&view.records, &mut store, &request).expect("view.records feeds assemble");
 }
 
 #[test]
