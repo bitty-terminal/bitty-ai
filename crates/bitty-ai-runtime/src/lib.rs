@@ -83,14 +83,18 @@ pub use bridge::{
 };
 pub use cache_key::{CacheKey, CacheKeyError, CacheScope};
 pub use compression::{
-    CompressedSpan, CompressedView, CompressionConfig, CompressionError, DEFAULT_MAX_SPAN_BYTES,
-    FakeSummarizer, MAX_SPAN_ID_LEN, MAX_SPANS, RetentionClass, RetentionPolicy, RetentionTags,
-    SpanRange, SummarizeInput, Summarizer, compress_records, inherit_retention, select_breakpoints,
+    CompactionOutcome, CompactionWindow, CompressedSpan, CompressedView, CompressionConfig,
+    CompressionError, DEFAULT_KEEP_RECENT_BYTES, DEFAULT_MAX_SPAN_BYTES, DEFAULT_RESERVE_BYTES,
+    FakeSummarizer, MAX_SPAN_ID_LEN, MAX_SPANS, MIN_KEEP_RECORDS, RESERVE_FRACTION_DENOMINATOR,
+    RESERVE_FRACTION_NUMERATOR, RetentionClass, RetentionPolicy, RetentionTags,
+    SelectiveCompactionConfig, SpanRange, SummarizeInput, Summarizer, compact_selective,
+    compress_records, effective_reserve_bytes, inherit_retention, select_breakpoints,
+    select_compaction_window, should_compact,
 };
 pub use context::{
     ArtifactRef, ArtifactStore, AssembledContent, AssembledContext, AssembledRecord, ContextError,
-    ContextPriority, ContextRecord, ContextRequest, DetailLevel, RecordBody, StableId, assemble,
-    validate_stable_id,
+    ContextPriority, ContextRecord, ContextRequest, DetailLevel, MAX_SUMMARY_BYTES, RecordBody,
+    StableId, assemble, validate_stable_id,
 };
 pub use extension::{
     AgentPoint, CommandPoint, CompactorPoint, ContextPoint, ExtensionPoint, Manifest, MemoryPoint,
