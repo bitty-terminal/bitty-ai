@@ -6,11 +6,50 @@
 //! - [`Rationale`]: Structured cognitive intent and observation record replacing raw CoT.
 //! - [`Checkpoint`]: Content-addressed DAG commit node binding parent hashes, task ID, agent, and rationale.
 //! - [`ContentStore`]: Unified transactional store managing blobs, checkpoints, refs, and DAG log/merge-base traversal.
+//!
+//! ## Durable pragma profile (AI-0178, formal path)
+//!
+//! Every open applies one unified profile before any schema statement:
+//! `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, and a nonzero
+//! `busy_timeout` of [`DURABLE_BUSY_TIMEOUT_MS`] milliseconds, plus
+//! `locking_mode=EXCLUSIVE` to hold the single-writer lock for the handle's
+//! lifetime (mirroring `journal_prototype` admission). Choices:
+//! - WAL keeps multi-statement commit transactions crash-atomic (torn writes
+//!   replay or roll back as a unit) while readers proceed during checkpoints.
+//! - FULL flushes each commit to the OS before it returns, so an acknowledged
+//!   HEAD survives a host crash (NORMAL could lose the tail).
+//! - Foreign keys enforce DAG integrity (parents, trees, ref targets) at the
+//!   SQL layer, failing closed on dangling links.
+//! - A 5 s busy timeout tolerates transient WAL checkpoint contention on CI
+//!   without masking a true second writer, which surfaces as
+//!   [`ContentStoreError::WriterBusy`] after the timeout. The initial
+//!   single-writer claim uses a zero timeout to fail fast; steady state is
+//!   always nonzero.
+//! - EXCLUSIVE holds the writer lock so a second `open`/`open_durable` while
+//!   the first lives fails with [`ContentStoreError::WriterBusy`] instead of
+//!   silently serializing.
+//!
+//! ## Single-Connection ownership (AI-0178)
+//!
+//! [`ContentStore`] owns its SQLite [`Connection`] behind
+//! `Arc<Mutex<..>>` so [`crate::wheel_kernel::WheelKernel`] can open the
+//! database file exactly once, initialize content and task schemas on that
+//! one connection, and share the handle into both [`ContentStore`] and
+//! [`crate::task_dag::TaskEngine`] via [`ContentStore::from_shared`]. Two
+//! independent `Connection`s on the same file (the pre-0178 pattern) split
+//! pragmas, split transactions, and let recovery observe divergent snapshots:
+//! a crash between the tree-blob write on one connection and the HEAD update
+//! on the other leaves a half-advanced HEAD. One connection plus one
+//! `transaction()` per commit keeps tree blob, checkpoint row, and HEAD/branch
+//! refs atomic.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -39,6 +78,17 @@ pub const MAX_RATIONALE_FIELD_BYTES: usize = 4096;
 
 /// Maximum aggregate byte length for a rationale (16384 bytes).
 pub const MAX_RATIONALE_TOTAL_BYTES: usize = 16384;
+
+/// Nonzero SQLite busy timeout for the durable profile (5 s).
+///
+/// Tolerates transient WAL checkpoint contention; a true second writer still
+/// fails closed as [`ContentStoreError::WriterBusy`] after the timeout. The
+/// initial writer-claim probe uses a zero timeout to fail fast; steady state
+/// is always this nonzero value.
+pub const DURABLE_BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// Durable profile marker stored in `durable_meta.profile`.
+pub const DURABLE_PROFILE: &str = "durable-v1";
 
 /// Errors arising from content store, rationale, or checkpoint operations.
 #[derive(Debug)]
@@ -75,6 +125,11 @@ pub enum ContentStoreError {
     EmptyField(&'static str),
     /// An invalid ref name was provided.
     InvalidRefName(String),
+    /// Malformed, corrupt, or schema-incompatible database state. Fail closed:
+    /// the file is never reset, truncated, or repaired implicitly.
+    Corrupt { detail: String },
+    /// Another live writer holds this database file's single-writer lock.
+    WriterBusy,
 }
 
 impl fmt::Display for ContentStoreError {
@@ -112,6 +167,10 @@ impl fmt::Display for ContentStoreError {
             }
             Self::EmptyField(field) => write!(f, "field '{field}' must not be empty"),
             Self::InvalidRefName(name) => write!(f, "invalid ref name {name:?}"),
+            Self::Corrupt { detail } => {
+                write!(f, "content store corrupt or incompatible: {detail}")
+            }
+            Self::WriterBusy => write!(f, "another writer holds the single-writer lock"),
         }
     }
 }
@@ -434,55 +493,378 @@ pub struct Checkpoint {
 }
 
 /// Transactional SQLite-backed store for content-addressed blobs, checkpoints, and refs.
+///
+/// The connection is shared behind `Arc<Mutex<..>>` so the Wheel durable
+/// path opens the file exactly once and splits the handle into the content
+/// store and the task engine (see module docs). Standalone `open` callers
+/// get a private handle; `from_shared` joins an already-admitted handle.
 pub struct ContentStore {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
+}
+
+/// Durable pragma profile applied on every open (see module docs).
+pub(crate) fn apply_durable_pragmas(conn: &Connection) -> Result<(), ContentStoreError> {
+    conn.busy_timeout(Duration::from_millis(DURABLE_BUSY_TIMEOUT_MS))
+        .map_err(map_busy)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA locking_mode = EXCLUSIVE;",
+    )
+    .map_err(map_busy)?;
+    Ok(())
+}
+
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Map a raw SQLite open error to a facade-ready string preserving the
+/// WriterBusy/Corrupt distinction for [`crate::facade::FacadeError`].
+pub(crate) fn map_busy_for_facade(err: rusqlite::Error) -> String {
+    match map_busy(err) {
+        ContentStoreError::WriterBusy => {
+            "writer busy: another writer holds the single-writer lock".to_owned()
+        }
+        ContentStoreError::Corrupt { detail } => format!("corrupt: {detail}"),
+        ContentStoreError::Sqlite(inner) => format!("sqlite error: {inner}"),
+        other => other.to_string(),
+    }
+}
+
+fn map_busy(err: rusqlite::Error) -> ContentStoreError {
+    if is_busy(&err) {
+        ContentStoreError::WriterBusy
+    } else if let rusqlite::Error::SqliteFailure(e, _) = &err {
+        if matches!(
+            e.code,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+        ) {
+            return ContentStoreError::Corrupt {
+                detail: err.to_string(),
+            };
+        }
+        ContentStoreError::Sqlite(err)
+    } else {
+        ContentStoreError::Sqlite(err)
+    }
+}
+
+pub(crate) fn check_sqlite_magic(path: &Path) -> Result<(), ContentStoreError> {
+    // Bounded header probe: only the first 16 bytes are ever read, so the
+    // check costs O(1) memory no matter how large the database grows.
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(ContentStoreError::Corrupt {
+                detail: format!("unreadable database file: {e}"),
+            });
+        }
+    };
+    let mut header = [0u8; 16];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) => {
+                return Err(ContentStoreError::Corrupt {
+                    detail: format!("unreadable database file: {e}"),
+                });
+            }
+        }
+    }
+    if read == 0 {
+        return Ok(());
+    }
+    if read < 16 || header != *b"SQLite format 3\0" {
+        return Err(ContentStoreError::Corrupt {
+            detail: "file is not a SQLite database".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) const CONTENT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS blobs (
+    hash TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+    hash TEXT PRIMARY KEY,
+    parents_json TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    rationale_json TEXT NOT NULL,
+    tree_hash TEXT,
+    summary TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id);
+CREATE TABLE IF NOT EXISTS refs (
+    name TEXT PRIMARY KEY,
+    target_hash TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS durable_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);";
+
+pub(crate) fn init_content_schema(conn: &Connection) -> Result<(), ContentStoreError> {
+    conn.execute_batch(CONTENT_SCHEMA).map_err(map_busy)?;
+    Ok(())
+}
+
+pub(crate) fn claim_writer_fast(conn: &Connection) -> Result<(), ContentStoreError> {
+    conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
+    let claim = conn.execute(
+        "INSERT OR REPLACE INTO durable_meta (key, value) VALUES ('profile', ?1)",
+        params![DURABLE_PROFILE],
+    );
+    conn.busy_timeout(Duration::from_millis(DURABLE_BUSY_TIMEOUT_MS))
+        .map_err(map_busy)?;
+    claim.map_err(map_busy)?;
+    Ok(())
+}
+
+pub(crate) fn verify_profile(conn: &Connection) -> Result<(), ContentStoreError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM durable_meta WHERE key = 'profile'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(map_busy)?;
+    match stored.as_deref() {
+        Some(DURABLE_PROFILE) => Ok(()),
+        Some(other) => Err(ContentStoreError::Corrupt {
+            detail: format!("unrecognized durable profile '{other}'; no migration exists"),
+        }),
+        // Missing marker means a pre-0178 database without the marker table
+        // row (or a fresh init that has not claimed yet): the caller writes
+        // it via claim_writer_fast, so admission succeeds (migration, not
+        // refusal). A partially created store is caught by admit_or_init
+        // before this runs.
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn admit_or_init(conn: &Connection) -> Result<(), ContentStoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE name COLLATE NOCASE IN ('blobs', 'checkpoints', 'refs', 'durable_meta')",
+        )
+        .map_err(map_busy)?;
+    let mut matches: Vec<(String, String)> = Vec::new();
+    let mut rows = stmt.query([]).map_err(map_busy)?;
+    while let Some(row) = rows.next().map_err(map_busy)? {
+        matches.push((
+            row.get::<_, String>(0).map_err(map_busy)?,
+            row.get::<_, String>(1).map_err(map_busy)?,
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+
+    const EXPECTED: [&str; 4] = ["blobs", "checkpoints", "refs", "durable_meta"];
+    let mut present: Vec<&str> = Vec::new();
+    for expected in EXPECTED {
+        if matches
+            .iter()
+            .any(|(ty, name)| ty == "table" && name == expected)
+        {
+            present.push(expected);
+            continue;
+        }
+        if let Some((ty, name)) = matches.iter().find(|(ty, name)| {
+            matches!(ty.as_str(), "table" | "view" | "index") && name.eq_ignore_ascii_case(expected)
+        }) {
+            return Err(ContentStoreError::Corrupt {
+                detail: format!(
+                    "durable name '{expected}' is occupied by {ty} '{name}', not the exact-case table"
+                ),
+            });
+        }
+    }
+    // Fresh or foreign-but-empty of durable names: no schema statement has
+    // run yet, so initializing now cannot clobber anything. Unrelated tables
+    // are preserved (no exclusive ownership claim over the file).
+    if present.is_empty() {
+        return Ok(());
+    }
+    // durable_meta is created alongside the other tables; a store missing
+    // only it is a pre-0178 database (migration path: init adds it). The
+    // surviving tables are still shape-checked first so a wrong-column
+    // legacy table fails closed at admission instead of at first query.
+    let missing_meta_only =
+        present.len() == 3 && !present.contains(&"durable_meta") && present.contains(&"blobs");
+    if missing_meta_only {
+        for table in ["blobs", "checkpoints", "refs"] {
+            verify_content_table_shape(conn, table)?;
+        }
+        return Ok(());
+    }
+    if present.len() != EXPECTED.len() {
+        return Err(ContentStoreError::Corrupt {
+            detail: format!("partial durable schema; present tables: {present:?}"),
+        });
+    }
+    for table in ["blobs", "checkpoints", "refs"] {
+        verify_content_table_shape(conn, table)?;
+    }
+    verify_profile(conn)?;
+    Ok(())
+}
+
+fn verify_content_table_shape(conn: &Connection, table: &str) -> Result<(), ContentStoreError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_busy)?;
+    let mut cols: Vec<(String, String, bool, u32)> = Vec::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(5)? as u32,
+            ))
+        })
+        .map_err(map_busy)?;
+    for row in rows {
+        cols.push(row.map_err(map_busy)?);
+    }
+    drop(stmt);
+    let expected: &[(&str, &str, bool, u32)] = match table {
+        "blobs" => &[
+            ("hash", "TEXT", false, 1),
+            ("size", "INTEGER", true, 0),
+            ("data", "BLOB", true, 0),
+            ("created_at_ms", "INTEGER", true, 0),
+        ],
+        "checkpoints" => &[
+            ("hash", "TEXT", false, 1),
+            ("parents_json", "TEXT", true, 0),
+            ("task_id", "TEXT", true, 0),
+            ("agent_id", "TEXT", true, 0),
+            ("rationale_json", "TEXT", true, 0),
+            ("tree_hash", "TEXT", false, 0),
+            ("summary", "TEXT", true, 0),
+            ("created_at_ms", "INTEGER", true, 0),
+        ],
+        "refs" => &[
+            ("name", "TEXT", false, 1),
+            ("target_hash", "TEXT", true, 0),
+            ("updated_at_ms", "INTEGER", true, 0),
+        ],
+        _ => return Ok(()),
+    };
+    if cols.len() != expected.len() {
+        return Err(ContentStoreError::Corrupt {
+            detail: format!(
+                "table {table} has {} columns, expected {}",
+                cols.len(),
+                expected.len()
+            ),
+        });
+    }
+    for (i, (name, ty, notnull, pk)) in expected.iter().enumerate() {
+        let (aname, aty, anotnull, apk) = &cols[i];
+        if aname != *name || aty != *ty || anotnull != notnull || apk != pk {
+            return Err(ContentStoreError::Corrupt {
+                detail: format!("table {table} column {i} shape mismatch"),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl ContentStore {
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ContentStoreError> {
+        self.conn.lock().map_err(|_| ContentStoreError::Corrupt {
+            detail: "content store lock poisoned; fail closed".to_owned(),
+        })
+    }
+
     /// Open a content store at the given SQLite database path.
+    ///
+    /// Applies the durable pragma profile, admits the store (new files are
+    /// initialized; complete stores are verified; partial, occupied, or
+    /// foreign stores fail with [`ContentStoreError::Corrupt`] unchanged),
+    /// and claims the single-writer lock. The busy timeout stays zero through
+    /// admission and schema init so a second open while the first lives fails
+    /// fast with [`ContentStoreError::WriterBusy`]; steady state restores the
+    /// nonzero profile timeout only after the writer claim succeeds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
-        let conn = Connection::open(path)?;
-        Self::init_with_connection(conn)
+        let path = path.as_ref();
+        check_sqlite_magic(path)?;
+        let conn = Connection::open(path).map_err(map_busy)?;
+        conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
+        // Non-mutating gate: foreign_keys is per-connection state.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(map_busy)?;
+        admit_or_init(&conn)?;
+        apply_durable_pragmas(&conn)?;
+        conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
+        init_content_schema(&conn)?;
+        verify_profile(&conn)?;
+        claim_writer_fast(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Open a durable content store (formal path, same profile as [`Self::open`]).
+    ///
+    /// Kept as a named alias so call sites spell the formal-path intent;
+    /// behavior matches [`Self::open`] exactly.
+    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
+        Self::open(path)
     }
 
     /// Open an in-memory content store (useful for testing and ephemeral workflows).
     pub fn open_in_memory() -> Result<Self, ContentStoreError> {
-        let conn = Connection::open_in_memory()?;
-        Self::init_with_connection(conn)
+        let conn = Connection::open_in_memory().map_err(map_busy)?;
+        apply_durable_pragmas(&conn)?;
+        init_content_schema(&conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO durable_meta (key, value) VALUES ('profile', ?1)",
+            params![DURABLE_PROFILE],
+        )
+        .map_err(map_busy)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
-    fn init_with_connection(conn: Connection) -> Result<Self, ContentStoreError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
-
-             CREATE TABLE IF NOT EXISTS blobs (
-                 hash TEXT PRIMARY KEY,
-                 size INTEGER NOT NULL,
-                 data BLOB NOT NULL,
-                 created_at_ms INTEGER NOT NULL
-             );
-
-             CREATE TABLE IF NOT EXISTS checkpoints (
-                 hash TEXT PRIMARY KEY,
-                 parents_json TEXT NOT NULL,
-                 task_id TEXT NOT NULL,
-                 agent_id TEXT NOT NULL,
-                 rationale_json TEXT NOT NULL,
-                 tree_hash TEXT,
-                 summary TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id);
-
-             CREATE TABLE IF NOT EXISTS refs (
-                 name TEXT PRIMARY KEY,
-                 target_hash TEXT NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
-             );",
-        )?;
-
-        Ok(Self { conn })
+    /// Join an already-admitted shared connection (Wheel single-open path).
+    ///
+    /// The caller opened the file once, applied the durable profile, and
+    /// initialized content and task schemas. This re-runs the idempotent
+    /// schema creation and joins the handle without re-claiming the writer
+    /// lock (the opener already holds it).
+    pub(crate) fn from_shared(shared: Arc<Mutex<Connection>>) -> Result<Self, ContentStoreError> {
+        {
+            let guard = shared.lock().map_err(|_| ContentStoreError::Corrupt {
+                detail: "content store lock poisoned; fail closed".to_owned(),
+            })?;
+            guard.execute_batch(CONTENT_SCHEMA).map_err(map_busy)?;
+        }
+        Ok(Self { conn: shared })
     }
 
     /// Store a raw data blob.
@@ -505,15 +887,23 @@ impl ContentStore {
         let hash = ContentHash::compute(data);
         let hash_hex = hash.to_hex();
 
-        // Check for deduplication
-        let mut exists_stmt = self.conn.prepare("SELECT 1 FROM blobs WHERE hash = ?1")?;
-        let exists = exists_stmt.exists(params![hash_hex])?;
+        // Check for deduplication (scoped lock so the guard drops before insert)
+        let exists = {
+            let guard = self.lock_conn()?;
+            let mut exists_stmt = guard
+                .prepare("SELECT 1 FROM blobs WHERE hash = ?1")
+                .map_err(map_busy)?;
+            exists_stmt.exists(params![hash_hex]).map_err(map_busy)?
+        };
 
         if !exists {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
-                params![hash_hex, data.len() as i64, data, created_at_ms as i64],
-            )?;
+            let guard = self.lock_conn()?;
+            guard
+                .execute(
+                    "INSERT OR IGNORE INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                    params![hash_hex, data.len() as i64, data, created_at_ms as i64],
+                )
+                .map_err(map_busy)?;
         }
 
         Ok(hash)
@@ -524,14 +914,16 @@ impl ContentStore {
     /// Verifies the cryptographic digest before returning to ensure data integrity.
     pub fn get_blob(&self, hash: &ContentHash) -> Result<Option<Vec<u8>>, ContentStoreError> {
         let hash_hex = hash.to_hex();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT data FROM blobs WHERE hash = ?1")?;
+        let maybe_data: Option<Vec<u8>> = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare("SELECT data FROM blobs WHERE hash = ?1")
+                .map_err(map_busy)?;
 
-        let maybe_data: Option<Vec<u8>> = stmt
-            .query_row(params![hash_hex], |row| row.get::<_, Vec<u8>>(0))
-            .optional()?;
-
+            stmt.query_row(params![hash_hex], |row| row.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(map_busy)?
+        };
         match maybe_data {
             Some(data) => {
                 let computed = ContentHash::compute(&data);
@@ -550,8 +942,11 @@ impl ContentStore {
     /// Check if a blob exists in the store without reading its payload.
     pub fn has_blob(&self, hash: &ContentHash) -> Result<bool, ContentStoreError> {
         let hash_hex = hash.to_hex();
-        let mut stmt = self.conn.prepare("SELECT 1 FROM blobs WHERE hash = ?1")?;
-        Ok(stmt.exists(params![hash_hex])?)
+        let guard = self.lock_conn()?;
+        let mut stmt = guard
+            .prepare("SELECT 1 FROM blobs WHERE hash = ?1")
+            .map_err(map_busy)?;
+        stmt.exists(params![hash_hex]).map_err(map_busy)
     }
 
     /// Create and persist a new [`Checkpoint`] from a validated draft.
@@ -621,20 +1016,23 @@ impl ContentStore {
             let parents_json = serde_json::to_string(&draft.parents)?;
             let tree_hex = draft.tree_hash.as_ref().map(ContentHash::to_hex);
 
-            self.conn.execute(
-                "INSERT OR IGNORE INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    id_hex,
-                    parents_json,
-                    draft.task_id,
-                    draft.agent_id,
-                    rationale_json,
-                    tree_hex,
-                    draft.summary,
-                    draft.timestamp_ms as i64
-                ],
-            )?;
+            let guard = self.lock_conn()?;
+            guard
+                .execute(
+                    "INSERT OR IGNORE INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id_hex,
+                        parents_json,
+                        draft.task_id,
+                        draft.agent_id,
+                        rationale_json,
+                        tree_hex,
+                        draft.summary,
+                        draft.timestamp_ms as i64
+                    ],
+                )
+                .map_err(map_busy)?;
         }
 
         Ok(Checkpoint {
@@ -649,19 +1047,167 @@ impl ContentStore {
         })
     }
 
+    /// Atomically persist tree blob, checkpoint row, and HEAD/branch refs in one transaction.
+    ///
+    /// This is the Wheel durable commit path (AI-0178): the tree blob insert,
+    /// the checkpoint insert, and every ref update commit or roll back as one
+    /// SQLite transaction, so a crash between the blob insert and the HEAD
+    /// update can never leave a half-advanced HEAD. HEAD advances only when
+    /// the transaction commits. Idempotent: re-committing an existing
+    /// checkpoint still advances the named refs to it.
+    pub fn commit_checkpoint_atomic(
+        &mut self,
+        tree_bytes: &[u8],
+        tree_created_at_ms: u64,
+        draft: CheckpointDraft,
+        ref_names: &[&str],
+        updated_at_ms: u64,
+    ) -> Result<Checkpoint, ContentStoreError> {
+        if tree_bytes.len() > MAX_BLOB_BYTES {
+            return Err(ContentStoreError::OversizedField {
+                field: "blob_data",
+                size: tree_bytes.len(),
+                max: MAX_BLOB_BYTES,
+            });
+        }
+        if draft.parents.len() > MAX_CHECKPOINT_PARENTS {
+            return Err(ContentStoreError::OversizedField {
+                field: "parents",
+                size: draft.parents.len(),
+                max: MAX_CHECKPOINT_PARENTS,
+            });
+        }
+        if draft.task_id.trim().is_empty() {
+            return Err(ContentStoreError::EmptyField("task_id"));
+        }
+        if draft.task_id.len() > MAX_TASK_ID_BYTES {
+            return Err(ContentStoreError::OversizedField {
+                field: "task_id",
+                size: draft.task_id.len(),
+                max: MAX_TASK_ID_BYTES,
+            });
+        }
+        if draft.agent_id.trim().is_empty() {
+            return Err(ContentStoreError::EmptyField("agent_id"));
+        }
+        if draft.agent_id.len() > MAX_AGENT_ID_BYTES {
+            return Err(ContentStoreError::OversizedField {
+                field: "agent_id",
+                size: draft.agent_id.len(),
+                max: MAX_AGENT_ID_BYTES,
+            });
+        }
+        if draft.summary.len() > MAX_SUMMARY_BYTES {
+            return Err(ContentStoreError::OversizedField {
+                field: "summary",
+                size: draft.summary.len(),
+                max: MAX_SUMMARY_BYTES,
+            });
+        }
+        draft.rationale.validate()?;
+        for name in ref_names {
+            Self::validate_ref_name(name)?;
+        }
+
+        let tree_hash = ContentHash::compute(tree_bytes);
+        let tree_hex = tree_hash.to_hex();
+        let effective = CheckpointDraft {
+            parents: draft.parents.clone(),
+            task_id: draft.task_id.clone(),
+            agent_id: draft.agent_id.clone(),
+            rationale: draft.rationale.clone(),
+            tree_hash: Some(tree_hash),
+            summary: draft.summary.clone(),
+            timestamp_ms: draft.timestamp_ms,
+        };
+        let id = effective.canonical_hash()?;
+        let id_hex = id.to_hex();
+        let rationale_json = serde_json::to_string(&effective.rationale)?;
+        let parents_json = serde_json::to_string(&effective.parents)?;
+
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(map_busy)?;
+        // Parents must exist inside the same transaction (immutable rows, so
+        // the check cannot race with deletion; checkpoints are never deleted).
+        for parent in &effective.parents {
+            let hex = parent.to_hex();
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM checkpoints WHERE hash = ?1",
+                    params![hex],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_busy)?
+                .is_some();
+            if !exists {
+                return Err(ContentStoreError::MissingParent(*parent));
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                tree_hex,
+                tree_bytes.len() as i64,
+                tree_bytes,
+                tree_created_at_ms as i64
+            ],
+        )
+        .map_err(map_busy)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id_hex,
+                parents_json,
+                effective.task_id,
+                effective.agent_id,
+                rationale_json,
+                tree_hex,
+                effective.summary,
+                effective.timestamp_ms as i64
+            ],
+        )
+        .map_err(map_busy)?;
+        for name in ref_names {
+            tx.execute(
+                "INSERT INTO refs (name, target_hash, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET target_hash = excluded.target_hash, updated_at_ms = excluded.updated_at_ms",
+                params![name, id_hex, updated_at_ms as i64],
+            )
+            .map_err(map_busy)?;
+        }
+        tx.commit().map_err(map_busy)?;
+
+        Ok(Checkpoint {
+            id,
+            parents: effective.parents,
+            task_id: effective.task_id,
+            agent_id: effective.agent_id,
+            rationale: effective.rationale,
+            tree_hash: effective.tree_hash,
+            summary: effective.summary,
+            timestamp_ms: effective.timestamp_ms,
+        })
+    }
+
     /// Retrieve a checkpoint by its content hash.
     pub fn get_checkpoint(
         &self,
         hash: &ContentHash,
     ) -> Result<Option<Checkpoint>, ContentStoreError> {
         let hash_hex = hash.to_hex();
-        let mut stmt = self.conn.prepare(
-            "SELECT parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms
-             FROM checkpoints WHERE hash = ?1",
-        )?;
+        let row = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms
+                     FROM checkpoints WHERE hash = ?1",
+                )
+                .map_err(map_busy)?;
 
-        let row = stmt
-            .query_row(params![hash_hex], |row| {
+            stmt.query_row(params![hash_hex], |row| {
                 let parents_json: String = row.get::<_, String>(0)?;
                 let task_id: String = row.get::<_, String>(1)?;
                 let agent_id: String = row.get::<_, String>(2)?;
@@ -680,8 +1226,9 @@ impl ContentStore {
                     created_at_ms,
                 ))
             })
-            .optional()?;
-
+            .optional()
+            .map_err(map_busy)?
+        };
         match row {
             Some((
                 parents_json,
@@ -735,10 +1282,11 @@ impl ContentStore {
     /// Check if a checkpoint exists in the store.
     pub fn has_checkpoint(&self, hash: &ContentHash) -> Result<bool, ContentStoreError> {
         let hash_hex = hash.to_hex();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT 1 FROM checkpoints WHERE hash = ?1")?;
-        Ok(stmt.exists(params![hash_hex])?)
+        let guard = self.lock_conn()?;
+        let mut stmt = guard
+            .prepare("SELECT 1 FROM checkpoints WHERE hash = ?1")
+            .map_err(map_busy)?;
+        stmt.exists(params![hash_hex]).map_err(map_busy)
     }
 
     /// Update or create multiple named references atomically within a single SQLite transaction.
@@ -758,7 +1306,8 @@ impl ContentStore {
             }
         }
 
-        let tx = self.conn.transaction()?;
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(map_busy)?;
         for (name, target) in refs {
             let target_hex = target.to_hex();
             tx.execute(
@@ -766,9 +1315,10 @@ impl ContentStore {
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(name) DO UPDATE SET target_hash = excluded.target_hash, updated_at_ms = excluded.updated_at_ms",
                 params![name, target_hex, updated_at_ms as i64],
-            )?;
+            )
+            .map_err(map_busy)?;
         }
-        tx.commit()?;
+        tx.commit().map_err(map_busy)?;
 
         Ok(())
     }
@@ -785,12 +1335,15 @@ impl ContentStore {
 
     /// Get the target checkpoint hash of a named reference.
     pub fn get_ref(&self, name: &str) -> Result<Option<ContentHash>, ContentStoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT target_hash FROM refs WHERE name = ?1")?;
-        let maybe_hex: Option<String> = stmt
-            .query_row(params![name], |row| row.get::<_, String>(0))
-            .optional()?;
+        let maybe_hex: Option<String> = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare("SELECT target_hash FROM refs WHERE name = ?1")
+                .map_err(map_busy)?;
+            stmt.query_row(params![name], |row| row.get::<_, String>(0))
+                .optional()
+                .map_err(map_busy)?
+        };
 
         match maybe_hex {
             Some(hex) => Ok(Some(ContentHash::from_hex(&hex)?)),
@@ -800,27 +1353,36 @@ impl ContentStore {
 
     /// Delete a named reference. Returns `true` if the reference existed and was deleted.
     pub fn delete_ref(&mut self, name: &str) -> Result<bool, ContentStoreError> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM refs WHERE name = ?1", params![name])?;
+        let guard = self.lock_conn()?;
+        let affected = guard
+            .execute("DELETE FROM refs WHERE name = ?1", params![name])
+            .map_err(map_busy)?;
         Ok(affected > 0)
     }
 
     /// List all named references and their target checkpoint hashes.
     pub fn list_refs(&self) -> Result<Vec<(String, ContentHash)>, ContentStoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name, target_hash FROM refs ORDER BY name ASC")?;
-
-        let rows = stmt.query_map([], |row| {
-            let name: String = row.get::<_, String>(0)?;
-            let hash_hex: String = row.get::<_, String>(1)?;
-            Ok((name, hash_hex))
-        })?;
+        let pairs: Vec<(String, String)> = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare("SELECT name, target_hash FROM refs ORDER BY name ASC")
+                .map_err(map_busy)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let name: String = row.get::<_, String>(0)?;
+                    let hash_hex: String = row.get::<_, String>(1)?;
+                    Ok((name, hash_hex))
+                })
+                .map_err(map_busy)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item.map_err(map_busy)?);
+            }
+            out
+        };
 
         let mut result = Vec::new();
-        for item in rows {
-            let (name, hash_hex) = item?;
+        for (name, hash_hex) in pairs {
             result.push((name, ContentHash::from_hex(&hash_hex)?));
         }
 
@@ -931,5 +1493,43 @@ impl ContentStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod durable_profile_tests {
+    use super::*;
+
+    /// `PRAGMA synchronous` and `PRAGMA foreign_keys` are per-connection
+    /// state, so they must be asserted on the same connection that applied
+    /// them (a fresh connection only shows build defaults).
+    #[test]
+    fn pragmas_apply_on_the_same_connection() {
+        // A temp file (not memory): in-memory databases cannot use WAL, so
+        // journal_mode would read back "memory" regardless of the request.
+        let dir = std::env::temp_dir().join(format!(
+            "bitty_test_profile_{}_{}",
+            std::process::id(),
+            "same-conn"
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let db_path = dir.join("profile.db");
+        let _ = std::fs::remove_file(&db_path);
+        let conn = Connection::open(&db_path).expect("open");
+        apply_durable_pragmas(&conn).expect("pragmas");
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(journal.to_lowercase(), "wal");
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("synchronous");
+        assert_eq!(synchronous, 2, "synchronous must be FULL");
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .expect("foreign_keys");
+        assert_eq!(foreign_keys, 1, "foreign_keys must be ON");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

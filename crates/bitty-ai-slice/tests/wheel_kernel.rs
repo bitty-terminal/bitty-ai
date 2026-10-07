@@ -383,3 +383,34 @@ fn test_kernel_task_view_dependencies() {
     let non_existent = TaskId::new("unknown-id").unwrap();
     assert!(kernel.get_task_view(&non_existent).unwrap().is_none());
 }
+
+#[test]
+fn test_kernel_commit_is_atomic_head_and_branch_move_together() {
+    use bitty_ai_slice::content_store::Rationale;
+    let mut kernel = WheelKernel::open_in_memory().expect("kernel opens");
+    kernel.put_slot("a.txt", b"v1", 1000).unwrap();
+    let cp = kernel
+        .commit_checkpoint(Rationale::new("Why", "What"), Some("heads/main"), 1010)
+        .unwrap();
+    let head = kernel.head_checkpoint().expect("HEAD").to_owned();
+    assert_eq!(head, cp.id);
+    let branch = kernel
+        .content_store()
+        .get_ref("heads/main")
+        .unwrap()
+        .expect("branch");
+    assert_eq!(branch, cp.id);
+}
+
+#[test]
+fn test_kernel_session_state_is_non_persisted_documented() {
+    // recent_actions and active_task_id are session-only by design.
+    let mut kernel = WheelKernel::open_in_memory().expect("kernel opens");
+    kernel
+        .record_action_outcome("act-1", true, Some(0), 5, "ok", "", 1000)
+        .unwrap();
+    assert_eq!(kernel.recent_actions().len(), 1);
+    kernel.clear_recent_actions();
+    assert!(kernel.recent_actions().is_empty());
+    assert!(kernel.active_task().is_none());
+}
