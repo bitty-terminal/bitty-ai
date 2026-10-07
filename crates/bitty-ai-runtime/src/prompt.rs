@@ -1,11 +1,11 @@
 //! Deterministic five-layer prompt assembly with narrowing-only policy.
 //!
-//! Mirrors the draft `docs/specifications/prompt-layering-design.md` (status:
+//! Mirrors the draft `docs/context/prompt-layering-design.md` (status:
 //! draft, not an accepted contract): five layers from most stable to most
 //! dynamic — Core Contract, User, Project/`.wheel`, Skills/Profile, and
 //! Runtime/Turn — assembled stable-before-dynamic and aligned with the
 //! prefix-cache layering in
-//! `docs/specifications/prefix-cache-context-design.md`.
+//! `docs/context/prefix-cache-context-design.md`.
 //!
 //! # Precedence and the no-grant rule
 //!
