@@ -37,7 +37,7 @@ crates/
   bitty-ai-slice/              # Experimental pressure test, not shipped
 ```
 
-The v0.1 direction (see `docs/specifications/implementation-profile-v0.1.md`)
+The v0.1 direction (see `docs/product/implementation-profile-v0.1.md`)
 starts from a single `bitty-ai-runtime` crate instead of splitting
 model/context/agent/tool-bus/workspace crates up front; the split happens only
 once implementation evidence demands it.

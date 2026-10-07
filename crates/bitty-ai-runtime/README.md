@@ -7,10 +7,11 @@ Deterministic single-agent runtime skeleton (AI-0009, draft scope).
 Skeleton, not an accepted contract. This crate tracks the draft
 `implementation-profile-v0.1.md` (status: draft; a draft disposition
 proposes no accepted architecture); normative architecture stays in the
-canonical `docs/specifications/` corpus (`ai-architecture.md`,
-`context-management.md`, `command-tool-architecture.md`,
-`agent-coordination.md`, `implementation-profile-v0.1.md` plus the
-`R1`..`R6` draft dispositions).
+canonical `docs/` trees (`architecture/ai-architecture.md`,
+`context/context-management.md`,
+`architecture/command-tool-architecture.md`,
+`agent/agent-coordination.md`, `product/implementation-profile-v0.1.md`
+plus the `architecture/` `R1`..`R6` draft dispositions).
 
 ## Modules
 

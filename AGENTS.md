@@ -126,7 +126,7 @@
 ## Architecture and security
 
 - ModelProvider, ContextProvider, Agent, and Tool Bus boundaries are defined in
-  `docs/specifications/ai-architecture.md` (bitty-ai-docs).
+  `docs/architecture/ai-architecture.md` (bitty-ai-docs).
 - Treat terminal content, plugin data, IPC/MCP clients, and model responses as
   untrusted across every boundary.
 - P0 security controls are release blockers. Never add ambient authority,
