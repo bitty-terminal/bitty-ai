@@ -359,6 +359,7 @@ fn corrupt_checkpoint_detection_on_sqlite_tamper() {
             .as_nanos()
     ));
 
+    let cp_id: bitty_ai_slice::content_store::ContentHash;
     {
         let mut store = ContentStore::open(&db_path).expect("open store file");
         let cp = store
@@ -379,22 +380,31 @@ fn corrupt_checkpoint_detection_on_sqlite_tamper() {
             .expect("get clean cp")
             .expect("cp exists");
         assert_eq!(retrieved.id, cp.id);
+        cp_id = cp.id;
+        // AI-0178: single-writer EXCLUSIVE holds the file lock, so the raw
+        // tamper connection can only proceed after this handle drops.
+    }
 
+    {
         // Directly tamper with SQLite row without updating primary key hash
         let conn = rusqlite::Connection::open(&db_path).expect("open raw conn");
         conn.execute(
             "UPDATE checkpoints SET summary = ?1 WHERE hash = ?2",
-            rusqlite::params!["Tampered summary", cp.id.to_hex()],
+            rusqlite::params!["Tampered summary", cp_id.to_hex()],
         )
         .expect("tamper row");
+    }
 
+    {
+        let store = ContentStore::open(&db_path).expect("reopen");
         // Verify get_checkpoint fails closed with CorruptCheckpoint
-        let err = store
-            .get_checkpoint(&cp.id)
-            .expect_err("must detect corruption");
+        let err = match store.get_checkpoint(&cp_id) {
+            Ok(_) => panic!("must detect corruption"),
+            Err(e) => e,
+        };
         match err {
             ContentStoreError::CorruptCheckpoint { expected, found } => {
-                assert_eq!(expected, cp.id);
+                assert_eq!(expected, cp_id);
                 assert_ne!(found, expected);
             }
             other => panic!("expected CorruptCheckpoint, got: {other:?}"),
@@ -402,4 +412,59 @@ fn corrupt_checkpoint_detection_on_sqlite_tamper() {
     }
 
     let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn durable_pragmas_unified_on_open() {
+    let dir = std::env::temp_dir().join(format!("bitty_test_pragmas_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let db_path = dir.join("pragmas.db");
+    let _ = std::fs::remove_file(&db_path);
+    {
+        {
+            let _store = ContentStore::open(&db_path).expect("open");
+            // AI-0178: drop the single-writer handle before the raw read so
+            // the probe connection is not fenced by EXCLUSIVE.
+        }
+        let raw = rusqlite::Connection::open(&db_path).expect("raw");
+        let journal: String = raw
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("journal_mode");
+        assert_eq!(journal.to_lowercase(), "wal");
+        let sync: String = raw
+            .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+            .map(|v| v.to_string())
+            .expect("synchronous");
+        // FULL = 2
+        assert_eq!(sync, "2");
+        let fk: i64 = raw
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("fk");
+        assert_eq!(fk, 1);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn commit_checkpoint_atomic_advances_refs_together() {
+    use bitty_ai_slice::content_store::ContentHash;
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tree_bytes = b"{\"tree\":1}";
+    let draft = CheckpointDraft {
+        parents: Vec::new(),
+        task_id: "AI-0178".to_string(),
+        agent_id: "test".to_string(),
+        rationale: Rationale::new("Why", "What"),
+        tree_hash: None,
+        summary: "S".to_string(),
+        timestamp_ms: 1000,
+    };
+    let cp = store
+        .commit_checkpoint_atomic(tree_bytes, 1000, draft, &["heads/main", "HEAD"], 1000)
+        .expect("atomic commit");
+    assert_eq!(store.get_ref("HEAD").expect("head"), Some(cp.id));
+    assert_eq!(store.get_ref("heads/main").expect("branch"), Some(cp.id));
+    let blob_hash = ContentHash::compute(tree_bytes);
+    assert!(store.has_blob(&blob_hash).expect("blob persisted"));
+    assert!(store.has_checkpoint(&cp.id).expect("checkpoint persisted"));
 }

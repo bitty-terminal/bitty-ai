@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -93,6 +94,10 @@ pub enum TaskEngineError {
     EmptyField(&'static str),
     /// Content hash parsing error.
     InvalidHash(String),
+    /// Malformed, corrupt, or schema-incompatible database state.
+    Corrupt { detail: String },
+    /// Another live writer holds this database file's single-writer lock.
+    WriterBusy,
 }
 
 impl fmt::Display for TaskEngineError {
@@ -144,6 +149,8 @@ impl fmt::Display for TaskEngineError {
             }
             Self::EmptyField(field) => write!(f, "field '{field}' must not be empty"),
             Self::InvalidHash(err) => write!(f, "invalid checkpoint hash: {err}"),
+            Self::Corrupt { detail } => write!(f, "task engine corrupt or incompatible: {detail}"),
+            Self::WriterBusy => write!(f, "another writer holds the single-writer lock"),
         }
     }
 }
@@ -445,62 +452,228 @@ impl std::ops::Deref for TaskView {
 }
 
 /// Persistent, transactional Task DAG engine.
+///
+/// Shares the Wheel single-connection handle behind `Arc<Mutex<..>>` (see
+/// `crate::content_store` docs): the database file is opened exactly once
+/// and the handle is split into the content store and this engine.
 pub struct TaskEngine {
-    conn: Connection,
+    conn: Arc<Mutex<Connection>>,
+}
+
+fn task_is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Durable task schema shared by standalone and shared opens.
+pub(crate) const TASK_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    assigned_agent TEXT,
+    generation INTEGER NOT NULL,
+    checkpoint TEXT,
+    failure_reason TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
+    ON tasks(status, priority DESC, created_at_ms ASC);
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    prerequisite_id TEXT NOT NULL,
+    dependent_id TEXT NOT NULL,
+    PRIMARY KEY (prerequisite_id, dependent_id),
+    FOREIGN KEY (prerequisite_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+    FOREIGN KEY (dependent_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_deps_dependent
+    ON task_dependencies(dependent_id);
+CREATE INDEX IF NOT EXISTS idx_task_deps_prerequisite
+    ON task_dependencies(prerequisite_id);
+"#;
+
+pub(crate) fn admit_task_or_init(conn: &rusqlite::Connection) -> Result<(), TaskEngineError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE name COLLATE NOCASE IN ('tasks', 'task_dependencies')",
+        )
+        .map_err(task_map_busy)?;
+    let mut matches: Vec<(String, String)> = Vec::new();
+    let mut rows = stmt.query([]).map_err(task_map_busy)?;
+    while let Some(row) = rows.next().map_err(task_map_busy)? {
+        matches.push((
+            row.get::<_, String>(0).map_err(task_map_busy)?,
+            row.get::<_, String>(1).map_err(task_map_busy)?,
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+    let mut present = Vec::new();
+    for expected in ["tasks", "task_dependencies"] {
+        if matches
+            .iter()
+            .any(|(ty, name)| ty == "table" && name == expected)
+        {
+            present.push(expected);
+            continue;
+        }
+        if let Some((ty, name)) = matches.iter().find(|(ty, name)| {
+            matches!(ty.as_str(), "table" | "view" | "index") && name.eq_ignore_ascii_case(expected)
+        }) {
+            return Err(TaskEngineError::Corrupt {
+                detail: format!(
+                    "task name '{expected}' is occupied by {ty} '{name}', not the exact-case table"
+                ),
+            });
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    if present.len() != 2 {
+        return Err(TaskEngineError::Corrupt {
+            detail: format!("partial task schema; present tables: {present:?}"),
+        });
+    }
+    // Verify tasks columns (names/types/NOT NULL/PK position)
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(tasks)")
+        .map_err(task_map_busy)?;
+    let mut cols: Vec<(String, String, bool, u32)> = Vec::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(5)? as u32,
+            ))
+        })
+        .map_err(task_map_busy)?;
+    for row in rows {
+        cols.push(row.map_err(task_map_busy)?);
+    }
+    drop(stmt);
+    let expected: &[(&str, &str, bool, u32)] = &[
+        ("task_id", "TEXT", true, 1),
+        ("title", "TEXT", true, 0),
+        ("description", "TEXT", true, 0),
+        ("priority", "INTEGER", true, 0),
+        ("status", "TEXT", true, 0),
+        ("assigned_agent", "TEXT", false, 0),
+        ("generation", "INTEGER", true, 0),
+        ("checkpoint", "TEXT", false, 0),
+        ("failure_reason", "TEXT", false, 0),
+        ("created_at_ms", "INTEGER", true, 0),
+        ("updated_at_ms", "INTEGER", true, 0),
+    ];
+    if cols.len() != expected.len() {
+        return Err(TaskEngineError::Corrupt {
+            detail: format!(
+                "table tasks has {} columns, expected {}",
+                cols.len(),
+                expected.len()
+            ),
+        });
+    }
+    for (i, (name, ty, notnull, pk)) in expected.iter().enumerate() {
+        let (aname, aty, anotnull, apk) = &cols[i];
+        if aname != *name || aty != *ty || anotnull != notnull || apk != pk {
+            return Err(TaskEngineError::Corrupt {
+                detail: format!("table tasks column {i} shape mismatch"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn task_map_busy(err: rusqlite::Error) -> TaskEngineError {
+    if task_is_busy(&err) {
+        TaskEngineError::WriterBusy
+    } else if let rusqlite::Error::SqliteFailure(e, _) = &err {
+        if matches!(
+            e.code,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+        ) {
+            return TaskEngineError::Corrupt {
+                detail: err.to_string(),
+            };
+        }
+        TaskEngineError::Sqlite(err)
+    } else {
+        TaskEngineError::Sqlite(err)
+    }
 }
 
 impl TaskEngine {
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, TaskEngineError> {
+        self.conn.lock().map_err(|_| TaskEngineError::Corrupt {
+            detail: "task engine lock poisoned; fail closed".to_owned(),
+        })
+    }
+
     /// Open or create a persistent Task DAG SQLite database at the specified path.
+    ///
+    /// Applies the durable pragma profile shared with
+    /// `crate::content_store` (WAL, FULL, FK ON, nonzero busy timeout,
+    /// EXCLUSIVE single-writer).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path).map_err(task_map_busy)?;
         Self::from_connection(conn)
+    }
+
+    /// Open a durable task engine (formal path, same profile as `Self::open`).
+    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
+        Self::open(path)
     }
 
     /// Open an in-memory Task DAG SQLite database for ephemeral sessions and testing.
     pub fn open_in_memory() -> Result<Self, TaskEngineError> {
-        let conn = Connection::open_in_memory()?;
+        let conn = Connection::open_in_memory().map_err(task_map_busy)?;
         Self::from_connection(conn)
     }
 
+    /// Join an already-admitted shared connection (Wheel single-open path).
+    pub(crate) fn from_shared(shared: Arc<Mutex<Connection>>) -> Result<Self, TaskEngineError> {
+        {
+            let guard = shared.lock().map_err(|_| TaskEngineError::Corrupt {
+                detail: "task engine lock poisoned; fail closed".to_owned(),
+            })?;
+            guard.execute_batch(TASK_SCHEMA).map_err(task_map_busy)?;
+        }
+        Ok(Self { conn: shared })
+    }
+
     /// Initialize tables and indexes on an open connection.
+    ///
+    /// Applies the same durable pragma profile as the content store (WAL,
+    /// FULL, FK ON, nonzero busy timeout, EXCLUSIVE single-writer); values
+    /// must match `crate::content_store::DURABLE_BUSY_TIMEOUT_MS`.
     fn from_connection(conn: Connection) -> Result<Self, TaskEngineError> {
+        use std::time::Duration;
+        conn.busy_timeout(Duration::from_millis(5000))
+            .map_err(task_map_busy)?;
         conn.execute_batch(
-            r#"
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL,
-                priority INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                assigned_agent TEXT,
-                generation INTEGER NOT NULL,
-                checkpoint TEXT,
-                failure_reason TEXT,
-                created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
-                ON tasks(status, priority DESC, created_at_ms ASC);
-
-            CREATE TABLE IF NOT EXISTS task_dependencies (
-                prerequisite_id TEXT NOT NULL,
-                dependent_id TEXT NOT NULL,
-                PRIMARY KEY (prerequisite_id, dependent_id),
-                FOREIGN KEY (prerequisite_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
-                FOREIGN KEY (dependent_id) REFERENCES tasks(task_id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_task_deps_dependent
-                ON task_dependencies(dependent_id);
-
-            CREATE INDEX IF NOT EXISTS idx_task_deps_prerequisite
-                ON task_dependencies(prerequisite_id);
-            "#,
-        )?;
-        Ok(Self { conn })
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             PRAGMA foreign_keys = ON;
+             PRAGMA locking_mode = EXCLUSIVE;",
+        )
+        .map_err(task_map_busy)?;
+        conn.execute_batch(TASK_SCHEMA).map_err(task_map_busy)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Create and persist a new task in the DAG.
@@ -583,7 +756,8 @@ impl TaskEngine {
         };
 
         // Transactional insert
-        let tx = self.conn.transaction()?;
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(task_map_busy)?;
         {
             let mut stmt = tx.prepare(
                 r#"
@@ -621,7 +795,7 @@ impl TaskEngine {
             }
         }
 
-        tx.commit()?;
+        tx.commit().map_err(task_map_busy)?;
 
         Ok(TaskNode {
             id: draft.id,
@@ -658,18 +832,21 @@ impl TaskEngine {
         }
 
         // Check if edge already exists
-        let exists: bool = self
-            .conn
-            .query_row(
-                r#"
+        let exists: bool = {
+            let guard = self.lock_conn()?;
+            guard
+                .query_row(
+                    r#"
             SELECT 1 FROM task_dependencies
             WHERE prerequisite_id = ?1 AND dependent_id = ?2
             "#,
-                params![prerequisite_id.as_str(), dependent_id.as_str()],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
+                    params![prerequisite_id.as_str(), dependent_id.as_str()],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(task_map_busy)?
+                .unwrap_or(false)
+        };
 
         if exists {
             return Ok(());
@@ -693,13 +870,18 @@ impl TaskEngine {
         }
 
         // Insert dependency
-        self.conn.execute(
-            r#"
+        {
+            let guard = self.lock_conn()?;
+            guard
+                .execute(
+                    r#"
             INSERT INTO task_dependencies (prerequisite_id, dependent_id)
             VALUES (?1, ?2)
             "#,
-            params![prerequisite_id.as_str(), dependent_id.as_str()],
-        )?;
+                    params![prerequisite_id.as_str(), dependent_id.as_str()],
+                )
+                .map_err(task_map_busy)?;
+        }
 
         // Re-evaluate dependent task status
         let prereq_node = self.get_task(prerequisite_id)?;
@@ -750,21 +932,26 @@ impl TaskEngine {
         }
 
         let new_generation = task.generation + 1;
-        let rows = self.conn.execute(
-            r#"
+        let rows = {
+            let guard = self.lock_conn()?;
+            guard
+                .execute(
+                    r#"
             UPDATE tasks
             SET status = ?1, assigned_agent = ?2, generation = ?3, updated_at_ms = ?4
             WHERE task_id = ?5 AND status = 'ready' AND generation = ?6
             "#,
-            params![
-                TaskStatus::Running.as_str(),
-                agent_id,
-                new_generation as i64,
-                now_ms as i64,
-                task_id.as_str(),
-                task.generation as i64,
-            ],
-        )?;
+                    params![
+                        TaskStatus::Running.as_str(),
+                        agent_id,
+                        new_generation as i64,
+                        now_ms as i64,
+                        task_id.as_str(),
+                        task.generation as i64,
+                    ],
+                )
+                .map_err(task_map_busy)?
+        };
 
         if rows == 0 {
             let current = self.get_task(task_id)?;
@@ -810,7 +997,8 @@ impl TaskEngine {
 
         let checkpoint_str = checkpoint.as_ref().map(|h| h.to_string());
 
-        let tx = self.conn.transaction()?;
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(task_map_busy)?;
         let rows = {
             let mut stmt = tx.prepare(
                 r#"
@@ -889,7 +1077,8 @@ impl TaskEngine {
             }
         }
 
-        tx.commit()?;
+        tx.commit().map_err(task_map_busy)?;
+        drop(guard);
         self.get_task(task_id)
     }
 
@@ -930,7 +1119,8 @@ impl TaskEngine {
             });
         }
 
-        let tx = self.conn.transaction()?;
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(task_map_busy)?;
         let rows = {
             let mut stmt = tx.prepare(
                 r#"
@@ -967,7 +1157,8 @@ impl TaskEngine {
         // Transitive cascade block to all downstream dependents
         Self::cascade_block_downstream_on_conn(&tx, task_id, now_ms)?;
 
-        tx.commit()?;
+        tx.commit().map_err(task_map_busy)?;
+        drop(guard);
         self.get_task(task_id)
     }
 
@@ -990,7 +1181,8 @@ impl TaskEngine {
         }
 
         let new_generation = task.generation + 1;
-        let tx = self.conn.transaction()?;
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(task_map_busy)?;
         let rows = {
             let mut stmt = tx.prepare(
                 r#"
@@ -1019,7 +1211,8 @@ impl TaskEngine {
         // Transitive cascade block to all downstream dependents
         Self::cascade_block_downstream_on_conn(&tx, task_id, now_ms)?;
 
-        tx.commit()?;
+        tx.commit().map_err(task_map_busy)?;
+        drop(guard);
         self.get_task(task_id)
     }
 
@@ -1108,28 +1301,33 @@ impl TaskEngine {
         };
 
         let new_generation = task.generation + 1;
-        self.conn.execute(
-            r#"
+        {
+            let guard = self.lock_conn()?;
+            guard
+                .execute(
+                    r#"
             UPDATE tasks
             SET status = ?1, generation = ?2, failure_reason = NULL,
                 assigned_agent = NULL, checkpoint = NULL, updated_at_ms = ?3
             WHERE task_id = ?4
             "#,
-            params![
-                next_status.as_str(),
-                new_generation as i64,
-                now_ms as i64,
-                task_id.as_str()
-            ],
-        )?;
+                    params![
+                        next_status.as_str(),
+                        new_generation as i64,
+                        now_ms as i64,
+                        task_id.as_str()
+                    ],
+                )
+                .map_err(task_map_busy)?;
+        }
 
         self.get_task(task_id)
     }
 
     /// Retrieve the highest priority [`TaskStatus::Ready`] task from the queue.
     pub fn next_ready_task(&self) -> Result<Option<TaskNode>, TaskEngineError> {
-        let result = self
-            .conn
+        let guard = self.lock_conn()?;
+        let result = guard
             .query_row(
                 r#"
             SELECT task_id, title, description, priority, status,
@@ -1143,15 +1341,18 @@ impl TaskEngine {
                 [],
                 Self::row_to_task_node,
             )
-            .optional()?;
+            .optional()
+            .map_err(task_map_busy)?;
 
         Ok(result)
     }
 
     /// Retrieve all tasks currently in [`TaskStatus::Ready`] state, sorted by priority descending.
     pub fn ready_tasks(&self) -> Result<Vec<TaskNode>, TaskEngineError> {
-        let mut stmt = self.conn.prepare(
-            r#"
+        let guard = self.lock_conn()?;
+        let mut stmt = guard
+            .prepare(
+                r#"
             SELECT task_id, title, description, priority, status,
                    assigned_agent, generation, checkpoint, failure_reason,
                    created_at_ms, updated_at_ms
@@ -1159,19 +1360,22 @@ impl TaskEngine {
             WHERE status = 'ready'
             ORDER BY priority DESC, created_at_ms ASC, task_id ASC
             "#,
-        )?;
-        let rows = stmt.query_map([], Self::row_to_task_node)?;
+            )
+            .map_err(task_map_busy)?;
+        let rows = stmt
+            .query_map([], Self::row_to_task_node)
+            .map_err(task_map_busy)?;
         let mut tasks = Vec::new();
         for r in rows {
-            tasks.push(r?);
+            tasks.push(r.map_err(task_map_busy)?);
         }
         Ok(tasks)
     }
 
     /// Retrieve a task record by its identifier.
     pub fn get_task(&self, id: &TaskId) -> Result<TaskNode, TaskEngineError> {
-        let task = self
-            .conn
+        let guard = self.lock_conn()?;
+        let task = guard
             .query_row(
                 r#"
             SELECT task_id, title, description, priority, status,
@@ -1183,21 +1387,23 @@ impl TaskEngine {
                 params![id.as_str()],
                 Self::row_to_task_node,
             )
-            .optional()?;
+            .optional()
+            .map_err(task_map_busy)?;
 
         task.ok_or_else(|| TaskEngineError::TaskNotFound(id.clone()))
     }
 
     /// Check if a task exists.
     pub fn has_task(&self, id: &TaskId) -> Result<bool, TaskEngineError> {
-        let exists: bool = self
-            .conn
+        let guard = self.lock_conn()?;
+        let exists: bool = guard
             .query_row(
                 "SELECT 1 FROM tasks WHERE task_id = ?1",
                 params![id.as_str()],
                 |_| Ok(true),
             )
-            .optional()?
+            .optional()
+            .map_err(task_map_busy)?
             .unwrap_or(false);
 
         Ok(exists)
@@ -1205,19 +1411,24 @@ impl TaskEngine {
 
     /// List all tasks in the store.
     pub fn list_tasks(&self) -> Result<Vec<TaskNode>, TaskEngineError> {
-        let mut stmt = self.conn.prepare(
-            r#"
+        let guard = self.lock_conn()?;
+        let mut stmt = guard
+            .prepare(
+                r#"
             SELECT task_id, title, description, priority, status,
                    assigned_agent, generation, checkpoint, failure_reason,
                    created_at_ms, updated_at_ms
             FROM tasks
             ORDER BY created_at_ms ASC, task_id ASC
             "#,
-        )?;
-        let rows = stmt.query_map([], Self::row_to_task_node)?;
+            )
+            .map_err(task_map_busy)?;
+        let rows = stmt
+            .query_map([], Self::row_to_task_node)
+            .map_err(task_map_busy)?;
         let mut tasks = Vec::new();
         for r in rows {
-            tasks.push(r?);
+            tasks.push(r.map_err(task_map_busy)?);
         }
         Ok(tasks)
     }
@@ -1225,7 +1436,8 @@ impl TaskEngine {
     /// Retrieve an enriched view of a task including its inlined prerequisite dependencies.
     pub fn get_task_view(&self, id: &TaskId) -> Result<TaskView, TaskEngineError> {
         let task = self.get_task(id)?;
-        let dependencies = Self::query_prerequisites_on_conn(&self.conn, id)?;
+        let guard = self.lock_conn()?;
+        let dependencies = Self::query_prerequisites_on_conn(&guard, id)?;
         Ok(TaskView::new(task, dependencies))
     }
 
@@ -1240,17 +1452,24 @@ impl TaskEngine {
         }
 
         let mut deps_map: HashMap<TaskId, Vec<TaskId>> = HashMap::with_capacity(tasks.len());
-        let mut stmt = self.conn.prepare(
-            "SELECT prerequisite_id, dependent_id FROM task_dependencies ORDER BY prerequisite_id ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT prerequisite_id, dependent_id FROM task_dependencies ORDER BY prerequisite_id ASC",
+                )
+                .map_err(task_map_busy)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(task_map_busy)?;
 
-        for r in rows {
-            let (prereq_str, dep_str) = r?;
-            if let (Ok(prereq), Ok(dep)) = (TaskId::new(&prereq_str), TaskId::new(&dep_str)) {
-                deps_map.entry(dep).or_default().push(prereq);
+            for r in rows {
+                let (prereq_str, dep_str) = r.map_err(task_map_busy)?;
+                if let (Ok(prereq), Ok(dep)) = (TaskId::new(&prereq_str), TaskId::new(&dep_str)) {
+                    deps_map.entry(dep).or_default().push(prereq);
+                }
             }
         }
 
@@ -1270,7 +1489,8 @@ impl TaskEngine {
         if !self.has_task(id)? {
             return Err(TaskEngineError::TaskNotFound(id.clone()));
         }
-        Self::query_prerequisites_on_conn(&self.conn, id)
+        let guard = self.lock_conn()?;
+        Self::query_prerequisites_on_conn(&guard, id)
     }
 
     /// Retrieve direct downstream dependent task IDs for a task.
@@ -1278,7 +1498,8 @@ impl TaskEngine {
         if !self.has_task(id)? {
             return Err(TaskEngineError::TaskNotFound(id.clone()));
         }
-        Self::query_dependents_on_conn(&self.conn, id)
+        let guard = self.lock_conn()?;
+        Self::query_dependents_on_conn(&guard, id)
     }
 
     /// Compute a topological sort of all tasks in the DAG.
@@ -1301,15 +1522,18 @@ impl TaskEngine {
             task_priorities.insert(t.id.clone(), (t.priority, t.created_at_ms));
         }
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT prerequisite_id, dependent_id FROM task_dependencies")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let guard = self.lock_conn()?;
+        let mut stmt = guard
+            .prepare("SELECT prerequisite_id, dependent_id FROM task_dependencies")
+            .map_err(task_map_busy)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(task_map_busy)?;
 
         for r in rows {
-            let (prereq_str, dep_str) = r?;
+            let (prereq_str, dep_str) = r.map_err(task_map_busy)?;
             if let (Ok(prereq), Ok(dep)) = (TaskId::new(&prereq_str), TaskId::new(&dep_str)) {
                 if let Some(entry) = adj_list.get_mut(&prereq) {
                     entry.push(dep.clone());
@@ -1370,9 +1594,10 @@ impl TaskEngine {
         visited.insert(from.clone());
         queue.push_back(from.clone());
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT dependent_id FROM task_dependencies WHERE prerequisite_id = ?1")?;
+        let guard = self.lock_conn()?;
+        let mut stmt = guard
+            .prepare("SELECT dependent_id FROM task_dependencies WHERE prerequisite_id = ?1")
+            .map_err(task_map_busy)?;
 
         while let Some(current) = queue.pop_front() {
             if current == *to {
@@ -1410,10 +1635,15 @@ impl TaskEngine {
         status: TaskStatus,
         now_ms: u64,
     ) -> Result<(), TaskEngineError> {
-        self.conn.execute(
-            "UPDATE tasks SET status = ?1, updated_at_ms = ?2 WHERE task_id = ?3",
-            params![status.as_str(), now_ms as i64, id.as_str()],
-        )?;
+        {
+            let guard = self.lock_conn()?;
+            guard
+                .execute(
+                    "UPDATE tasks SET status = ?1, updated_at_ms = ?2 WHERE task_id = ?3",
+                    params![status.as_str(), now_ms as i64, id.as_str()],
+                )
+                .map_err(task_map_busy)?;
+        }
         Ok(())
     }
 

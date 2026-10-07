@@ -1,5 +1,20 @@
 //! Unified WheelKernel facade coordinating storage, task DAG, context compiler, and action protocols (AI-0167).
 //!
+//! Durable path notes (AI-0178, formal):
+//! - The database file is opened exactly once per [`WheelKernel`]; the single
+//!   [`rusqlite::Connection`] is shared into [`ContentStore`] and [`TaskEngine`]
+//!   (see `content_store` single-connection docs). Two connections on one file
+//!   split pragmas and let a crash land between the blob write and the HEAD
+//!   update; one connection plus one `transaction()` per commit keeps tree blob,
+//!   checkpoint row, and HEAD/branch refs atomic.
+//! - `commit_checkpoint` is atomic (see [`ContentStore::commit_checkpoint_atomic`]):
+//!   HEAD advances only when the transaction commits.
+//! - Recovery validates the HEAD -> checkpoint -> tree triple and fails closed
+//!   on any partial triple (typed [`FacadeError`], no partial HEAD advance).
+//! - `recent_actions` and `active_task_id` are explicitly non-persisted
+//!   session state: they reset on every open and never survive a reopen.
+//!   Durability covers HEAD, the checkpoint DAG, blobs/refs, and tasks only.
+//!
 //! Provides the boundary plane and runtime orchestrator for Wheel:
 //! - Coordinates transactional SQLite [`ContentStore`] (data plane).
 //! - Coordinates graph-theoretic [`TaskEngine`] (control plane).
@@ -8,6 +23,10 @@
 //! - Integrates streaming SSE sessions and three-zone context compilation under budget.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use rusqlite::Connection;
 
 use crate::action_protocol::{ActionEngine, ActionOutcome, SpilloverConfig};
 use crate::content_store::{Checkpoint, CheckpointDraft, ContentHash, ContentStore, Rationale};
@@ -44,35 +63,43 @@ impl WheelKernel {
     }
 
     /// Open a persistent WheelKernel with caller-supplied budget and spillover configurations.
+    ///
+    /// Opens the file exactly once, applies the durable pragma profile, admits
+    /// content and task schemas, claims the single-writer lock, shares the
+    /// handle into the content store and task engine, then validates the
+    /// HEAD -> checkpoint -> tree triple (fail closed on partial).
     pub fn open_with_config(
         path: impl AsRef<Path>,
         budget_config: CompilerBudgetConfig,
         spillover_config: SpilloverConfig,
     ) -> Result<Self, FacadeError> {
-        let content_store = ContentStore::open(path.as_ref()).map_err(FacadeError::from)?;
-        let task_engine = TaskEngine::open(path.as_ref()).map_err(FacadeError::from)?;
-        let head_checkpoint = content_store.get_ref("HEAD").map_err(FacadeError::from)?;
-        let mut active_tree = ContextTree::new();
-        if let Some(ref head_hash) = head_checkpoint {
-            if let Some(checkpoint) = content_store
-                .get_checkpoint(head_hash)
-                .map_err(FacadeError::from)?
-            {
-                if let Some(ref tree_hash) = checkpoint.tree_hash {
-                    if let Some(blob_bytes) = content_store
-                        .get_blob(tree_hash)
-                        .map_err(FacadeError::from)?
-                    {
-                        active_tree =
-                            ContextTree::from_canonical_bytes(&blob_bytes).map_err(|e| {
-                                FacadeError::Wheel(format!(
-                                    "failed to decode active context tree: {e}"
-                                ))
-                            })?;
-                    }
-                }
-            }
+        let path = path.as_ref();
+        crate::content_store::check_sqlite_magic(path).map_err(FacadeError::from)?;
+        let conn = Connection::open(path)
+            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
+        conn.busy_timeout(Duration::from_millis(
+            crate::content_store::DURABLE_BUSY_TIMEOUT_MS,
+        ))
+        .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
+        crate::content_store::admit_or_init(&conn).map_err(FacadeError::from)?;
+        crate::task_dag::admit_task_or_init(&conn).map_err(FacadeError::from)?;
+        crate::content_store::apply_durable_pragmas(&conn).map_err(FacadeError::from)?;
+        crate::content_store::init_content_schema(&conn).map_err(FacadeError::from)?;
+        {
+            use crate::task_dag::TASK_SCHEMA;
+            conn.execute_batch(TASK_SCHEMA)
+                .map_err(|e| FacadeError::TaskDag(format!("task schema init: {e}")))?;
         }
+        crate::content_store::verify_profile(&conn).map_err(FacadeError::from)?;
+        crate::content_store::claim_writer_fast(&conn).map_err(FacadeError::from)?;
+        let shared = Arc::new(Mutex::new(conn));
+        let content_store =
+            ContentStore::from_shared(Arc::clone(&shared)).map_err(FacadeError::from)?;
+        let task_engine =
+            TaskEngine::from_shared(Arc::clone(&shared)).map_err(FacadeError::from)?;
+        let (head_checkpoint, active_tree) = Self::recover(&content_store)?;
 
         let action_engine = ActionEngine::new(spillover_config.clone());
 
@@ -89,6 +116,50 @@ impl WheelKernel {
         })
     }
 
+    /// Open a durable WheelKernel (formal path, same profile as [`Self::open`]).
+    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, FacadeError> {
+        Self::open(path)
+    }
+
+    /// Validate the HEAD -> checkpoint -> tree triple after open.
+    ///
+    /// Returns the admitted HEAD plus the decoded tree, or fails closed with
+    /// a typed error when any link is missing or undecodable. Never advances
+    /// a partial HEAD: on error the caller receives `Err` and no kernel.
+    fn recover(
+        content_store: &ContentStore,
+    ) -> Result<(Option<ContentHash>, ContextTree), FacadeError> {
+        let head = content_store.get_ref("HEAD").map_err(FacadeError::from)?;
+        let Some(ref head_hash) = head else {
+            return Ok((None, ContextTree::new()));
+        };
+        let Some(checkpoint) = content_store
+            .get_checkpoint(head_hash)
+            .map_err(FacadeError::from)?
+        else {
+            return Err(FacadeError::Store(format!(
+                "durable recovery: HEAD {head_hash} has no checkpoint row; refusing partial HEAD"
+            )));
+        };
+        let Some(ref tree_hash) = checkpoint.tree_hash else {
+            return Err(FacadeError::Store(format!(
+                "durable recovery: checkpoint {head_hash} has no tree blob link; refusing partial HEAD"
+            )));
+        };
+        let Some(blob_bytes) = content_store
+            .get_blob(tree_hash)
+            .map_err(FacadeError::from)?
+        else {
+            return Err(FacadeError::Store(format!(
+                "durable recovery: checkpoint {head_hash} tree {tree_hash} blob missing; refusing partial HEAD"
+            )));
+        };
+        let tree = ContextTree::from_canonical_bytes(&blob_bytes).map_err(|e| {
+            FacadeError::Store(format!("durable recovery: tree decode failed: {e}"))
+        })?;
+        Ok((head, tree))
+    }
+
     /// Open an in-memory WheelKernel with default configurations.
     pub fn open_in_memory() -> Result<Self, FacadeError> {
         Self::open_in_memory_with_config(
@@ -102,8 +173,20 @@ impl WheelKernel {
         budget_config: CompilerBudgetConfig,
         spillover_config: SpilloverConfig,
     ) -> Result<Self, FacadeError> {
-        let content_store = ContentStore::open_in_memory().map_err(FacadeError::from)?;
-        let task_engine = TaskEngine::open_in_memory().map_err(FacadeError::from)?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
+        crate::content_store::apply_durable_pragmas(&conn).map_err(FacadeError::from)?;
+        crate::content_store::init_content_schema(&conn).map_err(FacadeError::from)?;
+        {
+            use crate::task_dag::TASK_SCHEMA;
+            conn.execute_batch(TASK_SCHEMA)
+                .map_err(|e| FacadeError::TaskDag(format!("task schema init: {e}")))?;
+        }
+        let shared = Arc::new(Mutex::new(conn));
+        let content_store =
+            ContentStore::from_shared(Arc::clone(&shared)).map_err(FacadeError::from)?;
+        let task_engine =
+            TaskEngine::from_shared(Arc::clone(&shared)).map_err(FacadeError::from)?;
         let action_engine = ActionEngine::new(spillover_config.clone());
 
         Ok(Self {
@@ -299,6 +382,13 @@ impl WheelKernel {
 
     /// Commit a cognitive checkpoint linking the current Merkle tree, structured rationale,
     /// and parent reference into the immutable content store.
+    ///
+    /// Atomic (AI-0178): the tree blob, checkpoint row, and HEAD/branch ref
+    /// updates commit in one SQLite `transaction()` via
+    /// [`ContentStore::commit_checkpoint_atomic`]. HEAD advances only when the
+    /// transaction commits; a torn write (crash between blob insert and HEAD
+    /// update) replays as the pre-crash HEAD on reopen, never a half-advanced
+    /// HEAD.
     pub fn commit_checkpoint(
         &mut self,
         rationale: Rationale,
@@ -306,10 +396,6 @@ impl WheelKernel {
         now_ms: u64,
     ) -> Result<Checkpoint, FacadeError> {
         let tree_bytes = self.active_tree.canonical_bytes();
-        let tree_hash = self
-            .content_store
-            .put_blob(&tree_bytes, now_ms)
-            .map_err(FacadeError::from)?;
         let parents = match &self.head_checkpoint {
             Some(h) => vec![*h],
             None => Vec::new(),
@@ -324,23 +410,17 @@ impl WheelKernel {
             task_id,
             agent_id: "wheel-kernel".to_string(),
             rationale,
-            tree_hash: Some(tree_hash),
+            tree_hash: None,
             summary: "cognitive checkpoint".to_string(),
             timestamp_ms: now_ms,
         };
+        let ref_names: Vec<&str> = match branch {
+            Some(b) => vec![b, "HEAD"],
+            None => vec!["HEAD"],
+        };
         let checkpoint = self
             .content_store
-            .commit_checkpoint(draft)
-            .map_err(FacadeError::from)?;
-
-        let mut refs_to_update = Vec::with_capacity(2);
-        if let Some(b) = branch {
-            refs_to_update.push((b, &checkpoint.id));
-        }
-        refs_to_update.push(("HEAD", &checkpoint.id));
-
-        self.content_store
-            .update_refs_atomic(&refs_to_update, now_ms)
+            .commit_checkpoint_atomic(&tree_bytes, now_ms, draft, &ref_names, now_ms)
             .map_err(FacadeError::from)?;
         self.head_checkpoint = Some(checkpoint.id);
 
