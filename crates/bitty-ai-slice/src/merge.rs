@@ -132,8 +132,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use rusqlite::params;
-
 use crate::content_hash::ContentHash;
 use crate::content_store::{Checkpoint, CheckpointDraft, ContentStore, ContentStoreError};
 use crate::context_compiler::{ContextTree, SlotConflict, TreeMergeResult};
@@ -630,78 +628,20 @@ struct GcPlan {
     unreferenced_blobs: Vec<ContentHash>,
 }
 
-/// Read every `(old_hash, new_hash)` pair in the reflog grace window.
-///
-/// Returns raw hex strings; the SQLite read lock is released before any
-/// caller parses hashes or touches the checkpoint tables (single non-reentrant
-/// connection lock). Bad hex in-window is [`MergeError::Corrupt`].
-fn read_reflog_window(
-    store: &ContentStore,
-    threshold_i64: i64,
-) -> Result<Vec<(Option<String>, String)>, MergeError> {
-    let pairs: Vec<(Option<String>, String)> = {
-        let guard = store.lock_conn().map_err(map_store)?;
-        let mut stmt = guard
-            .prepare("SELECT old_hash, new_hash FROM reflog WHERE at_ms >= ?1")
-            .map_err(map_sqlite)?;
-        let rows = stmt
-            .query_map(params![threshold_i64], |row| {
-                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(map_sqlite)?;
-        let mut out = Vec::new();
-        for item in rows {
-            out.push(item.map_err(map_sqlite)?);
-        }
-        out
-    };
-    Ok(pairs)
-}
-
 /// List every checkpoint hash, ordered ascending for deterministic batches.
+///
+/// Thin wrapper over [`ContentStore::all_checkpoint_hashes`]: bad hex in the
+/// table is [`MergeError::Corrupt`] via the store-error mapping.
 fn list_all_checkpoint_hashes(store: &ContentStore) -> Result<Vec<ContentHash>, MergeError> {
-    let hexes: Vec<String> = {
-        let guard = store.lock_conn().map_err(map_store)?;
-        let mut stmt = guard
-            .prepare("SELECT hash FROM checkpoints ORDER BY hash ASC")
-            .map_err(map_sqlite)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(map_sqlite)?;
-        let mut out = Vec::new();
-        for item in rows {
-            out.push(item.map_err(map_sqlite)?);
-        }
-        out
-    };
-    let mut hashes = Vec::with_capacity(hexes.len());
-    for hex in hexes {
-        hashes.push(ContentHash::from_hex(&hex).map_err(|_| MergeError::Corrupt)?);
-    }
-    Ok(hashes)
+    store.all_checkpoint_hashes().map_err(map_store)
 }
 
 /// List every blob hash, ordered ascending for deterministic batches.
+///
+/// Thin wrapper over [`ContentStore::all_blob_hashes`]: bad hex in the table
+/// is [`MergeError::Corrupt`] via the store-error mapping.
 fn list_all_blob_hashes(store: &ContentStore) -> Result<Vec<ContentHash>, MergeError> {
-    let hexes: Vec<String> = {
-        let guard = store.lock_conn().map_err(map_store)?;
-        let mut stmt = guard
-            .prepare("SELECT hash FROM blobs ORDER BY hash ASC")
-            .map_err(map_sqlite)?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(map_sqlite)?;
-        let mut out = Vec::new();
-        for item in rows {
-            out.push(item.map_err(map_sqlite)?);
-        }
-        out
-    };
-    let mut hashes = Vec::with_capacity(hexes.len());
-    for hex in hexes {
-        hashes.push(ContentHash::from_hex(&hex).map_err(|_| MergeError::Corrupt)?);
-    }
-    Ok(hashes)
+    store.all_blob_hashes().map_err(map_store)
 }
 
 /// Maximum nested-tree traversal depth for GC blob retention.
@@ -740,21 +680,19 @@ fn gc_compute(store: &ContentStore, options: &GcOptions) -> Result<GcPlan, Merge
             return Err(MergeError::Corrupt);
         }
     }
-    let threshold_u64 = options.now_ms.saturating_sub(options.reflog_grace_ms);
-    let threshold_i64 = threshold_u64.min(i64::MAX as u64) as i64;
-    let window = read_reflog_window(store, threshold_i64)?;
+    let threshold_window = store
+        .reflog_window_hashes(options.now_ms, options.reflog_grace_ms)
+        .map_err(map_store)?;
     let zero = tombstone_hash();
     let mut roots: HashSet<ContentHash> = ref_targets.clone();
-    for (old_opt, new_hex) in &window {
-        if let Some(old_hex) = old_opt {
-            let hash = ContentHash::from_hex(old_hex).map_err(|_| MergeError::Corrupt)?;
-            if hash != zero {
-                roots.insert(hash);
+    for (old_opt, new_hash) in &threshold_window {
+        if let Some(old_hash) = old_opt {
+            if *old_hash != zero {
+                roots.insert(*old_hash);
             }
         }
-        let hash = ContentHash::from_hex(new_hex).map_err(|_| MergeError::Corrupt)?;
-        if hash != zero {
-            roots.insert(hash);
+        if *new_hash != zero {
+            roots.insert(*new_hash);
         }
     }
     let mut reachable: HashSet<ContentHash> = HashSet::new();
@@ -901,28 +839,24 @@ pub fn collect_garbage(
     }
     let plan = gc_compute(store, options)?;
     let report = bound_report(&plan, options.max_deletes_per_call);
-    let checkpoint_deletes = plan
+    let checkpoint_deletes: Vec<ContentHash> = plan
         .unreachable_checkpoints
         .iter()
-        .take(report.deleted_checkpoints);
-    let blob_deletes = plan.unreferenced_blobs.iter().take(report.deleted_blobs);
+        .take(report.deleted_checkpoints)
+        .copied()
+        .collect();
+    let blob_deletes: Vec<ContentHash> = plan
+        .unreferenced_blobs
+        .iter()
+        .take(report.deleted_blobs)
+        .copied()
+        .collect();
     if report.deleted_checkpoints == 0 && report.deleted_blobs == 0 {
         return Ok(report);
     }
-    let mut guard = store.lock_conn().map_err(map_store)?;
-    let tx = guard.transaction().map_err(map_sqlite)?;
-    for hash in checkpoint_deletes {
-        tx.execute(
-            "DELETE FROM checkpoints WHERE hash = ?1",
-            params![hash.to_hex()],
-        )
-        .map_err(map_sqlite)?;
-    }
-    for hash in blob_deletes {
-        tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash.to_hex()])
-            .map_err(map_sqlite)?;
-    }
-    tx.commit().map_err(map_sqlite)?;
+    store
+        .delete_checkpoints_and_blobs(&checkpoint_deletes, &blob_deletes)
+        .map_err(map_store)?;
     Ok(report)
 }
 
@@ -998,98 +932,57 @@ mod tests {
     }
 
     fn snapshot(store: &ContentStore) -> StoreSnapshot {
-        let guard = store.lock_conn().expect("lock");
-        let mut checkpoints = Vec::new();
-        {
-            let mut stmt = guard
-                .prepare(
-                    "SELECT hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms
-                     FROM checkpoints ORDER BY hash ASC",
+        // Public-API snapshot (AI-0188): no raw connection access. Checkpoint
+        // and blob rows are immutable, so their hash sets observe those
+        // tables completely; refs are observed as name/target pairs in
+        // `list_refs` order; reflog is observed as a full-table `seq`-ordered
+        // scan (including tombstone rows for deleted refs). KNOWN GAP vs the
+        // pre-0188 raw-SQL version: the `updated_at_ms` / `created_at_ms`
+        // stamps are not observed. Every guarded op leaves those stamps
+        // untouched (GC issues no ref writes by construction; failure paths
+        // roll back; dry-run writes nothing), so before/after equality keeps
+        // its tripwire value.
+        let checkpoints: Vec<String> = store
+            .all_checkpoint_hashes()
+            .expect("checkpoint hashes")
+            .iter()
+            .map(ContentHash::to_hex)
+            .collect();
+        let blobs: Vec<String> = store
+            .all_blob_hashes()
+            .expect("blob hashes")
+            .iter()
+            .map(ContentHash::to_hex)
+            .collect();
+        let live_refs = store.list_refs().expect("refs");
+        let refs: Vec<String> = live_refs
+            .iter()
+            .map(|(name, target)| format!("{name}|{}", target.to_hex()))
+            .collect();
+        // Full-table ordered scan: observes every reflog row including
+        // tombstone rows for deleted refs, exactly like the pre-0188
+        // raw-SQL version.
+        let entries = crate::session_refs::dump_reflog_all(store).expect("reflog");
+        let reflog: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}|{}|{}|{}|{}|{}|{}",
+                    entry.seq,
+                    entry.ref_name,
+                    entry
+                        .old_hash
+                        .as_ref()
+                        .map(ContentHash::to_hex)
+                        .as_deref()
+                        .unwrap_or("-"),
+                    entry.new_hash.to_hex(),
+                    entry.reason,
+                    entry.actor,
+                    entry.at_ms
                 )
-                .expect("prepare checkpoints");
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(format!(
-                        "{}|{}|{}|{}|{}|{}|{}|{}",
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?.as_deref().unwrap_or("-"),
-                        row.get::<_, String>(6)?,
-                        row.get::<_, i64>(7)?
-                    ))
-                })
-                .expect("query checkpoints");
-            for item in rows {
-                checkpoints.push(item.expect("row"));
-            }
-        }
-        let mut blobs = Vec::new();
-        {
-            let mut stmt = guard
-                .prepare("SELECT hash, size, created_at_ms FROM blobs ORDER BY hash ASC")
-                .expect("prepare blobs");
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(format!(
-                        "{}|{}|{}",
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?
-                    ))
-                })
-                .expect("query blobs");
-            for item in rows {
-                blobs.push(item.expect("row"));
-            }
-        }
-        let mut refs = Vec::new();
-        {
-            let mut stmt = guard
-                .prepare("SELECT name, target_hash, updated_at_ms FROM refs ORDER BY name ASC")
-                .expect("prepare refs");
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(format!(
-                        "{}|{}|{}",
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?
-                    ))
-                })
-                .expect("query refs");
-            for item in rows {
-                refs.push(item.expect("row"));
-            }
-        }
-        let mut reflog = Vec::new();
-        {
-            let mut stmt = guard
-                .prepare(
-                    "SELECT seq, ref_name, old_hash, new_hash, reason, actor, at_ms
-                     FROM reflog ORDER BY seq ASC",
-                )
-                .expect("prepare reflog");
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(format!(
-                        "{}|{}|{}|{}|{}|{}|{}",
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?.as_deref().unwrap_or("-"),
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?
-                    ))
-                })
-                .expect("query reflog");
-            for item in rows {
-                reflog.push(item.expect("row"));
-            }
-        }
+            })
+            .collect();
         StoreSnapshot {
             checkpoints,
             blobs,

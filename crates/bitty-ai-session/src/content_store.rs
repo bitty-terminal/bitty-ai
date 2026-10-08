@@ -2,7 +2,8 @@
 //!
 //! Provides the immutable data plane for Wheel:
 //! - [`ContentHash`]: Type-safe SHA-256 content address with strict hex validation.
-//! - [`BlobStore`]: Deduplicating immutable blob storage in SQLite.
+//! - Blob storage: deduplicating immutable blob storage in SQLite (see
+//!   [`ContentStore::put_blob`] and [`ContentStore::get_blob`]).
 //! - [`Rationale`]: Structured cognitive intent and observation record replacing raw CoT.
 //! - [`Checkpoint`]: Content-addressed DAG commit node binding parent hashes, task ID, agent, and rationale.
 //! - [`ContentStore`]: Unified transactional store managing blobs, checkpoints, refs, and DAG log/merge-base traversal.
@@ -42,6 +43,24 @@
 //! on the other leaves a half-advanced HEAD. One connection plus one
 //! `transaction()` per commit keeps tree blob, checkpoint row, and HEAD/branch
 //! refs atomic.
+//!
+//! ## Why the admission helpers stay `pub` (AI-0188)
+//!
+//! [`ContentStore::open`] owns the whole file admission for standalone
+//! callers, but the Wheel single-open path cannot use it: the caller must
+//! admit the content schema AND the task schema on one shared raw
+//! [`Connection`] before either store exists, interleaving content steps
+//! (`check_sqlite_magic`, `admit_or_init`, `apply_durable_pragmas`,
+//! `init_content_schema`, `verify_profile`, `claim_writer_fast`) with task
+//! steps owned by another crate. Moving only the content half into a
+//! session-side bundle would reorder the observable failure precedence
+//! between the content and task probes, so the sequence stays caller-driven
+//! and its helpers stay `pub`. [`ContentStore::from_shared`] and
+//! [`map_busy_for_facade`] stay `pub` for the same reason: joining the
+//! shared handle and mapping pre-store connection errors happen outside any
+//! store. Only `lock_conn`, `CONTENT_SCHEMA`, and `validate_ref_name`
+//! re-narrowed to `pub(crate)` once narrow GC-support methods covered every
+//! cross-crate raw-connection use.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -512,7 +531,7 @@ pub fn check_sqlite_magic(path: &Path) -> Result<(), ContentStoreError> {
     Ok(())
 }
 
-pub const CONTENT_SCHEMA: &str = "
+pub(crate) const CONTENT_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS blobs (
     hash TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -740,7 +759,15 @@ fn verify_content_table_shape(conn: &Connection, table: &str) -> Result<(), Cont
 }
 
 impl ContentStore {
-    pub fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ContentStoreError> {
+    /// Borrow the shared connection for one scoped operation.
+    ///
+    /// `pub(crate)`: cross-crate callers use the narrow GC-support methods
+    /// ([`Self::reflog_window_hashes`], [`Self::all_checkpoint_hashes`],
+    /// [`Self::all_blob_hashes`], [`Self::delete_checkpoints_and_blobs`])
+    /// instead of touching the raw connection.
+    pub(crate) fn lock_conn(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, ContentStoreError> {
         self.conn.lock().map_err(|_| ContentStoreError::Corrupt {
             detail: "content store lock poisoned; fail closed".to_owned(),
         })
@@ -1335,6 +1362,130 @@ impl ContentStore {
         Ok(result)
     }
 
+    /// Read every reflog `(old_hash, new_hash)` pair inside the GC grace window.
+    ///
+    /// GC support (AI-0188): covers the former cross-crate raw-connection
+    /// read so callers never lock the connection directly. The window is
+    /// `at_ms >= now_ms.saturating_sub(grace_ms)` (saturating, `i64`-clamped),
+    /// rows arrive in no guaranteed order, and unparseable hex fails as
+    /// [`ContentStoreError::InvalidHash`]. Callers filter tombstones.
+    pub fn reflog_window_hashes(
+        &self,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<Vec<(Option<ContentHash>, ContentHash)>, ContentStoreError> {
+        let threshold_u64 = now_ms.saturating_sub(grace_ms);
+        let threshold_i64 = threshold_u64.min(i64::MAX as u64) as i64;
+        let pairs: Vec<(Option<String>, String)> = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare("SELECT old_hash, new_hash FROM reflog WHERE at_ms >= ?1")
+                .map_err(map_busy)?;
+            let rows = stmt
+                .query_map(params![threshold_i64], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(map_busy)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item.map_err(map_busy)?);
+            }
+            out
+        };
+        let mut result = Vec::with_capacity(pairs.len());
+        for (old_hex, new_hex) in pairs {
+            let old = match old_hex {
+                Some(hex) => Some(ContentHash::from_hex(&hex)?),
+                None => None,
+            };
+            result.push((old, ContentHash::from_hex(&new_hex)?));
+        }
+        Ok(result)
+    }
+
+    /// List every checkpoint hash, ascending for deterministic batches.
+    ///
+    /// GC support (AI-0188): covers the former cross-crate raw-connection
+    /// read. Unparseable hex fails as [`ContentStoreError::InvalidHash`].
+    pub fn all_checkpoint_hashes(&self) -> Result<Vec<ContentHash>, ContentStoreError> {
+        let hexes: Vec<String> = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare("SELECT hash FROM checkpoints ORDER BY hash ASC")
+                .map_err(map_busy)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_busy)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item.map_err(map_busy)?);
+            }
+            out
+        };
+        let mut hashes = Vec::with_capacity(hexes.len());
+        for hex in hexes {
+            hashes.push(ContentHash::from_hex(&hex)?);
+        }
+        Ok(hashes)
+    }
+
+    /// List every blob hash, ascending for deterministic batches.
+    ///
+    /// GC support (AI-0188): covers the former cross-crate raw-connection
+    /// read. Unparseable hex fails as [`ContentStoreError::InvalidHash`].
+    pub fn all_blob_hashes(&self) -> Result<Vec<ContentHash>, ContentStoreError> {
+        let hexes: Vec<String> = {
+            let guard = self.lock_conn()?;
+            let mut stmt = guard
+                .prepare("SELECT hash FROM blobs ORDER BY hash ASC")
+                .map_err(map_busy)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_busy)?;
+            let mut out = Vec::new();
+            for item in rows {
+                out.push(item.map_err(map_busy)?);
+            }
+            out
+        };
+        let mut hashes = Vec::with_capacity(hexes.len());
+        for hex in hexes {
+            hashes.push(ContentHash::from_hex(&hex)?);
+        }
+        Ok(hashes)
+    }
+
+    /// Delete unreachable checkpoints then unreferenced blobs in one transaction.
+    ///
+    /// GC support (AI-0188): covers the former cross-crate raw-connection
+    /// delete transaction with identical semantics (checkpoints first, then
+    /// blobs, single commit). Empty input performs no write and takes no
+    /// transaction.
+    pub fn delete_checkpoints_and_blobs(
+        &mut self,
+        checkpoints: &[ContentHash],
+        blobs: &[ContentHash],
+    ) -> Result<(), ContentStoreError> {
+        if checkpoints.is_empty() && blobs.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.lock_conn()?;
+        let tx = guard.transaction().map_err(map_busy)?;
+        for hash in checkpoints {
+            tx.execute(
+                "DELETE FROM checkpoints WHERE hash = ?1",
+                params![hash.to_hex()],
+            )
+            .map_err(map_busy)?;
+        }
+        for hash in blobs {
+            tx.execute("DELETE FROM blobs WHERE hash = ?1", params![hash.to_hex()])
+                .map_err(map_busy)?;
+        }
+        tx.commit().map_err(map_busy)?;
+        Ok(())
+    }
+
     /// Traverse backward through checkpoint DAG parent links from `head`, returning linear history.
     pub fn log(
         &self,
@@ -1417,7 +1568,10 @@ impl ContentStore {
         Ok(None)
     }
 
-    pub fn validate_ref_name(name: &str) -> Result<(), ContentStoreError> {
+    /// Validate a ref name against the store namespace (`pub(crate)`: every
+    /// cross-crate writer goes through the typed refs plane or the atomic
+    /// commit paths, which validate internally).
+    pub(crate) fn validate_ref_name(name: &str) -> Result<(), ContentStoreError> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err(ContentStoreError::EmptyField("ref_name"));
