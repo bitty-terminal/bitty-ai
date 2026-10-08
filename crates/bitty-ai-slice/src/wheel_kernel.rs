@@ -586,14 +586,92 @@ impl WheelKernel {
     // `StaleGeneration`; GC truncated-resume; `dry_run` / preview parity)
     // come verbatim from `merge.rs` via [`FacadeError`].
 
+    /// Check whether the working tree has uncommitted changes relative to HEAD.
+    ///
+    /// Read-only: performs no store writes. With no HEAD, an empty tree is
+    /// clean and any slot is dirty. Otherwise byte-compares
+    /// `active_tree.canonical_bytes()` against the HEAD checkpoint tree blob.
+    /// A missing checkpoint row, tree link, or blob fails closed via
+    /// [`FacadeError::Store`] (same shape as `recover`).
+    fn working_tree_dirty(&self) -> Result<bool, FacadeError> {
+        let Some(head_hash) = &self.head_checkpoint else {
+            return Ok(!self.active_tree.is_empty());
+        };
+        let Some(checkpoint) = self
+            .content_store
+            .get_checkpoint(head_hash)
+            .map_err(FacadeError::from)?
+        else {
+            return Err(FacadeError::Store(format!(
+                "working tree check: HEAD {head_hash} has no checkpoint row; refusing"
+            )));
+        };
+        let Some(tree_hash) = checkpoint.tree_hash else {
+            return Err(FacadeError::Store(format!(
+                "working tree check: checkpoint {head_hash} has no tree blob link; refusing"
+            )));
+        };
+        let Some(blob_bytes) = self
+            .content_store
+            .get_blob(&tree_hash)
+            .map_err(FacadeError::from)?
+        else {
+            return Err(FacadeError::Store(format!(
+                "working tree check: checkpoint {head_hash} tree {tree_hash} blob missing; refusing"
+            )));
+        };
+        Ok(self.active_tree.canonical_bytes() != blob_bytes)
+    }
+
     /// Merge two checkpoint tips into a two-parent commit on `target_branch`.
     ///
-    /// Thin passthrough over [`crate::merge::merge_commit`]: validation stays
-    /// in `merge.rs`. On success the in-memory HEAD mirrors the durable HEAD.
+    /// Refuses when the working tree is dirty (zero writes, [`FacadeError::Store`]
+    /// naming `uncommitted`): the gate runs before any store write so a dirty
+    /// `slot.put` without commit never loses slots to a blind overwrite. Also
+    /// refuses when HEAD exists and `input.ours` is not HEAD (zero writes):
+    /// otherwise the sync would drop committed HEAD-only slots from the
+    /// working tree and HEAD would jump to a lineage that does not descend
+    /// from the old HEAD. On a clean merge the working tree syncs from the
+    /// merged tree blob before the in-memory HEAD advances, so the next
+    /// `commit_checkpoint` keeps theirs-only slots. Validation stays in
+    /// `merge.rs`.
     pub fn merge_commit(&mut self, input: MergeInput) -> Result<Checkpoint, FacadeError> {
+        if self.working_tree_dirty()? {
+            return Err(FacadeError::Store(
+                "merge refused: working tree has uncommitted changes; commit or discard before merging"
+                    .to_string(),
+            ));
+        }
+        if let Some(head) = &self.head_checkpoint {
+            if input.ours != *head {
+                return Err(FacadeError::Store(format!(
+                    "merge refused: ours {} is not HEAD {head}; merge into HEAD only",
+                    input.ours
+                )));
+            }
+        }
         let checkpoint =
             crate::merge::merge_commit(&mut self.content_store, &self.task_engine, input)
                 .map_err(FacadeError::from)?;
+        let Some(tree_hash) = checkpoint.tree_hash else {
+            return Err(FacadeError::Store(format!(
+                "merge sync: checkpoint {} has no tree blob link; refusing",
+                checkpoint.id
+            )));
+        };
+        let Some(blob_bytes) = self
+            .content_store
+            .get_blob(&tree_hash)
+            .map_err(FacadeError::from)?
+        else {
+            return Err(FacadeError::Store(format!(
+                "merge sync: checkpoint {} tree {tree_hash} blob missing; refusing",
+                checkpoint.id
+            )));
+        };
+        let tree = ContextTree::from_canonical_bytes(&blob_bytes)
+            .map_err(|e| FacadeError::Store(format!("merge sync: tree decode failed: {e}")))?;
+        self.active_tree = tree;
         self.head_checkpoint = Some(checkpoint.id);
         Ok(checkpoint)
     }

@@ -595,6 +595,188 @@ fn bridge_gc_dry_run_parity_and_reflog_intact() {
 }
 
 #[test]
+fn bridge_merge_clean_advances_working_tree() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    let (ours, theirs) = setup_clean_pair(&mut bridge);
+    assert!(
+        bridge.kernel().active_tree().is_empty(),
+        "working tree starts empty"
+    );
+    let payload = merge_payload(&ours.id, &theirs.id, "heads/main");
+    let data = dispatch_ok(&mut bridge, "merge.commit", &payload);
+    let merged_hex = data["id"].as_str().expect("merged id");
+    let merged = ContentHash::from_hex(merged_hex).expect("merged hash");
+    let tree = bridge.kernel().active_tree();
+    assert!(tree.get("shared").is_some(), "merged shared survives");
+    assert!(tree.get("ours-only").is_some(), "merged ours-only survives");
+    assert!(
+        tree.get("theirs-only").is_some(),
+        "clean merge must advance working tree"
+    );
+    assert_eq!(
+        bridge.kernel().head_checkpoint(),
+        Some(&merged),
+        "kernel HEAD mirrors the merge"
+    );
+    let commit_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 9500
+    });
+    let commit_data = dispatch_ok(&mut bridge, "checkpoint.commit", &commit_payload);
+    let next_hex = commit_data["id"].as_str().expect("commit id");
+    let next = ContentHash::from_hex(next_hex).expect("next hash");
+    let next_cp = bridge
+        .kernel()
+        .content_store()
+        .get_checkpoint(&next)
+        .expect("checkpoint read")
+        .expect("checkpoint present");
+    assert!(
+        next_cp.parents.contains(&merged),
+        "next commit must descend from the merge"
+    );
+    let tree_hash = next_cp.tree_hash.expect("tree link");
+    let bytes = bridge
+        .kernel()
+        .content_store()
+        .get_blob(&tree_hash)
+        .expect("blob read")
+        .expect("tree blob present");
+    let next_tree = ContextTree::from_canonical_bytes(&bytes).expect("tree decodes");
+    assert!(
+        next_tree.get("theirs-only").is_some(),
+        "next commit must keep theirs-only slots with zero loss"
+    );
+    assert!(
+        next_tree.get("ours-only").is_some(),
+        "next commit must keep ours-only slots with zero loss"
+    );
+}
+
+#[test]
+fn bridge_merge_dirty_refused_zero_write() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    bridge
+        .kernel_mut()
+        .put_slot("local", b"v", 1000)
+        .expect("setup slot");
+    let setup_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 1500
+    });
+    dispatch_ok(&mut bridge, "checkpoint.commit", &setup_payload);
+    let head_before = bridge
+        .kernel()
+        .head_checkpoint()
+        .cloned()
+        .expect("HEAD established");
+    let (ours, theirs) = setup_clean_pair(&mut bridge);
+    bridge
+        .kernel_mut()
+        .put_slot("uncommitted", b"dirty", 8000)
+        .expect("dirty slot");
+    let before = snapshot(&bridge);
+    let before_head_store = bridge
+        .kernel()
+        .content_store()
+        .get_ref("HEAD")
+        .expect("head read");
+    assert_eq!(
+        before_head_store,
+        Some(head_before),
+        "durable HEAD matches kernel HEAD before merge"
+    );
+    let payload = merge_payload(&ours.id, &theirs.id, "heads/main");
+    let err = dispatch_err(&mut bridge, "merge.commit", &payload);
+    assert!(
+        err.contains("uncommitted"),
+        "dirty refusal must name uncommitted, got: {err}"
+    );
+    assert_eq!(snapshot(&bridge), before, "dirty merge must write nothing");
+    assert_eq!(
+        bridge.kernel().head_checkpoint(),
+        Some(&head_before),
+        "in-memory HEAD untouched"
+    );
+    assert_eq!(
+        bridge
+            .kernel()
+            .content_store()
+            .get_ref("HEAD")
+            .expect("head read"),
+        Some(head_before),
+        "durable HEAD untouched"
+    );
+    let dirty = bridge
+        .kernel()
+        .get_slot("uncommitted")
+        .expect("slot read")
+        .expect("dirty slot survives");
+    assert_eq!(dirty, b"dirty", "dirty payload survives refusal");
+    let local = bridge
+        .kernel()
+        .get_slot("local")
+        .expect("slot read")
+        .expect("committed slot survives");
+    assert_eq!(local, b"v", "committed payload survives refusal");
+}
+
+#[test]
+fn bridge_merge_ours_not_head_refused_zero_write() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    bridge
+        .kernel_mut()
+        .put_slot("local", b"v", 1000)
+        .expect("setup slot");
+    let setup_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 1500
+    });
+    dispatch_ok(&mut bridge, "checkpoint.commit", &setup_payload);
+    let head_before = bridge
+        .kernel()
+        .head_checkpoint()
+        .cloned()
+        .expect("HEAD established");
+    // Working tree is clean here: the commit snapshotted `local`, so the
+    // dirty gate passes and only the ours-vs-HEAD guard can refuse.
+    let (ours, theirs) = setup_clean_pair(&mut bridge);
+    assert_ne!(ours.id, head_before, "pair must not descend from HEAD");
+    let before = snapshot(&bridge);
+    let payload = merge_payload(&ours.id, &theirs.id, "heads/main");
+    let err = dispatch_err(&mut bridge, "merge.commit", &payload);
+    assert!(
+        err.contains("not HEAD"),
+        "ours-diverged refusal must name HEAD, got: {err}"
+    );
+    assert_eq!(
+        snapshot(&bridge),
+        before,
+        "refused merge must write nothing"
+    );
+    assert_eq!(
+        bridge.kernel().head_checkpoint(),
+        Some(&head_before),
+        "in-memory HEAD untouched"
+    );
+    assert_eq!(
+        bridge
+            .kernel()
+            .content_store()
+            .get_ref("HEAD")
+            .expect("head read"),
+        Some(head_before),
+        "durable HEAD untouched"
+    );
+    let local = bridge
+        .kernel()
+        .get_slot("local")
+        .expect("slot read")
+        .expect("HEAD-only slot survives");
+    assert_eq!(local, b"v", "HEAD-only payload survives refusal");
+}
+
+#[test]
 fn bridge_gc_wrong_typed_options_fail_closed() {
     let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
     let base = serde_json::json!({
