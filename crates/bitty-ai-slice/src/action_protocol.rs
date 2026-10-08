@@ -12,7 +12,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::content_store::{ContentHash, ContentStore, ContentStoreError, MAX_BLOB_BYTES};
+use crate::content_hash::ContentHash;
+use crate::content_store::{ContentStore, ContentStoreError, MAX_BLOB_BYTES};
 
 /// Default threshold above which tool stdout/stderr is spilled to the blob store (4 KiB).
 pub const DEFAULT_MAX_INLINE_PAYLOAD_BYTES: usize = 4096;

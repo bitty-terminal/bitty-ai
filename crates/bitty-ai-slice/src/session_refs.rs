@@ -52,8 +52,9 @@ use std::fmt;
 
 use rusqlite::{OptionalExtension, Transaction, params};
 
+use crate::content_hash::ContentHash;
 use crate::content_store::{
-    Checkpoint, CheckpointDraft, ContentHash, ContentStore, ContentStoreError, MAX_AGENT_ID_BYTES,
+    Checkpoint, CheckpointDraft, ContentStore, ContentStoreError, MAX_AGENT_ID_BYTES,
     MAX_BLOB_BYTES, MAX_CHECKPOINT_PARENTS, MAX_SUMMARY_BYTES, MAX_TASK_ID_BYTES,
 };
 use crate::facade::FacadeError;

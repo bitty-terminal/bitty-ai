@@ -56,6 +56,7 @@ pub mod ai_contrib;
 pub mod bridge;
 pub mod chat_stream;
 pub mod compaction_store;
+pub mod content_hash;
 pub mod content_store;
 pub mod context_compiler;
 pub mod error;

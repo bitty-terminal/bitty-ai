@@ -13,7 +13,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::content_store::{Checkpoint, ContentHash};
+use crate::content_hash::ContentHash;
+use crate::content_store::Checkpoint;
 use crate::task_dag::TaskNode;
 
 /// Maximum allowed byte length for a context slot name (256 bytes).

@@ -47,13 +47,17 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+// AI-0184 (DEC-0008 step 3): `ContentHash` lives in the `content_hash` leaf;
+// this re-export keeps every existing `content_store::ContentHash` path
+// resolving to the same type.
+pub use crate::content_hash::{ContentHash, ContentHashError};
 
 /// Maximum allowed size for a single blob (16 MiB).
 pub const MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -197,97 +201,11 @@ impl From<serde_json::Error> for ContentStoreError {
     }
 }
 
-/// Type-safe SHA-256 content address (32 bytes).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ContentHash([u8; 32]);
-
-impl ContentHash {
-    /// Compute the SHA-256 digest of the given byte slice.
-    #[must_use]
-    pub fn compute(data: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let result = hasher.finalize();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&result);
-        Self(bytes)
-    }
-
-    /// Construct a `ContentHash` from raw 32 bytes.
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Access the underlying 32-byte digest array.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    /// Parse a 64-character lowercase hex string into a `ContentHash`.
-    pub fn from_hex(s: &str) -> Result<Self, ContentStoreError> {
-        if s.len() != 64 {
-            return Err(ContentStoreError::InvalidHash(s.to_string()));
+impl From<ContentHashError> for ContentStoreError {
+    fn from(err: ContentHashError) -> Self {
+        match err {
+            ContentHashError::InvalidHash(hex) => Self::InvalidHash(hex),
         }
-
-        // Validate strictly lowercase hex digits
-        for b in s.bytes() {
-            if !matches!(b, b'0'..=b'9' | b'a'..=b'f') {
-                return Err(ContentStoreError::InvalidHash(s.to_string()));
-            }
-        }
-
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(s, &mut bytes)
-            .map_err(|_| ContentStoreError::InvalidHash(s.to_string()))?;
-
-        Ok(Self(bytes))
-    }
-
-    /// Render the content hash as a 64-character lowercase hex string.
-    #[must_use]
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-}
-
-impl fmt::Display for ContentHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
-    }
-}
-
-impl fmt::Debug for ContentHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ContentHash({})", self.to_hex())
-    }
-}
-
-impl FromStr for ContentHash {
-    type Err = ContentStoreError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_hex(s)
-    }
-}
-
-impl Serialize for ContentHash {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.to_hex())
-    }
-}
-
-impl<'de> Deserialize<'de> for ContentHash {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Self::from_hex(&s).map_err(serde::de::Error::custom)
     }
 }
 

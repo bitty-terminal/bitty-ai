@@ -126,9 +126,8 @@ use std::fmt;
 
 use rusqlite::params;
 
-use crate::content_store::{
-    Checkpoint, CheckpointDraft, ContentHash, ContentStore, ContentStoreError,
-};
+use crate::content_hash::ContentHash;
+use crate::content_store::{Checkpoint, CheckpointDraft, ContentStore, ContentStoreError};
 use crate::context_compiler::{ContextTree, EntryKind, SlotConflict};
 use crate::facade::FacadeError;
 use crate::session_refs::{BranchName, RefError, commit_checkpoint_with_branch};
