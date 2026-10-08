@@ -585,20 +585,34 @@ impl WheelBridge {
 /// Clocks are caller-supplied only (`now_ms` selects the reflog grace
 /// window); missing clocks default to `0` like the other bridge verbs and
 /// `max_deletes_per_call` defaults to the [`GcOptions`] default (256).
+/// Fail-closed on types: a present-but-wrong-typed field is an error rather
+/// than a silent default, so a mistyped `dry_run` can never turn a preview
+/// into a destructive collect. Absent or null fields keep their defaults.
 fn gc_options_from_payload(payload: &serde_json::Value) -> Result<GcOptions, String> {
-    let now_ms = payload.get("now_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-    let reflog_grace_ms = payload
-        .get("reflog_grace_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let max_deletes_per_call = payload
-        .get("max_deletes_per_call")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(256) as usize;
-    let dry_run = payload
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let now_ms = match payload.get("now_ms") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or("missing or invalid 'now_ms' field, expected u64")?,
+    };
+    let reflog_grace_ms = match payload.get("reflog_grace_ms") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or("missing or invalid 'reflog_grace_ms' field, expected u64")?,
+    };
+    let max_deletes_per_call = match payload.get("max_deletes_per_call") {
+        None | Some(serde_json::Value::Null) => 256,
+        Some(v) => v
+            .as_u64()
+            .ok_or("missing or invalid 'max_deletes_per_call' field, expected u64")?,
+    } as usize;
+    let dry_run = match payload.get("dry_run") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or("missing or invalid 'dry_run' field, expected boolean")?,
+    };
     Ok(GcOptions {
         now_ms,
         reflog_grace_ms,

@@ -593,3 +593,35 @@ fn bridge_gc_dry_run_parity_and_reflog_intact() {
         "alias verb drains to the same terminal state"
     );
 }
+
+#[test]
+fn bridge_gc_wrong_typed_options_fail_closed() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    let base = serde_json::json!({
+        "now_ms": 100_000,
+        "reflog_grace_ms": 1000,
+        "max_deletes_per_call": 1000
+    });
+    // Absent or null fields keep their defaults.
+    let mut nulls = base.clone();
+    nulls["dry_run"] = serde_json::Value::Null;
+    nulls["now_ms"] = serde_json::Value::Null;
+    dispatch_ok(&mut bridge, "gc.preview", &nulls);
+    // Present-but-wrong-typed fields fail closed instead of silently
+    // defaulting: a mistyped dry_run must never become a destructive collect.
+    for (field, bad) in [
+        ("dry_run", serde_json::json!("true")),
+        ("dry_run", serde_json::json!(1)),
+        ("max_deletes_per_call", serde_json::json!("1")),
+        ("now_ms", serde_json::json!("100")),
+        ("reflog_grace_ms", serde_json::json!("100")),
+    ] {
+        let mut payload = base.clone();
+        payload[field] = bad;
+        let err = dispatch_err(&mut bridge, "gc.collect", &payload);
+        assert!(
+            err.contains(field),
+            "wrong-typed {field} must name the field, got: {err}"
+        );
+    }
+}
