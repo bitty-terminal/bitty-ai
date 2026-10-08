@@ -35,6 +35,7 @@ use crate::context_compiler::{
     CompiledContext, CompilerBudgetConfig, ContextCompiler, ContextTree, EntryKind, TreeEntry,
 };
 use crate::facade::{AiStreamSession, FacadeError};
+use crate::merge::{GcOptions, GcReport, MergeInput};
 use crate::session_refs::{
     BranchName, ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch,
     get_branch, list_branches, read_reflog, rename_branch, update_branch,
@@ -575,6 +576,40 @@ impl WheelKernel {
     /// Read reflog history for any well-formed ref name, newest-first.
     pub fn read_reflog(&self, name: &str, limit: usize) -> Result<Vec<ReflogEntry>, FacadeError> {
         read_reflog(&self.content_store, name, limit).map_err(FacadeError::from)
+    }
+
+    // --- Merge + GC (session plane, AI-0190) ---
+    //
+    // Thin passthroughs over the [`crate::merge`] free functions: no
+    // validation, policy, or taxonomy lives here. All fail-closed errors
+    // (`NoCommonAncestor` / `CrissCross` / `Conflicts` zero-writes /
+    // `StaleGeneration`; GC truncated-resume; `dry_run` / preview parity)
+    // come verbatim from `merge.rs` via [`FacadeError`].
+
+    /// Merge two checkpoint tips into a two-parent commit on `target_branch`.
+    ///
+    /// Thin passthrough over [`crate::merge::merge_commit`]: validation stays
+    /// in `merge.rs`. On success the in-memory HEAD mirrors the durable HEAD.
+    pub fn merge_commit(&mut self, input: MergeInput) -> Result<Checkpoint, FacadeError> {
+        let checkpoint =
+            crate::merge::merge_commit(&mut self.content_store, &self.task_engine, input)
+                .map_err(FacadeError::from)?;
+        self.head_checkpoint = Some(checkpoint.id);
+        Ok(checkpoint)
+    }
+
+    /// Read-only GC preview: byte-matches the next destructive batch.
+    ///
+    /// Thin passthrough over [`crate::merge::gc_preview`].
+    pub fn gc_preview(&self, options: &GcOptions) -> Result<GcReport, FacadeError> {
+        crate::merge::gc_preview(&self.content_store, options).map_err(FacadeError::from)
+    }
+
+    /// Bounded destructive GC, or preview when `options.dry_run` is set.
+    ///
+    /// Thin passthrough over [`crate::merge::collect_garbage`].
+    pub fn collect_garbage(&mut self, options: &GcOptions) -> Result<GcReport, FacadeError> {
+        crate::merge::collect_garbage(&mut self.content_store, options).map_err(FacadeError::from)
     }
 
     // --- Action Protocol & Auto-Spillover Operations ---

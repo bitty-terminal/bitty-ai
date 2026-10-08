@@ -12,6 +12,7 @@ use crate::content_hash::ContentHash;
 use crate::content_store::Rationale;
 use crate::context_compiler::CompilerBudgetConfig;
 use crate::facade::FacadeError;
+use crate::merge::{GcOptions, GcReport, MergeInput};
 use crate::task_dag::{TaskDraft, TaskId};
 use crate::wheel_kernel::WheelKernel;
 
@@ -494,7 +495,138 @@ impl WheelBridge {
                 });
                 Ok(res)
             }
+            "merge.commit" => {
+                let ours_hex = payload
+                    .get("ours")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'ours' field")?;
+                let theirs_hex = payload
+                    .get("theirs")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'theirs' field")?;
+                let ours = ContentHash::from_hex(ours_hex).map_err(|e| e.to_string())?;
+                let theirs = ContentHash::from_hex(theirs_hex).map_err(|e| e.to_string())?;
+                let target_branch = payload
+                    .get("target_branch")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'target_branch' field")?;
+                let task_id = payload
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'task_id' field")?;
+                let agent_id = payload
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'agent_id' field")?;
+                let rationale_val = payload
+                    .get("rationale")
+                    .ok_or("missing 'rationale' object")?;
+                let rationale: Rationale = serde_json::from_value(rationale_val.clone())
+                    .map_err(|e| format!("invalid rationale: {e}"))?;
+                let summary = payload
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'summary' field")?;
+                let expected_task_generation = match payload.get("expected_task_generation") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .ok_or("missing or invalid 'expected_task_generation' field")?,
+                    ),
+                };
+                let actor = payload
+                    .get("actor")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'actor' field")?;
+                let reason = payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'reason' field")?;
+                let at_ms = payload.get("at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let input = MergeInput {
+                    ours,
+                    theirs,
+                    target_branch: target_branch.to_string(),
+                    task_id: task_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    rationale,
+                    summary: summary.to_string(),
+                    expected_task_generation,
+                    actor: actor.to_string(),
+                    reason: reason.to_string(),
+                    at_ms,
+                };
+                let cp = self.kernel.merge_commit(input).map_err(|e| e.to_string())?;
+                serde_json::to_value(cp).map_err(|e| e.to_string())
+            }
+            "gc.preview" => {
+                let options = gc_options_from_payload(&payload)?;
+                let report = self
+                    .kernel
+                    .gc_preview(&options)
+                    .map_err(|e| e.to_string())?;
+                Ok(gc_report_to_value(&report))
+            }
+            "gc.collect" | "gc.collect_garbage" => {
+                let options = gc_options_from_payload(&payload)?;
+                let report = self
+                    .kernel
+                    .collect_garbage(&options)
+                    .map_err(|e| e.to_string())?;
+                Ok(gc_report_to_value(&report))
+            }
             unknown => Err(format!("unknown bridge command: '{unknown}'")),
         }
     }
+}
+
+/// Parse caller-supplied GC options from a bridge payload.
+///
+/// Clocks are caller-supplied only (`now_ms` selects the reflog grace
+/// window); missing clocks default to `0` like the other bridge verbs and
+/// `max_deletes_per_call` defaults to the [`GcOptions`] default (256).
+/// Fail-closed on types: a present-but-wrong-typed field is an error rather
+/// than a silent default, so a mistyped `dry_run` can never turn a preview
+/// into a destructive collect. Absent or null fields keep their defaults.
+fn gc_options_from_payload(payload: &serde_json::Value) -> Result<GcOptions, String> {
+    let now_ms = match payload.get("now_ms") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or("missing or invalid 'now_ms' field, expected u64")?,
+    };
+    let reflog_grace_ms = match payload.get("reflog_grace_ms") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => v
+            .as_u64()
+            .ok_or("missing or invalid 'reflog_grace_ms' field, expected u64")?,
+    };
+    let max_deletes_per_call = match payload.get("max_deletes_per_call") {
+        None | Some(serde_json::Value::Null) => 256,
+        Some(v) => v
+            .as_u64()
+            .ok_or("missing or invalid 'max_deletes_per_call' field, expected u64")?,
+    } as usize;
+    let dry_run = match payload.get("dry_run") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or("missing or invalid 'dry_run' field, expected boolean")?,
+    };
+    Ok(GcOptions {
+        now_ms,
+        reflog_grace_ms,
+        max_deletes_per_call,
+        dry_run,
+    })
+}
+
+/// Render a [`GcReport`] as a bridge JSON value with stable field names.
+fn gc_report_to_value(report: &GcReport) -> serde_json::Value {
+    serde_json::json!({
+        "reachable_checkpoints": report.reachable_checkpoints,
+        "deleted_checkpoints": report.deleted_checkpoints,
+        "deleted_blobs": report.deleted_blobs,
+        "truncated": report.truncated,
+    })
 }
