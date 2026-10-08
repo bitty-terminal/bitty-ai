@@ -16,6 +16,7 @@
 pub mod content_hash;
 pub mod content_store;
 pub mod session_refs;
+pub mod sessions;
 
 pub use content_hash::{ContentHash, ContentHashError};
 pub use content_store::{
@@ -29,4 +30,8 @@ pub use session_refs::{
     MAX_REFLOG_REASON_BYTES, MIN_REFLOG_FLOOR, PruneReport, RefError, ReflogEntry,
     commit_checkpoint_with_branch, create_branch, delete_branch, dump_reflog_all, get_branch,
     list_branches, prune_reflog, read_reflog, rename_branch, update_branch,
+};
+pub use sessions::{
+    MAX_SESSION_ID_BYTES, SessionBinding, SessionError, WheelSessionId, bind_session,
+    bump_session_epoch, list_sessions, map_branch_err, resolve_session,
 };
