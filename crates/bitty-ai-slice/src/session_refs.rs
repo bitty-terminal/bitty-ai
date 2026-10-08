@@ -9,6 +9,6 @@
 
 pub use bitty_ai_session::session_refs::{
     BranchName, MAX_REFLOG_ACTOR_BYTES, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, RefError,
-    ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch, get_branch,
-    list_branches, read_reflog, rename_branch, update_branch,
+    ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch, dump_reflog_all,
+    get_branch, list_branches, read_reflog, rename_branch, update_branch,
 };

@@ -45,8 +45,7 @@
 //!
 //! Errors never echo caller-supplied text: every [`RefError`] display string
 //! is a static literal except [`RefError::MissingTarget`], which carries the
-//! fixed-size content hash (same reuse as
-//! [`ContentStoreError::MissingTarget`][crate::content_store::ContentStoreError::MissingTarget]).
+//! fixed-size content hash (same reuse as [`ContentStoreError::MissingTarget`]).
 
 use std::fmt;
 
@@ -290,8 +289,8 @@ fn read_ref_tx(tx: &Transaction<'_>, name: &str) -> Result<Option<ContentHash>, 
 /// Wheel durable commit path with branch (AI-0180): the tree blob insert,
 /// the checkpoint insert, the HEAD upsert, the branch insert-or-update,
 /// and the single branch reflog row commit or roll back together in one
-/// SQLite `transaction()`. Reuses [`append_reflog_tx`] so an oversize
-/// reason/actor aborts the whole commit (including HEAD), never a
+/// SQLite `transaction()`. Reuses the private `append_reflog_tx` helper so an
+/// oversize reason/actor aborts the whole commit (including HEAD), never a
 /// half-advanced HEAD. Branch creation stores `old_hash = NULL`; updates
 /// store the previous tip. The branch move is authoritative (not
 /// fast-forward-only), matching the previous
@@ -735,6 +734,59 @@ pub fn read_reflog(
         if ref_name != name {
             return Err(RefError::Corrupt);
         }
+        let old_hash = match old_hex {
+            Some(hex) => Some(ContentHash::from_hex(&hex).map_err(|_| RefError::Corrupt)?),
+            None => None,
+        };
+        let new_hash = ContentHash::from_hex(&new_hex).map_err(|_| RefError::Corrupt)?;
+        if at_ms < 0 {
+            return Err(RefError::Corrupt);
+        }
+        entries.push(ReflogEntry {
+            seq,
+            ref_name,
+            old_hash,
+            new_hash,
+            reason,
+            actor,
+            at_ms: at_ms as u64,
+        });
+    }
+    Ok(entries)
+}
+
+/// Read every reflog row in the table in `seq` order (audit support).
+///
+/// Sibling of [`read_reflog`] without the per-ref filter and without the
+/// [`MAX_REFLOG_READ_LIMIT`] cap: a full-table ordered scan for tooling that
+/// must observe rows for refs absent from [`ContentStore::list_refs`]
+/// (deleted-branch tombstone rows survive their ref). Bad hex or a negative
+/// timestamp fails closed as [`RefError::Corrupt`], matching [`read_reflog`].
+/// Full-table scan, no cap: callers needing bounds should use [`read_reflog`].
+pub fn dump_reflog_all(store: &ContentStore) -> Result<Vec<ReflogEntry>, RefError> {
+    let guard = store.lock_conn().map_err(map_store_err)?;
+    let mut stmt = guard
+        .prepare(
+            "SELECT seq, ref_name, old_hash, new_hash, reason, actor, at_ms
+                 FROM reflog ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(map_sqlite)?;
+    let mut entries = Vec::new();
+    for item in rows {
+        let (seq, ref_name, old_hex, new_hex, reason, actor, at_ms) = item.map_err(map_sqlite)?;
         let old_hash = match old_hex {
             Some(hex) => Some(ContentHash::from_hex(&hex).map_err(|_| RefError::Corrupt)?),
             None => None,
