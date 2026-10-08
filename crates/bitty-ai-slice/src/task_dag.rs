@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-use crate::content_store::ContentHash;
+use crate::content_hash::ContentHash;
 
 /// Maximum allowed byte length for a task ID (128 bytes).
 pub const MAX_TASK_ID_BYTES: usize = 128;

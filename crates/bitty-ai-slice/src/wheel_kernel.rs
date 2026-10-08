@@ -29,7 +29,8 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use crate::action_protocol::{ActionEngine, ActionOutcome, SpilloverConfig};
-use crate::content_store::{Checkpoint, CheckpointDraft, ContentHash, ContentStore, Rationale};
+use crate::content_hash::ContentHash;
+use crate::content_store::{Checkpoint, CheckpointDraft, ContentStore, Rationale};
 use crate::context_compiler::{
     CompiledContext, CompilerBudgetConfig, ContextCompiler, ContextTree, EntryKind, TreeEntry,
 };

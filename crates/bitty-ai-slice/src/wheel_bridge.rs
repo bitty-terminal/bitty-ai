@@ -8,7 +8,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::action_protocol::SpilloverConfig;
-use crate::content_store::{ContentHash, Rationale};
+use crate::content_hash::ContentHash;
+use crate::content_store::Rationale;
 use crate::context_compiler::CompilerBudgetConfig;
 use crate::facade::FacadeError;
 use crate::task_dag::{TaskDraft, TaskId};
