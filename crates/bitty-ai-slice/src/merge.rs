@@ -69,12 +69,15 @@
 //! (reachable) checkpoint are pruned. A surviving checkpoint references its
 //! `tree_hash` blob, and each surviving tree references every entry hash named
 //! in its canonical bytes (slot-payload blobs stored via `put_blob`, for
-//! example [`WheelKernel::put_slot`][crate::wheel_kernel::WheelKernel::put_slot]):
-//! GC materializes each surviving tree blob via
+//! example [`WheelKernel::put_slot`][crate::wheel_kernel::WheelKernel::put_slot]),
+//! plus transitively every entry of each nested tree named via `EntryKind::Tree`
+//! up to an explicit depth cap: GC materializes each surviving tree blob via
 //! [`ContextTree::from_canonical_bytes`][crate::context_compiler::ContextTree::from_canonical_bytes]
-//! and retains the union of all entry hashes. A surviving checkpoint with a
-//! missing `tree_hash` blob row, a digest mismatch, or undecodable tree bytes
-//! is [`MergeError::Corrupt`] (fail closed, no partial GC).
+//! and retains the union of all entry hashes, recursing into nested tree
+//! blobs. A surviving checkpoint with a missing `tree_hash` blob row, a digest
+//! mismatch, undecodable tree bytes, an undecodable nested tree blob, or a
+//! nesting chain deeper than the cap is [`MergeError::Corrupt`] (fail closed,
+//! no partial GC).
 //!
 //! Batching: one [`collect_garbage`] call deletes at most
 //! [`GcOptions::max_deletes_per_call`] rows (checkpoints first, then blobs, in
@@ -124,7 +127,7 @@ use rusqlite::params;
 use crate::content_store::{
     Checkpoint, CheckpointDraft, ContentHash, ContentStore, ContentStoreError,
 };
-use crate::context_compiler::{ContextTree, SlotConflict};
+use crate::context_compiler::{ContextTree, EntryKind, SlotConflict};
 use crate::facade::FacadeError;
 use crate::session_refs::{BranchName, RefError};
 use crate::task_dag::{TaskEngine, TaskEngineError, TaskId};
@@ -605,6 +608,16 @@ fn list_all_blob_hashes(store: &ContentStore) -> Result<Vec<ContentHash>, MergeE
     Ok(hashes)
 }
 
+/// Maximum nested-tree traversal depth for GC blob retention.
+///
+/// `EntryKind::Tree` entries name another tree blob whose own entries must be
+/// retained transitively. The bound caps chained `get_blob` reads per GC call;
+/// sharing and cycles cost no extra reads via the visited set. Exceeding the
+/// cap fails closed as [`MergeError::Corrupt`]. No production writer nests
+/// today (`WheelKernel::put_slot` is Blob-only), so 8 is generous for any
+/// foreseeable hierarchy use while keeping worst-case chained reads small.
+const GC_MAX_NESTED_TREE_DEPTH: usize = 8;
+
 /// Compute the full GC plan: reachable closure plus sorted garbage sets.
 ///
 /// Roots are live ref targets (verified to exist; a dangling ref is
@@ -613,10 +626,12 @@ fn list_all_blob_hashes(store: &ContentStore) -> Result<Vec<ContentHash>, MergeE
 /// A reachable checkpoint whose parent row is absent is [`MergeError::Corrupt`]
 /// (dangling DAG link): the closure check after the lenient BFS enforces it.
 /// Blob retention covers each surviving checkpoint's `tree_hash` blob plus
-/// every entry hash named in that surviving tree (slot-payload blobs): each
-/// surviving tree blob is materialized via `ContextTree::from_canonical_bytes`
-/// and undecodable tree bytes, a missing tree blob row, or a digest mismatch
-/// is [`MergeError::Corrupt`].
+/// every entry hash named in that surviving tree (slot-payload blobs), and
+/// transitively every entry of each nested tree named via `EntryKind::Tree`
+/// up to [`GC_MAX_NESTED_TREE_DEPTH`]: each visited tree blob is materialized
+/// via `ContextTree::from_canonical_bytes` and a missing tree blob row, a
+/// digest mismatch, undecodable tree bytes, a nested tree blob that does not
+/// decode, or a nesting chain deeper than the cap is [`MergeError::Corrupt`].
 fn gc_compute(store: &ContentStore, options: &GcOptions) -> Result<GcPlan, MergeError> {
     let ref_pairs = store.list_refs().map_err(map_store)?;
     let mut ref_targets = HashSet::new();
@@ -685,14 +700,46 @@ fn gc_compute(store: &ContentStore, options: &GcOptions) -> Result<GcPlan, Merge
         }
     }
     let mut surviving_blobs: HashSet<ContentHash> = surviving_trees.clone();
-    for tree_hash in &surviving_trees {
+    // Producibility evidence for `EntryKind::Tree` (choice (a): recurse):
+    // `ContextTree::insert` accepts any `TreeEntry` with no kind gate
+    // (context_compiler.rs), `TreeEntry::new` validates only the slot name,
+    // `from_canonical_bytes` decodes kind byte 2 into `EntryKind::Tree`,
+    // `merge_3way` propagates entries verbatim (kind preserved), and
+    // `commit_checkpoint_atomic` stores arbitrary caller-supplied tree bytes
+    // without canonical validation. No current production or test path builds
+    // one (`WheelKernel::put_slot` and every test helper hardcode
+    // `EntryKind::Blob`), but the reachable state is constructible through the
+    // public API and durable bytes, so fail-closed rejection would turn a
+    // constructible reachable state into a GC availability failure. GC
+    // therefore traverses nested trees with an explicit depth cap; `Blob`
+    // entries retain only their payload hash and are never traversed.
+    // The visited set makes sharing and reference cycles (including
+    // self-reference) terminate without extra reads.
+    let mut visited_trees: HashSet<ContentHash> = HashSet::new();
+    let mut tree_queue: VecDeque<(ContentHash, usize)> = surviving_trees
+        .iter()
+        .copied()
+        .map(|hash| (hash, 0))
+        .collect();
+    while let Some((tree_hash, depth)) = tree_queue.pop_front() {
+        if !visited_trees.insert(tree_hash) {
+            continue;
+        }
         let bytes = store
-            .get_blob(tree_hash)
+            .get_blob(&tree_hash)
             .map_err(map_store)?
             .ok_or(MergeError::Corrupt)?;
         let tree = ContextTree::from_canonical_bytes(&bytes).map_err(|_| MergeError::Corrupt)?;
         for entry in tree.entries() {
             surviving_blobs.insert(entry.hash);
+            if entry.kind == EntryKind::Tree {
+                if depth + 1 > GC_MAX_NESTED_TREE_DEPTH {
+                    return Err(MergeError::Corrupt);
+                }
+                if !visited_trees.contains(&entry.hash) {
+                    tree_queue.push_back((entry.hash, depth + 1));
+                }
+            }
         }
     }
     let all_blobs = list_all_blob_hashes(store)?;
@@ -740,7 +787,8 @@ pub fn gc_preview(store: &ContentStore, options: &GcOptions) -> Result<GcReport,
 /// blobs referenced by no surviving checkpoint tree.
 ///
 /// Retention covers each surviving checkpoint's `tree_hash` blob plus every
-/// entry hash named in the surviving trees (slot-payload blobs); standalone
+/// entry hash named in the surviving trees (slot-payload blobs), transitively
+/// including nested-tree entries up to the GC depth cap; standalone
 /// blobs referenced by no surviving tree (action-spillover payloads, orphan
 /// `put_blob` rows) are pruned. Deletes at most [`GcOptions::max_deletes_per_call`] rows (checkpoints
 /// first, then blobs, ascending hash order) in a single SQLite transaction.
@@ -1568,6 +1616,62 @@ mod tests {
             "tombstone payload stays absent"
         );
         let _ = report;
+    }
+
+    #[test]
+    fn gc_retains_nested_tree_payloads_transitively() {
+        let mut store = ContentStore::open_in_memory().expect("store");
+        // Nested-tree fixture: no production writer nests today
+        // (`WheelKernel::put_slot` is Blob-only), but `ContextTree::insert`,
+        // `merge_3way`, `from_canonical_bytes` (kind byte 2), and the commit
+        // path all preserve `EntryKind::Tree`, so the state is constructible
+        // and GC must traverse it. The shallow defect retained the nested
+        // tree blob itself yet pruned this payload.
+        let payload: &[u8] = b"nested payload";
+        let payload_hash = store.put_blob(payload, 1000).expect("payload blob");
+        let mut inner = ContextTree::new();
+        inner.insert(
+            TreeEntry::new("inner-doc", payload_hash, EntryKind::Blob, payload.len())
+                .expect("valid inner slot"),
+        );
+        let inner_bytes = inner.canonical_bytes();
+        let inner_hash = store.put_blob(&inner_bytes, 1000).expect("inner tree blob");
+        let mut outer = ContextTree::new();
+        outer.insert(
+            TreeEntry::new("nested", inner_hash, EntryKind::Tree, inner_bytes.len())
+                .expect("valid nested slot"),
+        );
+        let live = commit_tree(&mut store, Vec::new(), &outer, "live", 1000);
+        store
+            .update_refs_atomic(&[("HEAD", &live.id), ("heads/main", &live.id)], 1000)
+            .expect("live refs");
+        let options = GcOptions {
+            now_ms: 100_000,
+            reflog_grace_ms: 1000,
+            max_deletes_per_call: 1000,
+            dry_run: false,
+        };
+        let report = collect_garbage(&mut store, &options).expect("gc");
+        assert_eq!(report.reachable_checkpoints, 1);
+        assert_eq!(report.deleted_checkpoints, 0);
+        assert_eq!(report.deleted_blobs, 0);
+        assert!(!report.truncated);
+        assert_eq!(
+            store
+                .get_blob(&payload_hash)
+                .expect("payload post-gc")
+                .as_deref(),
+            Some(payload),
+            "transitively reachable payload through a nested tree must survive GC"
+        );
+        assert_eq!(
+            store
+                .get_blob(&inner_hash)
+                .expect("inner tree post-gc")
+                .as_deref(),
+            Some(inner_bytes.as_slice()),
+            "nested tree blob itself must survive GC"
+        );
     }
 
     #[test]
