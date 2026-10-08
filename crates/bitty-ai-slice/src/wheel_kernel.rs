@@ -666,14 +666,18 @@ impl WheelKernel {
     ///
     /// Returns the task row's `generation` when the checkpoint's `task_id`
     /// names a live task, else `0` (no task binding: `task-unassigned` or a
-    /// removed task). Never fails: an unbound task is ordinary, not corrupt.
-    fn live_task_generation(&self, checkpoint: &Checkpoint) -> u64 {
+    /// removed task). Only `TaskNotFound` maps to `0`: any other
+    /// task-engine failure (lock poison, busy store, corrupt database)
+    /// propagates so callers refuse before any row write instead of
+    /// persisting a bogus generation snapshot.
+    fn live_task_generation(&self, checkpoint: &Checkpoint) -> Result<u64, FacadeError> {
         let Ok(task_id) = TaskId::new(checkpoint.task_id.clone()) else {
-            return 0;
+            return Ok(0);
         };
         match self.task_engine.get_task(&task_id) {
-            Ok(node) => node.generation,
-            Err(_) => 0,
+            Ok(node) => Ok(node.generation),
+            Err(TaskEngineError::TaskNotFound(_)) => Ok(0),
+            Err(other) => Err(FacadeError::from(other)),
         }
     }
 
@@ -710,7 +714,7 @@ impl WheelKernel {
                 )));
             }
         };
-        let generation = self.live_task_generation(&checkpoint);
+        let generation = self.live_task_generation(&checkpoint)?;
         bind_session(
             &self.content_store,
             &id,
@@ -794,7 +798,7 @@ impl WheelKernel {
                     )));
                 }
             };
-            let generation = self.live_task_generation(&checkpoint);
+            let generation = self.live_task_generation(&checkpoint)?;
             // Fallible tree load runs BEFORE the epoch bump: a missing tree
             // link, missing blob, or undecodable tree refuses here with zero
             // row writes, so the same claim stays admissible for retry.
@@ -853,7 +857,7 @@ impl WheelKernel {
                 )));
             }
         };
-        let generation = self.live_task_generation(&checkpoint);
+        let generation = self.live_task_generation(&checkpoint)?;
         self.sync_working_tree_to(&tip)?;
         Ok(ResumeReport {
             session_id: None,
