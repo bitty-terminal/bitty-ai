@@ -6,9 +6,10 @@ use bitty_ai_slice::content_store::{
     CheckpointDraft, ContentHash, ContentStore, ContentStoreError, Rationale,
 };
 use bitty_ai_slice::session_refs::{
-    BranchName, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, MIN_REFLOG_FLOOR, PruneReport,
-    RefError, ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch, get_branch,
-    list_branches, prune_reflog, read_reflog, rename_branch, update_branch,
+    BranchName, MAX_REFLOG_PRUNE_ROWS, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES,
+    MIN_REFLOG_FLOOR, PruneReport, RefError, ReflogEntry, commit_checkpoint_with_branch,
+    create_branch, delete_branch, get_branch, list_branches, prune_reflog, read_reflog,
+    rename_branch, update_branch,
 };
 use bitty_ai_slice::wheel_bridge::{BridgeResponse, WheelBridge};
 use bitty_ai_slice::wheel_kernel::WheelKernel;
@@ -855,6 +856,117 @@ fn prune_max_rows_bounds_deletion_oldest_first() {
     assert_eq!(rows[0].reason, "move 4");
     assert_eq!(rows[1].reason, "move 3");
     assert_eq!(rows[2].reason, "move 2");
+}
+
+#[test]
+fn prune_uncapped_max_rows_clamps_to_cap() {
+    // An untrusted caller can pass max_rows = u64::MAX (the bridge accepts
+    // any u64). The plane clamps to MAX_REFLOG_PRUNE_ROWS, so one call
+    // performs bounded work: exactly the cap, oldest-first, floor intact.
+    let extra: usize = 10;
+    let moves: usize = MAX_REFLOG_PRUNE_ROWS + extra;
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
+    for i in 1..=moves {
+        update_branch(
+            &mut store,
+            "heads/main",
+            &tip,
+            &format!("move {i}"),
+            "bob",
+            1000 + i as u64,
+            false,
+        )
+        .expect("update");
+    }
+    let total = moves + 1;
+    assert_eq!(
+        read_reflog(&store, "heads/main", MAX_REFLOG_READ_LIMIT + extra + 2)
+            .expect("read")
+            .len(),
+        total.min(MAX_REFLOG_READ_LIMIT),
+        "fixture exceeds the read cap, so it exceeds the prune cap too"
+    );
+
+    let report = prune_reflog(&mut store, "heads/main", u64::MAX, usize::MAX, 0, 0).expect("prune");
+    assert_eq!(
+        report.pruned, MAX_REFLOG_PRUNE_ROWS,
+        "uncapped request clamps to exactly the cap"
+    );
+    assert_eq!(report.floor_kept, MIN_REFLOG_FLOOR);
+    let rows = read_reflog(&store, "heads/main", MAX_REFLOG_READ_LIMIT).expect("read after");
+    assert_eq!(
+        rows.len(),
+        total - MAX_REFLOG_PRUNE_ROWS,
+        "clamped prune leaves the newest remainder"
+    );
+    assert_eq!(
+        rows[0].reason,
+        format!("move {moves}"),
+        "floor keeps the latest row"
+    );
+
+    // Bounded calls still make progress: a second uncapped call drains the
+    // remainder down to the floor.
+    let second = prune_reflog(&mut store, "heads/main", u64::MAX, usize::MAX, 0, 0).expect("prune");
+    assert_eq!(second.pruned, extra);
+    let rows = read_reflog(&store, "heads/main", 10).expect("read final");
+    assert_eq!(rows.len(), MIN_REFLOG_FLOOR);
+    assert_eq!(rows[0].reason, format!("move {moves}"));
+}
+
+#[test]
+fn bridge_reflog_prune_u64_max_clamps_without_error() {
+    // End-to-end: the bridge passes max_rows = u64::MAX straight through
+    // (u64 -> usize cast, clamped in the plane). No overflow, no error, and
+    // the floor still keeps the latest row.
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    bridge
+        .kernel_mut()
+        .put_slot("a.txt", b"v1", 1000)
+        .expect("slot");
+    bridge
+        .kernel_mut()
+        .commit_checkpoint(
+            bitty_ai_slice::content_store::Rationale::new("First", "Baseline"),
+            Some("heads/main"),
+            1010,
+        )
+        .expect("commit");
+    bridge
+        .kernel_mut()
+        .put_slot("a.txt", b"v2", 1020)
+        .expect("slot");
+    bridge
+        .kernel_mut()
+        .commit_checkpoint(
+            bitty_ai_slice::content_store::Rationale::new("Second", "Advance"),
+            Some("heads/main"),
+            1030,
+        )
+        .expect("commit");
+    let data = dispatch_ok(
+        &mut bridge,
+        "reflog.prune",
+        &serde_json::json!({
+            "ref_name": "heads/main",
+            "older_than_ms": u64::MAX,
+            "max_rows": u64::MAX,
+            "tombstone_grace_ms": 0,
+            "now_ms": 0
+        }),
+    );
+    assert_eq!(data["pruned"], 1, "two rows minus the floor");
+    assert_eq!(data["floor_kept"], MIN_REFLOG_FLOOR);
+    assert_eq!(
+        bridge
+            .kernel()
+            .read_reflog("heads/main", 10)
+            .expect("read")
+            .len(),
+        1
+    );
 }
 
 #[test]
