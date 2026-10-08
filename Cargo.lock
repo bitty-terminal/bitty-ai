@@ -50,6 +50,7 @@ name = "bitty-ai-mcp"
 version = "0.0.1"
 dependencies = [
  "bitty-ai-runtime",
+ "bitty-network-api",
 ]
 
 [[package]]

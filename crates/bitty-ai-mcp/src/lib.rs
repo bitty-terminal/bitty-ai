@@ -39,6 +39,8 @@ pub mod config;
 pub mod error;
 pub mod frame;
 pub mod handshake;
+pub mod http_transport;
+pub mod remote;
 pub mod supervise;
 pub mod tools;
 
@@ -50,6 +52,14 @@ pub use config::{CredentialRef, McpServerConfig};
 pub use error::{McpError, McpFailure, McpStage};
 pub use frame::{FrameStats, MAX_FRAME_BYTES};
 pub use handshake::{InitializeResult, handshake, initialize_request, initialized_notification};
+pub use http_transport::{
+    HTTP_ACCEPT, HTTP_CONTENT_TYPE, HttpLineTransport, MAX_SESSION_ID_LEN,
+    MAX_SSE_FRAMES_PER_RESPONSE, SESSION_HEADER, TRANSPORT_ERROR_CODE,
+};
+pub use remote::{
+    MAX_REMOTE_HEADER_NAME_LEN, MAX_REMOTE_HEADER_VALUE_LEN, MAX_REMOTE_HEADERS,
+    MAX_REMOTE_HOST_LEN, MAX_REMOTE_URL_LEN, RemoteServerConfig,
+};
 pub use supervise::{McpHost, SupervisedServer};
 pub use tools::{ImportedTool, MAX_TOOL_PAGES, list_tools, sanitize_mcp_name};
 
