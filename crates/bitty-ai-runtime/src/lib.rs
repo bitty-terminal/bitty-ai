@@ -83,12 +83,14 @@ pub use bridge::{
 };
 pub use cache_key::{CacheKey, CacheKeyError, CacheScope};
 pub use compression::{
-    CompactionOutcome, CompactionWindow, CompressedSpan, CompressedView, CompressionConfig,
-    CompressionError, DEFAULT_KEEP_RECENT_BYTES, DEFAULT_MAX_SPAN_BYTES, DEFAULT_RESERVE_BYTES,
-    FakeSummarizer, MAX_SPAN_ID_LEN, MAX_SPANS, MIN_KEEP_RECORDS, RESERVE_FRACTION_DENOMINATOR,
-    RESERVE_FRACTION_NUMERATOR, RetentionClass, RetentionPolicy, RetentionTags,
-    SelectiveCompactionConfig, SpanRange, SummarizeInput, Summarizer, compact_selective,
-    compress_records, effective_reserve_bytes, inherit_retention, select_breakpoints,
+    CompactionOutcome, CompactionPolicy, CompactionPreview, CompactionWindow, CompressedSpan,
+    CompressedView, CompressionConfig, CompressionError, DEFAULT_COMPACTION_WINDOW_BYTES,
+    DEFAULT_KEEP_RECENT_BYTES, DEFAULT_MAX_INEFFECTIVE_STRIKES, DEFAULT_MAX_SPAN_BYTES,
+    DEFAULT_RESERVE_BYTES, FakeSummarizer, MAX_INEFFECTIVE_STRIKES, MAX_SPAN_ID_LEN, MAX_SPANS,
+    MIN_KEEP_RECORDS, PreviewOutcome, RESERVE_FRACTION_DENOMINATOR, RESERVE_FRACTION_NUMERATOR,
+    RetentionClass, RetentionPolicy, RetentionTags, SelectiveCompactionConfig, SpanRange,
+    SummarizeInput, Summarizer, compact_selective, compress_records, effective_reserve_bytes,
+    inherit_retention, preview_compaction, record_ineffective, select_breakpoints,
     select_compaction_window, should_compact,
 };
 pub use context::{
