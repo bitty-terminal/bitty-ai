@@ -678,15 +678,39 @@ impl WheelKernel {
 
     /// Read-only GC preview: byte-matches the next destructive batch.
     ///
-    /// Thin passthrough over [`crate::merge::gc_preview`].
+    /// Refuses when the working tree is dirty (zero reads beyond the gate,
+    /// [`FacadeError::Store`] naming `uncommitted`, same shape as
+    /// [`Self::merge_commit`]): `slot.put` payloads live only in the active
+    /// tree until `commit_checkpoint`, while GC roots cover refs and reflog
+    /// only, so even a preview must not run while uncommitted payloads are
+    /// invisible to reachability. The gate runs before any store read and is
+    /// identical to the [`Self::collect_garbage`] gate, so preview==collect
+    /// parity holds by construction. Thin passthrough over
+    /// [`crate::merge::gc_preview`] once clean.
     pub fn gc_preview(&self, options: &GcOptions) -> Result<GcReport, FacadeError> {
+        if self.working_tree_dirty()? {
+            return Err(FacadeError::Store(
+                "gc refused: working tree has uncommitted changes; commit or discard before collecting"
+                    .to_string(),
+            ));
+        }
         crate::merge::gc_preview(&self.content_store, options).map_err(FacadeError::from)
     }
 
     /// Bounded destructive GC, or preview when `options.dry_run` is set.
     ///
-    /// Thin passthrough over [`crate::merge::collect_garbage`].
+    /// Same dirty gate as [`Self::gc_preview`] (identical call, identical
+    /// [`FacadeError::Store`] refusal naming `uncommitted`): runs before any
+    /// store read or write, so a dirty `slot.put` without commit can never
+    /// lose its payload to collection. Thin passthrough over
+    /// [`crate::merge::collect_garbage`] once clean.
     pub fn collect_garbage(&mut self, options: &GcOptions) -> Result<GcReport, FacadeError> {
+        if self.working_tree_dirty()? {
+            return Err(FacadeError::Store(
+                "gc refused: working tree has uncommitted changes; commit or discard before collecting"
+                    .to_string(),
+            ));
+        }
         crate::merge::collect_garbage(&mut self.content_store, options).map_err(FacadeError::from)
     }
 
