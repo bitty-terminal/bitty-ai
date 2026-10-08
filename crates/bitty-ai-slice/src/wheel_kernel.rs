@@ -37,8 +37,9 @@ use crate::context_compiler::{
 use crate::facade::{AiStreamSession, FacadeError};
 use crate::merge::{GcOptions, GcReport, MergeInput};
 use crate::session_refs::{
-    BranchName, ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch,
-    get_branch, list_branches, read_reflog, rename_branch, update_branch,
+    BranchName, PruneReport, ReflogEntry, commit_checkpoint_with_branch, create_branch,
+    delete_branch, get_branch, list_branches, prune_reflog, read_reflog, rename_branch,
+    update_branch,
 };
 use crate::task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskView};
 
@@ -576,6 +577,34 @@ impl WheelKernel {
     /// Read reflog history for any well-formed ref name, newest-first.
     pub fn read_reflog(&self, name: &str, limit: usize) -> Result<Vec<ReflogEntry>, FacadeError> {
         read_reflog(&self.content_store, name, limit).map_err(FacadeError::from)
+    }
+
+    /// Explicitly expire reflog history for one ref, bounded by age and count.
+    ///
+    /// Thin passthrough over [`prune_reflog`][crate::session_refs::prune_reflog]:
+    /// no validation, policy, or clock selection lives here. The caller
+    /// supplies every bound (`older_than_ms`, `max_rows`) and every clock
+    /// (`tombstone_grace_ms`, `now_ms`); the floor
+    /// ([`MIN_REFLOG_FLOOR`][crate::session_refs::MIN_REFLOG_FLOOR]) and the
+    /// tombstone-grace rule come verbatim from the refs plane via
+    /// [`FacadeError`].
+    pub fn prune_reflog(
+        &mut self,
+        name: &str,
+        older_than_ms: u64,
+        max_rows: usize,
+        tombstone_grace_ms: u64,
+        now_ms: u64,
+    ) -> Result<PruneReport, FacadeError> {
+        prune_reflog(
+            &mut self.content_store,
+            name,
+            older_than_ms,
+            max_rows,
+            tombstone_grace_ms,
+            now_ms,
+        )
+        .map_err(FacadeError::from)
     }
 
     // --- Merge + GC (session plane, AI-0190) ---
