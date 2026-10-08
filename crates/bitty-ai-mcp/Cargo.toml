@@ -15,6 +15,11 @@ workspace = true
 
 [dependencies]
 # Only path dependency on the sibling runtime crate for the ToolSpec bounds
-# and the ToolExecutor / ConsentLedger seams. No external crates, no async
-# runtime, no JSON crate: the wire encoding is hand-rolled in `json.rs`.
+# and the ToolExecutor / ConsentLedger seams. No async runtime, no JSON crate:
+# the wire encoding is hand-rolled in `json.rs`.
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
+# AI-0194 remote transport: first network dependency in the workspace.
+# Reuse path (a): http+https via NetworkService. Mirrors the exact pin used
+# by bitty-ai-slice (rev f3c313244667e5dca910b4f7cd8e9d9447dce9a7); the
+# runtime kernel stays std-only, only this client takes the dependency.
+bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "f3c313244667e5dca910b4f7cd8e9d9447dce9a7" }
