@@ -26,7 +26,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bitty_ai_session::sessions::{
+    SessionBinding, SessionError, WheelSessionId, bind_session, bump_session_epoch, list_sessions,
+    resolve_session,
+};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use crate::action_protocol::{ActionEngine, ActionOutcome, SpilloverConfig};
 use crate::content_hash::ContentHash;
@@ -51,6 +56,47 @@ const WHEEL_COMMIT_REFLOG_REASON: &str = "wheel commit";
 
 /// Reflog actor recorded for branch moves driven by [`WheelKernel::commit_checkpoint`].
 const WHEEL_COMMIT_REFLOG_ACTOR: &str = "wheel-kernel";
+
+/// Fenced resume outcome (AI-0197).
+///
+/// `session_id` is `Some` on the session-id (fenced) path and `None` on the
+/// bare branch/`HEAD` (unfenced read) path. `checkpoint` is the resolved live
+/// tip. `generation` is the live task-engine generation re-read at resume
+/// time, `0` when the checkpoint's task names no task row (informational
+/// snapshot, never a fence). `pending_unknowns` is always empty with
+/// `pending_log_absent = true`: no durable pending tool-call log exists, so
+/// resume honestly reports HEAD plus generation and says so (a durable
+/// pending log is a separate follow-up slice). `fence_token` is the admitted
+/// epoch on the session path, `0` on the branch path (no fence admitted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeReport {
+    /// Bound session id, or `None` for unfenced branch/`HEAD` resumes.
+    pub session_id: Option<WheelSessionId>,
+    /// Branch followed (`heads/...`, or `HEAD` for direct HEAD resumes).
+    pub branch: String,
+    /// Resolved live-tip checkpoint.
+    pub checkpoint: ContentHash,
+    /// Live task-engine generation at resume time (`0` = no task binding).
+    pub generation: u64,
+    /// In-flight tool-call ids surviving the crash (always empty: no log).
+    pub pending_unknowns: Vec<String>,
+    /// Always `true`: no durable pending log exists (honest flag).
+    pub pending_log_absent: bool,
+    /// Admitted fencing epoch (session path) or `0` (branch path).
+    pub fence_token: u64,
+}
+
+/// Map a sessions-plane error into the stringly-typed [`FacadeError`].
+///
+/// No new `FacadeError` variant: `Store` already carries every fail-closed
+/// refusal shape on this boundary (the task directs reusing an existing
+/// variant where one fits). The typed [`SessionError::StaleEpoch`] refusal
+/// (mirroring the adoption-rule `StaleEpoch` field shape) survives in the
+/// message text; callers needing typed discrimination use the sessions plane
+/// directly.
+fn map_session_err(err: SessionError) -> FacadeError {
+    FacadeError::Store(err.to_string())
+}
 
 /// Unified runtime orchestrator coordinating all Wheel upstream layers.
 pub struct WheelKernel {
@@ -605,6 +651,306 @@ impl WheelKernel {
             now_ms,
         )
         .map_err(FacadeError::from)
+    }
+
+    // --- Session Bindings & Resume (AI-0197) ---
+    //
+    // Durable caller-provided session ids bound to branch tips, plus the
+    // fenced resume and cheap-fork verbs over them. Thin orchestration over
+    // the [`bitty_ai_session::sessions`] plane: shape validation, fencing,
+    // and row storage live there; what lives here is tip resolution (refs
+    // plane), live task-generation reads (task engine), and working-tree
+    // sync so the next commit continues from the resumed checkpoint.
+
+    /// Read the live task-engine generation for a checkpoint's task.
+    ///
+    /// Returns the task row's `generation` when the checkpoint's `task_id`
+    /// names a live task, else `0` (no task binding: `task-unassigned` or a
+    /// removed task). Never fails: an unbound task is ordinary, not corrupt.
+    fn live_task_generation(&self, checkpoint: &Checkpoint) -> u64 {
+        let Ok(task_id) = TaskId::new(checkpoint.task_id.clone()) else {
+            return 0;
+        };
+        match self.task_engine.get_task(&task_id) {
+            Ok(node) => node.generation,
+            Err(_) => 0,
+        }
+    }
+
+    /// Bind a caller-provided session id to a branch tip (no force).
+    ///
+    /// The branch must exist; its live tip's checkpoint supplies the stored
+    /// head and the generation snapshot (see
+    /// [`bitty_ai_session::sessions`] for snapshot-vs-live semantics). The
+    /// row mints epoch `1`. A bound id refuses with `AlreadyExists` (via
+    /// [`FacadeError::Store`); the kernel never mints or reuses session ids.
+    pub fn new_session(
+        &mut self,
+        session_id: &str,
+        branch: &str,
+        now_ms: u64,
+    ) -> Result<SessionBinding, FacadeError> {
+        let id = WheelSessionId::parse(session_id).map_err(map_session_err)?;
+        let branch_name = BranchName::parse(branch).map_err(FacadeError::from)?;
+        let tip = match get_branch(&self.content_store, branch_name.as_str())
+            .map_err(FacadeError::from)?
+        {
+            Some(hash) => hash,
+            None => return Err(map_session_err(SessionError::NotFound)),
+        };
+        let checkpoint = match self
+            .content_store
+            .get_checkpoint(&tip)
+            .map_err(FacadeError::from)?
+        {
+            Some(checkpoint) => checkpoint,
+            None => {
+                return Err(FacadeError::Store(format!(
+                    "session branch {branch_name} points at a missing checkpoint; refusing"
+                )));
+            }
+        };
+        let generation = self.live_task_generation(&checkpoint);
+        bind_session(
+            &self.content_store,
+            &id,
+            &branch_name,
+            &tip,
+            generation,
+            1,
+            now_ms,
+        )
+        .map_err(map_session_err)
+    }
+
+    /// Resume a session by id (fenced) or a branch/`HEAD` ref (unfenced read).
+    ///
+    /// Session-id path: the id must be bound; the claim is admitted only
+    /// when `claim_epoch > stored epoch`, else [`SessionError::StaleEpoch`]
+    /// refuses with zero writes. On success the row advances to the branch's
+    /// live tip (sessions follow branch moves), the live generation, and the
+    /// claimed epoch, and the report carries that epoch as `fence_token`. A
+    /// bound session whose branch was deleted refuses as `NotFound`.
+    ///
+    /// Branch/`HEAD` path: resolves the tip with no fencing and no row
+    /// write; `session_id` is `None` and `fence_token` is `0` (no fence
+    /// admitted). Resume is read-only apart from the session-path epoch
+    /// bump: it never replays tool calls and never re-executes effects.
+    ///
+    /// Both paths refuse when the working tree is dirty (zero writes,
+    /// [`FacadeError::Store`] naming `uncommitted`): the gate runs before
+    /// any store write -- including the session-path epoch bump -- so a
+    /// dirty `slot.put` without commit never loses slots to the resume sync,
+    /// matching the `merge_commit` / GC gates.
+    ///
+    /// `pending_unknowns` is always empty with `pending_log_absent = true`:
+    /// no durable pending tool-call log exists anywhere in this tree (the
+    /// runtime pending set is in-memory only), so an honest resume reports
+    /// HEAD plus generation and says so. `generation` is the live
+    /// task-engine generation re-read at resume time (`0` when the HEAD
+    /// checkpoint's task names no task row).
+    pub fn resume_session(
+        &mut self,
+        ref_or_branch: &str,
+        claim_epoch: u64,
+        now_ms: u64,
+    ) -> Result<ResumeReport, FacadeError> {
+        // Dirty gate first (both paths): a resume sync would blindly
+        // overwrite the in-memory tree, so uncommitted slots refuse before
+        // any store read or write, exactly like `merge_commit` / GC.
+        if self.working_tree_dirty()? {
+            return Err(FacadeError::Store(
+                "resume refused: working tree has uncommitted changes; commit or discard before resuming"
+                    .to_string(),
+            ));
+        }
+        // Session namespace and branch namespace are disjoint by
+        // construction (session ids never contain `/`, branches always do),
+        // so a successful session-id parse selects the session path
+        // exclusively: an unbound id is NotFound, never a branch retry.
+        if let Ok(id) = WheelSessionId::parse(ref_or_branch) {
+            let Some(binding) =
+                resolve_session(&self.content_store, &id).map_err(map_session_err)?
+            else {
+                return Err(map_session_err(SessionError::NotFound));
+            };
+            let branch_name = BranchName::parse(&binding.branch)
+                .map_err(|_| map_session_err(SessionError::Corrupt))?;
+            let tip = match get_branch(&self.content_store, branch_name.as_str())
+                .map_err(FacadeError::from)?
+            {
+                Some(hash) => hash,
+                None => return Err(map_session_err(SessionError::NotFound)),
+            };
+            let checkpoint = match self
+                .content_store
+                .get_checkpoint(&tip)
+                .map_err(FacadeError::from)?
+            {
+                Some(checkpoint) => checkpoint,
+                None => {
+                    return Err(FacadeError::Store(format!(
+                        "session branch {branch_name} points at a missing checkpoint; refusing"
+                    )));
+                }
+            };
+            let generation = self.live_task_generation(&checkpoint);
+            // Fallible tree load runs BEFORE the epoch bump: a missing tree
+            // link, missing blob, or undecodable tree refuses here with zero
+            // row writes, so the same claim stays admissible for retry.
+            let tree = self.load_tree_for(&tip)?;
+            let advanced = bump_session_epoch(
+                &self.content_store,
+                &id,
+                claim_epoch,
+                &tip,
+                generation,
+                now_ms,
+            )
+            .map_err(map_session_err)?;
+            // Infallible assignment runs only after the bump succeeds.
+            self.active_tree = tree;
+            self.head_checkpoint = Some(tip);
+            return Ok(ResumeReport {
+                session_id: Some(id),
+                branch: advanced.branch,
+                checkpoint: tip,
+                generation,
+                pending_unknowns: Vec::new(),
+                pending_log_absent: true,
+                fence_token: advanced.epoch,
+            });
+        }
+        let (branch_text, tip) = if ref_or_branch == "HEAD" {
+            let head = match self
+                .content_store
+                .get_ref("HEAD")
+                .map_err(FacadeError::from)?
+            {
+                Some(hash) => hash,
+                None => return Err(map_session_err(SessionError::NotFound)),
+            };
+            ("HEAD".to_owned(), head)
+        } else {
+            let branch_name = BranchName::parse(ref_or_branch).map_err(FacadeError::from)?;
+            let tip = match get_branch(&self.content_store, branch_name.as_str())
+                .map_err(FacadeError::from)?
+            {
+                Some(hash) => hash,
+                None => return Err(map_session_err(SessionError::NotFound)),
+            };
+            (branch_name.as_str().to_owned(), tip)
+        };
+        let checkpoint = match self
+            .content_store
+            .get_checkpoint(&tip)
+            .map_err(FacadeError::from)?
+        {
+            Some(checkpoint) => checkpoint,
+            None => {
+                return Err(FacadeError::Store(format!(
+                    "resume ref {branch_text} points at a missing checkpoint; refusing"
+                )));
+            }
+        };
+        let generation = self.live_task_generation(&checkpoint);
+        self.sync_working_tree_to(&tip)?;
+        Ok(ResumeReport {
+            session_id: None,
+            branch: branch_text,
+            checkpoint: tip,
+            generation,
+            pending_unknowns: Vec::new(),
+            pending_log_absent: true,
+            fence_token: 0,
+        })
+    }
+
+    /// Fork a branch at an existing checkpoint tip (cheap snapshot).
+    ///
+    /// Thin passthrough over the refs-plane `create_branch`: a fork is a new
+    /// ref pointing at the same checkpoint, so parent blobs are shared by
+    /// construction (no data is copied; both tips reach the same tree blob
+    /// through content addressing). Missing targets refuse as
+    /// `MissingTarget`; taken names as `AlreadyExists`.
+    pub fn fork_branch(
+        &mut self,
+        name: &str,
+        from_tip: &ContentHash,
+        reason: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<BranchName, FacadeError> {
+        create_branch(
+            &mut self.content_store,
+            name,
+            from_tip,
+            reason,
+            actor,
+            now_ms,
+        )
+        .map_err(FacadeError::from)
+    }
+
+    /// List all bound sessions, ordered by session id ascending.
+    ///
+    /// Global to the database file (no directory scoping, owner decision
+    /// AI-0197). Thin passthrough over the sessions plane.
+    pub fn list_sessions(&self) -> Result<Vec<SessionBinding>, FacadeError> {
+        list_sessions(&self.content_store).map_err(map_session_err)
+    }
+
+    /// Load and decode the tree blob for a checkpoint tip.
+    ///
+    /// Fallible half of the resume sync: fails closed on a missing
+    /// checkpoint row, tree link, blob, or undecodable bytes (same shape as
+    /// `recover`). The session resume path calls this BEFORE
+    /// `bump_session_epoch` so tree failures refuse with zero row writes;
+    /// the infallible state assignment then runs only after the bump
+    /// succeeds. [`Self::sync_working_tree_to`] is load-plus-assign for the
+    /// paths (branch resume) that carry no epoch.
+    fn load_tree_for(&self, tip: &ContentHash) -> Result<ContextTree, FacadeError> {
+        let checkpoint = match self
+            .content_store
+            .get_checkpoint(tip)
+            .map_err(FacadeError::from)?
+        {
+            Some(checkpoint) => checkpoint,
+            None => {
+                return Err(FacadeError::Store(format!(
+                    "resume sync: checkpoint {tip} has no row; refusing"
+                )));
+            }
+        };
+        let Some(tree_hash) = checkpoint.tree_hash else {
+            return Err(FacadeError::Store(format!(
+                "resume sync: checkpoint {tip} has no tree blob link; refusing"
+            )));
+        };
+        let Some(blob_bytes) = self
+            .content_store
+            .get_blob(&tree_hash)
+            .map_err(FacadeError::from)?
+        else {
+            return Err(FacadeError::Store(format!(
+                "resume sync: checkpoint {tip} tree {tree_hash} blob missing; refusing"
+            )));
+        };
+        ContextTree::from_canonical_bytes(&blob_bytes)
+            .map_err(|e| FacadeError::Store(format!("resume sync: tree decode failed: {e}")))
+    }
+
+    /// Sync the in-memory working tree and HEAD pointer to a resumed tip.
+    ///
+    /// Loads the checkpoint's tree blob and decodes it into the active tree
+    /// (fail closed on a missing row, link, blob, or undecodable bytes, same
+    /// shape as `recover`), so the next `commit_checkpoint` continues from
+    /// the resumed lineage instead of forking history off a stale tree.
+    fn sync_working_tree_to(&mut self, tip: &ContentHash) -> Result<(), FacadeError> {
+        let tree = self.load_tree_for(tip)?;
+        self.active_tree = tree;
+        self.head_checkpoint = Some(*tip);
+        Ok(())
     }
 
     // --- Merge + GC (session plane, AI-0190) ---

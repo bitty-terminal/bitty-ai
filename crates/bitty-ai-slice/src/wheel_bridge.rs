@@ -14,7 +14,8 @@ use crate::context_compiler::CompilerBudgetConfig;
 use crate::facade::FacadeError;
 use crate::merge::{GcOptions, GcReport, MergeInput};
 use crate::task_dag::{TaskDraft, TaskId};
-use crate::wheel_kernel::WheelKernel;
+use crate::wheel_kernel::{ResumeReport, WheelKernel};
+use bitty_ai_session::sessions::SessionBinding;
 
 /// Unified bridge response payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,6 +617,166 @@ impl WheelBridge {
                     .map_err(|e| e.to_string())?;
                 Ok(prune_report_to_value(&report))
             }
+            // --- Session resume/CLI surface (AI-0197) ---
+            //
+            // Strict field types throughout (AI-0190 lesson): a
+            // present-but-wrong-typed field is an error naming the field,
+            // never a silent default. Required fields (`session_id`,
+            // `ref`, `claim_epoch`, `name`, `target`, ...) error when
+            // missing or null; optional clocks/metadata (`now_ms`,
+            // `reason`, `actor`) default only when absent or null.
+            "session.new" => {
+                let session_id = req_string(&payload, "session_id")?;
+                let branch = req_string(&payload, "branch")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let binding = self
+                    .kernel
+                    .new_session(&session_id, &branch, now_ms)
+                    .map_err(|e| e.to_string())?;
+                Ok(session_binding_to_value(&binding))
+            }
+            "session.resume" => {
+                let ref_or_branch = req_string(&payload, "ref")?;
+                let claim_epoch = req_u64(&payload, "claim_epoch")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let report = self
+                    .kernel
+                    .resume_session(&ref_or_branch, claim_epoch, now_ms)
+                    .map_err(|e| e.to_string())?;
+                Ok(resume_report_to_value(&report))
+            }
+            "session.fork" => {
+                let name = req_string(&payload, "name")?;
+                let from_tip = req_hash(&payload, "from_tip")?;
+                let reason = opt_string(&payload, "reason", "")?;
+                let actor = opt_string(&payload, "actor", "")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let branch = self
+                    .kernel
+                    .fork_branch(&name, &from_tip, &reason, &actor, now_ms)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "name": branch.as_str(),
+                    "target": from_tip.to_hex(),
+                }))
+            }
+            "session.list" => {
+                let bindings = self.kernel.list_sessions().map_err(|e| e.to_string())?;
+                let values: Vec<serde_json::Value> =
+                    bindings.iter().map(session_binding_to_value).collect();
+                Ok(serde_json::Value::Array(values))
+            }
+            "branch.create" => {
+                let name = req_string(&payload, "name")?;
+                let target = req_hash(&payload, "target")?;
+                let reason = opt_string(&payload, "reason", "")?;
+                let actor = opt_string(&payload, "actor", "")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let branch = self
+                    .kernel
+                    .create_branch(&name, &target, &reason, &actor, now_ms)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "name": branch.as_str(),
+                    "target": target.to_hex(),
+                }))
+            }
+            "branch.list" => {
+                let branches = self.kernel.list_branches().map_err(|e| e.to_string())?;
+                let values: Vec<serde_json::Value> = branches
+                    .iter()
+                    .map(|(name, target)| {
+                        serde_json::json!({
+                            "name": name.as_str(),
+                            "target": target.to_hex(),
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::Value::Array(values))
+            }
+            "branch.get" => {
+                let name = req_string(&payload, "name")?;
+                match self.kernel.get_branch(&name).map_err(|e| e.to_string())? {
+                    Some(target) => Ok(serde_json::json!({
+                        "name": name,
+                        "found": true,
+                        "target": target.to_hex(),
+                    })),
+                    None => Ok(serde_json::json!({
+                        "name": name,
+                        "found": false,
+                    })),
+                }
+            }
+            "branch.update" => {
+                let name = req_string(&payload, "name")?;
+                let target = req_hash(&payload, "target")?;
+                let reason = opt_string(&payload, "reason", "")?;
+                let actor = opt_string(&payload, "actor", "")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let fast_forward_only = opt_bool(&payload, "fast_forward_only", false)?;
+                let branch = self
+                    .kernel
+                    .update_branch(&name, &target, &reason, &actor, now_ms, fast_forward_only)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "name": branch.as_str(),
+                    "target": target.to_hex(),
+                }))
+            }
+            "branch.delete" => {
+                let name = req_string(&payload, "name")?;
+                let reason = opt_string(&payload, "reason", "")?;
+                let actor = opt_string(&payload, "actor", "")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let deleted = self
+                    .kernel
+                    .delete_branch(&name, &reason, &actor, now_ms)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "name": name,
+                    "deleted_target": deleted.to_hex(),
+                }))
+            }
+            "branch.rename" => {
+                let old_name = req_string(&payload, "old_name")?;
+                let new_name = req_string(&payload, "new_name")?;
+                let reason = opt_string(&payload, "reason", "")?;
+                let actor = opt_string(&payload, "actor", "")?;
+                let now_ms = opt_u64(&payload, "now_ms", 0)?;
+                let target = self
+                    .kernel
+                    .rename_branch(&old_name, &new_name, &reason, &actor, now_ms)
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({
+                    "old_name": old_name,
+                    "new_name": new_name,
+                    "target": target.to_hex(),
+                }))
+            }
+            "reflog.read" => {
+                let ref_name = req_string(&payload, "ref_name")?;
+                let limit = opt_u64(&payload, "limit", 64)? as usize;
+                let entries = self
+                    .kernel
+                    .read_reflog(&ref_name, limit)
+                    .map_err(|e| e.to_string())?;
+                let values: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "seq": entry.seq,
+                            "ref_name": entry.ref_name,
+                            "old_hash": entry.old_hash.as_ref().map(|h| h.to_hex()),
+                            "new_hash": entry.new_hash.to_hex(),
+                            "reason": entry.reason,
+                            "actor": entry.actor,
+                            "at_ms": entry.at_ms,
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::Value::Array(values))
+            }
             unknown => Err(format!("unknown bridge command: '{unknown}'")),
         }
     }
@@ -684,5 +845,90 @@ fn prune_report_to_value(report: &crate::session_refs::PruneReport) -> serde_jso
         "pruned": report.pruned,
         "floor_kept": report.floor_kept,
         "tombstone_survived": report.tombstone_survived,
+    })
+}
+
+/// Require a string field: missing or null is an error, and a
+/// present-but-wrong-typed value is an error (never a silent default).
+fn req_string(payload: &serde_json::Value, field: &str) -> Result<String, String> {
+    match payload.get(field) {
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
+        None | Some(serde_json::Value::Null) => Err(format!("missing '{field}' field")),
+        Some(_) => Err(format!("invalid '{field}' field, expected string")),
+    }
+}
+
+/// Optional string field: absent or null takes `default`, wrong-typed errors.
+fn opt_string(payload: &serde_json::Value, field: &str, default: &str) -> Result<String, String> {
+    match payload.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(default.to_owned()),
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
+        Some(_) => Err(format!("invalid '{field}' field, expected string")),
+    }
+}
+
+/// Require a u64 field: missing, null, or wrong-typed is an error.
+fn req_u64(payload: &serde_json::Value, field: &str) -> Result<u64, String> {
+    match payload.get(field) {
+        None | Some(serde_json::Value::Null) => Err(format!("missing '{field}' field")),
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| format!("invalid '{field}' field, expected u64")),
+    }
+}
+
+/// Optional u64 field: absent or null takes `default`, wrong-typed errors.
+fn opt_u64(payload: &serde_json::Value, field: &str, default: u64) -> Result<u64, String> {
+    match payload.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| format!("invalid '{field}' field, expected u64")),
+    }
+}
+
+/// Optional boolean field: absent or null takes `default`, wrong-typed errors.
+fn opt_bool(payload: &serde_json::Value, field: &str, default: bool) -> Result<bool, String> {
+    match payload.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| format!("invalid '{field}' field, expected boolean")),
+    }
+}
+
+/// Require a content-hash field as lowercase hex: missing, wrong-typed, or
+/// malformed hex is an error.
+fn req_hash(payload: &serde_json::Value, field: &str) -> Result<ContentHash, String> {
+    let raw = req_string(payload, field)?;
+    ContentHash::from_hex(&raw).map_err(|e| e.to_string())
+}
+
+/// Render a [`SessionBinding`] as a bridge JSON value with stable field names.
+fn session_binding_to_value(binding: &SessionBinding) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": binding.session_id.as_str(),
+        "branch": binding.branch,
+        "head": binding.head.to_hex(),
+        "generation": binding.generation,
+        "epoch": binding.epoch,
+        "updated_at_ms": binding.updated_at_ms,
+    })
+}
+
+/// Render a [`ResumeReport`] as a bridge JSON value with stable field names.
+///
+/// `session_id` is null on the unfenced branch/`HEAD` path; `fence_token` is
+/// `0` there (no fence admitted). `pending_unknowns` is always empty with
+/// `pending_log_absent = true` (no durable pending log exists).
+fn resume_report_to_value(report: &ResumeReport) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": report.session_id.as_ref().map(|id| id.as_str()),
+        "branch": report.branch,
+        "checkpoint": report.checkpoint.to_hex(),
+        "generation": report.generation,
+        "pending_unknowns": report.pending_unknowns,
+        "pending_log_absent": report.pending_log_absent,
+        "fence_token": report.fence_token,
     })
 }
