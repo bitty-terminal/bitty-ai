@@ -617,6 +617,16 @@ CREATE TABLE IF NOT EXISTS refs (
     target_hash TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reflog (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref_name TEXT NOT NULL,
+    old_hash TEXT,
+    new_hash TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reflog_ref_seq ON reflog(ref_name, seq);
 CREATE TABLE IF NOT EXISTS durable_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -666,7 +676,7 @@ pub(crate) fn admit_or_init(conn: &Connection) -> Result<(), ContentStoreError> 
     let mut stmt = conn
         .prepare(
             "SELECT type, name FROM sqlite_master
-             WHERE name COLLATE NOCASE IN ('blobs', 'checkpoints', 'refs', 'durable_meta')",
+             WHERE name COLLATE NOCASE IN ('blobs', 'checkpoints', 'refs', 'reflog', 'durable_meta')",
         )
         .map_err(map_busy)?;
     let mut matches: Vec<(String, String)> = Vec::new();
@@ -680,7 +690,7 @@ pub(crate) fn admit_or_init(conn: &Connection) -> Result<(), ContentStoreError> 
     drop(rows);
     drop(stmt);
 
-    const EXPECTED: [&str; 4] = ["blobs", "checkpoints", "refs", "durable_meta"];
+    const EXPECTED: [&str; 5] = ["blobs", "checkpoints", "refs", "reflog", "durable_meta"];
     let mut present: Vec<&str> = Vec::new();
     for expected in EXPECTED {
         if matches
@@ -706,15 +716,24 @@ pub(crate) fn admit_or_init(conn: &Connection) -> Result<(), ContentStoreError> 
     if present.is_empty() {
         return Ok(());
     }
-    // durable_meta is created alongside the other tables; a store missing
-    // only it is a pre-0178 database (migration path: init adds it). The
-    // surviving tables are still shape-checked first so a wrong-column
-    // legacy table fails closed at admission instead of at first query.
-    let missing_meta_only =
-        present.len() == 3 && !present.contains(&"durable_meta") && present.contains(&"blobs");
-    if missing_meta_only {
+    // Additive-table migration (AI-0178 durable_meta, AI-0180 reflog): the
+    // core triple (blobs, checkpoints, refs) must be fully present; the only
+    // tables allowed to be missing are the ones introduced after it. A store
+    // missing just `reflog` is the AI-0180 migration (init creates it); a
+    // store missing `durable_meta`, or both, is the pre-0178 path (init
+    // creates them). Every present table is still shape-checked first, so a
+    // malformed `reflog` fails closed here instead of being silently kept.
+    // Anything missing from the core triple is a partial schema and fails
+    // closed below.
+    let core_present = ["blobs", "checkpoints", "refs"]
+        .iter()
+        .all(|table| present.contains(table));
+    if core_present && present.len() < EXPECTED.len() {
         for table in ["blobs", "checkpoints", "refs"] {
             verify_content_table_shape(conn, table)?;
+        }
+        if present.contains(&"reflog") {
+            verify_content_table_shape(conn, "reflog")?;
         }
         return Ok(());
     }
@@ -723,7 +742,7 @@ pub(crate) fn admit_or_init(conn: &Connection) -> Result<(), ContentStoreError> 
             detail: format!("partial durable schema; present tables: {present:?}"),
         });
     }
-    for table in ["blobs", "checkpoints", "refs"] {
+    for table in ["blobs", "checkpoints", "refs", "reflog"] {
         verify_content_table_shape(conn, table)?;
     }
     verify_profile(conn)?;
@@ -771,6 +790,15 @@ fn verify_content_table_shape(conn: &Connection, table: &str) -> Result<(), Cont
             ("target_hash", "TEXT", true, 0),
             ("updated_at_ms", "INTEGER", true, 0),
         ],
+        "reflog" => &[
+            ("seq", "INTEGER", false, 1),
+            ("ref_name", "TEXT", true, 0),
+            ("old_hash", "TEXT", false, 0),
+            ("new_hash", "TEXT", true, 0),
+            ("reason", "TEXT", true, 0),
+            ("actor", "TEXT", true, 0),
+            ("at_ms", "INTEGER", true, 0),
+        ],
         _ => return Ok(()),
     };
     if cols.len() != expected.len() {
@@ -794,7 +822,9 @@ fn verify_content_table_shape(conn: &Connection, table: &str) -> Result<(), Cont
 }
 
 impl ContentStore {
-    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, ContentStoreError> {
+    pub(crate) fn lock_conn(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Connection>, ContentStoreError> {
         self.conn.lock().map_err(|_| ContentStoreError::Corrupt {
             detail: "content store lock poisoned; fail closed".to_owned(),
         })
@@ -1471,7 +1501,7 @@ impl ContentStore {
         Ok(None)
     }
 
-    fn validate_ref_name(name: &str) -> Result<(), ContentStoreError> {
+    pub(crate) fn validate_ref_name(name: &str) -> Result<(), ContentStoreError> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err(ContentStoreError::EmptyField("ref_name"));

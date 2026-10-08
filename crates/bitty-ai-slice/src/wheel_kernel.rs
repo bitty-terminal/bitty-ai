@@ -34,10 +34,17 @@ use crate::context_compiler::{
     CompiledContext, CompilerBudgetConfig, ContextCompiler, ContextTree, EntryKind, TreeEntry,
 };
 use crate::facade::{AiStreamSession, FacadeError};
+use crate::session_refs::{BranchName, ReflogEntry};
 use crate::task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskView};
 
 /// Maximum retained uncollapsed action outcomes in memory for Zone 3 compilation (64).
 pub const MAX_RECENT_ACTIONS: usize = 64;
+
+/// Reflog reason recorded for branch moves driven by [`WheelKernel::commit_checkpoint`].
+const WHEEL_COMMIT_REFLOG_REASON: &str = "wheel commit";
+
+/// Reflog actor recorded for branch moves driven by [`WheelKernel::commit_checkpoint`].
+const WHEEL_COMMIT_REFLOG_ACTOR: &str = "wheel-kernel";
 
 /// Unified runtime orchestrator coordinating all Wheel upstream layers.
 pub struct WheelKernel {
@@ -386,12 +393,20 @@ impl WheelKernel {
     /// Commit a cognitive checkpoint linking the current Merkle tree, structured rationale,
     /// and parent reference into the immutable content store.
     ///
-    /// Atomic (AI-0178): the tree blob, checkpoint row, and HEAD/branch ref
-    /// updates commit in one SQLite `transaction()` via
+    /// Atomic (AI-0178): the tree blob, checkpoint row, and HEAD ref update
+    /// commit in one SQLite `transaction()` via
     /// [`ContentStore::commit_checkpoint_atomic`]. HEAD advances only when the
     /// transaction commits; a torn write (crash between blob insert and HEAD
     /// update) replays as the pre-crash HEAD on reopen, never a half-advanced
     /// HEAD.
+    ///
+    /// The `branch` move routes through the refs-plane verbs (AI-0180):
+    /// [`ContentStore::create_branch`] when the branch is new,
+    /// [`ContentStore::update_branch`] otherwise, so every branch move
+    /// appends a reflog row. The checkpoint commit is authoritative, so the
+    /// update is not fast-forward-only. A branch-verb failure after the
+    /// atomic commit still reports `Err`, with the in-memory HEAD mirroring
+    /// the durably advanced HEAD.
     pub fn commit_checkpoint(
         &mut self,
         rationale: Rationale,
@@ -417,16 +432,45 @@ impl WheelKernel {
             summary: "cognitive checkpoint".to_string(),
             timestamp_ms: now_ms,
         };
-        let ref_names: Vec<&str> = match branch {
-            Some(b) => vec![b, "HEAD"],
-            None => vec!["HEAD"],
+        let Some(branch_name) = branch else {
+            let checkpoint = self
+                .content_store
+                .commit_checkpoint_atomic(&tree_bytes, now_ms, draft, &["HEAD"], now_ms)
+                .map_err(FacadeError::from)?;
+            self.head_checkpoint = Some(checkpoint.id);
+            return Ok(checkpoint);
         };
+        // Validate the namespace before any write so a bad branch name fails
+        // without persisting a checkpoint or advancing HEAD.
+        let parsed = BranchName::parse(branch_name).map_err(FacadeError::from)?;
         let checkpoint = self
             .content_store
-            .commit_checkpoint_atomic(&tree_bytes, now_ms, draft, &ref_names, now_ms)
+            .commit_checkpoint_atomic(&tree_bytes, now_ms, draft, &["HEAD"], now_ms)
             .map_err(FacadeError::from)?;
+        let branch_result = match self
+            .content_store
+            .get_branch(parsed.as_str())
+            .map_err(FacadeError::from)?
+        {
+            Some(_) => self.content_store.update_branch(
+                parsed.as_str(),
+                &checkpoint.id,
+                WHEEL_COMMIT_REFLOG_REASON,
+                WHEEL_COMMIT_REFLOG_ACTOR,
+                now_ms,
+                false,
+            ),
+            None => self.content_store.create_branch(
+                parsed.as_str(),
+                &checkpoint.id,
+                WHEEL_COMMIT_REFLOG_REASON,
+                WHEEL_COMMIT_REFLOG_ACTOR,
+                now_ms,
+            ),
+        };
+        // Durable HEAD already advanced; mirror it before reporting.
         self.head_checkpoint = Some(checkpoint.id);
-
+        branch_result.map_err(FacadeError::from)?;
         Ok(checkpoint)
     }
 
@@ -452,6 +496,88 @@ impl WheelKernel {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    // --- Typed Branch Verbs & Reflog (refs-plane v1, AI-0180) ---
+    //
+    // Thin passthroughs over the [`ContentStore`] refs-plane verbs: no logic
+    // lives here, only error mapping into [`FacadeError`].
+
+    /// Create a branch pointing at an existing checkpoint (no force).
+    pub fn create_branch(
+        &mut self,
+        name: &str,
+        target: &ContentHash,
+        reason: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<BranchName, FacadeError> {
+        self.content_store
+            .create_branch(name, target, reason, actor, now_ms)
+            .map_err(FacadeError::from)
+    }
+
+    /// Move a branch to an existing checkpoint, recording history.
+    pub fn update_branch(
+        &mut self,
+        name: &str,
+        target: &ContentHash,
+        reason: &str,
+        actor: &str,
+        now_ms: u64,
+        fast_forward_only: bool,
+    ) -> Result<BranchName, FacadeError> {
+        self.content_store
+            .update_branch(name, target, reason, actor, now_ms, fast_forward_only)
+            .map_err(FacadeError::from)
+    }
+
+    /// Delete a branch, leaving a tombstone reflog row. Returns the deleted tip.
+    pub fn delete_branch(
+        &mut self,
+        name: &str,
+        reason: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<ContentHash, FacadeError> {
+        self.content_store
+            .delete_branch(name, reason, actor, now_ms)
+            .map_err(FacadeError::from)
+    }
+
+    /// Atomically rename a branch. Returns the moved tip.
+    pub fn rename_branch(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        reason: &str,
+        actor: &str,
+        now_ms: u64,
+    ) -> Result<ContentHash, FacadeError> {
+        self.content_store
+            .rename_branch(old_name, new_name, reason, actor, now_ms)
+            .map_err(FacadeError::from)
+    }
+
+    /// List all branches (`heads/` only), ordered by name.
+    pub fn list_branches(&self) -> Result<Vec<(BranchName, ContentHash)>, FacadeError> {
+        self.content_store
+            .list_branches()
+            .map_err(FacadeError::from)
+    }
+
+    /// Get a branch tip (`heads/` only). Missing branches return `None`.
+    pub fn get_branch(&self, name: &str) -> Result<Option<ContentHash>, FacadeError> {
+        self.content_store
+            .get_branch(name)
+            .map_err(FacadeError::from)
+    }
+
+    /// Read reflog history for any well-formed ref name, newest-first.
+    pub fn read_reflog(&self, name: &str, limit: usize) -> Result<Vec<ReflogEntry>, FacadeError> {
+        self.content_store
+            .read_reflog(name, limit)
+            .map_err(FacadeError::from)
     }
 
     // --- Action Protocol & Auto-Spillover Operations ---
