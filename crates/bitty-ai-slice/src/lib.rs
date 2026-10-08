@@ -67,6 +67,7 @@ pub mod journal_prototype;
 pub mod live_host;
 pub mod local_provider;
 pub mod network_adapter;
+pub mod session_refs;
 pub mod snapshot_ingest;
 pub mod task_dag;
 pub mod wheel_bridge;
@@ -107,6 +108,10 @@ pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
 pub use network_adapter::{
     AdapterError, NetworkConsumerAdapter, NetworkConsumerAdapterConfig, RecordingNetworkService,
+};
+pub use session_refs::{
+    BranchName, MAX_REFLOG_ACTOR_BYTES, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, RefError,
+    ReflogEntry,
 };
 pub use snapshot_ingest::{
     COMPILED_DELTA_MARKER, COMPILED_DELTA_PROVIDER, CompiledTurnIngestError,
