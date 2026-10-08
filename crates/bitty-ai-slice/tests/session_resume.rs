@@ -305,6 +305,96 @@ fn session_list_is_global_and_ordered() {
 }
 
 #[test]
+fn dirty_working_tree_refuses_resume_with_zero_writes() {
+    let mut kernel = WheelKernel::open_in_memory().expect("open");
+    kernel.put_slot("w.txt", b"work", 1000).expect("put slot");
+    kernel
+        .commit_checkpoint(Rationale::new("Work", "State"), Some("heads/main"), 1010)
+        .expect("commit");
+    kernel
+        .new_session("sess-dirty-1", "heads/main", 1020)
+        .expect("bind session");
+    // An uncommitted slot dirties the tree: both resume paths (fenced
+    // session id and unfenced branch) must refuse before any store write,
+    // matching the merge_commit / GC dirty gates.
+    kernel
+        .put_slot("draft.txt", b"uncommitted draft", 1030)
+        .expect("put slot");
+    for refused in ["sess-dirty-1", "heads/main"] {
+        let err = kernel
+            .resume_session(refused, 2, 2000)
+            .expect_err("dirty resume must refuse");
+        assert!(
+            err.to_string().contains("uncommitted"),
+            "dirty refusal must name itself, got: {err}"
+        );
+    }
+    // The uncommitted slot survives the refusals and the session row never
+    // moved: no epoch was consumed, so the same claim stays admissible.
+    let slot = kernel
+        .get_slot("draft.txt")
+        .expect("slot read")
+        .expect("dirty slot preserved across refused resumes");
+    assert_eq!(slot.as_slice(), b"uncommitted draft");
+    let row = kernel
+        .list_sessions()
+        .expect("list")
+        .into_iter()
+        .find(|binding| binding.session_id.as_str() == "sess-dirty-1")
+        .expect("session row present");
+    assert_eq!(
+        row.epoch, 1,
+        "dirty refusal must write nothing to the session row"
+    );
+    // After committing the draft the same claim succeeds.
+    kernel
+        .commit_checkpoint(Rationale::new("Draft", "Flush"), Some("heads/main"), 1040)
+        .expect("commit");
+    let report = kernel
+        .resume_session("sess-dirty-1", 2, 2050)
+        .expect("resume once clean");
+    assert_eq!(report.fence_token, 2);
+}
+
+#[test]
+fn stale_claim_refusal_leaves_epoch_untouched() {
+    let mut kernel = WheelKernel::open_in_memory().expect("open");
+    kernel.put_slot("w.txt", b"work", 1000).expect("put slot");
+    kernel
+        .commit_checkpoint(Rationale::new("Work", "State"), Some("heads/main"), 1010)
+        .expect("commit");
+    kernel
+        .new_session("sess-fence-2", "heads/main", 1020)
+        .expect("bind session");
+    let first = kernel
+        .resume_session("sess-fence-2", 2, 2000)
+        .expect("first resume");
+    assert_eq!(first.fence_token, 2);
+    // A stale claim refuses and must not move the row: the admitted epoch
+    // stays 2, so a greater claim still advances afterwards.
+    let err = kernel
+        .resume_session("sess-fence-2", 2, 2010)
+        .expect_err("stale claim must refuse");
+    assert!(
+        err.to_string().contains("stale"),
+        "stale refusal must name itself, got: {err}"
+    );
+    let row = kernel
+        .list_sessions()
+        .expect("list")
+        .into_iter()
+        .find(|binding| binding.session_id.as_str() == "sess-fence-2")
+        .expect("session row present");
+    assert_eq!(
+        row.epoch, 2,
+        "stale refusal must write nothing to the session row"
+    );
+    let advanced = kernel
+        .resume_session("sess-fence-2", 3, 2020)
+        .expect("greater claim resumes");
+    assert_eq!(advanced.fence_token, 3);
+}
+#[test]
 fn bridge_session_verbs_round_trip_with_strict_types() {
     let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
     // Setup through the kernel: task + slot + commit so generation is live.

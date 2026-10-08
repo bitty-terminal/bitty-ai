@@ -737,6 +737,12 @@ impl WheelKernel {
     /// admitted). Resume is read-only apart from the session-path epoch
     /// bump: it never replays tool calls and never re-executes effects.
     ///
+    /// Both paths refuse when the working tree is dirty (zero writes,
+    /// [`FacadeError::Store`] naming `uncommitted`): the gate runs before
+    /// any store write -- including the session-path epoch bump -- so a
+    /// dirty `slot.put` without commit never loses slots to the resume sync,
+    /// matching the `merge_commit` / GC gates.
+    ///
     /// `pending_unknowns` is always empty with `pending_log_absent = true`:
     /// no durable pending tool-call log exists anywhere in this tree (the
     /// runtime pending set is in-memory only), so an honest resume reports
@@ -749,6 +755,15 @@ impl WheelKernel {
         claim_epoch: u64,
         now_ms: u64,
     ) -> Result<ResumeReport, FacadeError> {
+        // Dirty gate first (both paths): a resume sync would blindly
+        // overwrite the in-memory tree, so uncommitted slots refuse before
+        // any store read or write, exactly like `merge_commit` / GC.
+        if self.working_tree_dirty()? {
+            return Err(FacadeError::Store(
+                "resume refused: working tree has uncommitted changes; commit or discard before resuming"
+                    .to_string(),
+            ));
+        }
         // Session namespace and branch namespace are disjoint by
         // construction (session ids never contain `/`, branches always do),
         // so a successful session-id parse selects the session path
@@ -780,6 +795,10 @@ impl WheelKernel {
                 }
             };
             let generation = self.live_task_generation(&checkpoint);
+            // Fallible tree load runs BEFORE the epoch bump: a missing tree
+            // link, missing blob, or undecodable tree refuses here with zero
+            // row writes, so the same claim stays admissible for retry.
+            let tree = self.load_tree_for(&tip)?;
             let advanced = bump_session_epoch(
                 &self.content_store,
                 &id,
@@ -789,7 +808,9 @@ impl WheelKernel {
                 now_ms,
             )
             .map_err(map_session_err)?;
-            self.sync_working_tree_to(&tip)?;
+            // Infallible assignment runs only after the bump succeeds.
+            self.active_tree = tree;
+            self.head_checkpoint = Some(tip);
             return Ok(ResumeReport {
                 session_id: Some(id),
                 branch: advanced.branch,
@@ -879,13 +900,16 @@ impl WheelKernel {
         list_sessions(&self.content_store).map_err(map_session_err)
     }
 
-    /// Sync the in-memory working tree and HEAD pointer to a resumed tip.
+    /// Load and decode the tree blob for a checkpoint tip.
     ///
-    /// Loads the checkpoint's tree blob and decodes it into the active tree
-    /// (fail closed on a missing row, link, blob, or undecodable bytes, same
-    /// shape as `recover`), so the next `commit_checkpoint` continues from
-    /// the resumed lineage instead of forking history off a stale tree.
-    fn sync_working_tree_to(&mut self, tip: &ContentHash) -> Result<(), FacadeError> {
+    /// Fallible half of the resume sync: fails closed on a missing
+    /// checkpoint row, tree link, blob, or undecodable bytes (same shape as
+    /// `recover`). The session resume path calls this BEFORE
+    /// `bump_session_epoch` so tree failures refuse with zero row writes;
+    /// the infallible state assignment then runs only after the bump
+    /// succeeds. [`Self::sync_working_tree_to`] is load-plus-assign for the
+    /// paths (branch resume) that carry no epoch.
+    fn load_tree_for(&self, tip: &ContentHash) -> Result<ContextTree, FacadeError> {
         let checkpoint = match self
             .content_store
             .get_checkpoint(tip)
@@ -912,8 +936,18 @@ impl WheelKernel {
                 "resume sync: checkpoint {tip} tree {tree_hash} blob missing; refusing"
             )));
         };
-        let tree = ContextTree::from_canonical_bytes(&blob_bytes)
-            .map_err(|e| FacadeError::Store(format!("resume sync: tree decode failed: {e}")))?;
+        ContextTree::from_canonical_bytes(&blob_bytes)
+            .map_err(|e| FacadeError::Store(format!("resume sync: tree decode failed: {e}")))
+    }
+
+    /// Sync the in-memory working tree and HEAD pointer to a resumed tip.
+    ///
+    /// Loads the checkpoint's tree blob and decodes it into the active tree
+    /// (fail closed on a missing row, link, blob, or undecodable bytes, same
+    /// shape as `recover`), so the next `commit_checkpoint` continues from
+    /// the resumed lineage instead of forking history off a stale tree.
+    fn sync_working_tree_to(&mut self, tip: &ContentHash) -> Result<(), FacadeError> {
+        let tree = self.load_tree_for(tip)?;
         self.active_tree = tree;
         self.head_checkpoint = Some(*tip);
         Ok(())
