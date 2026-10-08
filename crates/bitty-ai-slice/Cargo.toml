@@ -15,6 +15,9 @@ workspace = true
 
 [dependencies]
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
+# AI-0186 (DEC-0008 step 5): session plane extracted from this crate as a pure
+# move. The dependency direction is slice -> session, never the reverse.
+bitty-ai-session = { path = "../bitty-ai-session" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty", rev = "cfeffa2d8e1387029850940af2b64877dbfbe25f" }
 # CTX-0916 S6 registration (AI-0172, DEC-0100): the slice contributes the AI
 # capability families, role ceilings, and provider-credential adapter against

@@ -1,0 +1,28 @@
+[package]
+name = "bitty-ai-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Session plane: content-addressed store, typed ref verbs, and content hash (AI-0186 decouple step)"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# AI-0186: same pins as the slice manifest these modules moved from (DEC-0008
+# step 5). No new external dependencies; everything here is already in the
+# lockfile. No `bitty-ai-runtime` dep: the moved code needs only std plus
+# these direct dependencies (verified: no `bitty_ai_runtime` imports in the
+# move set), and the runtime stays std-only by invariant.
+hex = { version = "=0.4.3" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151" }
+sha2 = { version = "=0.11.0" }
+# Same `bundled` SQLite profile as the slice (vendored SQLite; default
+# features off drops the wasm-only subtree and the statement cache).
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
