@@ -5,7 +5,8 @@
 //! parseable, the whole-operation timeout stays `1..=MAX_TIMEOUT_MS`, and the
 //! tool allowlist mirrors [`crate::config`] (non-empty, at most 32 entries of
 //! `1..=64` bytes over `[a-zA-Z0-9_.-]`). Custom headers are optional,
-//! bounded, and never echo values into errors or `Debug`.
+//! bounded, `https`-only (never sent over cleartext), and never echo values
+//! into errors or `Debug` (URL query strings are redacted there too).
 //!
 //! The network [`bitty_network_api::NetworkCapability`] grant travels with
 //! the config but is enforced per request by
@@ -87,10 +88,14 @@ fn authority_of(url: &str) -> Option<&str> {
     Some(rest.split(['/', '?', '#', '\\']).next().unwrap_or(""))
 }
 
+/// Whether `url` starts with `http://` (ASCII case-insensitive): cleartext.
+fn is_cleartext_http(url: &str) -> bool {
+    url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://")
+}
+
 /// Whether `url` starts with `http://` or `https://` (ASCII case-insensitive).
 fn has_http_scheme(url: &str) -> bool {
-    (url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://"))
-        || (url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://"))
+    is_cleartext_http(url) || (url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://"))
 }
 
 /// Host slice of `url` (authority minus userinfo and port, brackets honored).
@@ -118,8 +123,9 @@ fn host_of(url: &str) -> &str {
 /// Fail-closed validation ([`RemoteServerConfig::validate`]): `http`/`https`
 /// scheme only, no userinfo, parseable host, timeout `1..=MAX_TIMEOUT_MS`,
 /// non-empty allowlist mirroring [`crate::config`], bounded custom headers
-/// that never override transport-owned names, and a capability grant enforced
-/// pre-contact per request. Every refusal names the violated bound only.
+/// that never override transport-owned names and require `https`, and a
+/// capability grant enforced pre-contact per request. Every refusal names
+/// the violated bound only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RemoteServerConfig {
     /// Server id (`^[a-z][a-z0-9_]*$`, 1..=32 bytes): namespaces sanitized
@@ -131,7 +137,8 @@ pub struct RemoteServerConfig {
     pub timeout_ms: u64,
     /// Raw MCP tool names this server may expose (non-empty, at most 32).
     pub tool_allowlist: Vec<String>,
-    /// Extra HTTP headers (bounded; values are opaque secrets, never logged).
+    /// Extra HTTP headers (https-only, bounded; values are opaque secrets,
+    /// never logged).
     pub headers: Vec<(String, String)>,
     /// Network capability allowlist enforced pre-contact per request
     /// (offline-first deny-all default; zero service calls on deny).
@@ -231,6 +238,16 @@ impl RemoteServerConfig {
                 ));
             }
         }
+        // Custom headers (often `Authorization` secrets) must not ride
+        // cleartext: the capability grant checks host/port/method only, so an
+        // allowlisted `http://` endpoint would otherwise send credentials
+        // observable on the wire. Header-free `http://` (loopback/LAN without
+        // secrets) and headers over `https://` stay legal.
+        if is_cleartext_http(&self.url) && !self.headers.is_empty() {
+            return Err(McpError::invalid_config(
+                "remote custom headers require https",
+            ));
+        }
         Ok(())
     }
 
@@ -251,7 +268,12 @@ impl RemoteServerConfig {
 impl std::fmt::Debug for RemoteServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Rebuild without a derived impl so values can never leak through a
-        // future field addition without touching this site.
+        // future field addition without touching this site. The query string
+        // is redacted first: `?token=...` credentials must never reach logs.
+        let redacted_url = match self.url.split_once('?') {
+            Some((base, _)) => format!("{base}?[redacted]"),
+            None => self.url.clone(),
+        };
         let redacted_headers: Vec<(&str, &str)> = self
             .headers
             .iter()
@@ -261,7 +283,7 @@ impl std::fmt::Debug for RemoteServerConfig {
             .field("id", &self.id)
             .field(
                 "url",
-                &crate::error::bound_error_text(&self.url, MAX_REMOTE_URL_LEN),
+                &crate::error::bound_error_text(&redacted_url, MAX_REMOTE_URL_LEN),
             )
             .field("timeout_ms", &self.timeout_ms)
             .field("tool_allowlist", &self.tool_allowlist)
@@ -382,5 +404,32 @@ mod tests {
             "header value leaked: {rendered}"
         );
         assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn cleartext_http_refuses_custom_headers() {
+        let mut config = valid_config();
+        config.url = "http://mcp.example.com/rpc".to_owned();
+        assert!(config.validate().is_ok(), "header-free http refused");
+        config.headers = vec![("Authorization".to_owned(), "Bearer x".to_owned())];
+        assert!(
+            config.validate().is_err(),
+            "cleartext credential escaped validation"
+        );
+        config.url = "https://mcp.example.com/rpc".to_owned();
+        assert!(config.validate().is_ok(), "https header refused");
+    }
+
+    #[test]
+    fn debug_redacts_url_query() {
+        let mut config = valid_config();
+        config.url = "https://mcp.example.com/rpc?token=canary-7d2b".to_owned();
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("canary"), "query leaked: {rendered}");
+        assert!(
+            rendered.contains("https://mcp.example.com/rpc"),
+            "path lost"
+        );
+        assert!(rendered.contains("?[redacted]"), "query marker missing");
     }
 }
