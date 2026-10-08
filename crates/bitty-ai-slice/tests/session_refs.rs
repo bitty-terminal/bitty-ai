@@ -7,6 +7,8 @@ use bitty_ai_slice::content_store::{
 };
 use bitty_ai_slice::session_refs::{
     BranchName, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, RefError, ReflogEntry,
+    commit_checkpoint_with_branch, create_branch, delete_branch, get_branch, list_branches,
+    read_reflog, rename_branch, update_branch,
 };
 use bitty_ai_slice::wheel_kernel::WheelKernel;
 
@@ -37,20 +39,33 @@ fn branch_full_lifecycle_with_reflog() {
     let second = commit_linear(&mut store, vec![first], "second", 2000);
 
     // Create.
-    let branch = store
-        .create_branch("heads/main", &first, "create main", "alice", 1100)
-        .expect("create");
+    let branch = create_branch(
+        &mut store,
+        "heads/main",
+        &first,
+        "create main",
+        "alice",
+        1100,
+    )
+    .expect("create");
     assert_eq!(branch.as_str(), "heads/main");
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(first));
+    assert_eq!(get_branch(&store, "heads/main").expect("get"), Some(first));
 
     // Update.
-    store
-        .update_branch("heads/main", &second, "forward main", "bob", 2100, false)
-        .expect("update");
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(second));
+    update_branch(
+        &mut store,
+        "heads/main",
+        &second,
+        "forward main",
+        "bob",
+        2100,
+        false,
+    )
+    .expect("update");
+    assert_eq!(get_branch(&store, "heads/main").expect("get"), Some(second));
 
     // Reflog so far: newest-first [update, create].
-    let rows = store.read_reflog("heads/main", 10).expect("read");
+    let rows = read_reflog(&store, "heads/main", 10).expect("read");
     assert_eq!(rows.len(), 2);
     assert!(rows[0].seq > rows[1].seq);
     assert_eq!(
@@ -72,17 +87,22 @@ fn branch_full_lifecycle_with_reflog() {
     assert_eq!(rows[0].at_ms, 2100);
 
     // Rename: atomic delete + create + two rows.
-    let moved = store
-        .rename_branch("heads/main", "heads/next", "rename", "carol", 3000)
-        .expect("rename");
+    let moved = rename_branch(
+        &mut store,
+        "heads/main",
+        "heads/next",
+        "rename",
+        "carol",
+        3000,
+    )
+    .expect("rename");
     assert_eq!(moved, second);
-    assert_eq!(store.get_branch("heads/main").expect("get old"), None);
+    assert_eq!(get_branch(&store, "heads/main").expect("get old"), None);
     assert_eq!(
-        store.get_branch("heads/next").expect("get new"),
+        get_branch(&store, "heads/next").expect("get new"),
         Some(second)
     );
-    let names: Vec<String> = store
-        .list_branches()
+    let names: Vec<String> = list_branches(&store)
         .expect("list")
         .into_iter()
         .map(|(name, _)| name.to_string())
@@ -90,7 +110,7 @@ fn branch_full_lifecycle_with_reflog() {
     assert_eq!(names, vec!["heads/next".to_string()]);
 
     // Old-name history keeps the tombstone; new-name history starts fresh.
-    let old_rows = store.read_reflog("heads/main", 10).expect("read old");
+    let old_rows = read_reflog(&store, "heads/main", 10).expect("read old");
     assert_eq!(old_rows.len(), 3);
     let tombstone = &old_rows[0];
     assert_eq!(tombstone.old_hash, Some(second));
@@ -98,19 +118,17 @@ fn branch_full_lifecycle_with_reflog() {
     assert_eq!(tombstone.reason, "rename");
     assert_eq!(tombstone.actor, "carol");
     assert_eq!(tombstone.at_ms, 3000);
-    let new_rows = store.read_reflog("heads/next", 10).expect("read new");
+    let new_rows = read_reflog(&store, "heads/next", 10).expect("read new");
     assert_eq!(new_rows.len(), 1);
     assert_eq!(new_rows[0].old_hash, None);
     assert_eq!(new_rows[0].new_hash, second);
 
     // Delete: typed tip return, branch gone, tombstone appended.
-    let deleted = store
-        .delete_branch("heads/next", "retire", "dave", 4000)
-        .expect("delete");
+    let deleted = delete_branch(&mut store, "heads/next", "retire", "dave", 4000).expect("delete");
     assert_eq!(deleted, second);
-    assert_eq!(store.get_branch("heads/next").expect("get"), None);
-    assert!(store.list_branches().expect("list").is_empty());
-    let retired = store.read_reflog("heads/next", 10).expect("read retired");
+    assert_eq!(get_branch(&store, "heads/next").expect("get"), None);
+    assert!(list_branches(&store).expect("list").is_empty());
+    let retired = read_reflog(&store, "heads/next", 10).expect("read retired");
     assert_eq!(retired.len(), 2);
     assert_eq!(retired[0].old_hash, Some(second));
     assert_eq!(retired[0].new_hash, ContentHash::from_bytes([0u8; 32]));
@@ -125,23 +143,18 @@ fn branch_namespace_and_existence_refusals_are_typed() {
     // Bare names are invalid; HEAD is protected; tags are reserved.
     for bad in ["main", "", "heads/", "heads"] {
         assert_eq!(
-            store
-                .create_branch(bad, &tip, "r", "a", 1000)
-                .expect_err("bare must fail"),
+            create_branch(&mut store, bad, &tip, "r", "a", 1000).expect_err("bare must fail"),
             RefError::InvalidName,
             "name {bad:?} must be InvalidName"
         );
     }
     assert_eq!(
-        store
-            .create_branch("HEAD", &tip, "r", "a", 1000)
-            .expect_err("HEAD must fail"),
+        create_branch(&mut store, "HEAD", &tip, "r", "a", 1000).expect_err("HEAD must fail"),
         RefError::ProtectedHead
     );
     for reserved in ["tags/v1", "refs/heads/main", "other/ns"] {
         assert_eq!(
-            store
-                .create_branch(reserved, &tip, "r", "a", 1000)
+            create_branch(&mut store, reserved, &tip, "r", "a", 1000)
                 .expect_err("reserved must fail"),
             RefError::ReservedNamespace,
             "name {reserved:?} must be ReservedNamespace"
@@ -149,74 +162,61 @@ fn branch_namespace_and_existence_refusals_are_typed() {
     }
     // Namespace rules apply to reads and updates too.
     assert_eq!(
-        store.get_branch("HEAD").expect_err("HEAD get"),
+        get_branch(&store, "HEAD").expect_err("HEAD get"),
         RefError::ProtectedHead
     );
     assert_eq!(
-        store
-            .update_branch("tags/v1", &tip, "r", "a", 1000, false)
-            .expect_err("tags update"),
+        update_branch(&mut store, "tags/v1", &tip, "r", "a", 1000, false).expect_err("tags update"),
         RefError::ReservedNamespace
     );
     assert_eq!(
-        store
-            .delete_branch("HEAD", "r", "a", 1000)
-            .expect_err("HEAD delete"),
+        delete_branch(&mut store, "HEAD", "r", "a", 1000).expect_err("HEAD delete"),
         RefError::ProtectedHead
     );
 
     // Missing targets reuse MissingTarget.
-    let err = store
-        .create_branch("heads/main", &missing, "r", "a", 1000)
+    let err = create_branch(&mut store, "heads/main", &missing, "r", "a", 1000)
         .expect_err("missing target");
     assert_eq!(err, RefError::MissingTarget(missing));
 
     // Duplicate create, missing update/delete/rename.
-    store
-        .create_branch("heads/main", &tip, "create", "alice", 1000)
-        .expect("create");
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
     assert_eq!(
-        store
-            .create_branch("heads/main", &tip, "again", "alice", 1001)
+        create_branch(&mut store, "heads/main", &tip, "again", "alice", 1001)
             .expect_err("duplicate"),
         RefError::AlreadyExists
     );
     assert_eq!(
-        store
-            .update_branch("heads/gone", &tip, "r", "a", 1000, false)
+        update_branch(&mut store, "heads/gone", &tip, "r", "a", 1000, false)
             .expect_err("missing update"),
         RefError::NotFound
     );
     assert_eq!(
-        store
-            .delete_branch("heads/gone", "r", "a", 1000)
-            .expect_err("missing delete"),
+        delete_branch(&mut store, "heads/gone", "r", "a", 1000).expect_err("missing delete"),
         RefError::NotFound
     );
     assert_eq!(
-        store
-            .rename_branch("heads/gone", "heads/new", "r", "a", 1000)
+        rename_branch(&mut store, "heads/gone", "heads/new", "r", "a", 1000)
             .expect_err("missing rename source"),
         RefError::NotFound
     );
     assert_eq!(
-        store
-            .rename_branch("heads/main", "heads/main", "r", "a", 1000)
+        rename_branch(&mut store, "heads/main", "heads/main", "r", "a", 1000)
             .expect_err("self rename"),
         RefError::InvalidName
     );
-    store
-        .create_branch("heads/other", &tip, "create", "alice", 1000)
-        .expect("second branch");
+    create_branch(&mut store, "heads/other", &tip, "create", "alice", 1000).expect("second branch");
     assert_eq!(
-        store
-            .rename_branch("heads/main", "heads/other", "r", "a", 1000)
+        rename_branch(&mut store, "heads/main", "heads/other", "r", "a", 1000)
             .expect_err("rename onto taken name"),
         RefError::AlreadyExists
     );
     // Failed renames leave both sides untouched with no extra rows.
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(tip));
-    assert_eq!(store.read_reflog("heads/main", 10).expect("read").len(), 1);
+    assert_eq!(get_branch(&store, "heads/main").expect("get"), Some(tip));
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
+        1
+    );
 }
 
 #[test]
@@ -227,68 +227,94 @@ fn fast_forward_only_refuses_divergence_and_accepts_descendants() {
     let fork_b = commit_linear(&mut store, vec![root], "fork-b", 1200);
     let child_a = commit_linear(&mut store, vec![fork_a], "child-a", 1300);
 
-    store
-        .create_branch("heads/main", &fork_a, "create", "alice", 1400)
-        .expect("create");
+    create_branch(&mut store, "heads/main", &fork_a, "create", "alice", 1400).expect("create");
 
     // Divergent target with ff-only: refused, ref and reflog untouched.
-    let err = store
-        .update_branch("heads/main", &fork_b, "diverge", "bob", 1500, true)
-        .expect_err("divergent ff-only update must fail");
+    let err = update_branch(
+        &mut store,
+        "heads/main",
+        &fork_b,
+        "diverge",
+        "bob",
+        1500,
+        true,
+    )
+    .expect_err("divergent ff-only update must fail");
     assert!(
         matches!(err, RefError::Storage(_)),
         "ff refusal is a store-level refusal, got {err:?}"
     );
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(fork_a));
-    assert_eq!(store.read_reflog("heads/main", 10).expect("read").len(), 1);
+    assert_eq!(get_branch(&store, "heads/main").expect("get"), Some(fork_a));
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
+        1
+    );
 
     // Descendant with ff-only: accepted with a history row.
-    store
-        .update_branch("heads/main", &child_a, "forward", "bob", 1600, true)
-        .expect("descendant ff-only update");
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(child_a));
-    let rows = store.read_reflog("heads/main", 10).expect("read");
+    update_branch(
+        &mut store,
+        "heads/main",
+        &child_a,
+        "forward",
+        "bob",
+        1600,
+        true,
+    )
+    .expect("descendant ff-only update");
+    assert_eq!(
+        get_branch(&store, "heads/main").expect("get"),
+        Some(child_a)
+    );
+    let rows = read_reflog(&store, "heads/main", 10).expect("read");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].old_hash, Some(fork_a));
     assert_eq!(rows[0].new_hash, child_a);
 
     // Same call without ff-only allows the divergent move.
-    store
-        .update_branch("heads/main", &fork_b, "force", "bob", 1700, false)
-        .expect("non-ff update with flag off");
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(fork_b));
+    update_branch(
+        &mut store,
+        "heads/main",
+        &fork_b,
+        "force",
+        "bob",
+        1700,
+        false,
+    )
+    .expect("non-ff update with flag off");
+    assert_eq!(get_branch(&store, "heads/main").expect("get"), Some(fork_b));
 }
 
 #[test]
 fn reflog_read_is_bounded_newest_first() {
     let mut store = ContentStore::open_in_memory().expect("open");
     let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
-    store
-        .create_branch("heads/main", &tip, "create", "alice", 1000)
-        .expect("create");
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
     for i in 1..=4 {
-        store
-            .update_branch(
-                "heads/main",
-                &tip,
-                &format!("move {i}"),
-                "bob",
-                1000 + i as u64,
-                false,
-            )
-            .expect("update");
+        update_branch(
+            &mut store,
+            "heads/main",
+            &tip,
+            &format!("move {i}"),
+            "bob",
+            1000 + i as u64,
+            false,
+        )
+        .expect("update");
     }
     // Five rows total; limit 2 returns the two newest.
-    let capped = store.read_reflog("heads/main", 2).expect("capped read");
+    let capped = read_reflog(&store, "heads/main", 2).expect("capped read");
     assert_eq!(capped.len(), 2);
     assert_eq!(capped[0].reason, "move 4");
     assert_eq!(capped[1].reason, "move 3");
     assert!(capped[0].seq > capped[1].seq);
     // Empty and unknown names read back empty (no error).
-    assert!(store.read_reflog("heads/main", 0).expect("zero").is_empty());
     assert!(
-        store
-            .read_reflog("heads/never-created", 10)
+        read_reflog(&store, "heads/main", 0)
+            .expect("zero")
+            .is_empty()
+    );
+    assert!(
+        read_reflog(&store, "heads/never-created", 10)
             .expect("unknown")
             .is_empty()
     );
@@ -298,18 +324,21 @@ fn reflog_read_is_bounded_newest_first() {
 fn reflog_read_is_capped_at_the_hard_limit() {
     let mut store = ContentStore::open_in_memory().expect("open");
     let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
-    store
-        .create_branch("heads/main", &tip, "create", "alice", 1000)
-        .expect("create");
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
     for i in 1..=(MAX_REFLOG_READ_LIMIT as u64 + 5) {
-        store
-            .update_branch("heads/main", &tip, "tick", "bob", 1000 + i, false)
-            .expect("update");
+        update_branch(
+            &mut store,
+            "heads/main",
+            &tip,
+            "tick",
+            "bob",
+            1000 + i,
+            false,
+        )
+        .expect("update");
     }
     // An unbounded request still returns at most the hard cap, newest-first.
-    let rows = store
-        .read_reflog("heads/main", usize::MAX)
-        .expect("huge limit");
+    let rows = read_reflog(&store, "heads/main", usize::MAX).expect("huge limit");
     assert_eq!(rows.len(), MAX_REFLOG_READ_LIMIT);
     assert!(rows.windows(2).all(|pair| pair[0].seq > pair[1].seq));
 }
@@ -460,13 +489,15 @@ fn legacy_store_without_reflog_migrates() {
     legacy_four_table_db(&db_path);
 
     let mut store = ContentStore::open(&db_path).expect("legacy store migrates");
-    assert!(store.list_branches().expect("list").is_empty());
+    assert!(list_branches(&store).expect("list").is_empty());
     // The migrated store records history like any other.
     let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
-    store
-        .create_branch("heads/main", &tip, "create", "alice", 1000)
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000)
         .expect("create after migrate");
-    assert_eq!(store.read_reflog("heads/main", 10).expect("read").len(), 1);
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
+        1
+    );
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -566,23 +597,26 @@ fn commit_with_branch_rolls_back_head_branch_reflog_together() {
         summary: "v1".to_string(),
         timestamp_ms: 1000,
     };
-    let first = store
-        .commit_checkpoint_with_branch(
-            tree_v1,
-            1000,
-            draft_v1,
-            "heads/main",
-            "init",
-            "tester",
-            1000,
-        )
-        .expect("first commit");
+    let first = commit_checkpoint_with_branch(
+        &mut store,
+        tree_v1,
+        1000,
+        draft_v1,
+        "heads/main",
+        "init",
+        "tester",
+        1000,
+    )
+    .expect("first commit");
     assert_eq!(store.get_ref("HEAD").expect("head"), Some(first.id));
     assert_eq!(
-        store.get_branch("heads/main").expect("branch"),
+        get_branch(&store, "heads/main").expect("branch"),
         Some(first.id)
     );
-    assert_eq!(store.read_reflog("heads/main", 10).expect("read").len(), 1);
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
+        1
+    );
 
     // Oversize reason fails inside the same transaction: HEAD, branch, blob,
     // checkpoint, and reflog must all roll back together.
@@ -597,17 +631,17 @@ fn commit_with_branch_rolls_back_head_branch_reflog_together() {
         timestamp_ms: 2000,
     };
     let long_reason = "r".repeat(MAX_REFLOG_REASON_BYTES + 1);
-    let err = store
-        .commit_checkpoint_with_branch(
-            tree_v2,
-            2000,
-            draft_v2,
-            "heads/main",
-            &long_reason,
-            "tester",
-            2000,
-        )
-        .expect_err("oversize reason must fail the whole commit");
+    let err = commit_checkpoint_with_branch(
+        &mut store,
+        tree_v2,
+        2000,
+        draft_v2,
+        "heads/main",
+        &long_reason,
+        "tester",
+        2000,
+    )
+    .expect_err("oversize reason must fail the whole commit");
     assert_eq!(err, RefError::InvalidName);
     assert_eq!(
         store.get_ref("HEAD").expect("head"),
@@ -615,12 +649,12 @@ fn commit_with_branch_rolls_back_head_branch_reflog_together() {
         "failed commit must not advance HEAD"
     );
     assert_eq!(
-        store.get_branch("heads/main").expect("branch"),
+        get_branch(&store, "heads/main").expect("branch"),
         Some(first.id),
         "failed commit must not move the branch"
     );
     assert_eq!(
-        store.read_reflog("heads/main", 10).expect("read").len(),
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
         1,
         "failed commit must append no reflog row"
     );
@@ -639,18 +673,30 @@ fn ff_only_refuses_after_concurrent_branch_move() {
     let fork_b = commit_linear(&mut store, vec![root], "fork-b", 1200);
     let child_a = commit_linear(&mut store, vec![fork_a], "child-a", 1300);
 
-    store
-        .create_branch("heads/main", &fork_a, "create", "alice", 1400)
-        .expect("create");
+    create_branch(&mut store, "heads/main", &fork_a, "create", "alice", 1400).expect("create");
     // Simulate a concurrent writer moving the tip between the pre-read and
     // the write transaction (another handle/path): the stale fast-forward
     // attempt below must be refused.
-    store
-        .update_branch("heads/main", &fork_b, "concurrent", "mallory", 1450, false)
-        .expect("concurrent move");
-    let err = store
-        .update_branch("heads/main", &child_a, "stale ff", "bob", 1500, true)
-        .expect_err("stale ff-only update must fail");
+    update_branch(
+        &mut store,
+        "heads/main",
+        &fork_b,
+        "concurrent",
+        "mallory",
+        1450,
+        false,
+    )
+    .expect("concurrent move");
+    let err = update_branch(
+        &mut store,
+        "heads/main",
+        &child_a,
+        "stale ff",
+        "bob",
+        1500,
+        true,
+    )
+    .expect_err("stale ff-only update must fail");
     assert!(
         matches!(err, RefError::Storage(_)),
         "stale refusal is store-level, got {err:?}"
@@ -659,9 +705,9 @@ fn ff_only_refuses_after_concurrent_branch_move() {
         err.to_string().contains("non-fast-forward"),
         "stale refusal must mention non-fast-forward, got {err}"
     );
-    assert_eq!(store.get_branch("heads/main").expect("get"), Some(fork_b));
+    assert_eq!(get_branch(&store, "heads/main").expect("get"), Some(fork_b));
     assert_eq!(
-        store.read_reflog("heads/main", 10).expect("read").len(),
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
         2,
         "failed stale update must append no reflog row"
     );
