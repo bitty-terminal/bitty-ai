@@ -16,10 +16,13 @@
 //!
 //! 1. Validate `target_branch` with [`BranchName`][crate::session_refs::BranchName]
 //!    parsing (zero writes).
-//! 2. Optional [`TaskEngine`] generation fence: when
+//! 2. Optional generation fence via [`TaskGenerationLookup`]: when
 //!    [`MergeInput::expected_task_generation`] is `Some`, the live generation
-//!    of [`MergeInput::task_id`] must equal the supplied value, else
-//!    [`MergeError::StaleGeneration`] (zero writes).
+//!    for [`MergeInput::task_id`] read through the lookup must equal the
+//!    supplied value, else [`MergeError::StaleGeneration`] (zero writes).
+//!    The lookup is a trait so this module never names the task control
+//!    plane: the [`TaskEngine`][crate::task_dag::TaskEngine] implementation
+//!    lives in `task_dag.rs` (DEC-0008 step 4, AI-0185).
 //! 3. Strict LCA via [`strict_merge_base`]: full ancestor-set intersection
 //!    plus minimal-element filter. No common ancestor yields
 //!    [`MergeError::NoCommonAncestor`]; more than one minimal common ancestor
@@ -28,11 +31,16 @@
 //!    but strict instead of first-found.
 //! 4. Materialize the three trees (base, ours, theirs) from durable storage
 //!    only: `get_checkpoint` -> `tree_hash` -> `get_blob` (digest-verified) ->
-//!    [`ContextTree::from_canonical_bytes`][crate::context_compiler::ContextTree::from_canonical_bytes].
+//!    [`ContextTreeMerge::decode_canonical`][ContextTreeMerge::decode_canonical]
+//!    (implemented for
+//!    [`ContextTree`][crate::context_compiler::ContextTree] in
+//!    `context_compiler.rs`; DEC-0008 step 4 keeps the codec behind that seam
+//!    instead of moving it to `bitty-ai-runtime` — see the trait docs for the
+//!    rejected-move evidence).
 //!    An absent checkpoint row or blob row is [`MergeError::MissingObject`];
 //!    an absent `tree_hash` link, a digest mismatch, or undecodable tree bytes
 //!    is [`MergeError::Corrupt`].
-//! 5. [`ContextTree::merge_3way`][crate::context_compiler::ContextTree::merge_3way]:
+//! 5. [`ContextTreeMerge::merge_trees`][ContextTreeMerge::merge_trees]:
 //!    any slot conflict returns [`MergeError::Conflicts`] with zero writes.
 //! 6. Clean merges persist one [`Checkpoint`] with `parents == [ours, theirs]`
 //!    through
@@ -74,8 +82,8 @@
 //! example [`WheelKernel::put_slot`][crate::wheel_kernel::WheelKernel::put_slot]),
 //! plus transitively every entry of each nested tree named via `EntryKind::Tree`
 //! up to an explicit depth cap: GC materializes each surviving tree blob via
-//! [`ContextTree::from_canonical_bytes`][crate::context_compiler::ContextTree::from_canonical_bytes]
-//! and retains the union of all entry hashes, recursing into nested tree
+//!    [`ContextTreeMerge::decode_canonical`][ContextTreeMerge::decode_canonical]
+//!    and retains the union of all entry hashes, recursing into nested tree
 //! blobs. A surviving checkpoint with a missing `tree_hash` blob row, a digest
 //! mismatch, undecodable tree bytes, an undecodable nested tree blob, or a
 //! nesting chain deeper than the cap is [`MergeError::Corrupt`] (fail closed,
@@ -128,10 +136,111 @@ use rusqlite::params;
 
 use crate::content_hash::ContentHash;
 use crate::content_store::{Checkpoint, CheckpointDraft, ContentStore, ContentStoreError};
-use crate::context_compiler::{ContextTree, EntryKind, SlotConflict};
+use crate::context_compiler::{ContextTree, SlotConflict, TreeMergeResult};
 use crate::facade::FacadeError;
 use crate::session_refs::{BranchName, RefError, commit_checkpoint_with_branch};
-use crate::task_dag::{TaskEngine, TaskEngineError, TaskId};
+
+/// Generation-fence lookup over the task control plane (AI-0185, DEC-0008
+/// step 4).
+///
+/// This trait is the first of the two staying edges abstracted out of
+/// `merge.rs`: [`merge_commit`] reads the live generation for
+/// [`MergeInput::task_id`] only through this seam, so this module never
+/// imports the task DAG. The [`TaskEngine`][crate::task_dag::TaskEngine]
+/// implementation lives in `task_dag.rs` (the edge direction is inverted on
+/// purpose: `task_dag` depends on this seam, not the reverse), and the
+/// merge tests keep passing the real engine because it implements this
+/// trait (`&TaskEngine` coerces to `&dyn TaskGenerationLookup`).
+///
+/// The signature is `&str`-keyed (not `&TaskId`) so callers need no task-DAG
+/// type, and it returns `Result<u64, MergeError>` (not `Option<u64>`) so the
+/// historical error mapping is preserved exactly: unknown task is
+/// [`MergeError::NotFound`], malformed id is [`MergeError::InvalidName`],
+/// and storage or corrupt control-plane state stays [`MergeError::Storage`]
+/// or [`MergeError::Corrupt`]. Collapsing those into `None` would report a
+/// corrupt store as "task not found": an observable behavior change this
+/// pure refactor must not make.
+pub trait TaskGenerationLookup {
+    /// Return the live generation for `task_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MergeError::NotFound`] for an unknown task,
+    /// [`MergeError::InvalidName`] for a malformed id, and
+    /// [`MergeError::Storage`] or [`MergeError::Corrupt`] for control-plane
+    /// failures, matching the pre-trait `merge_commit` fence exactly.
+    fn task_generation(&self, task_id: &str) -> Result<u64, MergeError>;
+}
+
+/// Canonical-codec plus 3-way-merge seam over context trees (AI-0185,
+/// DEC-0008 step 4).
+///
+/// This trait is the second staying edge. [`merge_commit`] decodes,
+/// merges, and encodes trees only through this seam, and GC traversal
+/// reads slot-payload references only through
+/// [`slot_payload_refs`][ContextTreeMerge::slot_payload_refs]; the inherent
+/// [`ContextTree`][crate::context_compiler::ContextTree] methods are called
+/// solely by the `ContextTree` implementation in `context_compiler.rs`.
+///
+/// ## Why a trait instead of the `bitty-ai-runtime` move
+///
+/// `ContextTree::merge_3way` itself is pure (three trees in, merged tree
+/// plus conflicts out; no store or engine I/O — verified by reading
+/// `context_compiler.rs`: the function touches only the three `entries`
+/// maps). Its code path is std-only in logic but NOT in dependencies, so
+/// the type cannot move to the std-only zero-dependency `bitty-ai-runtime`
+/// without breaking that invariant (verified in this worktree):
+///
+/// - `TreeEntry`, `ContextTree`, and `EntryKind` derive serde
+///   `Serialize`/`Deserialize` (`use serde::{Deserialize, Serialize}` in
+///   `context_compiler.rs`) — moving them adds a `serde` dependency.
+/// - [`CompilerError`][crate::context_compiler::CompilerError] carries
+///   `Serialization(serde_json::Error)` with a `From<serde_json::Error>`
+///   impl — moving the error adds a `serde_json` dependency.
+/// - Every tree entry holds a [`ContentHash`][crate::content_hash::ContentHash],
+///   which needs `sha2` (digest), `hex` (rendering/parsing), and `serde`
+///   (hex-string rows); AI-0184 deliberately kept it a slice-internal leaf
+///   for exactly this reason (see `content_hash.rs`: moving it forces the
+///   runtime to gain those three dependencies for no behavioral gain).
+/// - The home module itself imports `content_store::Checkpoint` and
+///   `task_dag::TaskNode` for `ContextCompiler`, so even the module couples
+///   to the store and task planes.
+///
+/// The move would therefore add four dependencies (`serde`, `serde_json`,
+/// `sha2`, `hex`) to a crate whose manifest is verified zero-dependency
+/// (`crates/bitty-ai-runtime/Cargo.toml` lists no `[dependencies]` entries)
+/// under the task's no-new-deps constraint. [`decode_canonical`][ContextTreeMerge::decode_canonical]
+/// travels with the merge behind the same seam (consistent choice):
+/// `materialize_tree` and the GC nested-tree walk decode through it, so no
+/// `merge.rs` production path calls `from_canonical_bytes` directly.
+///
+/// Residual coupling after this step is type-only and stated at
+/// [`merge_commit`]: [`ContextTree`][crate::context_compiler::ContextTree]
+/// (materialize helper signature) and
+/// [`SlotConflict`][crate::context_compiler::SlotConflict]
+/// ([`MergeError::Conflicts`] payload, kept byte-identical as public API).
+pub trait ContextTreeMerge: Sized {
+    /// Decode canonical tree bytes; undecodable input fails closed as
+    /// [`MergeError::Corrupt`] (same mapping both pre-trait call sites used).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MergeError::Corrupt`] when `bytes` are not decodable tree
+    /// bytes.
+    fn decode_canonical(bytes: &[u8]) -> Result<Self, MergeError>;
+
+    /// Encode to canonical bytes for the durable merge-commit blob.
+    fn encode_canonical(&self) -> Vec<u8>;
+
+    /// Pure 3-way slot merge of `ours` and `theirs` against `base`:
+    /// conflicts collected, no writes.
+    fn merge_trees(base: &Self, ours: &Self, theirs: &Self) -> TreeMergeResult;
+
+    /// Slot-payload references in canonical order: one `(blob hash,
+    /// is_nested_tree)` pair per entry. GC retains every hash and recurses
+    /// only into nested-tree entries.
+    fn slot_payload_refs(&self) -> Vec<(ContentHash, bool)>;
+}
 
 /// All-zero content hash marking a deletion tombstone (mirrors git).
 ///
@@ -158,9 +267,10 @@ pub struct MergeInput {
     pub rationale: crate::content_store::Rationale,
     /// Short human-readable merge summary.
     pub summary: String,
-    /// Optional worker generation fence against the live [`TaskEngine`] task.
+    /// Optional worker generation fence against the live task generation read
+    /// through [`TaskGenerationLookup`].
     ///
-    /// When `Some`, the live generation of [`Self::task_id`] must equal this
+    /// When `Some`, the live generation for [`Self::task_id`] must equal this
     /// value or [`merge_commit`] fails with [`MergeError::StaleGeneration`]
     /// before any write. When `None`, no fence is checked.
     pub expected_task_generation: Option<u64>,
@@ -186,9 +296,9 @@ pub enum MergeError {
     MissingObject(ContentHash),
     /// The live task generation differs from the fenced expectation.
     ///
-    /// `expected` is the live [`TaskEngine`] generation, `found` is the
-    /// caller-supplied [`MergeInput::expected_task_generation`] value,
-    /// matching the existing engine convention (live first, supplied second).
+    /// `expected` is the live generation read through [`TaskGenerationLookup`],
+    /// `found` is the caller-supplied [`MergeInput::expected_task_generation`]
+    /// value, matching the existing engine convention (live first, supplied second).
     StaleGeneration {
         /// Live generation read from the task engine.
         expected: u64,
@@ -242,7 +352,7 @@ impl From<MergeError> for FacadeError {
 }
 
 /// Map a raw SQLite error to [`MergeError`] with static text.
-fn map_sqlite(err: rusqlite::Error) -> MergeError {
+pub(crate) fn map_sqlite(err: rusqlite::Error) -> MergeError {
     if let rusqlite::Error::SqliteFailure(failure, _) = &err {
         if matches!(
             failure.code,
@@ -287,31 +397,6 @@ fn map_ref_err(err: RefError) -> MergeError {
         RefError::MissingTarget(hash) => MergeError::MissingObject(hash),
         RefError::Corrupt => MergeError::Corrupt,
         RefError::Storage(_) => MergeError::Storage,
-    }
-}
-
-/// Map a task-engine lookup error to [`MergeError`].
-///
-/// [`TaskId`] parse failures (caller input) collapse to [`MergeError::InvalidName`];
-/// a missing task is [`MergeError::NotFound`]; stored-data problems are
-/// [`MergeError::Corrupt`]. Unreachable control-plane variants fail closed as
-/// [`MergeError::Corrupt`].
-fn map_task(err: TaskEngineError) -> MergeError {
-    match err {
-        TaskEngineError::TaskNotFound(_) => MergeError::NotFound,
-        TaskEngineError::InvalidTaskId(_)
-        | TaskEngineError::EmptyField(_)
-        | TaskEngineError::OversizedField { .. } => MergeError::InvalidName,
-        TaskEngineError::InvalidHash(_) => MergeError::Corrupt,
-        TaskEngineError::Corrupt { .. } => MergeError::Corrupt,
-        TaskEngineError::InvalidStatusTransition { .. }
-        | TaskEngineError::StaleGeneration { .. }
-        | TaskEngineError::CycleDetected { .. }
-        | TaskEngineError::SelfDependency(_)
-        | TaskEngineError::DuplicateTask(_)
-        | TaskEngineError::DependencyNotFound { .. } => MergeError::Corrupt,
-        TaskEngineError::WriterBusy => MergeError::Storage,
-        TaskEngineError::Sqlite(err) => map_sqlite(err),
     }
 }
 
@@ -419,7 +504,7 @@ fn materialize_tree(store: &ContentStore, id: &ContentHash) -> Result<ContextTre
         .get_blob(&tree_hash)
         .map_err(map_store)?
         .ok_or(MergeError::MissingObject(tree_hash))?;
-    ContextTree::from_canonical_bytes(&bytes).map_err(|_| MergeError::Corrupt)
+    ContextTree::decode_canonical(&bytes)
 }
 
 /// Merge two checkpoint tips into a two-parent commit on `target_branch`.
@@ -432,9 +517,20 @@ fn materialize_tree(store: &ContentStore, id: &ContentHash) -> Result<ContextTre
 /// store untouched. Step 6 is one atomic transaction (tree blob, checkpoint
 /// row, HEAD, branch ref, reflog row): an oversize `reason`/`actor` fails as
 /// [`MergeError::InvalidName`] with HEAD and the branch fully rolled back.
+///
+/// Residual coupling after AI-0185 (DEC-0008 step 4): this module imports no
+/// task-DAG item — the fence reads through `tasks:
+/// &dyn TaskGenerationLookup` — and calls no `context_compiler` function
+/// directly (decode/merge/encode/traversal go through [`ContextTreeMerge`]).
+/// Two type names remain: [`ContextTree`][crate::context_compiler::ContextTree]
+/// (the materialize helper signature and seam call paths) and
+/// [`SlotConflict`][crate::context_compiler::SlotConflict] (the
+/// [`MergeError::Conflicts`] payload, kept as public API). The 3-way merge
+/// was deliberately NOT moved to `bitty-ai-runtime`: see
+/// [`ContextTreeMerge`] for the verified impurity evidence.
 pub fn merge_commit(
     store: &mut ContentStore,
-    tasks: &TaskEngine,
+    tasks: &dyn TaskGenerationLookup,
     input: MergeInput,
 ) -> Result<Checkpoint, MergeError> {
     BranchName::parse(&input.target_branch).map_err(|err| match err {
@@ -448,11 +544,10 @@ pub fn merge_commit(
         RefError::Storage(_) => MergeError::Storage,
     })?;
     if let Some(fenced) = input.expected_task_generation {
-        let task_id = TaskId::new(input.task_id.as_str()).map_err(|_| MergeError::InvalidName)?;
-        let node = tasks.get_task(&task_id).map_err(map_task)?;
-        if node.generation != fenced {
+        let live = tasks.task_generation(&input.task_id)?;
+        if live != fenced {
             return Err(MergeError::StaleGeneration {
-                expected: node.generation,
+                expected: live,
                 found: fenced,
             });
         }
@@ -461,11 +556,11 @@ pub fn merge_commit(
     let base_tree = materialize_tree(store, &base_id)?;
     let ours_tree = materialize_tree(store, &input.ours)?;
     let theirs_tree = materialize_tree(store, &input.theirs)?;
-    let merged = ContextTree::merge_3way(&base_tree, &ours_tree, &theirs_tree);
+    let merged = ContextTree::merge_trees(&base_tree, &ours_tree, &theirs_tree);
     if !merged.conflicts.is_empty() {
         return Err(MergeError::Conflicts(merged.conflicts));
     }
-    let merged_bytes = merged.merged.canonical_bytes();
+    let merged_bytes = merged.merged.encode_canonical();
     let draft = CheckpointDraft {
         parents: vec![input.ours, input.theirs],
         task_id: input.task_id,
@@ -630,7 +725,7 @@ const GC_MAX_NESTED_TREE_DEPTH: usize = 8;
 /// every entry hash named in that surviving tree (slot-payload blobs), and
 /// transitively every entry of each nested tree named via `EntryKind::Tree`
 /// up to [`GC_MAX_NESTED_TREE_DEPTH`]: each visited tree blob is materialized
-/// via `ContextTree::from_canonical_bytes` and a missing tree blob row, a
+/// via [`ContextTreeMerge::decode_canonical`][ContextTreeMerge::decode_canonical] and a missing tree blob row, a
 /// digest mismatch, undecodable tree bytes, a nested tree blob that does not
 /// decode, or a nesting chain deeper than the cap is [`MergeError::Corrupt`].
 fn gc_compute(store: &ContentStore, options: &GcOptions) -> Result<GcPlan, MergeError> {
@@ -730,15 +825,15 @@ fn gc_compute(store: &ContentStore, options: &GcOptions) -> Result<GcPlan, Merge
             .get_blob(&tree_hash)
             .map_err(map_store)?
             .ok_or(MergeError::Corrupt)?;
-        let tree = ContextTree::from_canonical_bytes(&bytes).map_err(|_| MergeError::Corrupt)?;
-        for entry in tree.entries() {
-            surviving_blobs.insert(entry.hash);
-            if entry.kind == EntryKind::Tree {
+        let tree = ContextTree::decode_canonical(&bytes)?;
+        for (hash, is_tree) in tree.slot_payload_refs() {
+            surviving_blobs.insert(hash);
+            if is_tree {
                 if depth + 1 > GC_MAX_NESTED_TREE_DEPTH {
                     return Err(MergeError::Corrupt);
                 }
-                if !visited_trees.contains(&entry.hash) {
-                    tree_queue.push_back((entry.hash, depth + 1));
+                if !visited_trees.contains(&hash) {
+                    tree_queue.push_back((hash, depth + 1));
                 }
             }
         }
@@ -838,7 +933,7 @@ mod tests {
     use crate::session_refs::{
         MAX_REFLOG_REASON_BYTES, create_branch, delete_branch, get_branch, read_reflog,
     };
-    use crate::task_dag::{TaskDraft, TaskId};
+    use crate::task_dag::{TaskDraft, TaskEngine, TaskId};
 
     fn test_rationale() -> crate::content_store::Rationale {
         crate::content_store::Rationale::new("merge why", "merge what")
