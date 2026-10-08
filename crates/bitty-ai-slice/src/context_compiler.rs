@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::content_hash::ContentHash;
 use crate::content_store::Checkpoint;
+use crate::merge::{ContextTreeMerge, MergeError};
 use crate::task_dag::TaskNode;
 
 /// Maximum allowed byte length for a context slot name (256 bytes).
@@ -460,6 +461,39 @@ impl ContextTree {
         }
 
         TreeMergeResult { merged, conflicts }
+    }
+}
+
+impl ContextTreeMerge for ContextTree {
+    /// Decode canonical bytes behind the merge seam (AI-0185, DEC-0008
+    /// step 4).
+    ///
+    /// Delegates to the inherent [`ContextTree::from_canonical_bytes`] with
+    /// the same fail-closed mapping both `merge.rs` call sites used
+    /// (undecodable input is [`MergeError::Corrupt`]). This keeps the
+    /// serde/`sha2`/`hex`-dependent codec in this module instead of moving
+    /// it to the std-only `bitty-ai-runtime`; see [`ContextTreeMerge`] for
+    /// the rejected-move evidence.
+    fn decode_canonical(bytes: &[u8]) -> Result<Self, MergeError> {
+        Self::from_canonical_bytes(bytes).map_err(|_| MergeError::Corrupt)
+    }
+
+    /// Encode to canonical bytes behind the merge seam.
+    fn encode_canonical(&self) -> Vec<u8> {
+        self.canonical_bytes()
+    }
+
+    /// Pure 3-way slot merge behind the merge seam.
+    fn merge_trees(base: &Self, ours: &Self, theirs: &Self) -> TreeMergeResult {
+        Self::merge_3way(base, ours, theirs)
+    }
+
+    /// Slot-payload references behind the merge seam: canonical-order
+    /// `(blob hash, is_nested_tree)` pairs for GC retention.
+    fn slot_payload_refs(&self) -> Vec<(ContentHash, bool)> {
+        self.entries()
+            .map(|entry| (entry.hash, entry.kind == EntryKind::Tree))
+            .collect()
     }
 }
 

@@ -109,8 +109,8 @@ pub use harness::{
 pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
 pub use merge::{
-    GcOptions, GcReport, MergeError, MergeInput, collect_garbage, gc_preview, merge_commit,
-    strict_merge_base,
+    ContextTreeMerge, GcOptions, GcReport, MergeError, MergeInput, TaskGenerationLookup,
+    collect_garbage, gc_preview, merge_commit, strict_merge_base,
 };
 pub use network_adapter::{
     AdapterError, NetworkConsumerAdapter, NetworkConsumerAdapterConfig, RecordingNetworkService,

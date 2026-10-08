@@ -21,6 +21,7 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::content_hash::ContentHash;
+use crate::merge::{MergeError, TaskGenerationLookup, map_sqlite};
 
 /// Maximum allowed byte length for a task ID (128 bytes).
 pub const MAX_TASK_ID_BYTES: usize = 128;
@@ -1836,5 +1837,48 @@ impl TaskEngine {
             .optional()?;
 
         task.ok_or_else(|| TaskEngineError::TaskNotFound(id.clone()))
+    }
+}
+
+/// Map a task-engine lookup error to [`MergeError`], dropping untrusted payloads.
+///
+/// Moved verbatim from `merge.rs` (AI-0185, DEC-0008 step 4) so the fence
+/// implementation travels with the engine: [`TaskId`] parse failures
+/// (caller input) collapse to [`MergeError::InvalidName`]; a missing task
+/// is [`MergeError::NotFound`]; stored-data problems are
+/// [`MergeError::Corrupt`]. Unreachable control-plane variants fail closed
+/// as [`MergeError::Corrupt`].
+fn map_task(err: TaskEngineError) -> MergeError {
+    match err {
+        TaskEngineError::TaskNotFound(_) => MergeError::NotFound,
+        TaskEngineError::InvalidTaskId(_)
+        | TaskEngineError::EmptyField(_)
+        | TaskEngineError::OversizedField { .. } => MergeError::InvalidName,
+        TaskEngineError::InvalidHash(_) => MergeError::Corrupt,
+        TaskEngineError::Corrupt { .. } => MergeError::Corrupt,
+        TaskEngineError::InvalidStatusTransition { .. }
+        | TaskEngineError::StaleGeneration { .. }
+        | TaskEngineError::CycleDetected { .. }
+        | TaskEngineError::SelfDependency(_)
+        | TaskEngineError::DuplicateTask(_)
+        | TaskEngineError::DependencyNotFound { .. } => MergeError::Corrupt,
+        TaskEngineError::WriterBusy => MergeError::Storage,
+        TaskEngineError::Sqlite(err) => map_sqlite(err),
+    }
+}
+
+impl TaskGenerationLookup for TaskEngine {
+    /// Read the live generation for `task_id` (merge-commit fence, AI-0185).
+    ///
+    /// This is the `merge.rs` staying edge with its direction inverted on
+    /// purpose (DEC-0008 step 4): the session plane (`merge`) owns the seam
+    /// and the control plane (`task_dag`) implements it, so `merge` never
+    /// imports this module. Validation and error mapping are identical to
+    /// the pre-trait fence: malformed ids are [`MergeError::InvalidName`]
+    /// via the shared [`map_task`] mapping.
+    fn task_generation(&self, task_id: &str) -> Result<u64, MergeError> {
+        let id = TaskId::new(task_id).map_err(map_task)?;
+        let node = self.get_task(&id).map_err(map_task)?;
+        Ok(node.generation)
     }
 }
