@@ -6,7 +6,7 @@
 //!
 //! - [`merge_commit`]: strict lowest-common-ancestor merge of two checkpoint
 //!   tips into a two-parent commit written via
-//!   [`ContentStore::commit_checkpoint_with_branch`].
+//!   [`commit_checkpoint_with_branch`](crate::session_refs::commit_checkpoint_with_branch).
 //! - [`collect_garbage`] / [`gc_preview`]: bounded reachability garbage
 //!   collection over checkpoints and tree blobs.
 //!
@@ -35,7 +35,9 @@
 //! 5. [`ContextTree::merge_3way`][crate::context_compiler::ContextTree::merge_3way]:
 //!    any slot conflict returns [`MergeError::Conflicts`] with zero writes.
 //! 6. Clean merges persist one [`Checkpoint`] with `parents == [ours, theirs]`
-//!    through [`ContentStore::commit_checkpoint_with_branch`], which advances
+//!    through
+//!    [`commit_checkpoint_with_branch`](crate::session_refs::commit_checkpoint_with_branch),
+//!    which advances
 //!    HEAD, advances `target_branch`, and appends exactly one reflog row in a
 //!    single SQLite transaction. An oversize `reason`/`actor` therefore rolls
 //!    the whole commit back, including HEAD.
@@ -129,7 +131,7 @@ use crate::content_store::{
 };
 use crate::context_compiler::{ContextTree, EntryKind, SlotConflict};
 use crate::facade::FacadeError;
-use crate::session_refs::{BranchName, RefError};
+use crate::session_refs::{BranchName, RefError, commit_checkpoint_with_branch};
 use crate::task_dag::{TaskEngine, TaskEngineError, TaskId};
 
 /// All-zero content hash marking a deletion tombstone (mirrors git).
@@ -474,17 +476,17 @@ pub fn merge_commit(
         summary: input.summary,
         timestamp_ms: input.at_ms,
     };
-    store
-        .commit_checkpoint_with_branch(
-            &merged_bytes,
-            input.at_ms,
-            draft,
-            &input.target_branch,
-            &input.reason,
-            &input.actor,
-            input.at_ms,
-        )
-        .map_err(map_ref_err)
+    commit_checkpoint_with_branch(
+        store,
+        &merged_bytes,
+        input.at_ms,
+        draft,
+        &input.target_branch,
+        &input.reason,
+        &input.actor,
+        input.at_ms,
+    )
+    .map_err(map_ref_err)
 }
 
 /// Options for [`gc_preview`] and [`collect_garbage`].
@@ -834,7 +836,9 @@ pub fn collect_garbage(
 mod tests {
     use super::*;
     use crate::context_compiler::{EntryKind, TreeEntry};
-    use crate::session_refs::MAX_REFLOG_REASON_BYTES;
+    use crate::session_refs::{
+        MAX_REFLOG_REASON_BYTES, create_branch, delete_branch, get_branch, read_reflog,
+    };
     use crate::task_dag::{TaskDraft, TaskId};
 
     fn test_rationale() -> crate::content_store::Rationale {
@@ -1054,11 +1058,11 @@ mod tests {
         assert_eq!(merged.parents, vec![ours.id, theirs.id]);
         assert_eq!(store.get_ref("HEAD").expect("head"), Some(merged.id));
         assert_eq!(
-            store.get_branch("heads/main").expect("branch"),
+            get_branch(&store, "heads/main").expect("branch"),
             Some(merged.id)
         );
         assert_ne!(head_before, Some(merged.id));
-        let history = store.read_reflog("heads/main", 10).expect("reflog");
+        let history = read_reflog(&store, "heads/main", 10).expect("reflog");
         assert_eq!(history.len(), 1, "creation writes exactly one reflog row");
         assert_eq!(history[0].old_hash, None);
         assert_eq!(history[0].new_hash, merged.id);
@@ -1275,7 +1279,7 @@ mod tests {
             "HEAD must roll back"
         );
         assert_eq!(
-            store.get_branch("heads/main").expect("branch after"),
+            get_branch(&store, "heads/main").expect("branch after"),
             None,
             "branch must not exist after rollback"
         );
@@ -1373,12 +1377,9 @@ mod tests {
             "pinned",
             2000,
         );
-        store
-            .create_branch("heads/tmp", &pinned.id, "pin", "tester", 9000)
+        create_branch(&mut store, "heads/tmp", &pinned.id, "pin", "tester", 9000)
             .expect("pin branch");
-        store
-            .delete_branch("heads/tmp", "unpin", "tester", 9100)
-            .expect("unpin branch");
+        delete_branch(&mut store, "heads/tmp", "unpin", "tester", 9100).expect("unpin branch");
         let full = GcOptions {
             now_ms: 10_000,
             reflog_grace_ms: 2000,
@@ -1564,12 +1565,16 @@ mod tests {
             "gone",
             1500,
         );
-        store
-            .create_branch("heads/gone", &gone_tip.id, "create", "tester", 1600)
-            .expect("gone branch");
-        store
-            .delete_branch("heads/gone", "remove", "tester", 1700)
-            .expect("delete branch");
+        create_branch(
+            &mut store,
+            "heads/gone",
+            &gone_tip.id,
+            "create",
+            "tester",
+            1600,
+        )
+        .expect("gone branch");
+        delete_branch(&mut store, "heads/gone", "remove", "tester", 1700).expect("delete branch");
         let zero = tombstone_hash();
         assert!(
             store.get_blob(&zero).expect("zero blob").is_none(),

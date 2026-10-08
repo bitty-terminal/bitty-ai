@@ -34,7 +34,10 @@ use crate::context_compiler::{
     CompiledContext, CompilerBudgetConfig, ContextCompiler, ContextTree, EntryKind, TreeEntry,
 };
 use crate::facade::{AiStreamSession, FacadeError};
-use crate::session_refs::{BranchName, ReflogEntry};
+use crate::session_refs::{
+    BranchName, ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch,
+    get_branch, list_branches, read_reflog, rename_branch, update_branch,
+};
 use crate::task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskView};
 
 /// Maximum retained uncollapsed action outcomes in memory for Zone 3 compilation (64).
@@ -396,13 +399,15 @@ impl WheelKernel {
     /// Atomic (AI-0178): the tree blob, checkpoint row, and HEAD ref update
     /// commit in one SQLite `transaction()` via
     /// [`ContentStore::commit_checkpoint_atomic`] (no branch) or
-    /// [`ContentStore::commit_checkpoint_with_branch`] (with branch). HEAD
+    /// [`commit_checkpoint_with_branch`](crate::session_refs::commit_checkpoint_with_branch)
+    /// (with branch). HEAD
     /// advances only when the transaction commits; a torn write (crash
     /// between blob insert and HEAD update) replays as the pre-crash HEAD on
     /// reopen, never a half-advanced HEAD.
     ///
     /// The `branch` move commits in the same transaction as the checkpoint
-    /// and HEAD (AI-0180): [`ContentStore::commit_checkpoint_with_branch`]
+    /// and HEAD (AI-0180):
+    /// [`commit_checkpoint_with_branch`](crate::session_refs::commit_checkpoint_with_branch)
     /// writes the blob, checkpoint, HEAD, branch ref, and reflog row
     /// atomically, so every branch move appends a reflog row. The checkpoint
     /// commit is authoritative, so the update is not fast-forward-only. A
@@ -442,21 +447,20 @@ impl WheelKernel {
             return Ok(checkpoint);
         };
         // Single-transaction HEAD + branch commit: namespace validation happens
-        // inside the store method before any write, so a bad branch name fails
+        // inside the refs-plane function before any write, so a bad branch name fails
         // without persisting a checkpoint or advancing HEAD. A reflog failure
         // rolls back the whole commit (including HEAD).
-        let checkpoint = self
-            .content_store
-            .commit_checkpoint_with_branch(
-                &tree_bytes,
-                now_ms,
-                draft,
-                branch_name,
-                WHEEL_COMMIT_REFLOG_REASON,
-                WHEEL_COMMIT_REFLOG_ACTOR,
-                now_ms,
-            )
-            .map_err(FacadeError::from)?;
+        let checkpoint = commit_checkpoint_with_branch(
+            &mut self.content_store,
+            &tree_bytes,
+            now_ms,
+            draft,
+            branch_name,
+            WHEEL_COMMIT_REFLOG_REASON,
+            WHEEL_COMMIT_REFLOG_ACTOR,
+            now_ms,
+        )
+        .map_err(FacadeError::from)?;
         self.head_checkpoint = Some(checkpoint.id);
         Ok(checkpoint)
     }
@@ -487,8 +491,8 @@ impl WheelKernel {
 
     // --- Typed Branch Verbs & Reflog (refs-plane v1, AI-0180) ---
     //
-    // Thin passthroughs over the [`ContentStore`] refs-plane verbs: no logic
-    // lives here, only error mapping into [`FacadeError`].
+    // Thin passthroughs over the [`crate::session_refs`] refs-plane free
+    // functions: no logic lives here, only error mapping into [`FacadeError`].
 
     /// Create a branch pointing at an existing checkpoint (no force).
     pub fn create_branch(
@@ -499,8 +503,7 @@ impl WheelKernel {
         actor: &str,
         now_ms: u64,
     ) -> Result<BranchName, FacadeError> {
-        self.content_store
-            .create_branch(name, target, reason, actor, now_ms)
+        create_branch(&mut self.content_store, name, target, reason, actor, now_ms)
             .map_err(FacadeError::from)
     }
 
@@ -514,9 +517,16 @@ impl WheelKernel {
         now_ms: u64,
         fast_forward_only: bool,
     ) -> Result<BranchName, FacadeError> {
-        self.content_store
-            .update_branch(name, target, reason, actor, now_ms, fast_forward_only)
-            .map_err(FacadeError::from)
+        update_branch(
+            &mut self.content_store,
+            name,
+            target,
+            reason,
+            actor,
+            now_ms,
+            fast_forward_only,
+        )
+        .map_err(FacadeError::from)
     }
 
     /// Delete a branch, leaving a tombstone reflog row. Returns the deleted tip.
@@ -527,8 +537,7 @@ impl WheelKernel {
         actor: &str,
         now_ms: u64,
     ) -> Result<ContentHash, FacadeError> {
-        self.content_store
-            .delete_branch(name, reason, actor, now_ms)
+        delete_branch(&mut self.content_store, name, reason, actor, now_ms)
             .map_err(FacadeError::from)
     }
 
@@ -541,30 +550,30 @@ impl WheelKernel {
         actor: &str,
         now_ms: u64,
     ) -> Result<ContentHash, FacadeError> {
-        self.content_store
-            .rename_branch(old_name, new_name, reason, actor, now_ms)
-            .map_err(FacadeError::from)
+        rename_branch(
+            &mut self.content_store,
+            old_name,
+            new_name,
+            reason,
+            actor,
+            now_ms,
+        )
+        .map_err(FacadeError::from)
     }
 
     /// List all branches (`heads/` only), ordered by name.
     pub fn list_branches(&self) -> Result<Vec<(BranchName, ContentHash)>, FacadeError> {
-        self.content_store
-            .list_branches()
-            .map_err(FacadeError::from)
+        list_branches(&self.content_store).map_err(FacadeError::from)
     }
 
     /// Get a branch tip (`heads/` only). Missing branches return `None`.
     pub fn get_branch(&self, name: &str) -> Result<Option<ContentHash>, FacadeError> {
-        self.content_store
-            .get_branch(name)
-            .map_err(FacadeError::from)
+        get_branch(&self.content_store, name).map_err(FacadeError::from)
     }
 
     /// Read reflog history for any well-formed ref name, newest-first.
     pub fn read_reflog(&self, name: &str, limit: usize) -> Result<Vec<ReflogEntry>, FacadeError> {
-        self.content_store
-            .read_reflog(name, limit)
-            .map_err(FacadeError::from)
+        read_reflog(&self.content_store, name, limit).map_err(FacadeError::from)
     }
 
     // --- Action Protocol & Auto-Spillover Operations ---
