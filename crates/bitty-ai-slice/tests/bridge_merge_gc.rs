@@ -722,6 +722,61 @@ fn bridge_merge_dirty_refused_zero_write() {
 }
 
 #[test]
+fn bridge_merge_ours_not_head_refused_zero_write() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    bridge
+        .kernel_mut()
+        .put_slot("local", b"v", 1000)
+        .expect("setup slot");
+    let setup_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 1500
+    });
+    dispatch_ok(&mut bridge, "checkpoint.commit", &setup_payload);
+    let head_before = bridge
+        .kernel()
+        .head_checkpoint()
+        .cloned()
+        .expect("HEAD established");
+    // Working tree is clean here: the commit snapshotted `local`, so the
+    // dirty gate passes and only the ours-vs-HEAD guard can refuse.
+    let (ours, theirs) = setup_clean_pair(&mut bridge);
+    assert_ne!(ours.id, head_before, "pair must not descend from HEAD");
+    let before = snapshot(&bridge);
+    let payload = merge_payload(&ours.id, &theirs.id, "heads/main");
+    let err = dispatch_err(&mut bridge, "merge.commit", &payload);
+    assert!(
+        err.contains("not HEAD"),
+        "ours-diverged refusal must name HEAD, got: {err}"
+    );
+    assert_eq!(
+        snapshot(&bridge),
+        before,
+        "refused merge must write nothing"
+    );
+    assert_eq!(
+        bridge.kernel().head_checkpoint(),
+        Some(&head_before),
+        "in-memory HEAD untouched"
+    );
+    assert_eq!(
+        bridge
+            .kernel()
+            .content_store()
+            .get_ref("HEAD")
+            .expect("head read"),
+        Some(head_before),
+        "durable HEAD untouched"
+    );
+    let local = bridge
+        .kernel()
+        .get_slot("local")
+        .expect("slot read")
+        .expect("HEAD-only slot survives");
+    assert_eq!(local, b"v", "HEAD-only payload survives refusal");
+}
+
+#[test]
 fn bridge_gc_wrong_typed_options_fail_closed() {
     let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
     let base = serde_json::json!({

@@ -627,16 +627,28 @@ impl WheelKernel {
     ///
     /// Refuses when the working tree is dirty (zero writes, [`FacadeError::Store`]
     /// naming `uncommitted`): the gate runs before any store write so a dirty
-    /// `slot.put` without commit never loses slots to a blind overwrite. On a
-    /// clean merge the working tree syncs from the merged tree blob before the
-    /// in-memory HEAD advances, so the next `commit_checkpoint` keeps
-    /// theirs-only slots. Validation stays in `merge.rs`.
+    /// `slot.put` without commit never loses slots to a blind overwrite. Also
+    /// refuses when HEAD exists and `input.ours` is not HEAD (zero writes):
+    /// otherwise the sync would drop committed HEAD-only slots from the
+    /// working tree and HEAD would jump to a lineage that does not descend
+    /// from the old HEAD. On a clean merge the working tree syncs from the
+    /// merged tree blob before the in-memory HEAD advances, so the next
+    /// `commit_checkpoint` keeps theirs-only slots. Validation stays in
+    /// `merge.rs`.
     pub fn merge_commit(&mut self, input: MergeInput) -> Result<Checkpoint, FacadeError> {
         if self.working_tree_dirty()? {
             return Err(FacadeError::Store(
                 "merge refused: working tree has uncommitted changes; commit or discard before merging"
                     .to_string(),
             ));
+        }
+        if let Some(head) = &self.head_checkpoint {
+            if input.ours != *head {
+                return Err(FacadeError::Store(format!(
+                    "merge refused: ours {} is not HEAD {head}; merge into HEAD only",
+                    input.ours
+                )));
+            }
         }
         let checkpoint =
             crate::merge::merge_commit(&mut self.content_store, &self.task_engine, input)
