@@ -57,10 +57,22 @@ name = "bitty-ai-runtime"
 version = "0.0.1"
 
 [[package]]
+name = "bitty-ai-session"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "bitty-ai-slice"
 version = "0.0.1"
 dependencies = [
  "bitty-ai-runtime",
+ "bitty-ai-session",
  "bitty-ipc",
  "bitty-network-api",
  "bitty-package",
