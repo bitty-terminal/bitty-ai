@@ -777,6 +777,233 @@ fn bridge_merge_ours_not_head_refused_zero_write() {
 }
 
 #[test]
+fn bridge_gc_dirty_refused_zero_loss_then_proceeds_after_commit() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    let options = serde_json::json!({
+        "now_ms": 100_000,
+        "reflog_grace_ms": 1000,
+        "max_deletes_per_call": 1000
+    });
+    // No-HEAD dirty path: any slot with no HEAD is uncommitted.
+    bridge
+        .kernel_mut()
+        .put_slot("pre", b"pre", 500)
+        .expect("pre slot");
+    let pre_before = snapshot(&bridge);
+    for command in ["gc.preview", "gc.collect"] {
+        let err = dispatch_err(&mut bridge, command, &options);
+        assert!(
+            err.contains("uncommitted"),
+            "{command} refusal must name uncommitted, got: {err}"
+        );
+    }
+    assert_eq!(
+        snapshot(&bridge),
+        pre_before,
+        "refused GC must write nothing"
+    );
+    bridge
+        .kernel_mut()
+        .put_slot("live", b"v1", 1000)
+        .expect("setup slot");
+    let setup_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 1500
+    });
+    dispatch_ok(&mut bridge, "checkpoint.commit", &setup_payload);
+    let head_c1 = bridge
+        .kernel()
+        .head_checkpoint()
+        .cloned()
+        .expect("HEAD established");
+    // Abandoned fork at the store level: unreachable from HEAD, so the
+    // post-commit GC has something real to prune.
+    let fork = commit_tree(
+        &mut bridge,
+        vec![head_c1],
+        &slot_tree(&[("slot", "gone")]),
+        "fork",
+        1600,
+    );
+    bridge
+        .kernel_mut()
+        .put_slot("dirty", b"dirty-payload", 2000)
+        .expect("dirty slot");
+    let before = snapshot(&bridge);
+    for command in ["gc.preview", "gc.collect"] {
+        let err = dispatch_err(&mut bridge, command, &options);
+        assert!(
+            err.contains("uncommitted"),
+            "{command} refusal must name uncommitted, got: {err}"
+        );
+    }
+    // A dry-run collect refuses exactly like preview: parity by construction.
+    let mut dry = options.clone();
+    dry["dry_run"] = serde_json::json!(true);
+    let dry_err = dispatch_err(&mut bridge, "gc.collect", &dry);
+    assert!(
+        dry_err.contains("uncommitted"),
+        "dry-run refusal must name uncommitted, got: {dry_err}"
+    );
+    assert_eq!(snapshot(&bridge), before, "refused GC must write nothing");
+    assert_eq!(
+        bridge.kernel().head_checkpoint(),
+        Some(&head_c1),
+        "in-memory HEAD untouched"
+    );
+    assert_eq!(
+        bridge
+            .kernel()
+            .content_store()
+            .get_ref("HEAD")
+            .expect("head read"),
+        Some(head_c1),
+        "durable HEAD untouched"
+    );
+    // The uncommitted payload stays fully dereferenceable through refusal.
+    assert_eq!(
+        bridge
+            .kernel()
+            .get_slot("dirty")
+            .expect("slot read")
+            .expect("dirty slot survives"),
+        b"dirty-payload"
+    );
+    let dirty_hash = bridge
+        .kernel()
+        .active_tree()
+        .get("dirty")
+        .expect("dirty entry")
+        .hash;
+    assert_eq!(
+        bridge
+            .kernel()
+            .content_store()
+            .get_blob(&dirty_hash)
+            .expect("blob read")
+            .expect("dirty blob survives"),
+        b"dirty-payload"
+    );
+    // Commit, then GC proceeds: pin the fork first so pinned accounting is
+    // exercised, then unpin (long past the grace window) and prune.
+    let commit_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 2500
+    });
+    dispatch_ok(&mut bridge, "checkpoint.commit", &commit_payload);
+    let head_c2 = bridge
+        .kernel()
+        .head_checkpoint()
+        .cloned()
+        .expect("post-commit HEAD");
+    assert_ne!(head_c2, head_c1, "commit must advance HEAD");
+    bridge
+        .kernel_mut()
+        .create_branch("heads/keep", &fork.id, "pin", "tester", 3000)
+        .expect("pin branch");
+    let pinned_preview = dispatch_ok(&mut bridge, "gc.preview", &options);
+    assert_eq!(pinned_preview["reachable_checkpoints"], 3);
+    assert_eq!(pinned_preview["deleted_checkpoints"], 0);
+    let pinned_collect = dispatch_ok(&mut bridge, "gc.collect", &options);
+    assert_eq!(
+        pinned_collect, pinned_preview,
+        "pinned collect matches preview"
+    );
+    assert!(
+        bridge
+            .kernel()
+            .content_store()
+            .has_checkpoint(&fork.id)
+            .expect("fork check"),
+        "pinned fork must survive"
+    );
+    bridge
+        .kernel_mut()
+        .delete_branch("heads/keep", "unpin", "tester", 4000)
+        .expect("unpin branch");
+    let reflog_unpinned = snapshot(&bridge).reflog;
+    let preview = dispatch_ok(&mut bridge, "gc.preview", &options);
+    assert_eq!(preview["reachable_checkpoints"], 2);
+    assert_eq!(preview["deleted_checkpoints"], 1);
+    assert_eq!(preview["deleted_blobs"], 1);
+    assert_eq!(preview["truncated"], false);
+    let report = dispatch_ok(&mut bridge, "gc.collect", &options);
+    assert_eq!(report, preview, "destructive batch matches preview");
+    for kept in [head_c1, head_c2] {
+        assert!(
+            bridge
+                .kernel()
+                .content_store()
+                .has_checkpoint(&kept)
+                .expect("kept check"),
+            "reachable checkpoint must survive"
+        );
+    }
+    assert!(
+        !bridge
+            .kernel()
+            .content_store()
+            .has_checkpoint(&fork.id)
+            .expect("gone check"),
+        "abandoned fork must be pruned"
+    );
+    assert_eq!(
+        snapshot(&bridge).reflog,
+        reflog_unpinned,
+        "reflog rows are never pruned"
+    );
+    assert_eq!(
+        bridge
+            .kernel()
+            .get_slot("dirty")
+            .expect("slot read")
+            .expect("dirty slot survives GC"),
+        b"dirty-payload",
+        "committed payload survives GC"
+    );
+}
+
+#[test]
+fn bridge_gc_clean_proceeds_control() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    bridge
+        .kernel_mut()
+        .put_slot("live", b"v1", 1000)
+        .expect("setup slot");
+    let commit_payload = serde_json::json!({
+        "rationale": {"why": "merge why", "what": "merge what"},
+        "now_ms": 1500
+    });
+    dispatch_ok(&mut bridge, "checkpoint.commit", &commit_payload);
+    // Working tree equals HEAD: the dirty gate must let clean GC through.
+    let options = serde_json::json!({
+        "now_ms": 100_000,
+        "reflog_grace_ms": 1000,
+        "max_deletes_per_call": 1000
+    });
+    let reflog_before = snapshot(&bridge).reflog;
+    let preview = dispatch_ok(&mut bridge, "gc.preview", &options);
+    assert_eq!(preview["reachable_checkpoints"], 1);
+    assert_eq!(preview["deleted_checkpoints"], 0);
+    assert_eq!(preview["truncated"], false);
+    let report = dispatch_ok(&mut bridge, "gc.collect", &options);
+    assert_eq!(report, preview, "clean collect matches preview");
+    assert_eq!(
+        snapshot(&bridge).reflog,
+        reflog_before,
+        "reflog rows are never pruned"
+    );
+    assert_eq!(
+        bridge
+            .kernel()
+            .get_slot("live")
+            .expect("slot read")
+            .expect("live slot survives"),
+        b"v1"
+    );
+}
+
+#[test]
 fn bridge_gc_wrong_typed_options_fail_closed() {
     let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
     let base = serde_json::json!({
