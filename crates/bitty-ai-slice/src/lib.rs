@@ -66,6 +66,7 @@ pub mod harness;
 pub mod journal_prototype;
 pub mod live_host;
 pub mod local_provider;
+pub mod merge;
 pub mod network_adapter;
 pub mod session_refs;
 pub mod snapshot_ingest;
@@ -106,6 +107,10 @@ pub use harness::{
 };
 pub use live_host::LiveBittyHost;
 pub use local_provider::{LocalEndpoint, LocalProvider, MonotonicClock, SystemMonotonicClock};
+pub use merge::{
+    GcOptions, GcReport, MergeError, MergeInput, collect_garbage, gc_preview, merge_commit,
+    strict_merge_base,
+};
 pub use network_adapter::{
     AdapterError, NetworkConsumerAdapter, NetworkConsumerAdapterConfig, RecordingNetworkService,
 };
