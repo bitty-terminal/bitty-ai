@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitty_ai_mcp::McpTransport;
 use bitty_ai_mcp::{
@@ -322,6 +322,231 @@ fn sse_cut_before_match_resolves_to_unknown_on_call() {
         Err(bitty_ai_mcp::McpCallError::Unknown { .. }) => {}
         other => panic!("expected Unknown, got {other:?}"),
     }
+}
+
+// ── AI-0195: SSE multi-data accumulation ───────────────────────────────────
+
+#[test]
+fn sse_multi_data_fields_join_into_one_message() {
+    let service = FakeService::new();
+    // One SSE event splits a single JSON-RPC object across three data:
+    // fields; comment and event fields are ignored while the payload
+    // accumulates, and the newline-joined payload queues as one message.
+    let body = ": comment ignored\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":1,\ndata: \"result\":{}}\n\n";
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.as_bytes().to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}")
+        .expect("sse posts");
+    assert_eq!(transport.queued_len(), 1);
+    let line = transport.recv_line(10).expect("recv").expect("joined");
+    assert!(line.contains("\"id\":1"));
+    // The joined payload carries the SSE newline separator: three data:
+    // lines became one queued message, not three.
+    assert!(line.contains('\n'));
+    assert_eq!(transport.recv_line(10).expect("drained"), None);
+}
+
+#[test]
+fn sse_trailing_event_without_blank_separator_still_flushes() {
+    let service = FakeService::new();
+    // No trailing blank line: the pending event still flushes at end of body,
+    // preserving the previous per-line behavior for single-data replies.
+    let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.as_bytes().to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}")
+        .expect("sse posts");
+    assert_eq!(transport.queued_len(), 1);
+    let line = transport.recv_line(10).expect("recv").expect("flushed");
+    assert!(line.contains("\"id\":1"));
+}
+
+#[test]
+fn sse_fan_out_counts_events_not_lines() {
+    let service = FakeService::new();
+    // Seventeen data: lines in ONE event (single blank dispatch) join into
+    // one payload: fan-out counts the event, so exactly one line queues.
+    let mut single_event = String::new();
+    for _ in 0..17 {
+        single_event.push_str("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");
+    }
+    single_event.push('\n');
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: single_event.into_bytes(),
+    });
+    // Seventeen blank-dispatched events exceed the 16-frame fan-out bound.
+    let mut many_events = String::new();
+    for _ in 0..17 {
+        many_events.push_str("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
+    }
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: many_events.into_bytes(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")
+        .expect("single event joins to one");
+    assert_eq!(transport.queued_len(), 1);
+    assert!(transport.recv_line(10).expect("recv").is_some());
+    assert_eq!(transport.recv_line(10).expect("drained"), None);
+    let error = transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}")
+        .expect_err("17 events exceed fan-out");
+    assert!(matches!(error.failure, McpFailure::FrameTooLarge { .. }));
+}
+
+#[test]
+fn sse_oversize_joined_payload_is_frame_reject() {
+    let service = FakeService::new();
+    // Two fragments each under the frame cap join past it in one event.
+    let half = "x".repeat(bitty_ai_mcp::MAX_FRAME_BYTES / 2 + 256);
+    let body = format!(
+        "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"pad\":\"{half}\ndata: {half}\"}}}}\n\n"
+    );
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let error = transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")
+        .expect_err("joined oversize");
+    assert!(matches!(error.failure, McpFailure::FrameTooLarge { .. }));
+}
+
+// ── AI-0196: bounded wait in recv_line ─────────────────────────────────────
+//
+// `HttpLineTransport` is synchronous (`&mut self`, no background thread), so
+// no line can arrive concurrently mid-`recv`: the queue grows only via
+// `send_line` before `recv` runs. These tests prove the two observable
+// halves: a pre-queued line returns promptly without waiting the full caller
+// budget, and an empty queue waits a bounded slice (not instant, never past
+// the caller deadline) instead of busy-spinning.
+
+#[test]
+fn recv_returns_queued_line_without_waiting_full_timeout() {
+    let service = FakeService::new();
+    service.queue_response(json_ok(200, &call_answer(1, "hi")));
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect("post");
+    let start = Instant::now();
+    let line = transport.recv_line(1_000).expect("recv").expect("queued");
+    let elapsed = start.elapsed();
+    assert!(line.contains("\"id\":1"));
+    // Far below the 1s caller budget: the fast path never sleeps.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "waited full budget: {elapsed:?}"
+    );
+}
+
+#[test]
+fn recv_empty_queue_waits_bounded_then_reports_none() {
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 202,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+        .expect("202 accepts");
+    let start = Instant::now();
+    let outcome = transport.recv_line(50).expect("recv");
+    let elapsed = start.elapsed();
+    assert_eq!(outcome, None);
+    // Bounded wait: not an instant return, never past the caller budget plus
+    // generous scheduling slack (small bounds, no wall-clock flakiness).
+    assert!(
+        elapsed >= Duration::from_millis(30),
+        "returned instantly: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "extended past budget: {elapsed:?}"
+    );
+}
+
+#[test]
+fn recv_closed_returns_err_immediately() {
+    let service = FakeService::new();
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    transport.shutdown();
+    assert!(transport.is_closed());
+    let start = Instant::now();
+    let error = transport.recv_line(200).expect_err("closed");
+    let elapsed = start.elapsed();
+    assert_eq!(error.failure, McpFailure::TransportClosed);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "closed waited: {elapsed:?}"
+    );
+}
+
+#[test]
+fn unrelated_sse_id_still_resolves_to_unknown_within_deadline() {
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: b"data: {\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{}}\n\n".to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let start = Instant::now();
+    let outcome = call_tool(
+        &mut transport,
+        2,
+        "echo",
+        "mcp_demo_echo",
+        b"{}",
+        "/tmp/bitty",
+        200,
+    );
+    let elapsed = start.elapsed();
+    match outcome {
+        Err(bitty_ai_mcp::McpCallError::Unknown { .. }) => {}
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+    // The bounded wait composes with the whole-op deadline: the 200ms budget
+    // resolves near the deadline, never far past it.
+    assert!(
+        elapsed < Duration::from_millis(2_000),
+        "extended past deadline: {elapsed:?}"
+    );
 }
 
 // ── statuses: 401/404 reject, 202 accepts, 405 shutdown ignored ─────────────
