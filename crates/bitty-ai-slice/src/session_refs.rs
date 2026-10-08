@@ -3,8 +3,9 @@
 //! `bitty_ai_slice::session_refs::*` path byte-identically.
 //!
 //! The `From<RefError> for FacadeError` impl cannot move with the type
-//! (orphan rule: both the trait source and `FacadeError` are foreign to the
-//! session crate), so it is re-homed in [`crate::facade`].
+//! (the session crate cannot name `FacadeError` without depending on the
+//! slice, which would cycle: slice -> session, never the reverse),
+//! so it is re-homed in [`crate::facade`].
 
 pub use bitty_ai_session::session_refs::{
     BranchName, MAX_REFLOG_ACTOR_BYTES, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, RefError,

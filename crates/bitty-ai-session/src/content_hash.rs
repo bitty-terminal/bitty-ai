@@ -3,10 +3,10 @@
 //! This module is the canonical home of [`ContentHash`]: the 32-byte digest
 //! value plus its strict lowercase-hex validation, rendering, and serde
 //! mapping. It depends only on external crates (`sha2`, `hex`, `serde`) and
-//! the standard library — on no other `bitty-ai-slice` module — so the hash
-//! value can later travel with the session plane without dragging the store.
+//! the standard library — on no other workspace crate — so the hash
+//! value travels with the session plane without dragging the store.
 //!
-//! ## Why a slice-internal leaf instead of `bitty-ai-runtime`
+//! ## Why a session-crate leaf instead of `bitty-ai-runtime`
 //!
 //! `bitty-ai-runtime` is std-only by invariant (zero dependencies; see its
 //! `Cargo.toml` and the AI-0121 boundary note in the slice manifest).
@@ -15,8 +15,8 @@
 //! previous parse error lived on the storage error type. Moving the type to
 //! the runtime would force the runtime to gain those three dependencies (plus
 //! a storage-coupled error), breaking the invariant for no behavioral gain.
-//! The slice-internal leaf keeps every existing dependency exactly where it
-//! already is: no manifest changes.
+//! The session-crate leaf keeps every existing dependency exactly where it
+//! already is: no new external dependencies.
 //!
 //! ## Error carrier
 //!

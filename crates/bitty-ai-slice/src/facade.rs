@@ -92,8 +92,9 @@ impl From<crate::content_store::ContentStoreError> for FacadeError {
 }
 
 // AI-0186 (DEC-0008 step 5): re-homed from `session_refs` (now in
-// `bitty-ai-session`). The orphan rule forbids the impl there (`FacadeError`
-// is foreign to the session crate); the `Store` string shape is unchanged.
+// `bitty-ai-session`). The session crate cannot name `FacadeError` without
+// depending on the slice, which would cycle (dependency direction is slice
+// -> session, never the reverse); the `Store` string shape is unchanged.
 impl From<crate::session_refs::RefError> for FacadeError {
     fn from(err: crate::session_refs::RefError) -> Self {
         Self::Store(err.to_string())

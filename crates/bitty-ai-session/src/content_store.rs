@@ -32,10 +32,10 @@
 //! ## Single-Connection ownership (AI-0178)
 //!
 //! [`ContentStore`] owns its SQLite [`Connection`] behind
-//! `Arc<Mutex<..>>` so [`crate::wheel_kernel::WheelKernel`] can open the
-//! database file exactly once, initialize content and task schemas on that
-//! one connection, and share the handle into both [`ContentStore`] and
-//! [`crate::task_dag::TaskEngine`] via [`ContentStore::from_shared`]. Two
+//! `Arc<Mutex<..>>` so `bitty_ai_slice::wheel_kernel::WheelKernel` can open
+//! the database file exactly once, initialize content and task schemas on
+//! that one connection, and share the handle into both [`ContentStore`] and
+//! `bitty_ai_slice::task_dag::TaskEngine` via [`ContentStore::from_shared`]. Two
 //! independent `Connection`s on the same file (the pre-0178 pattern) split
 //! pragmas, split transactions, and let recovery observe divergent snapshots:
 //! a crash between the tree-blob write on one connection and the HEAD update
@@ -446,7 +446,7 @@ fn is_busy(err: &rusqlite::Error) -> bool {
 }
 
 /// Map a raw SQLite open error to a facade-ready string preserving the
-/// WriterBusy/Corrupt distinction for [`crate::facade::FacadeError`].
+/// WriterBusy/Corrupt distinction for `bitty_ai_slice::facade::FacadeError`.
 pub fn map_busy_for_facade(err: rusqlite::Error) -> String {
     match map_busy(err) {
         ContentStoreError::WriterBusy => {
