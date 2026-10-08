@@ -25,8 +25,8 @@ pub use content_store::{
     MAX_TASK_ID_BYTES, Rationale,
 };
 pub use session_refs::{
-    BranchName, MAX_REFLOG_ACTOR_BYTES, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES,
-    MIN_REFLOG_FLOOR, PruneReport, RefError, ReflogEntry, commit_checkpoint_with_branch,
-    create_branch, delete_branch, dump_reflog_all, get_branch, list_branches, prune_reflog,
-    read_reflog, rename_branch, update_branch,
+    BranchName, MAX_REFLOG_ACTOR_BYTES, MAX_REFLOG_PRUNE_ROWS, MAX_REFLOG_READ_LIMIT,
+    MAX_REFLOG_REASON_BYTES, MIN_REFLOG_FLOOR, PruneReport, RefError, ReflogEntry,
+    commit_checkpoint_with_branch, create_branch, delete_branch, dump_reflog_all, get_branch,
+    list_branches, prune_reflog, read_reflog, rename_branch, update_branch,
 };

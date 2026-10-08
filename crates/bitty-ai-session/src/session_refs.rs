@@ -66,6 +66,15 @@ pub const MAX_REFLOG_ACTOR_BYTES: usize = 128;
 /// Maximum reflog entries returned by a single [`read_reflog`] call (1024).
 pub const MAX_REFLOG_READ_LIMIT: usize = 1024;
 
+/// Maximum reflog rows deleted by a single [`prune_reflog`] call (1024).
+///
+/// Mirrors the [`MAX_REFLOG_READ_LIMIT`] precedent: `max_rows` above this cap
+/// is clamped at function entry, so an untrusted caller (for example a bridge
+/// client sending `max_rows = u64::MAX`) can only cause a bounded number of
+/// deletes in the single transaction. The reported `pruned` count reflects
+/// the rows actually deleted after clamping.
+pub const MAX_REFLOG_PRUNE_ROWS: usize = 1024;
+
 /// Minimum retained reflog rows per ref after [`prune_reflog`] (1).
 ///
 /// The floor always keeps the latest row regardless of age so HEAD recovery
@@ -847,14 +856,22 @@ pub struct PruneReport {
 ///
 /// Fail-safe defaults: `older_than_ms = 0` matches nothing (`at_ms < 0` is
 /// impossible for validated rows) so the call is a no-op; `max_rows = 0`
-/// deletes nothing. Shape validation matches [`read_reflog`]: a malformed
-/// name is [`RefError::InvalidName`], and any bad hex or negative `at_ms`
-/// among this ref's rows fails closed as [`RefError::Corrupt`] with zero
-/// writes (the transaction rolls back). Reuses the existing error mapping;
-/// no new variants.
+/// deletes nothing. `max_rows` above [`MAX_REFLOG_PRUNE_ROWS`] is clamped to
+/// the cap at function entry: a request above the cap deletes at most the cap
+/// and the report reflects the rows actually deleted. Shape validation matches
+/// [`read_reflog`]: a malformed name is [`RefError::InvalidName`], and any bad
+/// hex or negative `at_ms` among this ref's rows fails closed as
+/// [`RefError::Corrupt`] with zero writes (the transaction rolls back). Reuses
+/// the existing error mapping; no new variants.
 ///
-/// Time/Space: O(N) reads over this ref's rows (N unbounded for an unpruned
-/// ref) plus O(K) writes for K deleted rows; space is O(N) hashes in memory.
+/// Time/Space: O(N) indexed reads over this ref's rows (N unbounded for an
+/// unpruned ref) plus O(K) writes for K deleted rows with K capped at
+/// [`MAX_REFLOG_PRUNE_ROWS`]; space is O(K) victim sequence numbers. The
+/// floor row is excluded in SQL (`seq < (SELECT MAX(seq) ...)`) so selection
+/// never buffers full rows; every streamed row (including the floor row,
+/// fetched separately) is still validated with the `read_reflog` mapping
+/// before any write, so corruption anywhere in this ref's history fails
+/// closed even after the victim buffer is full.
 pub fn prune_reflog(
     store: &mut ContentStore,
     name: &str,
@@ -864,20 +881,71 @@ pub fn prune_reflog(
     now_ms: u64,
 ) -> Result<PruneReport, RefError> {
     ContentStore::validate_ref_name(name).map_err(|_| RefError::InvalidName)?;
+    let cap = max_rows.min(MAX_REFLOG_PRUNE_ROWS);
     let grace_threshold = now_ms.saturating_sub(tombstone_grace_ms);
     let zero = tombstone_hash();
 
     let mut guard = store.lock_conn().map_err(map_store_err)?;
     let tx = guard.transaction().map_err(map_sqlite)?;
-    let raw: Vec<(i64, Option<String>, String, i64)> = {
+
+    // Floor: the newest row (largest seq) for this ref is never deletable.
+    // A missing MAX means the ref holds no rows: nothing to do.
+    let max_seq: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(seq) FROM reflog WHERE ref_name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .map_err(map_sqlite)?;
+    let Some(max_seq) = max_seq else {
+        tx.commit().map_err(map_sqlite)?;
+        return Ok(PruneReport {
+            pruned: 0,
+            floor_kept: 0,
+            tombstone_survived: 0,
+        });
+    };
+    // Exactly one row is floor-protected (total >= 1, so min(total, floor)
+    // is MIN_REFLOG_FLOOR itself).
+    let floor_kept = MIN_REFLOG_FLOOR;
+
+    // Fail closed before any write: validate the floor row with the same
+    // mapping as read_reflog (bad hex or negative timestamp is Corrupt). The
+    // candidate scan below excludes this row in SQL, so it needs its own
+    // check to keep corruption coverage total.
+    {
+        let (old_hex, new_hex, at_ms): (Option<String>, String, i64) = tx
+            .query_row(
+                "SELECT old_hash, new_hash, at_ms FROM reflog WHERE seq = ?1",
+                params![max_seq],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(map_sqlite)?;
+        if let Some(hex) = &old_hex {
+            ContentHash::from_hex(hex).map_err(|_| RefError::Corrupt)?;
+        }
+        ContentHash::from_hex(&new_hex).map_err(|_| RefError::Corrupt)?;
+        if at_ms < 0 {
+            return Err(RefError::Corrupt);
+        }
+    }
+
+    // Stream age candidates oldest-first (floor excluded in SQL) and buffer
+    // only victim seq values, bounded by the clamped cap. Rows past a full
+    // buffer are still validated so a later corrupt row fails closed instead
+    // of being silently skipped; grace survivors are counted regardless of
+    // the cap, matching the pre-cap truncate ordering.
+    let mut victims: Vec<i64> = Vec::new();
+    let mut tombstone_survived: usize = 0;
+    {
         let mut stmt = tx
             .prepare(
                 "SELECT seq, old_hash, new_hash, at_ms
-                 FROM reflog WHERE ref_name = ?1 ORDER BY seq ASC",
+                 FROM reflog WHERE ref_name = ?1 AND seq < ?2 ORDER BY seq ASC",
             )
             .map_err(map_sqlite)?;
         let rows = stmt
-            .query_map(params![name], |row| {
+            .query_map(params![name, max_seq], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -886,54 +954,28 @@ pub fn prune_reflog(
                 ))
             })
             .map_err(map_sqlite)?;
-        let mut out = Vec::new();
         for item in rows {
-            out.push(item.map_err(map_sqlite)?);
+            let (seq, old_hex, new_hex, at_ms) = item.map_err(map_sqlite)?;
+            if let Some(hex) = &old_hex {
+                ContentHash::from_hex(hex).map_err(|_| RefError::Corrupt)?;
+            }
+            let new_hash = ContentHash::from_hex(&new_hex).map_err(|_| RefError::Corrupt)?;
+            if at_ms < 0 {
+                return Err(RefError::Corrupt);
+            }
+            let at_ms = at_ms as u64;
+            if at_ms >= older_than_ms {
+                continue;
+            }
+            if new_hash == zero && at_ms >= grace_threshold {
+                tombstone_survived += 1;
+                continue;
+            }
+            if victims.len() < cap {
+                victims.push(seq);
+            }
         }
-        out
-    };
-
-    // Fail closed before any write: validate every row for this ref with the
-    // same mapping as read_reflog (bad hex or negative timestamp is Corrupt).
-    let mut validated: Vec<(i64, ContentHash, u64)> = Vec::with_capacity(raw.len());
-    for (seq, old_hex, new_hex, at_ms) in &raw {
-        if let Some(hex) = old_hex {
-            ContentHash::from_hex(hex).map_err(|_| RefError::Corrupt)?;
-        }
-        let new_hash = ContentHash::from_hex(new_hex).map_err(|_| RefError::Corrupt)?;
-        if *at_ms < 0 {
-            return Err(RefError::Corrupt);
-        }
-        validated.push((*seq, new_hash, *at_ms as u64));
     }
-
-    let total = validated.len();
-    let floor_kept = total.min(MIN_REFLOG_FLOOR);
-    if total <= MIN_REFLOG_FLOOR {
-        tx.commit().map_err(map_sqlite)?;
-        return Ok(PruneReport {
-            pruned: 0,
-            floor_kept,
-            tombstone_survived: 0,
-        });
-    }
-
-    // Floor excludes the newest MIN_REFLOG_FLOOR rows (largest seq values;
-    // SELECT arrived oldest-first so the prefix is deletable).
-    let deletable = &validated[..total - MIN_REFLOG_FLOOR];
-    let mut tombstone_survived: usize = 0;
-    let mut victims: Vec<i64> = Vec::new();
-    for (seq, new_hash, at_ms) in deletable {
-        if *at_ms >= older_than_ms {
-            continue;
-        }
-        if *new_hash == zero && *at_ms >= grace_threshold {
-            tombstone_survived += 1;
-            continue;
-        }
-        victims.push(*seq);
-    }
-    victims.truncate(max_rows);
 
     for seq in &victims {
         let affected = tx
