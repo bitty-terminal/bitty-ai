@@ -6,10 +6,11 @@ use bitty_ai_slice::content_store::{
     CheckpointDraft, ContentHash, ContentStore, ContentStoreError, Rationale,
 };
 use bitty_ai_slice::session_refs::{
-    BranchName, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, RefError, ReflogEntry,
-    commit_checkpoint_with_branch, create_branch, delete_branch, get_branch, list_branches,
-    read_reflog, rename_branch, update_branch,
+    BranchName, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, MIN_REFLOG_FLOOR, PruneReport,
+    RefError, ReflogEntry, commit_checkpoint_with_branch, create_branch, delete_branch, get_branch,
+    list_branches, prune_reflog, read_reflog, rename_branch, update_branch,
 };
+use bitty_ai_slice::wheel_bridge::{BridgeResponse, WheelBridge};
 use bitty_ai_slice::wheel_kernel::WheelKernel;
 
 fn commit_linear(
@@ -710,5 +711,330 @@ fn ff_only_refuses_after_concurrent_branch_move() {
         read_reflog(&store, "heads/main", 10).expect("read").len(),
         2,
         "failed stale update must append no reflog row"
+    );
+}
+
+#[test]
+fn prune_floor_keeps_latest_row_despite_age() {
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
+    for i in 1..=3 {
+        update_branch(
+            &mut store,
+            "heads/main",
+            &tip,
+            &format!("move {i}"),
+            "bob",
+            1000 + i as u64,
+            false,
+        )
+        .expect("update");
+    }
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
+        4
+    );
+    // Every row is age-eligible, but the floor keeps the newest one.
+    let report = prune_reflog(&mut store, "heads/main", u64::MAX, 100, 0, 0).expect("prune");
+    assert_eq!(report.pruned, 3);
+    assert_eq!(report.floor_kept, MIN_REFLOG_FLOOR);
+    assert_eq!(report.tombstone_survived, 0);
+    let rows = read_reflog(&store, "heads/main", 10).expect("read after");
+    assert_eq!(rows.len(), 1, "floor keeps exactly the latest row");
+    assert_eq!(rows[0].reason, "move 3");
+
+    // A single-row ref never prunes: floor covers the only row.
+    let mut single = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut single, Vec::new(), "tip", 1000);
+    create_branch(&mut single, "heads/solo", &tip, "create", "alice", 1000).expect("create");
+    let report = prune_reflog(&mut single, "heads/solo", u64::MAX, 100, 0, 0).expect("prune solo");
+    assert_eq!(report.pruned, 0);
+    assert_eq!(report.floor_kept, 1);
+    assert_eq!(
+        read_reflog(&single, "heads/solo", 10)
+            .expect("read solo")
+            .len(),
+        1
+    );
+
+    // Kernel passthrough reaches the same plane with no extra policy.
+    let mut kernel = WheelKernel::open_in_memory().expect("kernel opens");
+    kernel.put_slot("a.txt", b"v1", 1000).expect("slot");
+    kernel
+        .commit_checkpoint(
+            bitty_ai_slice::content_store::Rationale::new("First", "Baseline"),
+            Some("heads/main"),
+            1010,
+        )
+        .expect("commit");
+    kernel.put_slot("a.txt", b"v2", 1020).expect("slot");
+    kernel
+        .commit_checkpoint(
+            bitty_ai_slice::content_store::Rationale::new("Second", "Advance"),
+            Some("heads/main"),
+            1030,
+        )
+        .expect("commit");
+    let kernel_report = kernel
+        .prune_reflog("heads/main", u64::MAX, 100, 0, 0)
+        .expect("kernel prune");
+    assert_eq!(kernel_report.pruned, 1);
+    assert_eq!(kernel_report.floor_kept, MIN_REFLOG_FLOOR);
+    assert_eq!(
+        kernel
+            .read_reflog("heads/main", 10)
+            .expect("kernel read")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn prune_tombstone_grace_survives_and_out_of_grace_prunes() {
+    fn setup_with_recreate() -> ContentStore {
+        let mut store = ContentStore::open_in_memory().expect("open");
+        let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
+        create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
+        update_branch(&mut store, "heads/main", &tip, "move", "bob", 2000, false).expect("move");
+        delete_branch(&mut store, "heads/main", "retire", "dave", 9000).expect("delete");
+        // Recreate so the tombstone is not the floor-protected newest row.
+        create_branch(&mut store, "heads/main", &tip, "recreate", "alice", 9500).expect("recreate");
+        store
+    }
+
+    // In-grace tombstone survives: threshold 8000, tombstone at 9000 is kept.
+    let mut store = setup_with_recreate();
+    let report = prune_reflog(&mut store, "heads/main", 9500, 100, 2000, 10_000).expect("prune");
+    assert_eq!(report.floor_kept, MIN_REFLOG_FLOOR);
+    assert_eq!(report.tombstone_survived, 1);
+    assert_eq!(report.pruned, 2, "create + move prune, tombstone survives");
+    let rows = read_reflog(&store, "heads/main", 10).expect("read");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].reason, "recreate");
+    assert_eq!(rows[0].at_ms, 9500);
+    assert_eq!(
+        rows[1].new_hash,
+        ContentHash::from_bytes([0u8; 32]),
+        "surviving row is the tombstone"
+    );
+
+    // Out-of-grace tombstone prunes like any other row: threshold 18000.
+    let mut store = setup_with_recreate();
+    let report = prune_reflog(&mut store, "heads/main", 9500, 100, 2000, 20_000).expect("prune");
+    assert_eq!(report.tombstone_survived, 0);
+    assert_eq!(report.pruned, 3, "tombstone out of grace is prunable");
+    let rows = read_reflog(&store, "heads/main", 10).expect("read");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reason, "recreate");
+}
+
+#[test]
+fn prune_max_rows_bounds_deletion_oldest_first() {
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
+    for i in 1..=4 {
+        update_branch(
+            &mut store,
+            "heads/main",
+            &tip,
+            &format!("move {i}"),
+            "bob",
+            1000 + i as u64,
+            false,
+        )
+        .expect("update");
+    }
+    // Five rows; floor protects move 4, the four older rows are eligible.
+    let report = prune_reflog(&mut store, "heads/main", u64::MAX, 2, 0, 0).expect("prune");
+    assert_eq!(report.pruned, 2);
+    assert_eq!(report.floor_kept, MIN_REFLOG_FLOOR);
+    let rows = read_reflog(&store, "heads/main", 10).expect("read");
+    assert_eq!(rows.len(), 3, "bounded prune leaves three newest rows");
+    assert_eq!(rows[0].reason, "move 4");
+    assert_eq!(rows[1].reason, "move 3");
+    assert_eq!(rows[2].reason, "move 2");
+}
+
+#[test]
+fn prune_corrupt_row_fails_closed() {
+    // A stored negative at_ms (u64::MAX wraps to -1 on the i64 column) is
+    // corrupt: prune must fail closed with zero writes, matching read_reflog.
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", u64::MAX).expect("create");
+    let err = prune_reflog(&mut store, "heads/main", u64::MAX, 100, 0, 0).expect_err("corrupt");
+    assert_eq!(err, RefError::Corrupt);
+    // No partial progress: a second call still fails closed instead of
+    // succeeding on a trimmed table.
+    let err =
+        prune_reflog(&mut store, "heads/main", u64::MAX, 100, 0, 0).expect_err("still corrupt");
+    assert_eq!(err, RefError::Corrupt);
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect_err("read corrupt"),
+        RefError::Corrupt
+    );
+
+    // Malformed names never reach the store scan (shape only, like
+    // read_reflog: bare but well-formed names such as "main" are readable and
+    // prune to an empty report, while bad charset or empty names are Invalid).
+    let mut clean = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut clean, Vec::new(), "tip", 1000);
+    create_branch(&mut clean, "heads/main", &tip, "create", "alice", 1000).expect("create");
+    let empty_report = prune_reflog(&mut clean, "heads/never-created", u64::MAX, 100, 0, 0)
+        .expect("unknown well-formed name prunes nothing");
+    assert_eq!(empty_report.pruned, 0);
+    for bad in ["", "bad name with spaces", "bad:name"] {
+        assert_eq!(
+            prune_reflog(&mut clean, bad, u64::MAX, 100, 0, 0).expect_err("bad shape"),
+            RefError::InvalidName,
+            "name {bad:?} must be InvalidName"
+        );
+    }
+}
+
+fn dispatch_ok(
+    bridge: &mut WheelBridge,
+    command: &str,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let raw = bridge.dispatch(command, &payload.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&raw).expect("bridge response parses");
+    assert!(resp.success, "command {command} failed: {:?}", resp.error);
+    resp.data.expect("response data present")
+}
+
+fn dispatch_err(bridge: &mut WheelBridge, command: &str, payload: &serde_json::Value) -> String {
+    let raw = bridge.dispatch(command, &payload.to_string());
+    let resp: BridgeResponse = serde_json::from_str(&raw).expect("bridge response parses");
+    assert!(!resp.success, "command {command} unexpectedly succeeded");
+    resp.error.expect("error present")
+}
+
+#[test]
+fn bridge_reflog_prune_wrong_typed_fields_fail_closed() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    let base = serde_json::json!({
+        "ref_name": "heads/main",
+        "older_than_ms": 5000,
+        "max_rows": 10,
+        "tombstone_grace_ms": 1000,
+        "now_ms": 10000
+    });
+    // Absent or null numerics keep fail-safe defaults (no error).
+    let mut nulls = base.clone();
+    nulls["older_than_ms"] = serde_json::Value::Null;
+    nulls["max_rows"] = serde_json::Value::Null;
+    nulls["tombstone_grace_ms"] = serde_json::Value::Null;
+    nulls["now_ms"] = serde_json::Value::Null;
+    let data = dispatch_ok(&mut bridge, "reflog.prune", &nulls);
+    assert_eq!(data["pruned"], 0, "null defaults prune nothing");
+    // Present-but-wrong-typed fields fail closed naming the field.
+    for (field, bad) in [
+        ("ref_name", serde_json::json!(42)),
+        ("older_than_ms", serde_json::json!("5000")),
+        ("max_rows", serde_json::json!("10")),
+        ("tombstone_grace_ms", serde_json::json!("1000")),
+        ("now_ms", serde_json::json!("10000")),
+    ] {
+        let mut payload = base.clone();
+        payload[field] = bad;
+        let err = dispatch_err(&mut bridge, "reflog.prune", &payload);
+        assert!(
+            err.contains(field),
+            "wrong-typed {field} must name the field, got: {err}"
+        );
+    }
+    // Missing ref_name is an error, never a default.
+    let err = dispatch_err(&mut bridge, "reflog.prune", &serde_json::json!({}));
+    assert!(
+        err.contains("ref_name"),
+        "missing ref_name must error, got: {err}"
+    );
+}
+
+#[test]
+fn bridge_reflog_prune_default_noop_safe() {
+    let mut bridge = WheelBridge::open_in_memory().expect("bridge opens");
+    bridge
+        .kernel_mut()
+        .put_slot("a.txt", b"v1", 1000)
+        .expect("slot");
+    bridge
+        .kernel_mut()
+        .commit_checkpoint(
+            bitty_ai_slice::content_store::Rationale::new("First", "Baseline"),
+            Some("heads/main"),
+            1010,
+        )
+        .expect("commit");
+    bridge
+        .kernel_mut()
+        .put_slot("a.txt", b"v2", 1020)
+        .expect("slot");
+    bridge
+        .kernel_mut()
+        .commit_checkpoint(
+            bitty_ai_slice::content_store::Rationale::new("Second", "Advance"),
+            Some("heads/main"),
+            1030,
+        )
+        .expect("commit");
+    let before = bridge
+        .kernel()
+        .read_reflog("heads/main", 10)
+        .expect("read before");
+    assert_eq!(before.len(), 2);
+
+    // Bare ref_name uses fail-safe numeric defaults (0): pruning with a zero
+    // bound matches nothing, so the call is a no-op.
+    let data = dispatch_ok(
+        &mut bridge,
+        "reflog.prune",
+        &serde_json::json!({
+            "ref_name": "heads/main"
+        }),
+    );
+    assert_eq!(data["pruned"], 0);
+    assert_eq!(data["floor_kept"], 1);
+    assert_eq!(data["tombstone_survived"], 0);
+    let after = bridge
+        .kernel()
+        .read_reflog("heads/main", 10)
+        .expect("read after");
+    assert_eq!(after, before, "default prune deletes nothing");
+
+    // Explicit zeros behave identically.
+    let data = dispatch_ok(
+        &mut bridge,
+        "reflog.prune",
+        &serde_json::json!({
+            "ref_name": "heads/main",
+            "older_than_ms": 0,
+            "max_rows": 100,
+            "tombstone_grace_ms": 0,
+            "now_ms": 9999
+        }),
+    );
+    assert_eq!(data["pruned"], 0);
+    assert_eq!(
+        bridge
+            .kernel()
+            .read_reflog("heads/main", 10)
+            .expect("read")
+            .len(),
+        2
+    );
+
+    // Direct free-function no-op parity: zero bounds delete nothing.
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
+    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000).expect("create");
+    let report: PruneReport = prune_reflog(&mut store, "heads/main", 0, 0, 0, 0).expect("noop");
+    assert_eq!(report.pruned, 0);
+    assert_eq!(
+        read_reflog(&store, "heads/main", 10).expect("read").len(),
+        1
     );
 }

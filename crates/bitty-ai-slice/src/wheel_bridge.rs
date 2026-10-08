@@ -575,6 +575,47 @@ impl WheelBridge {
                     .map_err(|e| e.to_string())?;
                 Ok(gc_report_to_value(&report))
             }
+            "reflog.prune" => {
+                let ref_name = payload
+                    .get("ref_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("missing or invalid 'ref_name' field")?;
+                let older_than_ms = match payload.get("older_than_ms") {
+                    None | Some(serde_json::Value::Null) => 0,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or("missing or invalid 'older_than_ms' field, expected u64")?,
+                };
+                let max_rows = match payload.get("max_rows") {
+                    None | Some(serde_json::Value::Null) => 0,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or("missing or invalid 'max_rows' field, expected u64")?,
+                } as usize;
+                let tombstone_grace_ms = match payload.get("tombstone_grace_ms") {
+                    None | Some(serde_json::Value::Null) => 0,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or("missing or invalid 'tombstone_grace_ms' field, expected u64")?,
+                };
+                let now_ms = match payload.get("now_ms") {
+                    None | Some(serde_json::Value::Null) => 0,
+                    Some(v) => v
+                        .as_u64()
+                        .ok_or("missing or invalid 'now_ms' field, expected u64")?,
+                };
+                let report = self
+                    .kernel
+                    .prune_reflog(
+                        ref_name,
+                        older_than_ms,
+                        max_rows,
+                        tombstone_grace_ms,
+                        now_ms,
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(prune_report_to_value(&report))
+            }
             unknown => Err(format!("unknown bridge command: '{unknown}'")),
         }
     }
@@ -628,5 +669,20 @@ fn gc_report_to_value(report: &GcReport) -> serde_json::Value {
         "deleted_checkpoints": report.deleted_checkpoints,
         "deleted_blobs": report.deleted_blobs,
         "truncated": report.truncated,
+    })
+}
+
+/// Render a [`PruneReport`][crate::session_refs::PruneReport] as a bridge JSON value.
+///
+/// Fail-safe defaults (see `reflog.prune` arm): absent or null numeric fields
+/// default to `0`, so a bare `{"ref_name": ...}` call prunes nothing
+/// (`older_than_ms = 0` matches no validated row; `max_rows = 0` deletes
+/// nothing). Present-but-wrong-typed fields are errors naming the field, never
+/// silent defaults.
+fn prune_report_to_value(report: &crate::session_refs::PruneReport) -> serde_json::Value {
+    serde_json::json!({
+        "pruned": report.pruned,
+        "floor_kept": report.floor_kept,
+        "tombstone_survived": report.tombstone_survived,
     })
 }

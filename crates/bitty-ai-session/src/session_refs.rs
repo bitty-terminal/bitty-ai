@@ -66,6 +66,14 @@ pub const MAX_REFLOG_ACTOR_BYTES: usize = 128;
 /// Maximum reflog entries returned by a single [`read_reflog`] call (1024).
 pub const MAX_REFLOG_READ_LIMIT: usize = 1024;
 
+/// Minimum retained reflog rows per ref after [`prune_reflog`] (1).
+///
+/// The floor always keeps the latest row regardless of age so HEAD recovery
+/// stays inspectable. A fixed constant (not a caller parameter) keeps the
+/// explicit prune op fail-safe: callers can bound age and count but can never
+/// trim history to zero rows.
+pub const MIN_REFLOG_FLOOR: usize = 1;
+
 /// Required branch namespace prefix.
 const BRANCH_NAMESPACE: &str = "heads/";
 
@@ -806,6 +814,144 @@ pub fn dump_reflog_all(store: &ContentStore) -> Result<Vec<ReflogEntry>, RefErro
         });
     }
     Ok(entries)
+}
+
+/// Outcome of [`prune_reflog`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Rows actually deleted by this call.
+    pub pruned: usize,
+    /// Newest rows excluded from deletion by [`MIN_REFLOG_FLOOR`]
+    /// (`min(total, floor)`; all rows when the ref holds at most the floor).
+    pub floor_kept: usize,
+    /// Age-eligible non-floor tombstone rows skipped by the grace window.
+    pub tombstone_survived: usize,
+}
+
+/// Explicitly expire reflog history for one ref, bounded by age and count.
+///
+/// Deletes rows for `name` with `at_ms < older_than_ms`, oldest-first, up to
+/// `max_rows` rows, in a single SQLite transaction (candidate select, delete,
+/// and report commit or roll back together). Pruned rows are history evidence
+/// only: pruning history never resurrects or deletes live objects, and GC
+/// keeps ignoring reflog rows.
+///
+/// Two protections always apply:
+/// - Floor: the latest [`MIN_REFLOG_FLOOR`] rows are never deleted,
+///   regardless of age, so HEAD recovery stays inspectable.
+/// - Tombstone grace: deletion tombstone rows (`new_hash` is the all-zero
+///   hash) with `at_ms >= now_ms.saturating_sub(tombstone_grace_ms)` survive
+///   even when age-eligible. Tombstones carry no `at_ms` trust beyond this
+///   caller-supplied window: out-of-grace tombstones prune like any other
+///   age-eligible row. All clocks are caller-supplied; no wall-clock is read.
+///
+/// Fail-safe defaults: `older_than_ms = 0` matches nothing (`at_ms < 0` is
+/// impossible for validated rows) so the call is a no-op; `max_rows = 0`
+/// deletes nothing. Shape validation matches [`read_reflog`]: a malformed
+/// name is [`RefError::InvalidName`], and any bad hex or negative `at_ms`
+/// among this ref's rows fails closed as [`RefError::Corrupt`] with zero
+/// writes (the transaction rolls back). Reuses the existing error mapping;
+/// no new variants.
+///
+/// Time/Space: O(N) reads over this ref's rows (N unbounded for an unpruned
+/// ref) plus O(K) writes for K deleted rows; space is O(N) hashes in memory.
+pub fn prune_reflog(
+    store: &mut ContentStore,
+    name: &str,
+    older_than_ms: u64,
+    max_rows: usize,
+    tombstone_grace_ms: u64,
+    now_ms: u64,
+) -> Result<PruneReport, RefError> {
+    ContentStore::validate_ref_name(name).map_err(|_| RefError::InvalidName)?;
+    let grace_threshold = now_ms.saturating_sub(tombstone_grace_ms);
+    let zero = tombstone_hash();
+
+    let mut guard = store.lock_conn().map_err(map_store_err)?;
+    let tx = guard.transaction().map_err(map_sqlite)?;
+    let raw: Vec<(i64, Option<String>, String, i64)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT seq, old_hash, new_hash, at_ms
+                 FROM reflog WHERE ref_name = ?1 ORDER BY seq ASC",
+            )
+            .map_err(map_sqlite)?;
+        let rows = stmt
+            .query_map(params![name], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(map_sqlite)?;
+        let mut out = Vec::new();
+        for item in rows {
+            out.push(item.map_err(map_sqlite)?);
+        }
+        out
+    };
+
+    // Fail closed before any write: validate every row for this ref with the
+    // same mapping as read_reflog (bad hex or negative timestamp is Corrupt).
+    let mut validated: Vec<(i64, ContentHash, u64)> = Vec::with_capacity(raw.len());
+    for (seq, old_hex, new_hex, at_ms) in &raw {
+        if let Some(hex) = old_hex {
+            ContentHash::from_hex(hex).map_err(|_| RefError::Corrupt)?;
+        }
+        let new_hash = ContentHash::from_hex(new_hex).map_err(|_| RefError::Corrupt)?;
+        if *at_ms < 0 {
+            return Err(RefError::Corrupt);
+        }
+        validated.push((*seq, new_hash, *at_ms as u64));
+    }
+
+    let total = validated.len();
+    let floor_kept = total.min(MIN_REFLOG_FLOOR);
+    if total <= MIN_REFLOG_FLOOR {
+        tx.commit().map_err(map_sqlite)?;
+        return Ok(PruneReport {
+            pruned: 0,
+            floor_kept,
+            tombstone_survived: 0,
+        });
+    }
+
+    // Floor excludes the newest MIN_REFLOG_FLOOR rows (largest seq values;
+    // SELECT arrived oldest-first so the prefix is deletable).
+    let deletable = &validated[..total - MIN_REFLOG_FLOOR];
+    let mut tombstone_survived: usize = 0;
+    let mut victims: Vec<i64> = Vec::new();
+    for (seq, new_hash, at_ms) in deletable {
+        if *at_ms >= older_than_ms {
+            continue;
+        }
+        if *new_hash == zero && *at_ms >= grace_threshold {
+            tombstone_survived += 1;
+            continue;
+        }
+        victims.push(*seq);
+    }
+    victims.truncate(max_rows);
+
+    for seq in &victims {
+        let affected = tx
+            .execute(
+                "DELETE FROM reflog WHERE seq = ?1 AND ref_name = ?2",
+                params![seq, name],
+            )
+            .map_err(map_sqlite)?;
+        if affected != 1 {
+            return Err(RefError::Corrupt);
+        }
+    }
+    tx.commit().map_err(map_sqlite)?;
+    Ok(PruneReport {
+        pruned: victims.len(),
+        floor_kept,
+        tombstone_survived,
+    })
 }
 
 #[cfg(test)]
