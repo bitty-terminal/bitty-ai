@@ -5,7 +5,8 @@
 //! one JSON-RPC frame with `Accept: application/json, text/event-stream` and
 //! `Content-Type: application/json` (plus `Mcp-Session-Id` once known),
 //! captures the session id from the response, and queues the decoded answer
-//! lines; `recv_line` pops the queue else reports `Ok(None)`. `shutdown`
+//! lines; `recv_line` pops the queue else waits a bounded slice before
+//! reporting `Ok(None)`. `shutdown`
 //! best-effort DELETEs the session. There is deliberately no background GET
 //! listener in v1 (poll-per-request only) and no auto-reconnect: failures
 //! surface as [`McpFailure::TransportClosed`], [`McpFailure::Timeout`],
@@ -17,9 +18,12 @@
 //!
 //! - `application/json`: one JSON-RPC frame queued verbatim (frame-cap
 //!   bounded).
-//! - `text/event-stream`: each `data:` payload holding a JSON object is one
-//!   queued line (frame-cap bounded per event, fan-out bounded by
-//!   [`MAX_SSE_FRAMES_PER_RESPONSE`]); other SSE fields are ignored.
+//! - `text/event-stream`: the `data:` fields of one event join with `"\n"`
+//!   into one payload at the blank-line separator, and each joined payload
+//!   holding a JSON object is one queued line (frame-cap bounded on the
+//!   joined total, fan-out bounded by [`MAX_SSE_FRAMES_PER_RESPONSE`]
+//!   counting events, not lines); other SSE fields and comment lines are
+//!   ignored.
 //! - Empty bodies (for example `202 Accepted` on a notification) queue
 //!   nothing: `recv_line` then reports `Ok(None)`.
 //!
@@ -54,7 +58,7 @@
 //! [`McpFailure::Io`]: crate::error::McpFailure::Io
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitty_network_api::{HttpMethod, NetworkError, NetworkService, Request, Response};
 
@@ -73,6 +77,11 @@ pub const SESSION_HEADER: &str = "mcp-session-id";
 pub const MAX_SSE_FRAMES_PER_RESPONSE: usize = 16;
 /// Maximum session id length in bytes (opaque token bound).
 pub const MAX_SESSION_ID_LEN: usize = 256;
+/// Poll slice for the [`HttpLineTransport::recv_line`] bounded wait.
+///
+/// Small enough that whole-operation deadline overshoot stays negligible,
+/// large enough to avoid a hot spin while `wait_for_response` waits.
+const RECV_POLL_SLICE: Duration = Duration::from_millis(5);
 /// Synthetic JSON-RPC error code for transport-level HTTP rejections.
 pub const TRANSPORT_ERROR_CODE: i64 = -32000;
 
@@ -355,6 +364,24 @@ impl<S> HttpLineTransport<S> {
         Ok(())
     }
 
+    fn enqueue_sse_payload(&mut self, payload: &str) -> Result<(), McpError> {
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return Ok(());
+        }
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(frame_too_large());
+        }
+        if !is_json_object(payload) {
+            return Ok(());
+        }
+        if self.queue.len() >= MAX_SSE_FRAMES_PER_RESPONSE {
+            return Err(frame_too_large());
+        }
+        self.queue.push_back(payload.to_owned());
+        Ok(())
+    }
+
     fn handle_sse_body(&mut self, id: Option<&str>, body: &[u8]) -> Result<(), McpError> {
         if body.is_empty() {
             return Ok(());
@@ -365,8 +392,18 @@ impl<S> HttpLineTransport<S> {
                 return self.enqueue_or_reject(id, "malformed event-stream body");
             }
         };
+        let mut event_data = String::new();
+        let mut has_data = false;
         for raw_line in text.split('\n') {
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if line.is_empty() {
+                if has_data {
+                    self.enqueue_sse_payload(&event_data)?;
+                    event_data.clear();
+                    has_data = false;
+                }
+                continue;
+            }
             let trimmed = line.trim_start();
             if !trimmed.starts_with("data:") {
                 continue;
@@ -376,21 +413,19 @@ impl<S> HttpLineTransport<S> {
                 payload = stripped;
             }
             let payload = payload.trim();
-            if payload.is_empty() || payload == "[DONE]" {
-                continue;
-            }
-            if payload.len() > MAX_FRAME_BYTES {
+            let additional = payload.len() + usize::from(has_data);
+            if event_data.len().saturating_add(additional) > MAX_FRAME_BYTES {
                 return Err(frame_too_large());
             }
-            if !is_json_object(payload) {
-                continue;
+            if has_data {
+                event_data.push('\n');
             }
-            if self.queue.len() >= MAX_SSE_FRAMES_PER_RESPONSE {
-                return Err(frame_too_large());
-            }
-            self.queue.push_back(payload.to_owned());
+            event_data.push_str(payload);
+            has_data = true;
         }
-        let _ = id;
+        if has_data {
+            self.enqueue_sse_payload(&event_data)?;
+        }
         Ok(())
     }
 
@@ -455,11 +490,35 @@ impl<S: NetworkService> McpTransport for HttpLineTransport<S> {
         }
     }
 
-    fn recv_line(&mut self, _timeout_ms: u64) -> Result<Option<String>, McpError> {
+    fn recv_line(&mut self, timeout_ms: u64) -> Result<Option<String>, McpError> {
         if self.closed {
             return Err(transport_closed());
         }
-        Ok(self.queue.pop_front())
+        if let Some(line) = self.queue.pop_front() {
+            return Ok(Some(line));
+        }
+        if timeout_ms == 0 {
+            return Ok(None);
+        }
+        // Bounded wait so `wait_for_response` does not busy-spin on an empty
+        // queue: sleep in small slices up to the caller deadline, rechecking
+        // the queue each slice. The queue is synchronous (filled only by
+        // `send_line`), so this is purely a backoff; the total never exceeds
+        // the caller budget and closed still fails immediately at entry.
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(line) = self.queue.pop_front() {
+                return Ok(Some(line));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            std::thread::sleep(remaining.min(RECV_POLL_SLICE));
+        }
     }
 }
 
