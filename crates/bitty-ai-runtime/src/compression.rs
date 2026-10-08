@@ -993,6 +993,13 @@ pub const MIN_KEEP_RECORDS: usize = 1;
 /// the window and [`DEFAULT_RESERVE_BYTES`], clamped strictly below
 /// `window`.
 ///
+/// AI-0177-compatible wrapper over [`CompactionPolicy::effective_reserve_bytes`]
+/// with a default policy carrying the caller's window: identical arithmetic
+/// (fraction [`RESERVE_FRACTION_NUMERATOR`] / [`RESERVE_FRACTION_DENOMINATOR`],
+/// floor [`DEFAULT_RESERVE_BYTES`], clamp below `window`), so existing
+/// trigger call sites behave unchanged. New code should thread a
+/// [`CompactionPolicy`] and call the method instead.
+///
 /// Fail-closed: a zero window yields `0` (no reserve without a window), and
 /// tiny windows clamp to `window - 1` rather than overflowing the budget
 /// they protect. Saturating arithmetic throughout, so pathological windows
@@ -1002,12 +1009,11 @@ pub const MIN_KEEP_RECORDS: usize = 1;
 /// summaries still land in the dynamic turn region, stable layers untouched.
 #[must_use]
 pub fn effective_reserve_bytes(window: usize) -> usize {
-    if window == 0 {
-        return 0;
+    CompactionPolicy {
+        window_bytes: window,
+        ..CompactionPolicy::default()
     }
-    let fraction = window.saturating_mul(RESERVE_FRACTION_NUMERATOR) / RESERVE_FRACTION_DENOMINATOR;
-    let reserve = fraction.max(DEFAULT_RESERVE_BYTES);
-    reserve.min(window.saturating_sub(1))
+    .effective_reserve_bytes()
 }
 
 /// Compaction trigger: true exactly when `used + reserve` exceeds `window`.
@@ -1349,6 +1355,341 @@ pub fn compact_selective(
             reason: error.to_string(),
         },
     }
+}
+
+// --- Compaction tuning knobs (AI-0183) ---
+//
+// Host-tunable policy plumbed over the AI-0177 slice above: one
+// [`CompactionPolicy`] carries the window, tail budget, reserve fraction,
+// and ineffective-strike bound; [`preview_compaction`] mirrors the driver's
+// pre-summarizer steps without touching the [`Summarizer`] seam; and
+// [`record_ineffective`] counts consecutive ineffective passes toward
+// disabling automatic compaction. Every item is fail-closed, deterministic
+// for a given input (no clock, no threads, no async; the caller supplies
+// `now_ms` where timestamps are needed), std-only, and cache-safe:
+// summaries land in the dynamic turn region only, stable prompt layers
+// untouched.
+
+/// Default host context window for [`CompactionPolicy`]: 64 KiB, twice the
+/// 32 KiB context-budget family, comfortably above the 20 KiB tail budget
+/// plus the 16 KiB reserve floor with headroom for one head summary.
+///
+/// Fail-closed default input (never a live measurement). Deterministic
+/// constant (no clock). Cache placement: the window only sizes the trigger
+/// and the doomed-call guard; summaries still land in the dynamic turn
+/// region, stable layers untouched.
+pub const DEFAULT_COMPACTION_WINDOW_BYTES: usize = 64 * 1024;
+/// Default ineffective-strike bound for [`CompactionPolicy`]: three
+/// consecutive ineffective passes disable automatic compaction, after which
+/// the host falls back to explicit operator action (the `/compact`
+/// command). Three strikes mirrors the familiar circuit-breaker practice:
+/// one miss is noise, two is a pattern, three retires the automatism until
+/// the operator resets the counter.
+///
+/// Fail-closed default input (never a live measurement). Deterministic
+/// constant (no clock). The runtime owns the disable decision; the slice
+/// store keeps counter persistence.
+pub const DEFAULT_MAX_INEFFECTIVE_STRIKES: u32 = 3;
+/// Upper sanity bound for [`CompactionPolicy::validate`]: strike bounds
+/// above 1_024 are rejected as misconfiguration (a counter that needs more
+/// than a thousand consecutive misses before retiring has no operational
+/// meaning; the host almost certainly scaled the wrong unit).
+///
+/// Fail-closed bound (never a live measurement). Deterministic constant
+/// (no clock).
+pub const MAX_INEFFECTIVE_STRIKES: u32 = 1_024;
+
+/// Host-tunable compaction policy: every knob the AI-0177 slice hard-codes
+/// in one fail-closed, validated struct.
+///
+/// - `window_bytes`: host context window; sizes the reserve (via
+///   [`CompactionPolicy::effective_reserve_bytes`]) and the doomed-call
+///   guard.
+/// - `keep_recent_bytes`: tail-protection budget kept verbatim (see
+///   [`select_compaction_window`]).
+/// - `reserve_num` / `reserve_den`: reserve fraction of the window
+///   (`reserve_num / reserve_den`), floored by [`DEFAULT_RESERVE_BYTES`]
+///   (see [`CompactionPolicy::effective_reserve_bytes`]).
+/// - `max_ineffective_strikes`: consecutive ineffective passes before
+///   automatic compaction disables itself (see [`record_ineffective`]).
+///
+/// Fail-closed: [`CompactionPolicy::validate`] rejects degenerate policies
+/// before use. Deterministic: plain data, no clock. Cache placement: the
+/// policy only sizes decisions; summaries still land in the dynamic turn
+/// region, stable layers untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionPolicy {
+    /// Host context window in bytes.
+    pub window_bytes: usize,
+    /// Tail-protection budget kept verbatim.
+    pub keep_recent_bytes: usize,
+    /// Numerator of the reserve fraction.
+    pub reserve_num: usize,
+    /// Denominator of the reserve fraction (non-zero).
+    pub reserve_den: usize,
+    /// Consecutive ineffective passes before auto-compaction disables.
+    pub max_ineffective_strikes: u32,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            window_bytes: DEFAULT_COMPACTION_WINDOW_BYTES,
+            keep_recent_bytes: DEFAULT_KEEP_RECENT_BYTES,
+            reserve_num: RESERVE_FRACTION_NUMERATOR,
+            reserve_den: RESERVE_FRACTION_DENOMINATOR,
+            max_ineffective_strikes: DEFAULT_MAX_INEFFECTIVE_STRIKES,
+        }
+    }
+}
+
+impl CompactionPolicy {
+    /// Validate bounds, fail closed with no partial policy accepted.
+    ///
+    /// Rejects: zero window; `keep_recent_bytes` at or above the window
+    /// (the tail must leave room for at least one head byte); zero
+    /// denominator, zero numerator, or a fraction above one (reserve at
+    /// most 100% of the window); zero or over-bound
+    /// (`> MAX_INEFFECTIVE_STRIKES`) strike bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompressionError::InvalidConfig`] for any degenerate bound.
+    pub fn validate(&self) -> Result<(), CompressionError> {
+        if self.window_bytes == 0 {
+            return Err(CompressionError::InvalidConfig {
+                reason: "window_bytes must be non-zero".to_owned(),
+            });
+        }
+        if self.keep_recent_bytes >= self.window_bytes {
+            return Err(CompressionError::InvalidConfig {
+                reason: "keep_recent_bytes must be strictly below window_bytes".to_owned(),
+            });
+        }
+        if self.reserve_den == 0 {
+            return Err(CompressionError::InvalidConfig {
+                reason: "reserve_den must be non-zero".to_owned(),
+            });
+        }
+        if self.reserve_num == 0 {
+            return Err(CompressionError::InvalidConfig {
+                reason: "reserve_num must be non-zero".to_owned(),
+            });
+        }
+        if self.reserve_num > self.reserve_den {
+            return Err(CompressionError::InvalidConfig {
+                reason: "reserve fraction must not exceed 1 (reserve_num <= reserve_den)"
+                    .to_owned(),
+            });
+        }
+        if self.max_ineffective_strikes == 0 {
+            return Err(CompressionError::InvalidConfig {
+                reason: "max_ineffective_strikes must be non-zero".to_owned(),
+            });
+        }
+        if self.max_ineffective_strikes > MAX_INEFFECTIVE_STRIKES {
+            return Err(CompressionError::InvalidConfig {
+                reason: "max_ineffective_strikes exceeds bound".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Effective compaction reserve for this policy's window: the larger of
+    /// `reserve_num / reserve_den` of [`CompactionPolicy::window_bytes`]
+    /// and [`DEFAULT_RESERVE_BYTES`], clamped strictly below the window.
+    /// This is the canonical AI-0183 path; the free
+    /// [`effective_reserve_bytes`] wrapper delegates here with default
+    /// fraction and floor, so default-policy reserves reproduce the AI-0177
+    /// trigger bit-for-bit.
+    ///
+    /// Fail-closed: a zero window yields `0`, and a zero denominator (an
+    /// unvalidated policy) yields the floor clamped below the window rather
+    /// than dividing by zero. Saturating arithmetic throughout, so
+    /// pathological windows cannot overflow or panic. Deterministic: a pure
+    /// function of the policy (no clock). Cache placement: the reserve only
+    /// sizes the trigger; summaries still land in the dynamic turn region,
+    /// stable layers untouched.
+    #[must_use]
+    pub fn effective_reserve_bytes(&self) -> usize {
+        let window = self.window_bytes;
+        if window == 0 {
+            return 0;
+        }
+        let scaled = window.saturating_mul(self.reserve_num);
+        let fraction = scaled.checked_div(self.reserve_den).unwrap_or(0);
+        let reserve = fraction.max(DEFAULT_RESERVE_BYTES);
+        reserve.min(window.saturating_sub(1))
+    }
+}
+
+impl SelectiveCompactionConfig {
+    /// Build the per-pass override struct from a [`CompactionPolicy`]:
+    /// window and tail budget come from the policy; per-pass overrides
+    /// (`protected_ids`, `current_generation`, `previous_summary`) stay
+    /// host-set afterwards (empty / `None` here). The struct itself is
+    /// unchanged so existing AI-0177 callers keep compiling.
+    ///
+    /// Deterministic: plain data movement, no clock, no validation (call
+    /// [`CompactionPolicy::validate`] first when the policy is
+    /// operator-supplied). Cache placement: as for [`compact_selective`].
+    #[must_use]
+    pub fn from_policy(policy: &CompactionPolicy) -> Self {
+        Self {
+            window_bytes: policy.window_bytes,
+            keep_recent_bytes: policy.keep_recent_bytes,
+            protected_ids: Vec::new(),
+            current_generation: None,
+            previous_summary: None,
+        }
+    }
+}
+
+/// Preview outcome: what [`compact_selective`] would decide before any
+/// summarizer contact. `WouldCompact` means the head is non-empty and fits
+/// the doomed-call guard, so the driver would call the summarizer;
+/// `NoOp` mirrors [`CompactionOutcome::NoOp`]; `Failed` mirrors
+/// [`CompactionOutcome::Failed`] for the pre-summarizer refusals the preview
+/// can observe (invalid policy, selection refusal, doomed window).
+///
+/// Fail-closed by construction. Deterministic for a given input (no clock,
+/// no threads). Cache placement: a preview moves no bytes; summaries from
+/// any follow-up driver pass still land in the dynamic turn region only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewOutcome {
+    /// Head non-empty and not doomed: the driver would call the summarizer.
+    WouldCompact,
+    /// Empty head: the driver would report `NoOp` without contact.
+    NoOp,
+    /// Fail-closed refusal with the same host-readable reason the driver
+    /// would report (policy, selection, or doomed-window refusal).
+    Failed {
+        /// Why the pass would refuse.
+        reason: String,
+    },
+}
+
+/// Dry-run compaction window: head/recent index sets plus the summed head
+/// footprint and the [`PreviewOutcome`]. Head and recent hold caller-slice
+/// indices in ascending caller order, partitioning the input exactly like
+/// [`select_compaction_window`]; `head_bytes` is the saturating footprint
+/// sum over the head, computed with the same arithmetic the driver uses for
+/// its doomed-call guard, so preview and driver byte-agree.
+///
+/// Fail-closed: on any refusal `head`/`recent` still carry the selection
+/// when one exists (doomed window) and are empty otherwise; `head_bytes`
+/// is `0` unless a head was selected. Deterministic for a given input
+/// (linear scan, no clock). Cache placement: a preview moves no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionPreview {
+    /// Indices that would compact, in ascending caller order.
+    pub head: Vec<usize>,
+    /// Indices that would stay verbatim, in ascending caller order.
+    pub recent: Vec<usize>,
+    /// Saturating footprint sum over `head` (`0` when no head selected).
+    pub head_bytes: usize,
+    /// What the driver would decide before summarizer contact.
+    pub outcome: PreviewOutcome,
+}
+
+/// Preview one selective-compaction pass without touching the
+/// [`Summarizer`] seam: validate the policy, run
+/// [`select_compaction_window`] with the policy tail budget, then apply the
+/// driver's doomed-call guard (`head_bytes + [`MAX_SUMMARY_BYTES`] `>`
+/// window refuses as doomed) with the identical message text, so preview
+/// and driver byte-agree on `NoOp`, doomed `Failed`, and would-compact.
+///
+/// Fail-closed: invalid policies and selection refusals become
+/// [`PreviewOutcome::Failed`] with the underlying reason (never a panic,
+/// never a partial window); an empty head becomes [`PreviewOutcome::NoOp`].
+/// Deterministic for a given input (no clock, no threads, no async; the
+/// caller supplies `now_ms` only where timestamps are needed — and this
+/// function takes none, because selection and doomed arithmetic need no
+/// timestamp). Cache placement: a preview moves no bytes; stable layers
+/// untouched either way. The `previous_summary` over-bound guard is driver
+///-only (the policy carries no seed), so a preview cannot observe it.
+#[must_use]
+pub fn preview_compaction(
+    records: &[ContextRecord],
+    policy: &CompactionPolicy,
+    protected_ids: &[&str],
+    current_generation: Option<u64>,
+) -> CompactionPreview {
+    if let Err(error) = policy.validate() {
+        return CompactionPreview {
+            head: Vec::new(),
+            recent: Vec::new(),
+            head_bytes: 0,
+            outcome: PreviewOutcome::Failed {
+                reason: error.to_string(),
+            },
+        };
+    }
+    let window = match select_compaction_window(
+        records,
+        policy.keep_recent_bytes,
+        protected_ids,
+        current_generation,
+    ) {
+        Ok(window) => window,
+        Err(error) => {
+            return CompactionPreview {
+                head: Vec::new(),
+                recent: Vec::new(),
+                head_bytes: 0,
+                outcome: PreviewOutcome::Failed {
+                    reason: error.to_string(),
+                },
+            };
+        }
+    };
+    if window.head.is_empty() {
+        return CompactionPreview {
+            head: window.head,
+            recent: window.recent,
+            head_bytes: 0,
+            outcome: PreviewOutcome::NoOp,
+        };
+    }
+    let head_bytes: usize = window.head.iter().fold(0usize, |total, index| {
+        total.saturating_add(records[*index].footprint_bytes())
+    });
+    let window_bytes = policy.window_bytes;
+    if head_bytes.saturating_add(MAX_SUMMARY_BYTES) > window_bytes {
+        return CompactionPreview {
+            head: window.head,
+            recent: window.recent,
+            head_bytes,
+            outcome: PreviewOutcome::Failed {
+                reason: format!(
+                    "compaction doomed: head {head_bytes} bytes plus {MAX_SUMMARY_BYTES} byte summary bound exceeds {window_bytes} byte window"
+                ),
+            },
+        };
+    }
+    CompactionPreview {
+        head: window.head,
+        recent: window.recent,
+        head_bytes,
+        outcome: PreviewOutcome::WouldCompact,
+    }
+}
+
+/// Count one ineffective compaction pass: saturating increment plus the
+/// disable decision. Returns `(new_count, disabled)` where `disabled` is
+/// true exactly when `new_count >= policy.max_ineffective_strikes`.
+///
+/// The runtime owns the decision (callers disable automatic compaction when
+/// `disabled` is true and reset the counter on any effective pass); the
+/// slice store keeps counter persistence. Saturating arithmetic: a counter
+/// already at `u64::MAX` stays there (still disabled) rather than wrapping.
+/// An unvalidated zero bound disables on first call (fail closed).
+/// Deterministic: a pure function of its inputs (no clock). No bytes move.
+#[must_use]
+pub fn record_ineffective(current: u64, policy: &CompactionPolicy) -> (u64, bool) {
+    let next = current.saturating_add(1);
+    let disabled = next >= u64::from(policy.max_ineffective_strikes);
+    (next, disabled)
 }
 
 #[cfg(test)]
