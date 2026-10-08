@@ -52,7 +52,10 @@ use std::fmt;
 
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use crate::content_store::{ContentHash, ContentStore, ContentStoreError};
+use crate::content_store::{
+    Checkpoint, CheckpointDraft, ContentHash, ContentStore, ContentStoreError, MAX_AGENT_ID_BYTES,
+    MAX_BLOB_BYTES, MAX_CHECKPOINT_PARENTS, MAX_SUMMARY_BYTES, MAX_TASK_ID_BYTES,
+};
 use crate::facade::FacadeError;
 
 /// Maximum byte length for a reflog reason string (512 bytes).
@@ -289,6 +292,192 @@ fn read_ref_tx(tx: &Transaction<'_>, name: &str) -> Result<Option<ContentHash>, 
 }
 
 impl ContentStore {
+    /// Atomically persist tree blob, checkpoint, HEAD, branch, and reflog in one transaction.
+    ///
+    /// Wheel durable commit path with branch (AI-0180): the tree blob insert,
+    /// the checkpoint insert, the HEAD upsert, the branch insert-or-update,
+    /// and the single branch reflog row commit or roll back together in one
+    /// SQLite `transaction()`. Reuses [`append_reflog_tx`] so an oversize
+    /// reason/actor aborts the whole commit (including HEAD), never a
+    /// half-advanced HEAD. Branch creation stores `old_hash = NULL`; updates
+    /// store the previous tip. The branch move is authoritative (not
+    /// fast-forward-only), matching the previous
+    /// `create_branch`/`update_branch(false)` success behavior.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_checkpoint_with_branch(
+        &mut self,
+        tree_bytes: &[u8],
+        tree_created_at_ms: u64,
+        draft: CheckpointDraft,
+        branch_name: &str,
+        reason: &str,
+        actor: &str,
+        updated_at_ms: u64,
+    ) -> Result<Checkpoint, RefError> {
+        if tree_bytes.len() > MAX_BLOB_BYTES {
+            return Err(map_store_err(ContentStoreError::OversizedField {
+                field: "blob_data",
+                size: tree_bytes.len(),
+                max: MAX_BLOB_BYTES,
+            }));
+        }
+        if draft.parents.len() > MAX_CHECKPOINT_PARENTS {
+            return Err(map_store_err(ContentStoreError::OversizedField {
+                field: "parents",
+                size: draft.parents.len(),
+                max: MAX_CHECKPOINT_PARENTS,
+            }));
+        }
+        if draft.task_id.trim().is_empty() {
+            return Err(map_store_err(ContentStoreError::EmptyField("task_id")));
+        }
+        if draft.task_id.len() > MAX_TASK_ID_BYTES {
+            return Err(map_store_err(ContentStoreError::OversizedField {
+                field: "task_id",
+                size: draft.task_id.len(),
+                max: MAX_TASK_ID_BYTES,
+            }));
+        }
+        if draft.agent_id.trim().is_empty() {
+            return Err(map_store_err(ContentStoreError::EmptyField("agent_id")));
+        }
+        if draft.agent_id.len() > MAX_AGENT_ID_BYTES {
+            return Err(map_store_err(ContentStoreError::OversizedField {
+                field: "agent_id",
+                size: draft.agent_id.len(),
+                max: MAX_AGENT_ID_BYTES,
+            }));
+        }
+        if draft.summary.len() > MAX_SUMMARY_BYTES {
+            return Err(map_store_err(ContentStoreError::OversizedField {
+                field: "summary",
+                size: draft.summary.len(),
+                max: MAX_SUMMARY_BYTES,
+            }));
+        }
+        draft.rationale.validate().map_err(map_store_err)?;
+        let branch = BranchName::parse(branch_name)?;
+
+        let tree_hash = ContentHash::compute(tree_bytes);
+        let tree_hex = tree_hash.to_hex();
+        let effective = CheckpointDraft {
+            parents: draft.parents.clone(),
+            task_id: draft.task_id.clone(),
+            agent_id: draft.agent_id.clone(),
+            rationale: draft.rationale.clone(),
+            tree_hash: Some(tree_hash),
+            summary: draft.summary.clone(),
+            timestamp_ms: draft.timestamp_ms,
+        };
+        let id = effective.canonical_hash().map_err(map_store_err)?;
+        let id_hex = id.to_hex();
+        let rationale_json = serde_json::to_string(&effective.rationale)
+            .map_err(|err| RefError::Storage(err.to_string()))?;
+        let parents_json = serde_json::to_string(&effective.parents)
+            .map_err(|err| RefError::Storage(err.to_string()))?;
+
+        let mut guard = self.lock_conn().map_err(map_store_err)?;
+        let tx = guard.transaction().map_err(map_sqlite)?;
+        for parent in &effective.parents {
+            let hex = parent.to_hex();
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM checkpoints WHERE hash = ?1",
+                    params![hex],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_sqlite)?
+                .is_some();
+            if !exists {
+                return Err(map_store_err(ContentStoreError::MissingParent(*parent)));
+            }
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                tree_hex,
+                tree_bytes.len() as i64,
+                tree_bytes,
+                tree_created_at_ms as i64
+            ],
+        )
+        .map_err(map_sqlite)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id_hex,
+                parents_json,
+                effective.task_id,
+                effective.agent_id,
+                rationale_json,
+                tree_hex,
+                effective.summary,
+                effective.timestamp_ms as i64
+            ],
+        )
+        .map_err(map_sqlite)?;
+        tx.execute(
+            "INSERT INTO refs (name, target_hash, updated_at_ms)
+             VALUES ('HEAD', ?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET target_hash = excluded.target_hash, updated_at_ms = excluded.updated_at_ms",
+            params![id_hex, updated_at_ms as i64],
+        )
+        .map_err(map_sqlite)?;
+        let previous = read_ref_tx(&tx, branch.as_str())?;
+        match previous {
+            None => {
+                tx.execute(
+                    "INSERT INTO refs (name, target_hash, updated_at_ms) VALUES (?1, ?2, ?3)",
+                    params![branch.as_str(), id_hex, updated_at_ms as i64],
+                )
+                .map_err(map_sqlite)?;
+                append_reflog_tx(
+                    &tx,
+                    branch.as_str(),
+                    None,
+                    &id,
+                    reason,
+                    actor,
+                    updated_at_ms,
+                )?;
+            }
+            Some(current) => {
+                let affected = tx
+                    .execute(
+                        "UPDATE refs SET target_hash = ?1, updated_at_ms = ?2 WHERE name = ?3",
+                        params![id_hex, updated_at_ms as i64, branch.as_str()],
+                    )
+                    .map_err(map_sqlite)?;
+                if affected != 1 {
+                    return Err(RefError::NotFound);
+                }
+                append_reflog_tx(
+                    &tx,
+                    branch.as_str(),
+                    Some(&current),
+                    &id,
+                    reason,
+                    actor,
+                    updated_at_ms,
+                )?;
+            }
+        }
+        tx.commit().map_err(map_sqlite)?;
+
+        Ok(Checkpoint {
+            id,
+            parents: effective.parents,
+            task_id: effective.task_id,
+            agent_id: effective.agent_id,
+            rationale: effective.rationale,
+            tree_hash: effective.tree_hash,
+            summary: effective.summary,
+            timestamp_ms: effective.timestamp_ms,
+        })
+    }
+
     /// Create a branch pointing at an existing checkpoint (no force).
     ///
     /// Refuses existing names with [`RefError::AlreadyExists`] and missing
@@ -356,6 +545,9 @@ impl ContentStore {
             Some(hash) => hash,
             None => return Err(RefError::NotFound),
         };
+        if fast_forward_only && current != old_hash {
+            return Err(RefError::Storage(NON_FAST_FORWARD_MSG.to_owned()));
+        }
         let affected = tx
             .execute(
                 "UPDATE refs SET target_hash = ?1, updated_at_ms = ?2 WHERE name = ?3",

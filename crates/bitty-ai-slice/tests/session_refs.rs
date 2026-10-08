@@ -5,7 +5,9 @@
 use bitty_ai_slice::content_store::{
     CheckpointDraft, ContentHash, ContentStore, ContentStoreError, Rationale,
 };
-use bitty_ai_slice::session_refs::{BranchName, MAX_REFLOG_READ_LIMIT, RefError, ReflogEntry};
+use bitty_ai_slice::session_refs::{
+    BranchName, MAX_REFLOG_READ_LIMIT, MAX_REFLOG_REASON_BYTES, RefError, ReflogEntry,
+};
 use bitty_ai_slice::wheel_kernel::WheelKernel;
 
 fn commit_linear(
@@ -549,4 +551,118 @@ fn partial_schema_fails_closed() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn commit_with_branch_rolls_back_head_branch_reflog_together() {
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let tree_v1 = b"{\"v\":1}";
+    let draft_v1 = CheckpointDraft {
+        parents: Vec::new(),
+        task_id: "AI-0180".to_string(),
+        agent_id: "ctx-0180-impl".to_string(),
+        rationale: Rationale::new("Session graph refs plane", "Baseline"),
+        tree_hash: None,
+        summary: "v1".to_string(),
+        timestamp_ms: 1000,
+    };
+    let first = store
+        .commit_checkpoint_with_branch(
+            tree_v1,
+            1000,
+            draft_v1,
+            "heads/main",
+            "init",
+            "tester",
+            1000,
+        )
+        .expect("first commit");
+    assert_eq!(store.get_ref("HEAD").expect("head"), Some(first.id));
+    assert_eq!(
+        store.get_branch("heads/main").expect("branch"),
+        Some(first.id)
+    );
+    assert_eq!(store.read_reflog("heads/main", 10).expect("read").len(), 1);
+
+    // Oversize reason fails inside the same transaction: HEAD, branch, blob,
+    // checkpoint, and reflog must all roll back together.
+    let tree_v2 = b"{\"v\":2}";
+    let draft_v2 = CheckpointDraft {
+        parents: vec![first.id],
+        task_id: "AI-0180".to_string(),
+        agent_id: "ctx-0180-impl".to_string(),
+        rationale: Rationale::new("Session graph refs plane", "Advance"),
+        tree_hash: None,
+        summary: "v2".to_string(),
+        timestamp_ms: 2000,
+    };
+    let long_reason = "r".repeat(MAX_REFLOG_REASON_BYTES + 1);
+    let err = store
+        .commit_checkpoint_with_branch(
+            tree_v2,
+            2000,
+            draft_v2,
+            "heads/main",
+            &long_reason,
+            "tester",
+            2000,
+        )
+        .expect_err("oversize reason must fail the whole commit");
+    assert_eq!(err, RefError::InvalidName);
+    assert_eq!(
+        store.get_ref("HEAD").expect("head"),
+        Some(first.id),
+        "failed commit must not advance HEAD"
+    );
+    assert_eq!(
+        store.get_branch("heads/main").expect("branch"),
+        Some(first.id),
+        "failed commit must not move the branch"
+    );
+    assert_eq!(
+        store.read_reflog("heads/main", 10).expect("read").len(),
+        1,
+        "failed commit must append no reflog row"
+    );
+    let blob_v2 = ContentHash::compute(tree_v2);
+    assert!(
+        !store.has_blob(&blob_v2).expect("has blob"),
+        "failed commit must not persist the tree blob"
+    );
+}
+
+#[test]
+fn ff_only_refuses_after_concurrent_branch_move() {
+    let mut store = ContentStore::open_in_memory().expect("open");
+    let root = commit_linear(&mut store, Vec::new(), "root", 1000);
+    let fork_a = commit_linear(&mut store, vec![root], "fork-a", 1100);
+    let fork_b = commit_linear(&mut store, vec![root], "fork-b", 1200);
+    let child_a = commit_linear(&mut store, vec![fork_a], "child-a", 1300);
+
+    store
+        .create_branch("heads/main", &fork_a, "create", "alice", 1400)
+        .expect("create");
+    // Simulate a concurrent writer moving the tip between the pre-read and
+    // the write transaction (another handle/path): the stale fast-forward
+    // attempt below must be refused.
+    store
+        .update_branch("heads/main", &fork_b, "concurrent", "mallory", 1450, false)
+        .expect("concurrent move");
+    let err = store
+        .update_branch("heads/main", &child_a, "stale ff", "bob", 1500, true)
+        .expect_err("stale ff-only update must fail");
+    assert!(
+        matches!(err, RefError::Storage(_)),
+        "stale refusal is store-level, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("non-fast-forward"),
+        "stale refusal must mention non-fast-forward, got {err}"
+    );
+    assert_eq!(store.get_branch("heads/main").expect("get"), Some(fork_b));
+    assert_eq!(
+        store.read_reflog("heads/main", 10).expect("read").len(),
+        2,
+        "failed stale update must append no reflog row"
+    );
 }

@@ -395,18 +395,19 @@ impl WheelKernel {
     ///
     /// Atomic (AI-0178): the tree blob, checkpoint row, and HEAD ref update
     /// commit in one SQLite `transaction()` via
-    /// [`ContentStore::commit_checkpoint_atomic`]. HEAD advances only when the
-    /// transaction commits; a torn write (crash between blob insert and HEAD
-    /// update) replays as the pre-crash HEAD on reopen, never a half-advanced
-    /// HEAD.
+    /// [`ContentStore::commit_checkpoint_atomic`] (no branch) or
+    /// [`ContentStore::commit_checkpoint_with_branch`] (with branch). HEAD
+    /// advances only when the transaction commits; a torn write (crash
+    /// between blob insert and HEAD update) replays as the pre-crash HEAD on
+    /// reopen, never a half-advanced HEAD.
     ///
-    /// The `branch` move routes through the refs-plane verbs (AI-0180):
-    /// [`ContentStore::create_branch`] when the branch is new,
-    /// [`ContentStore::update_branch`] otherwise, so every branch move
-    /// appends a reflog row. The checkpoint commit is authoritative, so the
-    /// update is not fast-forward-only. A branch-verb failure after the
-    /// atomic commit still reports `Err`, with the in-memory HEAD mirroring
-    /// the durably advanced HEAD.
+    /// The `branch` move commits in the same transaction as the checkpoint
+    /// and HEAD (AI-0180): [`ContentStore::commit_checkpoint_with_branch`]
+    /// writes the blob, checkpoint, HEAD, branch ref, and reflog row
+    /// atomically, so every branch move appends a reflog row. The checkpoint
+    /// commit is authoritative, so the update is not fast-forward-only. A
+    /// failure rolls back the whole commit (including HEAD); the in-memory
+    /// HEAD mirrors the durable HEAD only on success.
     pub fn commit_checkpoint(
         &mut self,
         rationale: Rationale,
@@ -440,37 +441,23 @@ impl WheelKernel {
             self.head_checkpoint = Some(checkpoint.id);
             return Ok(checkpoint);
         };
-        // Validate the namespace before any write so a bad branch name fails
-        // without persisting a checkpoint or advancing HEAD.
-        let parsed = BranchName::parse(branch_name).map_err(FacadeError::from)?;
+        // Single-transaction HEAD + branch commit: namespace validation happens
+        // inside the store method before any write, so a bad branch name fails
+        // without persisting a checkpoint or advancing HEAD. A reflog failure
+        // rolls back the whole commit (including HEAD).
         let checkpoint = self
             .content_store
-            .commit_checkpoint_atomic(&tree_bytes, now_ms, draft, &["HEAD"], now_ms)
+            .commit_checkpoint_with_branch(
+                &tree_bytes,
+                now_ms,
+                draft,
+                branch_name,
+                WHEEL_COMMIT_REFLOG_REASON,
+                WHEEL_COMMIT_REFLOG_ACTOR,
+                now_ms,
+            )
             .map_err(FacadeError::from)?;
-        let branch_result = match self
-            .content_store
-            .get_branch(parsed.as_str())
-            .map_err(FacadeError::from)?
-        {
-            Some(_) => self.content_store.update_branch(
-                parsed.as_str(),
-                &checkpoint.id,
-                WHEEL_COMMIT_REFLOG_REASON,
-                WHEEL_COMMIT_REFLOG_ACTOR,
-                now_ms,
-                false,
-            ),
-            None => self.content_store.create_branch(
-                parsed.as_str(),
-                &checkpoint.id,
-                WHEEL_COMMIT_REFLOG_REASON,
-                WHEEL_COMMIT_REFLOG_ACTOR,
-                now_ms,
-            ),
-        };
-        // Durable HEAD already advanced; mirror it before reporting.
         self.head_checkpoint = Some(checkpoint.id);
-        branch_result.map_err(FacadeError::from)?;
         Ok(checkpoint)
     }
 
