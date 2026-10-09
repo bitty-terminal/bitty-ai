@@ -8,16 +8,15 @@
 //! child environments are built once by [`crate::supervise::spawn_server`]
 //! from [`CredentialRef`] names, and every error below quotes names only.
 //!
-//! Seam mapping for server answers (judgment call, documented): the
-//! [`ToolExecutor`] vocabulary offers only `Denied` (refusal) and
-//! `EffectUnknown` (uncertain) as reason-carrying errors, so an MCP
-//! `isError: true` answer maps to `ToolError::Denied` with the reason
-//! `tool reported failure: <bounded server text>`. The turn still fails
-//! closed with no blind retry, and the reason preserves the true
-//! attribution (executed, then failed). A future `ToolError::Failed`
-//! carrier would be the ideal mapping; until one exists this avoids the
-//! worse lie of a bound/shape variant with false numbers. Transport faults
-//! mid-call map to `EffectUnknown` (in-flight effect uncertain).
+//! Seam mapping for server answers: an MCP `isError: true` answer (or a
+//! JSON-RPC `error` answer) maps to [`ToolError::Failed`] with the reason
+//! `tool reported failure: <bounded server text>`. `Failed` means the tool
+//! executed and the host reported failure, distinct from [`ToolError::Denied`]
+//! (a policy refusal with no effect: allowlist miss, `inspect`-tier,
+//! authorizer, or consent). The turn still fails closed with no blind retry,
+//! and the reason preserves the true attribution (executed, then failed).
+//! Transport faults mid-call map to `EffectUnknown` (in-flight effect
+//! uncertain).
 
 use bitty_ai_runtime::bridge::{
     ConsentLedger, ConsentQuery, ensure_consented, validate_protocol_id,
@@ -156,6 +155,14 @@ impl McpToolAdapter {
         }
         .normalized()
     }
+
+    fn failed(&self, tool: &str, reason: &str) -> ToolError {
+        ToolError::Failed {
+            name: tool.to_owned(),
+            reason: reason.to_owned(),
+        }
+        .normalized()
+    }
 }
 
 impl ToolExecutor for McpToolAdapter {
@@ -228,7 +235,7 @@ impl ToolExecutor for McpToolAdapter {
                 Err(ToolError::ResultTooLarge { limit, actual })
             }
             Err(McpCallError::Failed { reason, .. }) => {
-                Err(self.deny(tool, &format!("tool reported failure: {reason}")))
+                Err(self.failed(tool, &format!("tool reported failure: {reason}")))
             }
             Err(McpCallError::Unknown { reason, .. }) => Err(ToolError::EffectUnknown {
                 name: tool.to_owned(),
@@ -243,7 +250,9 @@ mod tests {
     use super::*;
     use bitty_ai_runtime::bridge::FakeConsentLedger;
     use bitty_ai_runtime::session::IdIssuer;
-    use bitty_ai_runtime::tool::{AuthContext, ToolSpec};
+    use bitty_ai_runtime::tool::{
+        AuthContext, ToolBus, ToolCall, ToolRegistry, ToolSpec, ToolStatus,
+    };
     use std::collections::VecDeque;
 
     struct FakeTransport {
@@ -425,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_reported_failure_denies_with_attribution() {
+    fn tool_reported_failure_maps_to_failed_with_attribution() {
         let line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"kaput\"}],\"isError\":true}}";
         let (transport, _sent) = FakeTransport::fresh(vec![line.to_owned()]);
         let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
@@ -433,12 +442,73 @@ mod tests {
             .execute("mcp_demo_echo", b"{}", 1_000)
             .expect_err("isError must fail");
         match error {
-            ToolError::Denied { reason, .. } => {
+            ToolError::Failed { name, reason } => {
+                assert_eq!(name, "mcp_demo_echo");
                 assert!(reason.contains("tool reported failure"));
                 assert!(reason.contains("kaput"));
             }
-            other => panic!("expected Denied, got {other:?}"),
+            other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rpc_error_answer_maps_to_failed_not_denied() {
+        let line =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}";
+        let (transport, _sent) = FakeTransport::fresh(vec![line.to_owned()]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let error = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("RPC error must fail");
+        match error {
+            ToolError::Failed { reason, .. } => {
+                assert!(reason.contains("tool reported failure"));
+                assert!(reason.contains("bad params"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bus_dispatch_maps_is_error_failure_to_failed_status() {
+        // End-to-end through the bus: an `isError: true` answer is an
+        // executed-then-failed effect, so dispatch records
+        // `ToolStatus::Failed`, never `Denied` (policy refusal with no
+        // effect).
+        let line = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"kaput\"}],\"isError\":true}}";
+        let (transport, _sent) = FakeTransport::fresh(vec![line.to_owned()]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "mcp_demo_echo",
+                    "Echo",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "mcp.demo",
+                    true,
+                )
+                .expect("valid"),
+            )
+            .expect("capacity");
+        let mut bus = ToolBus::new(registry).with_authorizer(Allow);
+        let call = ToolCall {
+            name: "mcp_demo_echo".to_owned(),
+            arguments: b"{}".to_vec(),
+        };
+        let mut ids = IdIssuer::default();
+        let base_workspace = base(AgentLevel::Workspace);
+        let execution = bus
+            .dispatch(&mut adapter, &call, &base_workspace, ids.execution(), 1_000)
+            .expect("host failure is a recorded status, not a bus error");
+        match &execution.status {
+            ToolStatus::Failed { reason } => {
+                assert!(reason.contains("kaput"));
+            }
+            other => panic!("expected Failed status, got {other:?}"),
+        }
+        assert!(execution.data.is_empty());
+        assert!(execution.is_untrusted_surface);
     }
 
     #[test]

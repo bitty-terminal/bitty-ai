@@ -404,11 +404,11 @@ mod unix {
             .execute("mcp_fixture_fail_now", b"{}", 1_000)
             .expect_err("live failure reports");
         match error {
-            bitty_ai_runtime::tool::ToolError::Denied { reason, .. } => {
+            bitty_ai_runtime::tool::ToolError::Failed { reason, .. } => {
                 assert!(reason.contains("tool reported failure"));
                 assert!(reason.contains("kaput"));
             }
-            other => panic!("expected Denied, got {other:?}"),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
