@@ -58,15 +58,18 @@ const WHEEL_COMMIT_REFLOG_REASON: &str = "wheel commit";
 /// Reflog actor recorded for branch moves driven by [`WheelKernel::commit_checkpoint`].
 const WHEEL_COMMIT_REFLOG_ACTOR: &str = "wheel-kernel";
 
-/// Fenced resume outcome (AI-0197; pending set since AI-0199).
+/// Fenced resume outcome (AI-0197; pending set since AI-0199; explicit HEAD
+/// scope since AI-0200).
 ///
 /// `session_id` is `Some` on the session-id (fenced) path and `None` on the
 /// bare branch/`HEAD` (unfenced read) path. `checkpoint` is the resolved live
 /// tip. `generation` is the live task-engine generation re-read at resume
 /// time, `0` when the checkpoint's task names no task row (informational
 /// snapshot, never a fence). `pending_unknowns` names the open pending-effect
-/// call ids surviving the crash (oldest-first per session; branch resumes
-/// union the sessions bound to that branch in session-id order), with
+/// call ids surviving the crash (session path: that session oldest-first;
+/// `heads/...` resumes union the sessions bound to that branch in
+/// session-id order; direct-`HEAD` resumes union only the sessions carrying
+/// the explicit stored HEAD marker, never branches sharing one tip), with
 /// `pending_log_absent = false`: the durable pending log always exists, so
 /// resume reports HEAD plus generation plus the in-flight set. `fence_token`
 /// is the admitted epoch on the session path, `0` on the branch path (no
@@ -81,8 +84,10 @@ pub struct ResumeReport {
     pub checkpoint: ContentHash,
     /// Live task-engine generation at resume time (`0` = no task binding).
     pub generation: u64,
-    /// Open pending-effect call ids surviving the crash (oldest-first per
-    /// session; empty when none are open).
+    /// Open pending-effect call ids surviving the crash (session path: that
+    /// session oldest-first; `heads/...` path: sessions bound to that branch
+    /// in session-id order; direct-`HEAD` path: only explicitly HEAD-marked
+    /// sessions; empty when none are open).
     pub pending_unknowns: Vec<String>,
     /// Always `false`: the durable pending log exists (present flag).
     pub pending_log_absent: bool,
@@ -93,9 +98,10 @@ pub struct ResumeReport {
 /// Map a pending-plane error into the stringly-typed [`FacadeError`].
 ///
 /// No new `FacadeError` variant: `Store` already carries every fail-closed
-/// refusal shape on this boundary. A poisoned pending row therefore refuses
-/// the whole resume as `Store` (fail closed, rows preserved); callers
-/// needing typed discrimination use the pending plane directly.
+/// refusal shape on this boundary. A poisoned pending row or HEAD marker
+/// therefore refuses the whole resume as `Store` (fail closed, rows
+/// preserved); callers needing typed discrimination use the pending plane
+/// directly.
 fn map_pending_err(err: PendingError) -> FacadeError {
     FacadeError::Store(err.to_string())
 }
@@ -710,17 +716,35 @@ impl WheelKernel {
     }
 
     /// Read the open pending-effect call ids of every session bound to
-    /// `branch`.
+    /// `branch`, or carrying the explicit HEAD marker when `branch` is
+    /// `HEAD` (AI-0200).
     ///
-    /// Union in session-id order (the session list is ascending), each
-    /// session oldest-first: deterministic across reopens. A poisoned row
-    /// anywhere fails the whole read (fail closed, rows preserved). The
-    /// branch resume path calls this before syncing the working tree so a
-    /// corrupt log refuses with the in-memory tree untouched.
+    /// `heads/...` resumes union the sessions whose stored branch binding
+    /// equals `branch` in session-id order (the session list is ascending),
+    /// each session oldest-first: deterministic across reopens. Direct-`HEAD`
+    /// resumes union only the sessions listed by the stored HEAD scope
+    /// (`PendingStore::list_head_sessions`), each oldest-first in the same
+    /// marker order: branches that happen to share one checkpoint tip never
+    /// leak into each other, and an unmarked session stays invisible to
+    /// `HEAD` even when its branch tip equals `HEAD`. The marker is explicit
+    /// and additive (see [`Self::bind_head_session`]). A poisoned row
+    /// anywhere (pending entry or HEAD marker) fails the whole read (fail
+    /// closed, rows preserved). The branch resume path calls this before
+    /// syncing the working tree so a corrupt log refuses with the in-memory
+    /// tree untouched.
     fn pending_unknowns_for_branch(
         store: &ContentStore,
         branch: &str,
     ) -> Result<Vec<String>, FacadeError> {
+        if branch == "HEAD" {
+            let head_sessions = PendingStore::list_head_sessions(store).map_err(map_pending_err)?;
+            let mut unknowns = Vec::new();
+            for id in &head_sessions {
+                let open = PendingStore::list_open(store, id).map_err(map_pending_err)?;
+                unknowns.extend(open.into_iter().map(|entry| entry.call_id));
+            }
+            return Ok(unknowns);
+        }
         let bindings = list_sessions(store).map_err(map_session_err)?;
         let mut unknowns = Vec::new();
         for binding in &bindings {
@@ -779,6 +803,45 @@ impl WheelKernel {
         .map_err(map_session_err)
     }
 
+    /// Bind a session to the explicit HEAD resume scope (AI-0200).
+    ///
+    /// The marker is stored in the pending plane (`pending_head_scope`),
+    /// never inferred from branches sharing one tip: only marked sessions
+    /// resolve on a direct-`HEAD` resume. The marker is additive to the
+    /// session branch binding (it never moves the session row); `HEAD`
+    /// cannot be passed to [`Self::new_session`] (the refs plane protects
+    /// it), so this is the sole HEAD-association path. The session must
+    /// already be bound (dangling markers refuse as `NotFound` with zero
+    /// writes, so a typo cannot hide as an empty `HEAD` resume). `now_ms`
+    /// is the caller-supplied bind timestamp (caller clocks only). A
+    /// duplicate bind refuses with `AlreadyExists` and zero writes.
+    pub fn bind_head_session(&self, session_id: &str, now_ms: u64) -> Result<(), FacadeError> {
+        let id = WheelSessionId::parse(session_id).map_err(map_session_err)?;
+        let exists = resolve_session(&self.content_store, &id).map_err(map_session_err)?;
+        if exists.is_none() {
+            return Err(map_session_err(SessionError::NotFound));
+        }
+        PendingStore::bind_head(&self.content_store, &id, now_ms).map_err(map_pending_err)
+    }
+
+    /// Remove a session from the explicit HEAD resume scope.
+    ///
+    /// Deleting the marker makes the session invisible to direct-`HEAD`
+    /// resumes again; branch resumes keyed on the session branch binding are
+    /// unaffected. A missing marker reports `NotFound` with zero writes.
+    pub fn unbind_head_session(&self, session_id: &str) -> Result<(), FacadeError> {
+        let id = WheelSessionId::parse(session_id).map_err(map_session_err)?;
+        PendingStore::unbind_head(&self.content_store, &id).map_err(map_pending_err)
+    }
+
+    /// List the sessions carrying the explicit HEAD marker, ascending.
+    ///
+    /// Thin passthrough over the pending plane; a poisoned marker row fails
+    /// closed as `Store` with rows preserved.
+    pub fn list_head_sessions(&self) -> Result<Vec<WheelSessionId>, FacadeError> {
+        PendingStore::list_head_sessions(&self.content_store).map_err(map_pending_err)
+    }
+
     /// Resume a session by id (fenced) or a branch/`HEAD` ref (unfenced read).
     ///
     /// Session-id path: the id must be bound; the claim is admitted only
@@ -800,14 +863,16 @@ impl WheelKernel {
     /// matching the `merge_commit` / GC gates.
     ///
     /// `pending_unknowns` names the open pending-effect call ids surviving
-    /// the crash (session path: that session oldest-first; branch/`HEAD`
+    /// the crash (session path: that session oldest-first; `heads/...`
     /// path: every session bound to the resumed branch, in session-id
-    /// order) with `pending_log_absent = false`: the durable pending log
+    /// order; direct-`HEAD` path: only sessions carrying the explicit
+    /// stored HEAD marker, never inferred from shared tips) with
+    /// `pending_log_absent = false`: the durable pending log
     /// always exists, so an honest resume reports HEAD plus generation plus
-    /// the in-flight set. A poisoned pending row fails the whole resume
-    /// (fail closed, rows preserved) with zero row writes. `generation` is
-    /// the live task-engine generation re-read at resume time (`0` when the
-    /// HEAD checkpoint's task names no task row).
+    /// the in-flight set. A poisoned pending row or HEAD marker fails the
+    /// whole resume (fail closed, rows preserved) with zero row writes.
+    /// `generation` is the live task-engine generation re-read at resume
+    /// time (`0` when the HEAD checkpoint's task names no task row).
     pub fn resume_session(
         &mut self,
         ref_or_branch: &str,

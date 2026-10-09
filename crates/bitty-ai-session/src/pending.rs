@@ -87,6 +87,25 @@
 //! confused the returned set (opens only) with scan cost (which did grow
 //! with every retained row); the cache plus the status filter fix the cost.
 //!
+//! ## Explicit HEAD association (AI-0200)
+//!
+//! Direct-`HEAD` resumes report only sessions carrying a stored HEAD marker
+//! in the `pending_head_scope` table (`session_id TEXT PRIMARY KEY,
+//! bound_at_ms INTEGER NOT NULL`). The marker is explicit: the kernel writes
+//! it via [`PendingStore::bind_head`] (caller-supplied `bound_at_ms`, no wall
+//! clock) and removes it via [`PendingStore::unbind_head`]; the resume path
+//! lists it via [`PendingStore::list_head_sessions`] (ascending session-id
+//! order) and unions each marked session oldest-first. Branches that happen
+//! to share one checkpoint tip never leak into each other: the `heads/...`
+//! path filters on stored branch-name equality, and the `HEAD` path reads
+//! only the marker table, never tip equality. A session may carry both a
+//! branch binding and a HEAD marker (the marker is additive); an unmarked
+//! session is invisible to direct-`HEAD` resumes even when its branch tip
+//! equals `HEAD`. Malformed marker rows (bad session-id shape, negative
+//! timestamp) fail the whole read as [`PendingError::Corrupt`] with rows
+//! preserved, so a poisoned marker refuses the resume with zero writes like
+//! any other poisoned pending row.
+//!
 //! ## Bounds and failure posture
 //!
 //! At most [`MAX_OPEN_PENDING_PER_SESSION`] open rows per session: an
@@ -114,9 +133,11 @@
 //! [`MAX_RESOLVED_RECENT`] cached rows); `list_open` is O(N) rows for N open
 //! entries of one session (SQL filters `status = 'open'`, so cached and
 //! legacy resolved rows are never read for validation); `open_blob_roots`
-//! is O(N) rows for N open entries file-wide (same filter). All clocks
-//! are caller-supplied (`begun_at_ms` / `resolved_at_ms`); no wall clock,
-//! no threads.
+//! is O(N) rows for N open entries file-wide (same filter). `bind_head` and
+//! `unbind_head` are O(1) single-row marker writes; `list_head_sessions` is
+//! O(N) rows for N marked sessions. All clocks
+//! are caller-supplied (`begun_at_ms` / `resolved_at_ms` / `bound_at_ms`);
+//! no wall clock, no threads.
 //!
 //! [bitty_ai_runtime_tool]: https://github.com/bitty-terminal/bitty-ai
 
@@ -388,7 +409,9 @@ const INTEGER_RANGE_MSG: &str = "pending integer out of range: value exceeds i64
 /// a fresh database lists zero open entries rather than erroring. Owned
 /// here so `sessions.rs` needs zero churn. The live table holds opens only
 /// (resolved rows are deleted on resolve); the recent table holds the newest
-/// [`MAX_RESOLVED_RECENT`] resolved snapshots for idempotent re-resolve.
+/// [`MAX_RESOLVED_RECENT`] resolved snapshots for idempotent re-resolve. The
+/// head-scope table holds the explicit HEAD markers for direct-`HEAD`
+/// resumes (AI-0200): one row per marked session, never inferred from tips.
 const PENDING_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS pending_effects (
     call_id TEXT PRIMARY KEY,
@@ -417,6 +440,10 @@ CREATE TABLE IF NOT EXISTS pending_resolved_recent (
     epoch INTEGER NOT NULL,
     begun_at_ms INTEGER NOT NULL,
     resolved_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_head_scope (
+    session_id TEXT PRIMARY KEY,
+    bound_at_ms INTEGER NOT NULL
 );";
 
 /// Shared column list for every pending row read.
@@ -800,6 +827,114 @@ impl PendingStore {
         roots.sort();
         roots.dedup();
         Ok(roots)
+    }
+
+    /// Bind one session to the explicit HEAD resume scope (AI-0200).
+    ///
+    /// The marker is stored, never inferred: only sessions listed by
+    /// [`PendingStore::list_head_sessions`] resolve on a direct-`HEAD`
+    /// resume. The marker is additive to the session branch binding (a
+    /// session may be visible on both its branch and `HEAD`); it never moves
+    /// the session row and never follows tip equality. `now_ms` is the
+    /// caller-supplied bind timestamp (caller clocks only). A duplicate bind
+    /// refuses with [`PendingError::AlreadyExists`] and zero writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PendingError::Storage`] for an out-of-range timestamp or a
+    /// store failure, [`PendingError::AlreadyExists`] for an already marked
+    /// session, and [`PendingError::Corrupt`] for a corrupt database.
+    pub fn bind_head(
+        store: &ContentStore,
+        session_id: &WheelSessionId,
+        now_ms: u64,
+    ) -> Result<(), PendingError> {
+        if now_ms > i64::MAX as u64 {
+            return Err(PendingError::Storage(INTEGER_RANGE_MSG.to_owned()));
+        }
+        ensure_table(store)?;
+        let guard = store.lock_conn().map_err(map_store_err)?;
+        guard
+            .execute(
+                "INSERT INTO pending_head_scope (session_id, bound_at_ms) VALUES (?1, ?2)",
+                params![session_id.as_str(), now_ms as i64],
+            )
+            .map_err(map_sqlite)?;
+        Ok(())
+    }
+
+    /// Remove one session from the explicit HEAD resume scope.
+    ///
+    /// Deleting the marker makes the session invisible to direct-`HEAD`
+    /// resumes again; branch resumes keyed on the session branch binding are
+    /// unaffected. A missing marker reports [`PendingError::NotFound`] with
+    /// zero writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PendingError::NotFound`] for an unmarked session,
+    /// [`PendingError::Corrupt`] for a corrupt database, and
+    /// [`PendingError::Storage`] for store failures.
+    pub fn unbind_head(
+        store: &ContentStore,
+        session_id: &WheelSessionId,
+    ) -> Result<(), PendingError> {
+        ensure_table(store)?;
+        let guard = store.lock_conn().map_err(map_store_err)?;
+        let affected = guard
+            .execute(
+                "DELETE FROM pending_head_scope WHERE session_id = ?1",
+                params![session_id.as_str()],
+            )
+            .map_err(map_sqlite)?;
+        if affected == 0 {
+            return Err(PendingError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// List the sessions carrying the explicit HEAD marker, ascending.
+    ///
+    /// Deterministic order (`session_id ASC`): direct-`HEAD` resumes union
+    /// each marked session oldest-first in this order. Fail-closed: any
+    /// malformed marker row (bad session-id shape, negative timestamp) fails
+    /// the whole read as [`PendingError::Corrupt`] with rows preserved. A
+    /// fresh database lists zero markers rather than erroring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PendingError::Corrupt`] for any malformed marker row and
+    /// [`PendingError::Storage`] for store failures.
+    pub fn list_head_sessions(store: &ContentStore) -> Result<Vec<WheelSessionId>, PendingError> {
+        ensure_table(store)?;
+        let pairs: Vec<(String, i64)> = {
+            let guard = store.lock_conn().map_err(map_store_err)?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT session_id, bound_at_ms FROM pending_head_scope
+                     ORDER BY session_id ASC",
+                )
+                .map_err(map_sqlite)?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(map_sqlite)?;
+            let mut out = Vec::new();
+            for item in mapped {
+                out.push(item.map_err(map_sqlite)?);
+            }
+            out
+        };
+        let mut result = Vec::with_capacity(pairs.len());
+        for (id_raw, bound_at_ms) in pairs {
+            let session_id = WheelSessionId::parse(&id_raw).map_err(|_| PendingError::Corrupt)?;
+            if bound_at_ms < 0 {
+                return Err(PendingError::Corrupt);
+            }
+            result.push(session_id);
+        }
+        Ok(result)
     }
 }
 
@@ -1526,5 +1661,79 @@ mod tests {
             PendingStore::open_blob_roots(&store),
             Err(PendingError::Corrupt)
         );
+    }
+
+    #[test]
+    fn head_scope_bind_list_unbind_is_explicit_and_ordered() {
+        let store = test_store();
+        assert!(
+            PendingStore::list_head_sessions(&store)
+                .expect("fresh lists zero")
+                .is_empty()
+        );
+        let first = WheelSessionId::parse("sess-head-b").expect("valid session");
+        let second = WheelSessionId::parse("sess-head-a").expect("valid session");
+        PendingStore::bind_head(&store, &first, 1000).expect("bind first");
+        PendingStore::bind_head(&store, &second, 1010).expect("bind second");
+        // Duplicate binds refuse with zero extra rows.
+        assert_eq!(
+            PendingStore::bind_head(&store, &first, 1020),
+            Err(PendingError::AlreadyExists)
+        );
+        let listed = PendingStore::list_head_sessions(&store).expect("list");
+        let names: Vec<&str> = listed.iter().map(|id| id.as_str()).collect();
+        assert_eq!(names, vec!["sess-head-a", "sess-head-b"]);
+        PendingStore::unbind_head(&store, &first).expect("unbind");
+        assert_eq!(
+            PendingStore::unbind_head(&store, &first),
+            Err(PendingError::NotFound)
+        );
+        let listed = PendingStore::list_head_sessions(&store).expect("list");
+        let names: Vec<&str> = listed.iter().map(|id| id.as_str()).collect();
+        assert_eq!(names, vec!["sess-head-a"]);
+    }
+
+    #[test]
+    fn head_scope_out_of_range_timestamp_refuses_with_zero_writes() {
+        let store = test_store();
+        let session = test_session();
+        assert_eq!(
+            PendingStore::bind_head(&store, &session, u64::MAX),
+            Err(PendingError::Storage(INTEGER_RANGE_MSG.to_owned()))
+        );
+        assert!(
+            PendingStore::list_head_sessions(&store)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn head_scope_poison_fails_whole_read_with_rows_preserved() {
+        let store = test_store();
+        let session = test_session();
+        PendingStore::bind_head(&store, &session, 1000).expect("bind");
+        {
+            let guard = store.lock_conn().expect("lock");
+            guard
+                .execute(
+                    "UPDATE pending_head_scope SET bound_at_ms = -1 WHERE session_id = 'sess-pending-1'",
+                    [],
+                )
+                .expect("plant negative timestamp");
+        }
+        assert_eq!(
+            PendingStore::list_head_sessions(&store),
+            Err(PendingError::Corrupt)
+        );
+        let count: i64 = {
+            let guard = store.lock_conn().expect("lock");
+            guard
+                .query_row("SELECT COUNT(*) FROM pending_head_scope", [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(count, 1);
     }
 }
