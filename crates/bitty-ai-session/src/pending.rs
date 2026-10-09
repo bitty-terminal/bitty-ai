@@ -897,7 +897,8 @@ impl PendingStore {
     ///
     /// Deterministic order (`session_id ASC`): direct-`HEAD` resumes union
     /// each marked session oldest-first in this order. Fail-closed: any
-    /// malformed marker row (bad session-id shape, negative timestamp) fails
+    /// malformed marker row (bad session-id shape, negative or non-integer
+    /// timestamp) fails
     /// the whole read as [`PendingError::Corrupt`] with rows preserved. A
     /// fresh database lists zero markers rather than erroring.
     ///
@@ -922,7 +923,18 @@ impl PendingStore {
                 .map_err(map_sqlite)?;
             let mut out = Vec::new();
             for item in mapped {
-                out.push(item.map_err(map_sqlite)?);
+                // Row-decode failures mean a malformed marker row (e.g. a
+                // non-integer timestamp planted via raw SQL), which the
+                // contract reports as `Corrupt`; query-execution failures
+                // stay `Storage` via `map_sqlite`.
+                out.push(item.map_err(|err| match err {
+                    rusqlite::Error::FromSqlConversionFailure(..)
+                    | rusqlite::Error::IntegralValueOutOfRange(..)
+                    | rusqlite::Error::Utf8Error(..)
+                    | rusqlite::Error::NulError(_)
+                    | rusqlite::Error::InvalidColumnType(..) => PendingError::Corrupt,
+                    _ => map_sqlite(err),
+                })?);
             }
             out
         };
@@ -1721,6 +1733,35 @@ mod tests {
                     [],
                 )
                 .expect("plant negative timestamp");
+        }
+        assert_eq!(
+            PendingStore::list_head_sessions(&store),
+            Err(PendingError::Corrupt)
+        );
+        let count: i64 = {
+            let guard = store.lock_conn().expect("lock");
+            guard
+                .query_row("SELECT COUNT(*) FROM pending_head_scope", [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn head_scope_non_integer_timestamp_fails_whole_read_as_corrupt() {
+        let store = test_store();
+        let session = test_session();
+        PendingStore::bind_head(&store, &session, 1000).expect("bind");
+        {
+            let guard = store.lock_conn().expect("lock");
+            guard
+                .execute(
+                    "UPDATE pending_head_scope SET bound_at_ms = 'not-an-integer' WHERE session_id = 'sess-pending-1'",
+                    [],
+                )
+                .expect("plant text timestamp");
         }
         assert_eq!(
             PendingStore::list_head_sessions(&store),
