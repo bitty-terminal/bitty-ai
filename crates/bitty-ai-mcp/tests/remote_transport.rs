@@ -1066,6 +1066,139 @@ fn poll_empty_body_disables() {
 }
 
 #[test]
+fn poll_non2xx_empty_is_error_without_disable() {
+    // Regression for review thread 4231298715: a failed poll with an empty
+    // body (for example a transient `503`) must report `HandshakeRejected`
+    // without stickily disabling polling; the next poll still performs I/O.
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 503,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let retry_body =
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: retry_body.as_bytes().to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let error = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect_err("503 empty must error");
+    assert!(
+        matches!(error.failure, McpFailure::HandshakeRejected { .. }),
+        "unexpected failure: {:?}",
+        error.failure
+    );
+    assert!(!transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    let queued = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("retry still performs I/O");
+    assert_eq!(queued, 1);
+    assert!(!transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 2);
+}
+
+#[test]
+fn poll_retains_events_beyond_cap_for_next_poll() {
+    // Regression for review thread 4231298737: one GET carrying more than
+    // `MAX_SSE_FRAMES_PER_RESPONSE` complete events keeps the suffix in
+    // transport state; the next poll dispatches it with zero new I/O.
+    use bitty_ai_mcp::MAX_SSE_FRAMES_PER_RESPONSE;
+    let service = FakeService::new();
+    let mut body = String::new();
+    for index in 0..MAX_SSE_FRAMES_PER_RESPONSE + 1 {
+        body.push_str(&format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/evt-{index}\"}}\n\n"
+        ));
+    }
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let queued = transport.poll_server_messages("/tmp/bitty").expect("poll");
+    assert_eq!(queued, MAX_SSE_FRAMES_PER_RESPONSE);
+    assert_eq!(transport.queued_len(), MAX_SSE_FRAMES_PER_RESPONSE);
+    assert!(!transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    for _ in 0..MAX_SSE_FRAMES_PER_RESPONSE {
+        transport.recv_line(10).expect("recv").expect("line");
+    }
+    assert_eq!(transport.recv_line(10).expect("drained"), None);
+    let retained = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("retained suffix");
+    assert_eq!(retained, 1);
+    assert_eq!(
+        transport.service().recorded_count(),
+        1,
+        "retained dispatch must be zero new I/O"
+    );
+    assert!(!transport.is_poll_disabled());
+    let last = transport.recv_line(10).expect("recv").expect("line");
+    assert!(
+        last.contains(&format!("evt-{}", MAX_SSE_FRAMES_PER_RESPONSE)),
+        "unexpected retained payload: {last}"
+    );
+}
+
+#[test]
+fn poll_retain_buffer_full_fails_closed() {
+    // The retain buffer is bounded at `MAX_SSE_FRAMES_PER_RESPONSE`: a GET
+    // with more than twice the cap fails `FrameTooLarge` (prior emits kept,
+    // polling not disabled); the retained half still drains with zero I/O.
+    use bitty_ai_mcp::MAX_SSE_FRAMES_PER_RESPONSE;
+    let service = FakeService::new();
+    let mut body = String::new();
+    for index in 0..2 * MAX_SSE_FRAMES_PER_RESPONSE + 1 {
+        body.push_str(&format!(
+            "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/evt-{index}\"}}\n\n"
+        ));
+    }
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let error = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect_err("buffer-full must fail closed");
+    assert!(
+        matches!(error.failure, McpFailure::FrameTooLarge { .. }),
+        "unexpected failure: {:?}",
+        error.failure
+    );
+    assert_eq!(transport.queued_len(), MAX_SSE_FRAMES_PER_RESPONSE);
+    assert!(!transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    for _ in 0..MAX_SSE_FRAMES_PER_RESPONSE {
+        transport.recv_line(10).expect("recv").expect("line");
+    }
+    let retained = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("retained half");
+    assert_eq!(retained, MAX_SSE_FRAMES_PER_RESPONSE);
+    assert_eq!(
+        transport.service().recorded_count(),
+        1,
+        "retained dispatch must be zero new I/O"
+    );
+    assert!(!transport.is_poll_disabled());
+}
+
+#[test]
 fn poll_timeout_disables() {
     let service = FakeService::new();
     service.queue_error(NetworkError::Timeout {

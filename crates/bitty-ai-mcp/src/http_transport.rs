@@ -275,10 +275,11 @@ fn valid_session_id(value: &str) -> bool {
 /// [`McpTransport`] over Streamable HTTP/SSE, backed by a sync service.
 ///
 /// Owns the [`RemoteServerConfig`], the service, a line queue, the optional
-/// session id, a closed flag, and a sticky poll-disabled flag. Synchronous
-/// only (`&mut self`, no threads, no async). Whole-operation deadlines come
-/// from the config: each POST and each poll GET sets `Request::timeout` to
-/// `timeout_ms` and `max_body_bytes` to the frame cap.
+/// session id, a closed flag, a sticky poll-disabled flag, and a bounded
+/// retain buffer for poll SSE overflow. Synchronous only (`&mut self`, no
+/// threads, no async). Whole-operation deadlines come from the config: each
+/// POST and each poll GET sets `Request::timeout` to `timeout_ms` and
+/// `max_body_bytes` to the frame cap.
 pub struct HttpLineTransport<S> {
     config: RemoteServerConfig,
     service: S,
@@ -286,6 +287,7 @@ pub struct HttpLineTransport<S> {
     session_id: Option<String>,
     closed: bool,
     poll_disabled: bool,
+    pending_poll: VecDeque<String>,
 }
 
 impl<S> HttpLineTransport<S> {
@@ -303,6 +305,7 @@ impl<S> HttpLineTransport<S> {
             session_id: None,
             closed: false,
             poll_disabled: false,
+            pending_poll: VecDeque::new(),
         })
     }
 
@@ -338,9 +341,11 @@ impl<S> HttpLineTransport<S> {
 
     /// Whether server-message polling is stickily disabled.
     ///
-    /// Set on HTTP `405`, empty poll bodies, and poll transport timeouts;
-    /// once set, [`HttpLineTransport::poll_server_messages`] returns `Ok(0)`
-    /// with zero I/O. Re-enable needs a new transport (no auto-retry).
+    /// Set on HTTP `405`, empty `2xx` poll bodies, and poll transport
+    /// timeouts; once set, [`HttpLineTransport::poll_server_messages`]
+    /// returns `Ok(0)` with zero I/O. Re-enable needs a new transport (no
+    /// auto-retry). Non-`2xx` poll responses (other than `405`) never
+    /// disable: they fail as [`McpFailure::HandshakeRejected`].
     #[must_use]
     pub fn is_poll_disabled(&self) -> bool {
         self.poll_disabled
@@ -368,6 +373,7 @@ impl<S> HttpLineTransport<S> {
         }
         self.closed = true;
         self.queue.clear();
+        self.pending_poll.clear();
         let session = self.session_id.clone();
         self.session_id = None;
         let Some(session) = session else {
@@ -536,6 +542,12 @@ impl<S> HttpLineTransport<S> {
     /// fan-out bound ([`MAX_SSE_FRAMES_PER_RESPONSE`] counting dispatched
     /// events, so at most that many answer `POST`s per poll), JSON-object
     /// filtering, and `[DONE]`/comment ignoring via the shared dispatcher.
+    /// Complete events beyond the per-poll bound are retained in a bounded
+    /// buffer (capped at [`MAX_SSE_FRAMES_PER_RESPONSE`] payloads) instead
+    /// of being discarded: the next poll dispatches the retained payloads
+    /// first, before any new I/O, preserving the per-call work bound. Only
+    /// when the retain buffer is also full does the poll fail with
+    /// [`McpFailure::FrameTooLarge`] (fail-closed, prior emits kept).
     ///
     /// Server requests (a `method` with an `id`) are answered inline with the
     /// same logic as the handshake path by reusing
@@ -557,13 +569,14 @@ impl<S> HttpLineTransport<S> {
     /// notifications plus any answer-`POST` responses; typically `202` empty
     /// answers queue nothing, so the count is the notification count).
     ///
-    /// Sticky-disable: HTTP `405`, an empty poll body, or a transport timeout
-    /// (on the `GET` or an answer `POST`) sets an internal disabled flag;
-    /// later polls return `Ok(0)` with zero I/O (no service call, no
-    /// capability check). Re-enable needs a new transport (no auto-retry, no
-    /// auto-reconnect). [`HttpLineTransport::is_poll_disabled`] observes it.
-    /// A closed transport still fails with [`McpFailure::TransportClosed`]
-    /// (closed takes precedence over disabled).
+    /// Sticky-disable: HTTP `405`, an empty `2xx` poll body, or a transport
+    /// timeout (on the `GET` or an answer `POST`) sets an internal disabled
+    /// flag; later polls return `Ok(0)` with zero I/O (no service call, no
+    /// capability check). Re-enable needs a new transport (no auto-retry,
+    /// no auto-reconnect). [`HttpLineTransport::is_poll_disabled`]
+    /// observes it. A closed transport still fails with
+    /// [`McpFailure::TransportClosed`] (closed takes precedence over
+    /// disabled).
     ///
     /// Capability, secret, and error-mapping conventions mirror `send_line`:
     /// capability deny is [`McpFailure::TransportClosed`] with zero service
@@ -595,6 +608,36 @@ impl<S> HttpLineTransport<S> {
         if self.config.capability.check_request(&request).is_err() {
             return Err(transport_closed());
         }
+        // Dispatch payloads retained from an over-cap previous poll before
+        // any new I/O, preserving the per-call work bound. Notifications
+        // dispatch with zero service calls; retained server requests still
+        // answer-POST like a fresh poll (hence after the capability check).
+        if !self.pending_poll.is_empty() {
+            let before = self.queue.len();
+            let mut events: usize = 0;
+            while events < MAX_SSE_FRAMES_PER_RESPONSE {
+                let Some(payload) = self.pending_poll.pop_front() else {
+                    break;
+                };
+                events += 1;
+                if let Some(reply) = crate::handshake::handle_server_request(&payload, cwd) {
+                    match <Self as McpTransport>::send_line(self, &reply) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            if matches!(error.failure, McpFailure::Timeout { .. }) {
+                                self.poll_disabled = true;
+                            }
+                            self.pending_poll.push_front(payload);
+                            return Err(error);
+                        }
+                    }
+                } else if let Err(error) = self.enqueue_sse_payload(&payload) {
+                    self.pending_poll.push_front(payload);
+                    return Err(error);
+                }
+            }
+            return Ok(self.queue.len().saturating_sub(before));
+        }
         let timeout_ms = self.config.effective_timeout_ms();
         let response = match self.service.request(&request) {
             Err(error) => {
@@ -608,18 +651,21 @@ impl<S> HttpLineTransport<S> {
         };
         self.note_session(&response);
         // Sticky-disable signals: the server does not speak GET streams
-        // (`405`) or has nothing to say (empty body). Both become `Ok(0)`.
+        // (`405`) or a `2xx` poll has nothing to say (empty body). Both
+        // become `Ok(0)`. The status check precedes the empty-body check so
+        // a failed request with an empty body (for example a transient
+        // `503`) reports `HandshakeRejected` without disabling polling.
         if response.status == 405 {
-            self.poll_disabled = true;
-            return Ok(0);
-        }
-        if response.body.is_empty() {
             self.poll_disabled = true;
             return Ok(0);
         }
         if !(200..300).contains(&response.status) {
             let message = format!("http status {}", response.status);
             return Err(handshake_rejected(&message));
+        }
+        if response.body.is_empty() {
+            self.poll_disabled = true;
+            return Ok(0);
         }
         match response.header("content-type") {
             Some(content_type) if is_sse_media_type(content_type) => {}
@@ -633,7 +679,13 @@ impl<S> HttpLineTransport<S> {
         let mut events: usize = 0;
         let poll_result = dispatch_sse_payloads(text, &mut |payload| {
             if events >= MAX_SSE_FRAMES_PER_RESPONSE {
-                return Err(frame_too_large());
+                // Retain the complete-payload suffix instead of discarding
+                // it; fail closed only when the retain buffer is full.
+                if self.pending_poll.len() >= MAX_SSE_FRAMES_PER_RESPONSE {
+                    return Err(frame_too_large());
+                }
+                self.pending_poll.push_back(payload);
+                return Ok(());
             }
             events += 1;
             if let Some(reply) = crate::handshake::handle_server_request(&payload, cwd) {
