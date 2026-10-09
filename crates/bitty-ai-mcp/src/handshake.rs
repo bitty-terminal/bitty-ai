@@ -9,8 +9,11 @@
 //!
 //! While waiting for the answer, server requests are answered inline:
 //! `ping` gets an empty result, `roots/list` gets exactly the pinned `cwd`
-//! as a `file://` URI (never the wider filesystem), and any other method
-//! gets JSON-RPC `-32601` (Method not found). Server notifications (no `id`)
+//! as a `file://` URI (never the wider filesystem), `sampling/*` and
+//! `elicitation/*` are refused with their own fixed messages (the client
+//! never samples and never elicits; see [`SAMPLING_REFUSED_MESSAGE`] and
+//! [`ELICITATION_REFUSED_MESSAGE`]), and any other method gets JSON-RPC
+//! `-32601` (Method not found). Server notifications (no `id`)
 //! are ignored.
 
 use std::time::Instant;
@@ -26,6 +29,26 @@ pub const MCP_CLIENT_NAME: &str = "bitty-ai-mcp";
 
 /// Client version reported in `clientInfo` (crate version, single place).
 pub const MCP_CLIENT_VERSION: &str = "0.0.1";
+
+/// Fixed refusal message for `sampling/*` server requests.
+///
+/// Never-sample policy: this client never asks a server to perform model
+/// sampling on its behalf, so every server-to-client `sampling/*` request
+/// (canonically `sampling/createMessage`) is refused with this static text.
+/// The refusal carries the same `-32601` error-code shape as an unknown
+/// method, but the distinct message keeps the taxonomy explicit.
+pub const SAMPLING_REFUSED_MESSAGE: &str = "Sampling not supported";
+
+/// Fixed refusal message for `elicitation/*` server requests.
+///
+/// Never-elicit policy: this client never solicits user input through a
+/// server, so every server-to-client `elicitation/*` request (canonically
+/// `elicitation/create`) is refused with this static text. Same `-32601`
+/// error-code shape as an unknown method, distinct message for taxonomy.
+pub const ELICITATION_REFUSED_MESSAGE: &str = "Elicitation not supported";
+
+/// Fixed message for any other unknown server-request method.
+pub const UNKNOWN_METHOD_MESSAGE: &str = "Method not found";
 
 /// Parsed `initialize` result: the facts the client requires before use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,10 +147,15 @@ pub fn parse_initialize_result(line: &str) -> Result<InitializeResult, McpError>
 /// Answer one server request frame, if `line` is one.
 ///
 /// Returns `Some(response_frame)` for requests carrying an `id` (`ping`,
-/// `roots/list`, or `-32601` for anything else) and `None` for responses,
-/// notifications, and malformed lines (never reply to those: answering a
-/// response would corrupt the id multiplexer, and answering a notification
-/// violates JSON-RPC).
+/// `roots/list`, the `sampling/*` / `elicitation/*` refusals, or `-32601`
+/// for anything else) and `None` for responses, notifications, and
+/// malformed lines (never reply to those: answering a response would corrupt
+/// the id multiplexer, and answering a notification violates JSON-RPC).
+///
+/// Refusals never echo request params: every error frame carries only a
+/// fixed static message ([`SAMPLING_REFUSED_MESSAGE`],
+/// [`ELICITATION_REFUSED_MESSAGE`], or [`UNKNOWN_METHOD_MESSAGE`]), so
+/// untrusted server payloads cannot reflect through the reply.
 #[must_use]
 pub fn handle_server_request(line: &str, cwd: &str) -> Option<String> {
     let method = find_string_field(line, "method")?;
@@ -144,10 +172,26 @@ pub fn handle_server_request(line: &str, cwd: &str) -> Option<String> {
                 escaped(&uri)
             ))
         }
-        _ => Some(format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{id_token},\"error\":{{\"code\":-32601,\"message\":\"Method not found\"}}}}"
-        )),
+        "sampling/createMessage" => Some(refusal_frame(&id_token, SAMPLING_REFUSED_MESSAGE)),
+        "elicitation/create" => Some(refusal_frame(&id_token, ELICITATION_REFUSED_MESSAGE)),
+        other if other.starts_with("sampling/") => {
+            Some(refusal_frame(&id_token, SAMPLING_REFUSED_MESSAGE))
+        }
+        other if other.starts_with("elicitation/") => {
+            Some(refusal_frame(&id_token, ELICITATION_REFUSED_MESSAGE))
+        }
+        _ => Some(refusal_frame(&id_token, UNKNOWN_METHOD_MESSAGE)),
     }
+}
+
+/// Build a `-32601` refusal frame carrying only a fixed static message.
+///
+/// `message` is always one of the module constants; request params are
+/// never interpolated, so the reply cannot reflect untrusted server input.
+fn refusal_frame(id_token: &str, message: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id_token},\"error\":{{\"code\":-32601,\"message\":\"{message}\"}}}}"
+    )
 }
 
 /// Render an extracted `id` token back into a frame.
@@ -179,7 +223,8 @@ fn render_id_token(token: &str) -> Option<String> {
 }
 
 /// Wait for the response frame carrying `want_id`, answering interleaved
-/// server requests inline (ping, roots/list, `-32601`).
+/// server requests inline (ping, roots/list, sampling/elicitation refusals,
+/// `-32601`).
 ///
 /// `deadline` bounds the whole wait; each transport poll uses the remaining
 /// time. Responses for other ids and server notifications are ignored.
@@ -266,7 +311,7 @@ fn response_id_matches(line: &str, want: &str) -> bool {
 }
 
 /// Run the full handshake: send `initialize`, wait for and validate the
-/// answer (answering pings inline), then send `notifications/initialized`.
+/// answer (answering server requests inline), then send `notifications/initialized`.
 ///
 /// `timeout_ms` bounds the whole handshake (`1..=MAX_TIMEOUT_MS` by
 /// construction of validated configs; unvalidated callers are clamped to at
@@ -401,6 +446,61 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn sampling_and_elicitation_are_refused_with_distinct_messages() {
+        // Canonical methods carry their own static message under the same
+        // -32601 code shape as unknown methods.
+        let sampling = "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[{\"role\":\"user\",\"content\":{\"text\":\"canary-sampling-params\"}}]}}";
+        let answer = handle_server_request(sampling, "/tmp/bitty").expect("sampling refused");
+        assert!(answer.contains("\"id\":11"));
+        assert!(answer.contains("-32601"));
+        assert!(answer.contains(SAMPLING_REFUSED_MESSAGE));
+        assert!(!answer.contains("Method not found"));
+        // No request-param echo: the untrusted payload cannot reflect.
+        assert!(!answer.contains("canary-sampling-params"));
+
+        let elicitation = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"elicitation/create\",\"params\":{\"message\":\"canary-elicitation-params\"}}";
+        let answer = handle_server_request(elicitation, "/tmp/bitty").expect("elicitation refused");
+        assert!(answer.contains("\"id\":12"));
+        assert!(answer.contains("-32601"));
+        assert!(answer.contains(ELICITATION_REFUSED_MESSAGE));
+        assert!(!answer.contains("Method not found"));
+        assert!(!answer.contains("canary-elicitation-params"));
+
+        // Namespace catch-alls: future variants cannot fall through to the
+        // generic message, and string ids keep their quoted shape.
+        let future_sampling =
+            "{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"sampling/futureVariant\"}";
+        let answer = handle_server_request(future_sampling, "/tmp/bitty").expect("sampling prefix");
+        assert!(answer.contains("\"id\":\"abc-1\""));
+        assert!(answer.contains(SAMPLING_REFUSED_MESSAGE));
+
+        let future_elicitation =
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"elicitation/futureVariant\"}";
+        let answer =
+            handle_server_request(future_elicitation, "/tmp/bitty").expect("elicitation prefix");
+        assert!(answer.contains(ELICITATION_REFUSED_MESSAGE));
+
+        // Unknown methods keep the generic message; ping and roots/list are
+        // unaffected by the new arms.
+        let unknown = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/frobnicate\"}";
+        let answer = handle_server_request(unknown, "/tmp/bitty").expect("unknown refused");
+        assert!(answer.contains("-32601"));
+        assert!(answer.contains(UNKNOWN_METHOD_MESSAGE));
+        assert!(!answer.contains(SAMPLING_REFUSED_MESSAGE));
+        assert!(!answer.contains(ELICITATION_REFUSED_MESSAGE));
+
+        let ping = "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"ping\"}";
+        let pong = handle_server_request(ping, "/tmp/bitty").expect("pong");
+        assert!(pong.contains("\"result\":{}"));
+        assert!(!pong.contains("error"));
+
+        let roots = "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"roots/list\"}";
+        let answer = handle_server_request(roots, "/tmp/bitty").expect("roots");
+        assert!(answer.contains("file:///tmp/bitty"));
+        assert!(!answer.contains("error"));
     }
 
     #[test]
