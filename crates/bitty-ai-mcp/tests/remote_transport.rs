@@ -1066,6 +1066,45 @@ fn poll_empty_body_disables() {
 }
 
 #[test]
+fn poll_non2xx_empty_is_error_without_disable() {
+    // Regression for review thread 4231298715: a failed poll with an empty
+    // body (for example a transient `503`) must report `HandshakeRejected`
+    // without stickily disabling polling; the next poll still performs I/O.
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 503,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let retry_body =
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: retry_body.as_bytes().to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let error = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect_err("503 empty must error");
+    assert!(
+        matches!(error.failure, McpFailure::HandshakeRejected { .. }),
+        "unexpected failure: {:?}",
+        error.failure
+    );
+    assert!(!transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    let queued = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("retry still performs I/O");
+    assert_eq!(queued, 1);
+    assert!(!transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 2);
+}
+
+#[test]
 fn poll_timeout_disables() {
     let service = FakeService::new();
     service.queue_error(NetworkError::Timeout {

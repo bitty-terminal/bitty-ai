@@ -338,9 +338,11 @@ impl<S> HttpLineTransport<S> {
 
     /// Whether server-message polling is stickily disabled.
     ///
-    /// Set on HTTP `405`, empty poll bodies, and poll transport timeouts;
-    /// once set, [`HttpLineTransport::poll_server_messages`] returns `Ok(0)`
-    /// with zero I/O. Re-enable needs a new transport (no auto-retry).
+    /// Set on HTTP `405`, empty `2xx` poll bodies, and poll transport
+    /// timeouts; once set, [`HttpLineTransport::poll_server_messages`]
+    /// returns `Ok(0)` with zero I/O. Re-enable needs a new transport (no
+    /// auto-retry). Non-`2xx` poll responses (other than `405`) never
+    /// disable: they fail as [`McpFailure::HandshakeRejected`].
     #[must_use]
     pub fn is_poll_disabled(&self) -> bool {
         self.poll_disabled
@@ -557,13 +559,14 @@ impl<S> HttpLineTransport<S> {
     /// notifications plus any answer-`POST` responses; typically `202` empty
     /// answers queue nothing, so the count is the notification count).
     ///
-    /// Sticky-disable: HTTP `405`, an empty poll body, or a transport timeout
-    /// (on the `GET` or an answer `POST`) sets an internal disabled flag;
-    /// later polls return `Ok(0)` with zero I/O (no service call, no
-    /// capability check). Re-enable needs a new transport (no auto-retry, no
-    /// auto-reconnect). [`HttpLineTransport::is_poll_disabled`] observes it.
-    /// A closed transport still fails with [`McpFailure::TransportClosed`]
-    /// (closed takes precedence over disabled).
+    /// Sticky-disable: HTTP `405`, an empty `2xx` poll body, or a transport
+    /// timeout (on the `GET` or an answer `POST`) sets an internal disabled
+    /// flag; later polls return `Ok(0)` with zero I/O (no service call, no
+    /// capability check). Re-enable needs a new transport (no auto-retry,
+    /// no auto-reconnect). [`HttpLineTransport::is_poll_disabled`]
+    /// observes it. A closed transport still fails with
+    /// [`McpFailure::TransportClosed`] (closed takes precedence over
+    /// disabled).
     ///
     /// Capability, secret, and error-mapping conventions mirror `send_line`:
     /// capability deny is [`McpFailure::TransportClosed`] with zero service
@@ -608,18 +611,21 @@ impl<S> HttpLineTransport<S> {
         };
         self.note_session(&response);
         // Sticky-disable signals: the server does not speak GET streams
-        // (`405`) or has nothing to say (empty body). Both become `Ok(0)`.
+        // (`405`) or a `2xx` poll has nothing to say (empty body). Both
+        // become `Ok(0)`. The status check precedes the empty-body check so
+        // a failed request with an empty body (for example a transient
+        // `503`) reports `HandshakeRejected` without disabling polling.
         if response.status == 405 {
-            self.poll_disabled = true;
-            return Ok(0);
-        }
-        if response.body.is_empty() {
             self.poll_disabled = true;
             return Ok(0);
         }
         if !(200..300).contains(&response.status) {
             let message = format!("http status {}", response.status);
             return Err(handshake_rejected(&message));
+        }
+        if response.body.is_empty() {
+            self.poll_disabled = true;
+            return Ok(0);
         }
         match response.header("content-type") {
             Some(content_type) if is_sse_media_type(content_type) => {}
