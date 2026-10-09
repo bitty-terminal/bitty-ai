@@ -124,6 +124,16 @@ pub enum ToolError {
         /// Hook reason.
         reason: String,
     },
+    /// The host executed the tool and reported failure (executed, then
+    /// failed). Distinct from [`ToolError::Denied`] (a policy refusal with
+    /// no effect) and [`ToolError::EffectUnknown`] (uncertain effect):
+    /// the effect happened and the host answered failure.
+    Failed {
+        /// Tool name.
+        name: String,
+        /// Host-reported failure reason.
+        reason: String,
+    },
     /// The effect may have happened but acknowledgement was lost (crash after
     /// execution, before ack). Returned by executors; the bus records it as
     /// [`ToolStatus::Unknown`] and the agent reconciles before retry.
@@ -168,6 +178,7 @@ impl Display for ToolError {
                 "tool schema of {actual} bytes exceeds {limit} byte limit"
             ),
             Self::Denied { name, reason } => write!(f, "tool {name} denied: {reason}"),
+            Self::Failed { name, reason } => write!(f, "tool {name} failed: {reason}"),
             Self::EffectUnknown { name, reason } => {
                 write!(f, "tool {name} effect unknown: {reason}")
             }
@@ -184,7 +195,8 @@ impl ToolError {
     ///
     /// The runtime-owned numeric/typed fields (bounds, limits, counts) are
     /// preserved verbatim; only externally sourced text — tool names and
-    /// authorizer/executor denial reasons — is scrubbed to printable ASCII
+    /// authorizer/executor denial, failure, and uncertainty reasons — is
+    /// scrubbed to printable ASCII
     /// and bounded to [`crate::bridge::MAX_REASON_BYTES`]. Conversion sites
     /// call this once when a host or model string enters the typed error
     /// surface, so `Display`, logs, and reconcile reports never carry
@@ -202,6 +214,10 @@ impl ToolError {
                 name: bound_reason(&name),
             },
             Self::Denied { name, reason } => Self::Denied {
+                name: bound_reason(&name),
+                reason: bound_reason(&reason),
+            },
+            Self::Failed { name, reason } => Self::Failed {
                 name: bound_reason(&name),
                 reason: bound_reason(&reason),
             },
@@ -646,7 +662,8 @@ pub trait ToolExecutor {
     ///
     /// # Errors
     ///
-    /// Return [`ToolError::Denied`] when the host refuses, or
+    /// Return [`ToolError::Denied`] when the host refuses,
+    /// [`ToolError::Failed`] when the host executed and reported failure, or
     /// [`ToolError::EffectUnknown`] when the effect may have happened but
     /// acknowledgement was lost. Other errors propagate as bus failures.
     fn execute(
@@ -1000,8 +1017,8 @@ impl ToolBus {
     /// # Errors
     ///
     /// Fails closed only for a non-[`ToolSuccess`] executor error that is
-    /// neither [`ToolError::EffectUnknown`] nor [`ToolError::Denied`]. The
-    /// caller observes [`ToolStatus::Refused`] (admission) and
+    /// neither [`ToolError::EffectUnknown`], [`ToolError::Denied`], nor
+    /// [`ToolError::Failed`]. The caller observes [`ToolStatus::Refused`] (admission) and
     /// [`ResultDisposition::Rejected`] (acceptance) through the returned
     /// [`ToolExecution`] and fails the turn itself with the carried typed
     /// cause.
@@ -1089,6 +1106,20 @@ impl ToolBus {
                 },
                 result_disposition: ResultDisposition::Accepted,
                 summary: "host denied execution".to_owned(),
+                data: Vec::new(),
+                is_untrusted_surface: true,
+            }),
+            Err(ToolError::Failed { reason, .. }) => Ok(ToolExecution {
+                execution_id,
+                tool: call.name.clone(),
+                // AI-RUN-008: the executor's failure reason is host-supplied;
+                // normalize it before it becomes a status that is displayed
+                // and messaged to the provider.
+                status: ToolStatus::Failed {
+                    reason: bound_reason(&reason),
+                },
+                result_disposition: ResultDisposition::Accepted,
+                summary: "host reported failure".to_owned(),
                 data: Vec::new(),
                 is_untrusted_surface: true,
             }),
@@ -1514,6 +1545,44 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_records_executor_failure_as_failed_status() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_error(ToolError::Failed {
+            name: "workspace_read".to_owned(),
+            reason: "host reported failure".to_owned(),
+        });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("host failure is a recorded status, not a bus error");
+        // An executed-then-failed effect is attributed as `Failed` (never
+        // `Denied`, which means policy refusal with no effect), with no
+        // payload, and the dispatch is still counted against the per-turn
+        // cap.
+        assert!(
+            matches!(&execution.status, ToolStatus::Failed { .. }),
+            "executor failure must record Failed, got {:?}",
+            execution.status
+        );
+        assert!(!matches!(execution.status, ToolStatus::Denied { .. }));
+        assert!(execution.data.is_empty());
+        assert!(execution.is_untrusted_surface);
+        assert_eq!(execution.tool, "workspace_read");
+        assert_eq!(bus.calls_this_turn(), 1);
+    }
+
+    #[test]
     fn dispatch_rechecks_the_hook_at_the_boundary_after_precheck() {
         use std::cell::Cell;
 
@@ -1759,9 +1828,10 @@ mod tests {
 
     #[test]
     fn tool_error_normalization_covers_every_external_branch() {
-        // AI-RUN-008 table: malformed-name, unknown, duplicate and denial
-        // errors normalize at the boundary; bound-arithmetic variants (no
-        // external text) pass through unchanged.
+        // AI-RUN-008 table: malformed-name, unknown, duplicate, denial,
+        // failure, and uncertainty errors normalize at the boundary;
+        // bound-arithmetic variants (no external text) pass through
+        // unchanged.
         let cases = vec![
             ToolError::InvalidName {
                 name: hostile("bad name "),
@@ -1775,6 +1845,10 @@ mod tests {
             ToolError::Denied {
                 name: hostile("deny "),
                 reason: hostile("policy "),
+            },
+            ToolError::Failed {
+                name: hostile("fail "),
+                reason: hostile("host "),
             },
             ToolError::EffectUnknown {
                 name: hostile("unknown "),
@@ -1790,7 +1864,9 @@ mod tests {
                 ToolError::InvalidName { name }
                 | ToolError::UnknownTool { name }
                 | ToolError::DuplicateTool { name } => assert_display_safe(name),
-                ToolError::Denied { name, reason } | ToolError::EffectUnknown { name, reason } => {
+                ToolError::Denied { name, reason }
+                | ToolError::Failed { name, reason }
+                | ToolError::EffectUnknown { name, reason } => {
                     assert_display_safe(name);
                     assert_display_safe(reason);
                 }
@@ -1895,6 +1971,46 @@ mod tests {
             panic!("expected Denied status");
         };
         assert_display_safe(&reason);
+    }
+
+    #[test]
+    fn executor_failure_status_is_bounded_at_the_bus_boundary() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_error(ToolError::Failed {
+            name: "workspace_read".to_owned(),
+            reason: hostile("executor "),
+        });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("host failure is a recorded status");
+        let ToolStatus::Failed { reason } = execution.status else {
+            panic!("expected Failed status");
+        };
+        assert_display_safe(&reason);
+    }
+
+    #[test]
+    fn failed_display_reports_failure_not_denial() {
+        let failed = ToolError::Failed {
+            name: "workspace_read".to_owned(),
+            reason: "kaput".to_owned(),
+        };
+        let render = failed.to_string();
+        assert!(render.contains("failed"), "got {render:?}");
+        assert!(!render.contains("denied"), "got {render:?}");
+        assert_single_line(&render);
     }
 
     #[test]
