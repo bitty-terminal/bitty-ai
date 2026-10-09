@@ -14,7 +14,10 @@
 //! never samples and never elicits; see [`SAMPLING_REFUSED_MESSAGE`] and
 //! [`ELICITATION_REFUSED_MESSAGE`]), and any other method gets JSON-RPC
 //! `-32601` (Method not found). Server notifications (no `id`)
-//! are ignored.
+//! are ignored here; `notifications/tools/list_changed` in particular is
+//! never answered inline — the host routes polled lines through
+//! [`crate::tools::is_tools_list_changed_notification`] and marks that
+//! server's adapter stale (AI-0211).
 
 use std::time::Instant;
 

@@ -347,7 +347,10 @@ impl ToolSpec {
     /// the host-side invalidation handle: the registry keeps refusing
     /// same-name re-registration ([`ToolError::DuplicateTool`]), so the
     /// host compares digests across its schema snapshots to detect drift
-    /// and never relies on the digest to smuggle a replacement.
+    /// and never relies on the digest to smuggle a replacement. AI-0211
+    /// reuses this digest as the MCP `ToolListSnapshot`/diff handle for
+    /// `notifications/tools/list_changed` re-lists; no semantics change,
+    /// refusal-only stands.
     #[must_use]
     pub fn schema_digest(&self) -> u64 {
         let mut hash = FNV_OFFSET_BASIS;
