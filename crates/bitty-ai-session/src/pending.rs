@@ -134,8 +134,10 @@
 //! entries of one session (SQL filters `status = 'open'`, so cached and
 //! legacy resolved rows are never read for validation); `open_blob_roots`
 //! is O(N) rows for N open entries file-wide (same filter). `bind_head` and
-//! `unbind_head` are O(1) single-row marker writes; `list_head_sessions` is
-//! O(N) rows for N marked sessions. All clocks
+//! `unbind_head` are O(1) single-row marker writes (plus a bounded
+//! marker-count check on bind, at most [`MAX_HEAD_MARKERS`] rows);
+//! `list_head_sessions` reads at most [`MAX_HEAD_MARKERS`] rows (SQL
+//! `LIMIT`, so the direct-`HEAD` resume fan-out stays bounded). All clocks
 //! are caller-supplied (`begun_at_ms` / `resolved_at_ms` / `bound_at_ms`);
 //! no wall clock, no threads.
 //!
@@ -178,6 +180,19 @@ pub const MAX_PENDING_TOOL_NAME: usize = 64;
 /// Mirrors the journal-prototype `MAX_ID_BYTES`: opaque hex ids stay index
 /// sized.
 pub const MAX_PENDING_CALL_ID: usize = 128;
+
+/// Maximum distinct HEAD-marker rows admitted in `pending_head_scope` (32).
+///
+/// Mirrors the [`MAX_OPEN_PENDING_PER_SESSION`] and [`MAX_RESOLVED_RECENT`]
+/// capacity story: the marked set stays small enough to list on every
+/// direct-`HEAD` resume. A resume unions each marked session oldest-first,
+/// and each session holds at most [`MAX_OPEN_PENDING_PER_SESSION`] open
+/// rows, so the worst-case resume fan-out stays `32 x 32` entries -- the
+/// same order as the documented worst-case pending footprint. Admission
+/// refuses past this bound with zero writes; the read path carries the same
+/// bound as SQL `LIMIT`, so even rows planted outside admission (raw SQL)
+/// cannot make a resume load more markers.
+pub const MAX_HEAD_MARKERS: usize = 32;
 
 /// Lifecycle status of one pending-effect row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,7 +349,13 @@ pub enum PendingError {
         /// Caller-supplied generation that failed the fence.
         found: u64,
     },
-    /// Session already holds the maximum open rows.
+    /// Admission bound refused.
+    ///
+    /// The session already holds the maximum open rows
+    /// ([`MAX_OPEN_PENDING_PER_SESSION`]), or the store already holds the
+    /// maximum distinct HEAD markers ([`MAX_HEAD_MARKERS`]). The bound that
+    /// refused travels in `limit`; no new variant is minted for the marker
+    /// path because this is the established admission-bound refusal shape.
     TooManyOpen {
         /// Bound that refused.
         limit: usize,
@@ -837,13 +858,19 @@ impl PendingStore {
     /// session may be visible on both its branch and `HEAD`); it never moves
     /// the session row and never follows tip equality. `now_ms` is the
     /// caller-supplied bind timestamp (caller clocks only). A duplicate bind
-    /// refuses with [`PendingError::AlreadyExists`] and zero writes.
+    /// refuses with [`PendingError::AlreadyExists`] and zero writes, even at
+    /// the marker bound. Past [`MAX_HEAD_MARKERS`] distinct markers a new
+    /// session refuses with [`PendingError::TooManyOpen`] (the admission
+    /// bound travels in `limit`) and zero writes, so a long-lived store can
+    /// never make a direct-`HEAD` resume fan out without bound.
     ///
     /// # Errors
     ///
     /// Returns [`PendingError::Storage`] for an out-of-range timestamp or a
     /// store failure, [`PendingError::AlreadyExists`] for an already marked
-    /// session, and [`PendingError::Corrupt`] for a corrupt database.
+    /// session, [`PendingError::TooManyOpen`] past [`MAX_HEAD_MARKERS`]
+    /// distinct markers, and [`PendingError::Corrupt`] for a corrupt
+    /// database.
     pub fn bind_head(
         store: &ContentStore,
         session_id: &WheelSessionId,
@@ -854,6 +881,28 @@ impl PendingStore {
         }
         ensure_table(store)?;
         let guard = store.lock_conn().map_err(map_store_err)?;
+        let marked: bool = guard
+            .query_row(
+                "SELECT 1 FROM pending_head_scope WHERE session_id = ?1",
+                params![session_id.as_str()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(map_sqlite)?
+            .unwrap_or(false);
+        if marked {
+            return Err(PendingError::AlreadyExists);
+        }
+        let marker_count: i64 = guard
+            .query_row("SELECT COUNT(*) FROM pending_head_scope", [], |row| {
+                row.get(0)
+            })
+            .map_err(map_sqlite)?;
+        if marker_count >= MAX_HEAD_MARKERS as i64 {
+            return Err(PendingError::TooManyOpen {
+                limit: MAX_HEAD_MARKERS,
+            });
+        }
         guard
             .execute(
                 "INSERT INTO pending_head_scope (session_id, bound_at_ms) VALUES (?1, ?2)",
@@ -896,9 +945,11 @@ impl PendingStore {
     /// List the sessions carrying the explicit HEAD marker, ascending.
     ///
     /// Deterministic order (`session_id ASC`): direct-`HEAD` resumes union
-    /// each marked session oldest-first in this order. Fail-closed: any
-    /// malformed marker row (bad session-id shape, negative or non-integer
-    /// timestamp) fails
+    /// each marked session oldest-first in this order. At most
+    /// [`MAX_HEAD_MARKERS`] rows are read (SQL `LIMIT`, matching the
+    /// admission bound, so the resume fan-out stays bounded even if rows
+    /// were planted outside admission). Fail-closed: any malformed marker
+    /// row (bad session-id shape, negative or non-integer timestamp) fails
     /// the whole read as [`PendingError::Corrupt`] with rows preserved. A
     /// fresh database lists zero markers rather than erroring.
     ///
@@ -913,11 +964,11 @@ impl PendingStore {
             let mut stmt = guard
                 .prepare(
                     "SELECT session_id, bound_at_ms FROM pending_head_scope
-                     ORDER BY session_id ASC",
+                     ORDER BY session_id ASC LIMIT ?1",
                 )
                 .map_err(map_sqlite)?;
             let mapped = stmt
-                .query_map([], |row| {
+                .query_map(params![MAX_HEAD_MARKERS as i64], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })
                 .map_err(map_sqlite)?;
@@ -1718,6 +1769,57 @@ mod tests {
                 .expect("list")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn head_scope_bound_refuses_cap_plus_one_with_zero_writes() {
+        let store = test_store();
+        let mut marked = Vec::with_capacity(MAX_HEAD_MARKERS);
+        for index in 0..MAX_HEAD_MARKERS {
+            let session =
+                WheelSessionId::parse(&format!("sess-head-{index:02}")).expect("valid session");
+            PendingStore::bind_head(&store, &session, 1000 + index as u64).expect("bind");
+            marked.push(session);
+        }
+        // The read path serves the full bound in order: this is exactly the
+        // set a direct-HEAD resume consumes, so resume works at the cap.
+        let listed = PendingStore::list_head_sessions(&store).expect("list at cap");
+        let names: Vec<&str> = listed.iter().map(|id| id.as_str()).collect();
+        let mut expected: Vec<String> = marked.iter().map(|id| id.as_str().to_owned()).collect();
+        expected.sort();
+        assert_eq!(
+            names,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        // One past the bound refuses typed with zero writes.
+        let extra = WheelSessionId::parse("sess-head-extra").expect("valid session");
+        assert_eq!(
+            PendingStore::bind_head(&store, &extra, 2000),
+            Err(PendingError::TooManyOpen {
+                limit: MAX_HEAD_MARKERS,
+            })
+        );
+        // A duplicate bind still reports AlreadyExists at the bound (the
+        // novelty check runs before the admission count), and unbinding one
+        // marker re-admits a new session.
+        assert_eq!(
+            PendingStore::bind_head(&store, &marked[0], 2010),
+            Err(PendingError::AlreadyExists)
+        );
+        let count: i64 = {
+            let guard = store.lock_conn().expect("lock");
+            guard
+                .query_row("SELECT COUNT(*) FROM pending_head_scope", [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(count, MAX_HEAD_MARKERS as i64);
+        PendingStore::unbind_head(&store, &marked[0]).expect("unbind");
+        PendingStore::bind_head(&store, &extra, 2020).expect("re-admit after unbind");
+        let listed = PendingStore::list_head_sessions(&store).expect("list");
+        assert_eq!(listed.len(), MAX_HEAD_MARKERS);
+        assert!(listed.iter().any(|id| id.as_str() == "sess-head-extra"));
     }
 
     #[test]
