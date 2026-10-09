@@ -726,7 +726,9 @@ impl WheelKernel {
     /// (`PendingStore::list_head_sessions`), each oldest-first in the same
     /// marker order: branches that happen to share one checkpoint tip never
     /// leak into each other, and an unmarked session stays invisible to
-    /// `HEAD` even when its branch tip equals `HEAD`. The marker is explicit
+    /// `HEAD` even when its branch tip equals `HEAD`. The marker set is
+    /// admission-bounded (see [`Self::bind_head_session`]), so this fan-out
+    /// stays bounded. The marker is explicit
     /// and additive (see [`Self::bind_head_session`]). A poisoned row
     /// anywhere (pending entry or HEAD marker) fails the whole read (fail
     /// closed, rows preserved). The branch resume path calls this before
@@ -814,7 +816,10 @@ impl WheelKernel {
     /// already be bound (dangling markers refuse as `NotFound` with zero
     /// writes, so a typo cannot hide as an empty `HEAD` resume). `now_ms`
     /// is the caller-supplied bind timestamp (caller clocks only). A
-    /// duplicate bind refuses with `AlreadyExists` and zero writes.
+    /// duplicate bind refuses with `AlreadyExists` and zero writes. Past the
+    /// pending-plane marker bound a new session refuses with `TooManyOpen`
+    /// (bound in `limit`) and zero writes, so the direct-`HEAD` resume
+    /// fan-out stays bounded.
     pub fn bind_head_session(&self, session_id: &str, now_ms: u64) -> Result<(), FacadeError> {
         let id = WheelSessionId::parse(session_id).map_err(map_session_err)?;
         let exists = resolve_session(&self.content_store, &id).map_err(map_session_err)?;
