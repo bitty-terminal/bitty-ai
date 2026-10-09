@@ -18,9 +18,10 @@
 //! `-32601`, or `-32602` maps to [`ToolError::ProtocolRejected`]: the server
 //! refused the frame before any effect, so the call never executed: never
 //! `Denied` (policy), never `EffectUnknown` (uncertain effect, reconcile),
-//! never `Failed` (executed-then-failed). The turn still fails closed with
-//! no blind retry, and the reason preserves the true attribution
-//! (rejected before execution, with the protocol code).
+//! never `Failed` (executed-then-failed). The bus records a
+//! model-observable failed status and the turn continues; the model may
+//! retry only as a new call with fixed params. The reason preserves the
+//! true attribution (rejected before execution, with the protocol code).
 //! Transport faults mid-call map to `EffectUnknown` (in-flight effect
 //! uncertain).
 
