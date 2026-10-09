@@ -962,6 +962,200 @@ fn bridge_allowlist_miss_is_zero_contact_over_http() {
     ));
 }
 
+// ── AI-0206: host-driven poll_server_messages ───────────────────────────────
+//
+// `HttpLineTransport::poll_server_messages` GETs the same URL with
+// `Accept: text/event-stream` plus the session header, parses SSE `data:`
+// frames into the line queue (POST-path bounds), answers server requests
+// inline via the handshake helper, and queues notifications for the host to
+// route. `405`/empty-body/timeout stickily disables (later polls are
+// `Ok(0)` with zero I/O; re-enable needs a new transport).
+
+#[test]
+fn poll_queues_sse_notifications_and_counts() {
+    let service = FakeService::new();
+    let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}\n\n";
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![
+            ("content-type".to_owned(), "text/event-stream".to_owned()),
+            ("mcp-session-id".to_owned(), "sess-poll-1".to_owned()),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let queued = transport.poll_server_messages("/tmp/bitty").expect("poll");
+    assert_eq!(queued, 2);
+    assert_eq!(transport.queued_len(), 2);
+    assert_eq!(transport.session_id(), Some("sess-poll-1"));
+    assert!(!transport.is_poll_disabled());
+    // Queued lines are retrievable via `recv_line` in order.
+    let first = transport.recv_line(10).expect("recv").expect("line");
+    assert!(first.contains("notifications/tools/list_changed"));
+    let second = transport.recv_line(10).expect("recv").expect("line");
+    assert!(second.contains("notifications/ping"));
+    assert_eq!(transport.recv_line(10).expect("drained"), None);
+    // Wire shape: single GET, SSE-only Accept, config timeout + frame cap.
+    let recorded = transport.service().recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].method, bitty_network_api::HttpMethod::Get);
+    assert!(
+        recorded[0].headers.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
+        )
+    );
+    assert_eq!(recorded[0].timeout, Some(Duration::from_millis(1_000)));
+    assert_eq!(
+        recorded[0].max_body_bytes,
+        Some(u64::try_from(bitty_ai_mcp::MAX_FRAME_BYTES).unwrap_or(u64::MAX))
+    );
+}
+
+#[test]
+fn poll_405_disables_and_second_poll_is_zero_io() {
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 405,
+        headers: Vec::new(),
+        body: b"nope".to_vec(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let first = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("405 disables");
+    assert_eq!(first, 0);
+    assert!(transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    let second = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("disabled no-op");
+    assert_eq!(second, 0);
+    assert_eq!(
+        transport.service().recorded_count(),
+        1,
+        "second poll must be zero I/O"
+    );
+}
+
+#[test]
+fn poll_empty_body_disables() {
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: Vec::new(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let first = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("empty disables");
+    assert_eq!(first, 0);
+    assert!(transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    let second = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("disabled no-op");
+    assert_eq!(second, 0);
+    assert_eq!(transport.service().recorded_count(), 1);
+}
+
+#[test]
+fn poll_timeout_disables() {
+    let service = FakeService::new();
+    service.queue_error(NetworkError::Timeout {
+        after: Duration::from_millis(7),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let error = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect_err("timeout");
+    assert!(matches!(error.failure, McpFailure::Timeout { .. }));
+    assert!(transport.is_poll_disabled());
+    assert_eq!(transport.service().recorded_count(), 1);
+    let second = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect("disabled no-op");
+    assert_eq!(second, 0);
+    assert_eq!(transport.service().recorded_count(), 1);
+}
+
+#[test]
+fn poll_answers_server_ping_inline() {
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: b"data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n\n".to_vec(),
+    });
+    service.queue_response(Response {
+        status: 202,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let queued = transport.poll_server_messages("/tmp/bitty").expect("poll");
+    // Ping is answered, not queued; the `202` answer POST queues nothing.
+    assert_eq!(queued, 0);
+    assert_eq!(transport.queued_len(), 0);
+    assert!(!transport.is_poll_disabled());
+    let recorded = transport.service().recorded();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].method, bitty_network_api::HttpMethod::Get);
+    assert_eq!(recorded[1].method, bitty_network_api::HttpMethod::Post);
+    let pong = String::from_utf8_lossy(&recorded[1].body).into_owned();
+    assert!(pong.contains("\"id\":9"));
+    assert!(pong.contains("\"result\":{}"));
+    assert!(!pong.contains("error"));
+    assert_eq!(transport.recv_line(10).expect("recv"), None);
+}
+
+#[test]
+fn poll_refuses_sampling_with_distinct_message() {
+    let canary = "canary-sampling-params-9f3a";
+    let service = FakeService::new();
+    let body = format!(
+        "data: {{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"sampling/createMessage\",\"params\":{{\"messages\":[{{\"role\":\"user\",\"content\":{{\"text\":\"{canary}\"}}}}]}}}}\n\n"
+    );
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    service.queue_response(Response {
+        status: 202,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let queued = transport.poll_server_messages("/tmp/bitty").expect("poll");
+    assert_eq!(queued, 0);
+    assert!(!transport.is_poll_disabled());
+    let recorded = transport.service().recorded();
+    assert_eq!(recorded.len(), 2);
+    let reply = String::from_utf8_lossy(&recorded[1].body).into_owned();
+    assert!(reply.contains("\"id\":11"));
+    assert!(reply.contains("-32601"));
+    assert!(reply.contains(bitty_ai_mcp::handshake::SAMPLING_REFUSED_MESSAGE));
+    assert!(!reply.contains("Method not found"));
+    assert!(
+        !reply.contains(canary),
+        "refusal must not echo params: {reply}"
+    );
+    assert_eq!(transport.recv_line(10).expect("recv"), None);
+}
+
 // ── secrets never in errors ────────────────────────────────────────────────
 
 #[test]
