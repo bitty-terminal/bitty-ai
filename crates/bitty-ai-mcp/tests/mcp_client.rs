@@ -148,6 +148,66 @@ fn full_handshake_against_fake_transport() {
     assert!(sent[1].contains("notifications/initialized"));
 }
 
+// ── AI-0205: never-sample / never-elicit refusals ────────────────────────────
+
+#[test]
+fn handshake_refuses_sampling_and_elicitation_inline() {
+    use bitty_ai_mcp::handshake::{ELICITATION_REFUSED_MESSAGE, SAMPLING_REFUSED_MESSAGE};
+    let answer = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}"
+    );
+    let (mut transport, sent) = FakeTransport::fresh(vec![
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[{\"role\":\"user\",\"content\":{\"text\":\"canary-sampling-params\"}}]}}"
+            .to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"elicitation/create\",\"params\":{\"message\":\"canary-elicitation-params\"}}"
+            .to_owned(),
+        answer,
+    ]);
+    let negotiated = handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+    assert!(negotiated.tools_supported);
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 4);
+    // Sampling refusal: same -32601 code shape, distinct static message, no
+    // request-param echo.
+    assert!(sent[1].contains("\"id\":9"));
+    assert!(sent[1].contains("-32601"));
+    assert!(sent[1].contains(SAMPLING_REFUSED_MESSAGE));
+    assert!(!sent[1].contains("Method not found"));
+    assert!(!sent[1].contains("canary-sampling-params"));
+    // Elicitation refusal: same code shape, its own distinct message.
+    assert!(sent[2].contains("\"id\":10"));
+    assert!(sent[2].contains("-32601"));
+    assert!(sent[2].contains(ELICITATION_REFUSED_MESSAGE));
+    assert!(!sent[2].contains("Method not found"));
+    assert!(!sent[2].contains("canary-elicitation-params"));
+    // The handshake still completes afterwards.
+    assert!(sent[3].contains("notifications/initialized"));
+}
+
+#[test]
+fn handshake_unknown_method_still_32601_ping_roots_unaffected() {
+    let answer = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}"
+    );
+    let (mut transport, sent) = FakeTransport::fresh(vec![
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"roots/list\"}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/frobnicate\"}".to_owned(),
+        answer,
+    ]);
+    handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 5);
+    assert!(sent[1].contains("\"id\":9"));
+    assert!(sent[1].contains("\"result\":{}"));
+    assert!(sent[2].contains("file:///tmp/bitty"));
+    assert_eq!(sent[2].matches("file://").count(), 1);
+    assert!(sent[3].contains("\"id\":11"));
+    assert!(sent[3].contains("-32601"));
+    assert!(sent[3].contains("Method not found"));
+    assert!(sent[4].contains("notifications/initialized"));
+}
+
 // ── sanitize: shape, collision, 64-byte cap ──────────────────────────────────
 
 #[test]
