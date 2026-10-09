@@ -9,12 +9,19 @@
 //! from [`CredentialRef`] names, and every error below quotes names only.
 //!
 //! Seam mapping for server answers: an MCP `isError: true` answer (or a
-//! JSON-RPC `error` answer) maps to [`ToolError::Failed`] with the reason
+//! JSON-RPC `error` answer outside the pre-execution protocol set) maps to
+//! [`ToolError::Failed`] with the reason
 //! `tool reported failure: <bounded server text>`. `Failed` means the tool
 //! executed and the host reported failure, distinct from [`ToolError::Denied`]
 //! (a policy refusal with no effect: allowlist miss, `inspect`-tier,
-//! authorizer, or consent). The turn still fails closed with no blind retry,
-//! and the reason preserves the true attribution (executed, then failed).
+//! authorizer, or consent). A JSON-RPC `error` answer with code `-32600`,
+//! `-32601`, or `-32602` maps to [`ToolError::ProtocolRejected`]: the server
+//! refused the frame before any effect, so the call never executed: never
+//! `Denied` (policy), never `EffectUnknown` (uncertain effect, reconcile),
+//! never `Failed` (executed-then-failed). The bus records a
+//! model-observable failed status and the turn continues; the model may
+//! retry only as a new call with fixed params. The reason preserves the
+//! true attribution (rejected before execution, with the protocol code).
 //! Transport faults mid-call map to `EffectUnknown` (in-flight effect
 //! uncertain).
 
@@ -163,6 +170,14 @@ impl McpToolAdapter {
         }
         .normalized()
     }
+
+    fn protocol_rejected(&self, tool: &str, code: i32, message: &str) -> ToolError {
+        ToolError::ProtocolRejected {
+            name: tool.to_owned(),
+            reason: format!("protocol rejected before execution (code {code}): {message}"),
+        }
+        .normalized()
+    }
 }
 
 impl ToolExecutor for McpToolAdapter {
@@ -236,6 +251,13 @@ impl ToolExecutor for McpToolAdapter {
             }
             Err(McpCallError::Failed { reason, .. }) => {
                 Err(self.failed(tool, &format!("tool reported failure: {reason}")))
+            }
+            // Pre-execution protocol refusal: never `Denied` (policy), never
+            // `EffectUnknown` (uncertain effect), never `Failed`
+            // (executed-then-failed). The bus records it model-observable
+            // with turn-continue semantics under its own attribution.
+            Err(McpCallError::ProtocolRejected { code, message, .. }) => {
+                Err(self.protocol_rejected(tool, code, &message))
             }
             Err(McpCallError::Unknown { reason, .. }) => Err(ToolError::EffectUnknown {
                 name: tool.to_owned(),
@@ -453,8 +475,10 @@ mod tests {
 
     #[test]
     fn rpc_error_answer_maps_to_failed_not_denied() {
+        // `-32603` is outside the pre-execution protocol set: it keeps the
+        // executed-failure mapping, never a policy denial.
         let line =
-            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}";
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"bad params\"}}";
         let (transport, _sent) = FakeTransport::fresh(vec![line.to_owned()]);
         let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
         let error = adapter
@@ -466,6 +490,35 @@ mod tests {
                 assert!(reason.contains("bad params"));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_execution_error_maps_to_protocol_rejected_not_failed() {
+        // `-32600`/`-32601`/`-32602` never executed: the adapter reports the
+        // distinct protocol outcome, never `Denied`, `EffectUnknown`, or
+        // `Failed`.
+        for code in [-32600, -32601, -32602] {
+            let line = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{{\"code\":{code},\"message\":\"bad frame\"}}}}"
+            );
+            let (transport, _sent) = FakeTransport::fresh(vec![line]);
+            let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+            let error = adapter
+                .execute("mcp_demo_echo", b"{}", 1_000)
+                .expect_err("protocol error must reject");
+            match &error {
+                ToolError::ProtocolRejected { name, reason } => {
+                    assert_eq!(name, "mcp_demo_echo");
+                    assert!(reason.contains("protocol rejected before execution"));
+                    assert!(reason.contains(&code.to_string()));
+                    assert!(reason.contains("bad frame"));
+                }
+                other => panic!("code {code}: expected ProtocolRejected, got {other:?}"),
+            }
+            assert!(!matches!(error, ToolError::Denied { .. }));
+            assert!(!matches!(error, ToolError::EffectUnknown { .. }));
+            assert!(!matches!(error, ToolError::Failed { .. }));
         }
     }
 
@@ -509,6 +562,57 @@ mod tests {
         }
         assert!(execution.data.is_empty());
         assert!(execution.is_untrusted_surface);
+    }
+
+    #[test]
+    fn bus_dispatch_maps_protocol_rejection_with_continue_semantics() {
+        // End-to-end through the bus: a pre-execution protocol rejection is
+        // a recorded non-executed outcome with turn-continue semantics (an
+        // `Ok` execution, counted, model-observable, untrusted), never a
+        // bus error, never `Denied` or `Unknown`.
+        let line =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}";
+        let (transport, _sent) = FakeTransport::fresh(vec![line.to_owned()]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "mcp_demo_echo",
+                    "Echo",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "mcp.demo",
+                    true,
+                )
+                .expect("valid"),
+            )
+            .expect("capacity");
+        let mut bus = ToolBus::new(registry).with_authorizer(Allow);
+        let call = ToolCall {
+            name: "mcp_demo_echo".to_owned(),
+            arguments: b"{}".to_vec(),
+        };
+        let mut ids = IdIssuer::default();
+        let base_workspace = base(AgentLevel::Workspace);
+        let execution = bus
+            .dispatch(&mut adapter, &call, &base_workspace, ids.execution(), 1_000)
+            .expect("protocol rejection is a recorded status, not a bus error");
+        match &execution.status {
+            ToolStatus::Failed { reason } => {
+                assert!(reason.contains("protocol rejected before execution"));
+            }
+            other => panic!("expected Failed status, got {other:?}"),
+        }
+        assert!(
+            execution.summary.contains("before execution"),
+            "summary must mark non-executed, got {:?}",
+            execution.summary
+        );
+        assert!(!matches!(execution.status, ToolStatus::Denied { .. }));
+        assert!(!matches!(execution.status, ToolStatus::Unknown { .. }));
+        assert!(execution.data.is_empty());
+        assert!(execution.is_untrusted_surface);
+        assert_eq!(bus.calls_this_turn(), 1);
     }
 
     #[test]

@@ -7,8 +7,14 @@
 //!
 //! Outcome mapping:
 //!
-//! - `isError: true` (or a JSON-RPC `error` answer) becomes
-//!   [`McpCallError::Failed`]: the tool executed and reported failure.
+//! - `isError: true` becomes [`McpCallError::Failed`]: the tool executed and
+//!   reported failure.
+//! - A JSON-RPC `error` answer with code `-32600` (invalid request),
+//!   `-32601` (method not found), or `-32602` (invalid params) becomes
+//!   [`McpCallError::ProtocolRejected`]: the server refused the frame before
+//!   any effect, so the call never executed. All other `error` answers
+//!   (including `-32603` and the server `-32000` range) stay
+//!   [`McpCallError::Failed`].
 //! - Results concatenate `content[].text` parts; a `structuredContent`-only
 //!   result synthesizes its text from the raw structured bytes (bounded).
 //! - Results past 16 KiB become [`McpCallError::ResultRejected`]: rejected
@@ -56,12 +62,28 @@ pub enum McpCallError {
         /// Observed text bytes.
         actual: usize,
     },
-    /// The tool executed and reported failure.
+    /// The tool executed and reported failure (`isError: true` answers and
+    /// JSON-RPC `error` answers outside the pre-execution protocol set).
     Failed {
         /// Tool display name.
         tool: String,
         /// Bounded server-reported reason.
         reason: String,
+    },
+    /// The server rejected the call at the protocol level before any effect
+    /// (JSON-RPC `-32600` invalid request, `-32601` method not found,
+    /// `-32602` invalid params). Non-executed: distinct from [`McpCallError::Failed`]
+    /// (executed, then failed) and [`McpCallError::Unknown`] (uncertain
+    /// effect, reconcile before retry). Retryable only with fixed params as
+    /// a new call, never a blind retry of the same bytes.
+    ProtocolRejected {
+        /// Tool display name.
+        tool: String,
+        /// JSON-RPC error code (`-32600`, `-32601`, or `-32602`).
+        code: i32,
+        /// Bounded server-reported message (no payload echo: the error
+        /// `data` member is never read).
+        message: String,
     },
     /// Acknowledgement was lost (deadline or mid-call close): reconcile
     /// before retry, never blindly retry.
@@ -86,6 +108,16 @@ impl std::fmt::Display for McpCallError {
                 "tool result of {actual} bytes exceeds {limit} byte limit"
             ),
             Self::Failed { tool, reason } => write!(f, "tool '{tool}' reported failure: {reason}"),
+            Self::ProtocolRejected {
+                tool,
+                code,
+                message,
+            } => {
+                write!(
+                    f,
+                    "tool '{tool}' protocol rejected (code {code}): {message}"
+                )
+            }
             Self::Unknown { tool, reason } => write!(f, "tool '{tool}' effect unknown: {reason}"),
         }
     }
@@ -124,15 +156,33 @@ pub fn call_request(id: u64, raw_tool: &str, arguments: &[u8]) -> String {
 /// # Errors
 ///
 /// Returns [`McpCallError::Failed`] for `isError: true` answers and
-/// JSON-RPC `error` answers.
+/// JSON-RPC `error` answers outside the pre-execution protocol set, and
+/// [`McpCallError::ProtocolRejected`] for `error` answers with code
+/// `-32600`, `-32601`, or `-32602` (rejected before any effect).
 pub fn parse_call_result(line: &str, tool: &str) -> Result<(String, usize), McpCallError> {
     if let Some(error) = find_object_field(line, "error") {
-        let code = find_raw_field(error, "code").unwrap_or("?");
+        let code_raw = find_raw_field(error, "code").unwrap_or("?");
         let message = find_string_field(error, "message").unwrap_or_default();
+        // Standard pre-execution rejections (AI-0204): invalid request,
+        // method not found, invalid params. The server refused the frame
+        // before any effect, so this is never `Failed` (which claims an
+        // executed effect). The error `data` member is deliberately never
+        // read: no request or result payload bytes enter the diagnostic.
+        if let Ok(code) = code_raw.trim().parse::<i32>() {
+            // Owner scope (PX-0897): exactly -32600/-32601/-32602, no wider
+            // range, no server -32000 range, no -32603.
+            if (-32602..=-32600).contains(&code) {
+                return Err(McpCallError::ProtocolRejected {
+                    tool: tool.to_owned(),
+                    code,
+                    message: bound_error_text(&message, crate::error::MAX_ERROR_TEXT_BYTES),
+                });
+            }
+        }
         return Err(McpCallError::Failed {
             tool: tool.to_owned(),
             reason: bound_error_text(
-                &format!("server error {code}: {message}"),
+                &format!("server error {code_raw}: {message}"),
                 crate::error::MAX_ERROR_TEXT_BYTES,
             ),
         });
@@ -231,6 +281,7 @@ fn collect_text_parts(result: &str) -> CollectedText {
 ///
 /// Returns [`McpCallError::ArgumentsTooLarge`] before any transport contact,
 /// [`McpCallError::Failed`] for server-reported failures,
+/// [`McpCallError::ProtocolRejected`] for pre-execution protocol rejections,
 /// [`McpCallError::ResultRejected`] past 16 KiB, [`McpCallError::Unknown`]
 /// on deadline or mid-call close, and [`McpCallError::Transport`] for
 /// frame-level faults.
@@ -346,6 +397,24 @@ pub fn call_stage(error: &McpCallError) -> McpError {
                 reason: reason.clone(),
             },
         ),
+        // Bridge reporting keeps the `CallTool`/`ToolFailed` shape (a
+        // JSON-RPC error answer, fatal: never blindly retried); the distinct
+        // non-executed outcome travels on the `McpCallError` carrier into
+        // `ToolError::ProtocolRejected`, where the message marks the code.
+        McpCallError::ProtocolRejected {
+            tool,
+            code,
+            message,
+        } => McpError::new(
+            McpStage::CallTool,
+            McpFailure::ToolFailed {
+                tool: tool.clone(),
+                reason: bound_error_text(
+                    &format!("protocol rejected (code {code}): {message}"),
+                    crate::error::MAX_ERROR_TEXT_BYTES,
+                ),
+            },
+        ),
         McpCallError::Unknown { tool, reason } => McpError::new(
             McpStage::CallTool,
             McpFailure::EffectUnknown {
@@ -412,10 +481,61 @@ mod tests {
 
     #[test]
     fn rpc_error_maps_to_failed() {
-        let line =
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"bad params\"}}";
-        let error = parse_call_result(line, "mcp_demo_echo").expect_err("failed");
-        assert!(matches!(error, McpCallError::Failed { .. }));
+        // `-32603` (internal error) and the server `-32000` range are not
+        // pre-execution rejections: they keep the executed-failure mapping.
+        for (code, message) in [("-32603", "boom"), ("-32000", "transport busy")] {
+            let line = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":{code},\"message\":\"{message}\"}}}}"
+            );
+            let error = parse_call_result(&line, "mcp_demo_echo").expect_err("failed");
+            assert!(
+                matches!(error, McpCallError::Failed { .. }),
+                "code {code} must stay Failed, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_execution_codes_map_to_protocol_rejected() {
+        // `-32600`/`-32601`/`-32602` never executed: distinct non-executed
+        // outcome, never `Failed` (executed-then-failed).
+        for code in [-32600, -32601, -32602] {
+            let line = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":{code},\"message\":\"bad frame\"}}}}"
+            );
+            let error = parse_call_result(&line, "mcp_demo_echo").expect_err("rejected");
+            match &error {
+                McpCallError::ProtocolRejected {
+                    tool,
+                    code: seen,
+                    message,
+                } => {
+                    assert_eq!(tool, "mcp_demo_echo");
+                    assert_eq!(*seen, code);
+                    assert!(message.contains("bad frame"));
+                }
+                other => panic!("code {code} must reject, got {other:?}"),
+            }
+            assert!(!matches!(error, McpCallError::Failed { .. }));
+        }
+    }
+
+    #[test]
+    fn protocol_rejection_carries_no_payload_echo() {
+        // The error `data` member (request/result payload bytes) is never
+        // read into the diagnostic: only code plus message travel.
+        let line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"bad params\",\"data\":{\"secret\":\"canary-payload-bytes\"}}}";
+        let error = parse_call_result(line, "mcp_demo_echo").expect_err("rejected");
+        match &error {
+            McpCallError::ProtocolRejected { message, .. } => {
+                assert!(!message.contains("canary-payload-bytes"));
+            }
+            other => panic!("expected ProtocolRejected, got {other:?}"),
+        }
+        let render = error.to_string();
+        assert!(render.contains("-32602"));
+        assert!(!render.contains("canary-payload-bytes"));
+        assert!(!render.contains('\n'));
     }
 
     #[test]

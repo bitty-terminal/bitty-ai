@@ -134,6 +134,21 @@ pub enum ToolError {
         /// Host-reported failure reason.
         reason: String,
     },
+    /// The server rejected the call at the protocol level before any effect
+    /// (JSON-RPC `-32600` invalid request, `-32601` method not found,
+    /// `-32602` invalid params). Non-executed: distinct from
+    /// [`ToolError::Failed`] (executed, then failed), [`ToolError::Denied`]
+    /// (a policy refusal), and [`ToolError::EffectUnknown`] (uncertain
+    /// effect). The bus records it model-observable with the same flow
+    /// direction as `Failed` (the turn continues; the model may retry with
+    /// fixed params as a new call), counted and untrusted, and it never
+    /// enters the reconcile path.
+    ProtocolRejected {
+        /// Tool name.
+        name: String,
+        /// Protocol rejection reason (code plus bounded server message).
+        reason: String,
+    },
     /// The effect may have happened but acknowledgement was lost (crash after
     /// execution, before ack). Returned by executors; the bus records it as
     /// [`ToolStatus::Unknown`] and the agent reconciles before retry.
@@ -179,6 +194,9 @@ impl Display for ToolError {
             ),
             Self::Denied { name, reason } => write!(f, "tool {name} denied: {reason}"),
             Self::Failed { name, reason } => write!(f, "tool {name} failed: {reason}"),
+            Self::ProtocolRejected { name, reason } => {
+                write!(f, "tool {name} protocol rejected: {reason}")
+            }
             Self::EffectUnknown { name, reason } => {
                 write!(f, "tool {name} effect unknown: {reason}")
             }
@@ -218,6 +236,10 @@ impl ToolError {
                 reason: bound_reason(&reason),
             },
             Self::Failed { name, reason } => Self::Failed {
+                name: bound_reason(&name),
+                reason: bound_reason(&reason),
+            },
+            Self::ProtocolRejected { name, reason } => Self::ProtocolRejected {
                 name: bound_reason(&name),
                 reason: bound_reason(&reason),
             },
@@ -663,7 +685,9 @@ pub trait ToolExecutor {
     /// # Errors
     ///
     /// Return [`ToolError::Denied`] when the host refuses,
-    /// [`ToolError::Failed`] when the host executed and reported failure, or
+    /// [`ToolError::Failed`] when the host executed and reported failure,
+    /// [`ToolError::ProtocolRejected`] when the server rejected the call at
+    /// the protocol level before any effect, or
     /// [`ToolError::EffectUnknown`] when the effect may have happened but
     /// acknowledgement was lost. Other errors propagate as bus failures.
     fn execute(
@@ -1008,7 +1032,11 @@ impl ToolBus {
     ///   cause, with [`ResultDisposition::Accepted`] (nothing was attempted);
     /// - **effect** — the executor return path maps to
     ///   [`ToolStatus::Success`]/[`ToolStatus::Failed`]/[`ToolStatus::Denied`]/
-    ///   [`ToolStatus::Unknown`] with no conflation;
+    ///   [`ToolStatus::Unknown`] with no conflation. A protocol rejection
+    ///   ([`ToolError::ProtocolRejected`], non-executed) records
+    ///   [`ToolStatus::Failed`] with a non-executed summary and reason, so
+    ///   the turn continues model-observable exactly like an executed
+    ///   failure while the attribution stays distinct;
     /// - **result acceptance** — a success whose payload is over-bound keeps
     ///   [`ToolStatus::Success`] (the effect happened) and records a
     ///   [`ResultDisposition::Rejected`] carrying the typed bound failure,
@@ -1017,8 +1045,8 @@ impl ToolBus {
     /// # Errors
     ///
     /// Fails closed only for a non-[`ToolSuccess`] executor error that is
-    /// neither [`ToolError::EffectUnknown`], [`ToolError::Denied`], nor
-    /// [`ToolError::Failed`]. The caller observes [`ToolStatus::Refused`] (admission) and
+    /// neither [`ToolError::EffectUnknown`], [`ToolError::Denied`],
+    /// [`ToolError::Failed`], nor [`ToolError::ProtocolRejected`]. The caller observes [`ToolStatus::Refused`] (admission) and
     /// [`ResultDisposition::Rejected`] (acceptance) through the returned
     /// [`ToolExecution`] and fails the turn itself with the carried typed
     /// cause.
@@ -1120,6 +1148,24 @@ impl ToolBus {
                 },
                 result_disposition: ResultDisposition::Accepted,
                 summary: "host reported failure".to_owned(),
+                data: Vec::new(),
+                is_untrusted_surface: true,
+            }),
+            // AI-0204: a pre-execution protocol rejection never executed, so
+            // it is never `Denied` (policy), never `Unknown` (no reconcile),
+            // and never an admission refusal. It records `Failed` status with
+            // a non-executed summary and reason so the turn continues
+            // model-observable exactly like an executed failure while the
+            // attribution stays distinct; the dispatch is counted and the
+            // surface stays untrusted.
+            Err(ToolError::ProtocolRejected { reason, .. }) => Ok(ToolExecution {
+                execution_id,
+                tool: call.name.clone(),
+                status: ToolStatus::Failed {
+                    reason: bound_reason(&reason),
+                },
+                result_disposition: ResultDisposition::Accepted,
+                summary: "protocol rejected before execution".to_owned(),
                 data: Vec::new(),
                 is_untrusted_surface: true,
             }),
@@ -1829,7 +1875,8 @@ mod tests {
     #[test]
     fn tool_error_normalization_covers_every_external_branch() {
         // AI-RUN-008 table: malformed-name, unknown, duplicate, denial,
-        // failure, and uncertainty errors normalize at the boundary;
+        // failure, protocol-rejection, and uncertainty errors normalize at
+        // the boundary;
         // bound-arithmetic variants (no external text) pass through
         // unchanged.
         let cases = vec![
@@ -1850,6 +1897,10 @@ mod tests {
                 name: hostile("fail "),
                 reason: hostile("host "),
             },
+            ToolError::ProtocolRejected {
+                name: hostile("rejected "),
+                reason: hostile("protocol "),
+            },
             ToolError::EffectUnknown {
                 name: hostile("unknown "),
                 reason: hostile("ack "),
@@ -1866,6 +1917,7 @@ mod tests {
                 | ToolError::DuplicateTool { name } => assert_display_safe(name),
                 ToolError::Denied { name, reason }
                 | ToolError::Failed { name, reason }
+                | ToolError::ProtocolRejected { name, reason }
                 | ToolError::EffectUnknown { name, reason } => {
                     assert_display_safe(name);
                     assert_display_safe(reason);
@@ -2011,6 +2063,68 @@ mod tests {
         assert!(render.contains("failed"), "got {render:?}");
         assert!(!render.contains("denied"), "got {render:?}");
         assert_single_line(&render);
+    }
+
+    #[test]
+    fn protocol_rejected_display_marks_non_executed() {
+        let rejected = ToolError::ProtocolRejected {
+            name: "workspace_read".to_owned(),
+            reason: "protocol rejected before execution (code -32602): bad params".to_owned(),
+        };
+        let render = rejected.to_string();
+        assert!(render.contains("protocol rejected"), "got {render:?}");
+        assert!(!render.contains("denied"), "got {render:?}");
+        assert!(!matches!(rejected, ToolError::Failed { .. }));
+        assert!(!matches!(rejected, ToolError::Denied { .. }));
+        assert!(!matches!(rejected, ToolError::EffectUnknown { .. }));
+        assert_single_line(&render);
+    }
+
+    #[test]
+    fn dispatch_records_protocol_rejection_with_continue_semantics() {
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_error(ToolError::ProtocolRejected {
+            name: "workspace_read".to_owned(),
+            reason: "protocol rejected before execution (code -32602): bad params".to_owned(),
+        });
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let execution = bus
+            .dispatch(&mut executor, &call, &base(), ids.execution(), 1_000)
+            .expect("protocol rejection is a recorded status, not a bus error");
+        // Same flow direction as an executed failure (recorded `Ok`, the
+        // turn continues model-observable) with distinct non-executed
+        // attribution: never `Denied`, never `Unknown` (no reconcile), the
+        // summary marks non-execution, and the dispatch is counted on the
+        // untrusted surface.
+        match &execution.status {
+            ToolStatus::Failed { reason } => {
+                assert!(reason.contains("protocol rejected before execution"));
+            }
+            other => panic!("expected Failed status, got {other:?}"),
+        }
+        assert!(
+            execution.summary.contains("before execution"),
+            "summary must mark non-executed, got {:?}",
+            execution.summary
+        );
+        assert!(!matches!(execution.status, ToolStatus::Denied { .. }));
+        assert!(!matches!(execution.status, ToolStatus::Unknown { .. }));
+        assert_eq!(execution.result_disposition, ResultDisposition::Accepted);
+        assert!(execution.data.is_empty());
+        assert!(execution.is_untrusted_surface);
+        assert_eq!(execution.tool, "workspace_read");
+        assert_eq!(bus.calls_this_turn(), 1);
     }
 
     #[test]
