@@ -355,6 +355,70 @@ fn oversize_call_result_is_rejected_never_truncated() {
 }
 
 #[test]
+fn pre_execution_protocol_errors_map_to_protocol_rejected() {
+    // AI-0204: `-32600`/`-32601`/`-32602` never executed, so the adapter
+    // reports the distinct protocol outcome: never `Denied`, never
+    // `EffectUnknown`, never `Failed`.
+    for code in [-32600, -32601, -32602] {
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{{\"code\":{code},\"message\":\"bad frame\"}}}}"
+        );
+        let (transport, _sent) = FakeTransport::fresh(vec![line]);
+        let mut adapter = test_adapter(
+            transport,
+            consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+        );
+        let error = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("protocol error must reject");
+        match &error {
+            bitty_ai_runtime::tool::ToolError::ProtocolRejected { reason, .. } => {
+                assert!(reason.contains("protocol rejected before execution"));
+                assert!(reason.contains(&code.to_string()));
+            }
+            other => panic!("code {code}: expected ProtocolRejected, got {other:?}"),
+        }
+        assert!(
+            !matches!(
+                error,
+                bitty_ai_runtime::tool::ToolError::Denied { .. }
+                    | bitty_ai_runtime::tool::ToolError::EffectUnknown { .. }
+                    | bitty_ai_runtime::tool::ToolError::Failed { .. }
+            ),
+            "code {code}: wrong attribution, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn non_protocol_rpc_errors_and_is_error_stay_failed() {
+    // AI-0204: `-32603`, the server `-32000` range, and `isError: true`
+    // answers keep the executed-failure mapping unchanged.
+    let frames = vec![
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"boom\"}}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32000,\"message\":\"busy\"}}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"kaput\"}],\"isError\":true}}"
+            .to_owned(),
+    ];
+    for line in frames {
+        let (transport, _sent) = FakeTransport::fresh(vec![line]);
+        let mut adapter = test_adapter(
+            transport,
+            consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+        );
+        let error = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("must report failure");
+        match error {
+            bitty_ai_runtime::tool::ToolError::Failed { reason, .. } => {
+                assert!(reason.contains("tool reported failure"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn mcp_invoke_is_param_required_shaped() {
     // S6 contribution pattern: `mcp.invoke` requires a per-tool parameter.
     // The client satisfies it by addressing tools only through exact
