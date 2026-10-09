@@ -169,15 +169,21 @@ fn handshake_refuses_sampling_and_elicitation_inline() {
     assert_eq!(sent.len(), 4);
     // Sampling refusal: same -32601 code shape, distinct static message, no
     // request-param echo.
-    assert!(sent[1].contains("\"id\":9"));
-    assert!(sent[1].contains("-32601"));
-    assert!(sent[1].contains(SAMPLING_REFUSED_MESSAGE));
+    assert_eq!(
+        sent[1],
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{{\"code\":-32601,\"message\":\"{SAMPLING_REFUSED_MESSAGE}\"}}}}"
+        )
+    );
     assert!(!sent[1].contains("Method not found"));
     assert!(!sent[1].contains("canary-sampling-params"));
     // Elicitation refusal: same code shape, its own distinct message.
-    assert!(sent[2].contains("\"id\":10"));
-    assert!(sent[2].contains("-32601"));
-    assert!(sent[2].contains(ELICITATION_REFUSED_MESSAGE));
+    assert_eq!(
+        sent[2],
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":10,\"error\":{{\"code\":-32601,\"message\":\"{ELICITATION_REFUSED_MESSAGE}\"}}}}"
+        )
+    );
     assert!(!sent[2].contains("Method not found"));
     assert!(!sent[2].contains("canary-elicitation-params"));
     // The handshake still completes afterwards.
@@ -186,6 +192,7 @@ fn handshake_refuses_sampling_and_elicitation_inline() {
 
 #[test]
 fn handshake_unknown_method_still_32601_ping_roots_unaffected() {
+    use bitty_ai_mcp::handshake::UNKNOWN_METHOD_MESSAGE;
     let answer = format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}"
     );
@@ -198,13 +205,15 @@ fn handshake_unknown_method_still_32601_ping_roots_unaffected() {
     handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
     let sent = sent.borrow();
     assert_eq!(sent.len(), 5);
-    assert!(sent[1].contains("\"id\":9"));
-    assert!(sent[1].contains("\"result\":{}"));
+    assert_eq!(sent[1], "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}");
     assert!(sent[2].contains("file:///tmp/bitty"));
     assert_eq!(sent[2].matches("file://").count(), 1);
-    assert!(sent[3].contains("\"id\":11"));
-    assert!(sent[3].contains("-32601"));
-    assert!(sent[3].contains("Method not found"));
+    assert_eq!(
+        sent[3],
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":11,\"error\":{{\"code\":-32601,\"message\":\"{UNKNOWN_METHOD_MESSAGE}\"}}}}"
+        )
+    );
     assert!(sent[4].contains("notifications/initialized"));
 }
 

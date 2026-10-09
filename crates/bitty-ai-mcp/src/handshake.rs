@@ -454,18 +454,24 @@ mod tests {
         // -32601 code shape as unknown methods.
         let sampling = "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[{\"role\":\"user\",\"content\":{\"text\":\"canary-sampling-params\"}}]}}";
         let answer = handle_server_request(sampling, "/tmp/bitty").expect("sampling refused");
-        assert!(answer.contains("\"id\":11"));
-        assert!(answer.contains("-32601"));
-        assert!(answer.contains(SAMPLING_REFUSED_MESSAGE));
+        assert_eq!(
+            answer,
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":11,\"error\":{{\"code\":-32601,\"message\":\"{SAMPLING_REFUSED_MESSAGE}\"}}}}"
+            )
+        );
         assert!(!answer.contains("Method not found"));
         // No request-param echo: the untrusted payload cannot reflect.
         assert!(!answer.contains("canary-sampling-params"));
 
         let elicitation = "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"elicitation/create\",\"params\":{\"message\":\"canary-elicitation-params\"}}";
         let answer = handle_server_request(elicitation, "/tmp/bitty").expect("elicitation refused");
-        assert!(answer.contains("\"id\":12"));
-        assert!(answer.contains("-32601"));
-        assert!(answer.contains(ELICITATION_REFUSED_MESSAGE));
+        assert_eq!(
+            answer,
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":12,\"error\":{{\"code\":-32601,\"message\":\"{ELICITATION_REFUSED_MESSAGE}\"}}}}"
+            )
+        );
         assert!(!answer.contains("Method not found"));
         assert!(!answer.contains("canary-elicitation-params"));
 
@@ -474,21 +480,34 @@ mod tests {
         let future_sampling =
             "{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"sampling/futureVariant\"}";
         let answer = handle_server_request(future_sampling, "/tmp/bitty").expect("sampling prefix");
-        assert!(answer.contains("\"id\":\"abc-1\""));
-        assert!(answer.contains(SAMPLING_REFUSED_MESSAGE));
+        assert_eq!(
+            answer,
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"error\":{{\"code\":-32601,\"message\":\"{SAMPLING_REFUSED_MESSAGE}\"}}}}"
+            )
+        );
 
         let future_elicitation =
             "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"elicitation/futureVariant\"}";
         let answer =
             handle_server_request(future_elicitation, "/tmp/bitty").expect("elicitation prefix");
-        assert!(answer.contains(ELICITATION_REFUSED_MESSAGE));
+        assert_eq!(
+            answer,
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":13,\"error\":{{\"code\":-32601,\"message\":\"{ELICITATION_REFUSED_MESSAGE}\"}}}}"
+            )
+        );
 
         // Unknown methods keep the generic message; ping and roots/list are
         // unaffected by the new arms.
         let unknown = "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/frobnicate\"}";
         let answer = handle_server_request(unknown, "/tmp/bitty").expect("unknown refused");
-        assert!(answer.contains("-32601"));
-        assert!(answer.contains(UNKNOWN_METHOD_MESSAGE));
+        assert_eq!(
+            answer,
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":14,\"error\":{{\"code\":-32601,\"message\":\"{UNKNOWN_METHOD_MESSAGE}\"}}}}"
+            )
+        );
         assert!(!answer.contains(SAMPLING_REFUSED_MESSAGE));
         assert!(!answer.contains(ELICITATION_REFUSED_MESSAGE));
 
