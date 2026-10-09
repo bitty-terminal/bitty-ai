@@ -119,6 +119,176 @@ fn crash_begin_reopen_resume_names_pending_on_both_paths() {
         assert!(!by_branch.pending_log_absent);
         assert_eq!(by_branch.session_id, None);
         assert_eq!(by_branch.fence_token, 0);
+        // Direct-HEAD resumes report only explicitly HEAD-marked sessions
+        // (AI-0200): without a marker the shared tip infers nothing, so the
+        // same open entry stays invisible on HEAD.
+        let head_empty = kernel
+            .resume_session("HEAD", 0, 2020)
+            .expect("head resume before marker");
+        assert!(
+            head_empty.pending_unknowns.is_empty(),
+            "unmarked sessions must stay invisible on HEAD"
+        );
+        assert!(!head_empty.pending_log_absent);
+        assert_eq!(head_empty.branch, "HEAD");
+        assert_eq!(head_empty.session_id, None);
+        assert_eq!(head_empty.fence_token, 0);
+        // The explicit marker makes the same entry visible on HEAD.
+        kernel
+            .bind_head_session("sess-pend-1", 2030)
+            .expect("bind head marker");
+        let head_marked = kernel
+            .resume_session("HEAD", 0, 2040)
+            .expect("head resume after marker");
+        assert_eq!(head_marked.pending_unknowns, vec!["beef01".to_owned()]);
+        assert!(!head_marked.pending_log_absent);
+        // Unbinding hides it again; branch resumes are unaffected.
+        kernel
+            .unbind_head_session("sess-pend-1")
+            .expect("unbind head marker");
+        let head_unmarked = kernel
+            .resume_session("HEAD", 0, 2050)
+            .expect("head resume after unbind");
+        assert!(
+            head_unmarked.pending_unknowns.is_empty(),
+            "unmarked sessions must stay invisible on HEAD"
+        );
+        let by_branch_again = kernel
+            .resume_session("heads/main", 0, 2060)
+            .expect("branch resume after unbind");
+        assert_eq!(by_branch_again.pending_unknowns, vec!["beef01".to_owned()]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_head_resume_reports_only_explicit_head_sessions() {
+    let dir = scratch_dir("direct-head-explicit");
+    let db_path = dir.join("wheel.db");
+    {
+        let mut kernel = WheelKernel::open(&db_path).expect("wheel open");
+        kernel
+            .create_task(test_task("pend-task-head"), 1000)
+            .expect("create task");
+        kernel
+            .put_slot("notes.txt", b"head-scope payload", 1010)
+            .expect("put slot");
+        let tip = kernel
+            .commit_checkpoint(
+                Rationale::new("Persist progress", "Save durable state"),
+                Some("heads/main"),
+                1020,
+            )
+            .expect("commit")
+            .id;
+        // A second branch at the same tip: shared-tip branches must never
+        // leak into each other, and neither leaks into HEAD without a marker.
+        kernel
+            .fork_branch("heads/feature", &tip, "share tip", "test", 1030)
+            .expect("fork at same tip");
+        kernel
+            .new_session("sess-head-1", "heads/main", 1040)
+            .expect("bind head session");
+        kernel
+            .new_session("sess-other-1", "heads/feature", 1050)
+            .expect("bind other session");
+        let head_session = WheelSessionId::parse("sess-head-1").expect("valid session");
+        let other_session = WheelSessionId::parse("sess-other-1").expect("valid session");
+        PendingStore::begin(
+            kernel.content_store(),
+            PendingBegin {
+                call_id: "beef02",
+                session_id: &head_session,
+                task_id: None,
+                tool: "write_file",
+                args: br#"{"path":"notes.txt"}"#,
+                generation: 0,
+                epoch: 1,
+                now_ms: 1060,
+            },
+        )
+        .expect("host begin head");
+        PendingStore::begin(
+            kernel.content_store(),
+            PendingBegin {
+                call_id: "beef03",
+                session_id: &other_session,
+                task_id: None,
+                tool: "write_file",
+                args: br#"{"path":"other.txt"}"#,
+                generation: 0,
+                epoch: 1,
+                now_ms: 1070,
+            },
+        )
+        .expect("host begin other");
+        // The explicit HEAD marker is durable: it survives the crash below.
+        kernel
+            .bind_head_session("sess-head-1", 1080)
+            .expect("bind head marker before crash");
+        // Dangling markers refuse: the session must already be bound.
+        let dangling = kernel.bind_head_session("sess-missing", 1090);
+        assert!(dangling.is_err(), "binding an unbound session must refuse");
+        // Drop the kernel without resolving: the crash-mid-turn point.
+    }
+    {
+        let kernel = WheelKernel::open(&db_path).expect("wheel reopen");
+        // Branch resumes stay isolated despite the shared tip.
+        let mut kernel = kernel;
+        let by_main = kernel
+            .resume_session("heads/main", 0, 2000)
+            .expect("main resume");
+        assert_eq!(by_main.pending_unknowns, vec!["beef02".to_owned()]);
+        let by_feature = kernel
+            .resume_session("heads/feature", 0, 2010)
+            .expect("feature resume");
+        assert_eq!(by_feature.pending_unknowns, vec!["beef03".to_owned()]);
+        // HEAD reports only the marked session, never the shared-tip other.
+        let head = kernel.resume_session("HEAD", 0, 2020).expect("head resume");
+        assert_eq!(head.pending_unknowns, vec!["beef02".to_owned()]);
+        assert_eq!(head.branch, "HEAD");
+        assert_eq!(head.session_id, None);
+        assert_eq!(head.fence_token, 0);
+        assert!(!head.pending_log_absent);
+        // Marking the other session unions both in session-id order.
+        kernel
+            .bind_head_session("sess-other-1", 2030)
+            .expect("bind other to head");
+        let head_both = kernel
+            .resume_session("HEAD", 0, 2040)
+            .expect("head resume both marked");
+        assert_eq!(
+            head_both.pending_unknowns,
+            vec!["beef02".to_owned(), "beef03".to_owned()]
+        );
+        // Duplicate markers refuse with zero writes.
+        assert!(
+            kernel.bind_head_session("sess-head-1", 2050).is_err(),
+            "duplicate head marker must refuse"
+        );
+        // Unbinding restores invisibility; the other entry stays.
+        kernel
+            .unbind_head_session("sess-head-1")
+            .expect("unbind head");
+        let head_other = kernel
+            .resume_session("HEAD", 0, 2060)
+            .expect("head resume other only");
+        assert_eq!(head_other.pending_unknowns, vec!["beef03".to_owned()]);
+        kernel
+            .unbind_head_session("sess-other-1")
+            .expect("unbind other");
+        let head_empty = kernel
+            .resume_session("HEAD", 0, 2070)
+            .expect("head resume empty");
+        assert!(
+            head_empty.pending_unknowns.is_empty(),
+            "unmarked sessions must stay invisible on HEAD"
+        );
+        // Branch resumes are unaffected by the HEAD markers coming and going.
+        let by_main_again = kernel
+            .resume_session("heads/main", 0, 2080)
+            .expect("main resume again");
+        assert_eq!(by_main_again.pending_unknowns, vec!["beef02".to_owned()]);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
