@@ -95,7 +95,9 @@ fn crash_mid_turn_resume_reports_head_and_live_generation() {
             "report must carry the live task generation, not a default"
         );
         assert!(report.pending_unknowns.is_empty());
-        assert!(report.pending_log_absent);
+        // AI-0199: the durable pending log always exists, so resume reports
+        // it present even when no call is in flight.
+        assert!(!report.pending_log_absent);
         assert_eq!(report.fence_token, 2);
         assert_eq!(
             report.session_id.as_ref().map(|id| id.as_str()),
@@ -141,7 +143,9 @@ fn resume_reports_zero_generation_without_task_binding() {
         .resume_session("sess-loose-1", 2, 2000)
         .expect("resume");
     assert_eq!(report.generation, 0);
-    assert!(report.pending_log_absent);
+    // AI-0199: the durable pending log always exists, so resume reports it
+    // present even when no call is in flight.
+    assert!(!report.pending_log_absent);
 }
 
 #[test]
@@ -474,7 +478,9 @@ fn bridge_session_verbs_round_trip_with_strict_types() {
     assert_eq!(report["generation"], 1);
     assert_eq!(report["fence_token"], 2);
     assert_eq!(report["pending_unknowns"].as_array().unwrap().len(), 0);
-    assert_eq!(report["pending_log_absent"], true);
+    // AI-0199: the durable pending log always exists, so resume reports it
+    // present even when no call is in flight.
+    assert_eq!(report["pending_log_absent"], false);
     // Stale claim through the bridge refuses.
     let err = dispatch_err(
         &mut bridge,

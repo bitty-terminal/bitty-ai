@@ -26,6 +26,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bitty_ai_session::pending::{PendingError, PendingStore};
 use bitty_ai_session::sessions::{
     SessionBinding, SessionError, WheelSessionId, bind_session, bump_session_epoch, list_sessions,
     resolve_session,
@@ -57,17 +58,19 @@ const WHEEL_COMMIT_REFLOG_REASON: &str = "wheel commit";
 /// Reflog actor recorded for branch moves driven by [`WheelKernel::commit_checkpoint`].
 const WHEEL_COMMIT_REFLOG_ACTOR: &str = "wheel-kernel";
 
-/// Fenced resume outcome (AI-0197).
+/// Fenced resume outcome (AI-0197; pending set since AI-0199).
 ///
 /// `session_id` is `Some` on the session-id (fenced) path and `None` on the
 /// bare branch/`HEAD` (unfenced read) path. `checkpoint` is the resolved live
 /// tip. `generation` is the live task-engine generation re-read at resume
 /// time, `0` when the checkpoint's task names no task row (informational
-/// snapshot, never a fence). `pending_unknowns` is always empty with
-/// `pending_log_absent = true`: no durable pending tool-call log exists, so
-/// resume honestly reports HEAD plus generation and says so (a durable
-/// pending log is a separate follow-up slice). `fence_token` is the admitted
-/// epoch on the session path, `0` on the branch path (no fence admitted).
+/// snapshot, never a fence). `pending_unknowns` names the open pending-effect
+/// call ids surviving the crash (oldest-first per session; branch resumes
+/// union the sessions bound to that branch in session-id order), with
+/// `pending_log_absent = false`: the durable pending log always exists, so
+/// resume reports HEAD plus generation plus the in-flight set. `fence_token`
+/// is the admitted epoch on the session path, `0` on the branch path (no
+/// fence admitted).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeReport {
     /// Bound session id, or `None` for unfenced branch/`HEAD` resumes.
@@ -78,12 +81,23 @@ pub struct ResumeReport {
     pub checkpoint: ContentHash,
     /// Live task-engine generation at resume time (`0` = no task binding).
     pub generation: u64,
-    /// In-flight tool-call ids surviving the crash (always empty: no log).
+    /// Open pending-effect call ids surviving the crash (oldest-first per
+    /// session; empty when none are open).
     pub pending_unknowns: Vec<String>,
-    /// Always `true`: no durable pending log exists (honest flag).
+    /// Always `false`: the durable pending log exists (present flag).
     pub pending_log_absent: bool,
     /// Admitted fencing epoch (session path) or `0` (branch path).
     pub fence_token: u64,
+}
+
+/// Map a pending-plane error into the stringly-typed [`FacadeError`].
+///
+/// No new `FacadeError` variant: `Store` already carries every fail-closed
+/// refusal shape on this boundary. A poisoned pending row therefore refuses
+/// the whole resume as `Store` (fail closed, rows preserved); callers
+/// needing typed discrimination use the pending plane directly.
+fn map_pending_err(err: PendingError) -> FacadeError {
+    FacadeError::Store(err.to_string())
 }
 
 /// Map a sessions-plane error into the stringly-typed [`FacadeError`].
@@ -681,6 +695,44 @@ impl WheelKernel {
         }
     }
 
+    /// Read the open pending-effect call ids of one session, oldest-first.
+    ///
+    /// Thin read over the pending plane: any poisoned row fails the whole
+    /// read (fail closed, rows preserved). The session resume path calls
+    /// this BEFORE `bump_session_epoch` so a corrupt log refuses with zero
+    /// row writes and the same claim stays admissible for retry.
+    fn pending_unknowns_for_session(
+        store: &ContentStore,
+        id: &WheelSessionId,
+    ) -> Result<Vec<String>, FacadeError> {
+        let open = PendingStore::list_open(store, id).map_err(map_pending_err)?;
+        Ok(open.into_iter().map(|entry| entry.call_id).collect())
+    }
+
+    /// Read the open pending-effect call ids of every session bound to
+    /// `branch`.
+    ///
+    /// Union in session-id order (the session list is ascending), each
+    /// session oldest-first: deterministic across reopens. A poisoned row
+    /// anywhere fails the whole read (fail closed, rows preserved). The
+    /// branch resume path calls this before syncing the working tree so a
+    /// corrupt log refuses with the in-memory tree untouched.
+    fn pending_unknowns_for_branch(
+        store: &ContentStore,
+        branch: &str,
+    ) -> Result<Vec<String>, FacadeError> {
+        let bindings = list_sessions(store).map_err(map_session_err)?;
+        let mut unknowns = Vec::new();
+        for binding in &bindings {
+            if binding.branch == branch {
+                let open =
+                    PendingStore::list_open(store, &binding.session_id).map_err(map_pending_err)?;
+                unknowns.extend(open.into_iter().map(|entry| entry.call_id));
+            }
+        }
+        Ok(unknowns)
+    }
+
     /// Bind a caller-provided session id to a branch tip (no force).
     ///
     /// The branch must exist; its live tip's checkpoint supplies the stored
@@ -747,12 +799,15 @@ impl WheelKernel {
     /// dirty `slot.put` without commit never loses slots to the resume sync,
     /// matching the `merge_commit` / GC gates.
     ///
-    /// `pending_unknowns` is always empty with `pending_log_absent = true`:
-    /// no durable pending tool-call log exists anywhere in this tree (the
-    /// runtime pending set is in-memory only), so an honest resume reports
-    /// HEAD plus generation and says so. `generation` is the live
-    /// task-engine generation re-read at resume time (`0` when the HEAD
-    /// checkpoint's task names no task row).
+    /// `pending_unknowns` names the open pending-effect call ids surviving
+    /// the crash (session path: that session oldest-first; branch/`HEAD`
+    /// path: every session bound to the resumed branch, in session-id
+    /// order) with `pending_log_absent = false`: the durable pending log
+    /// always exists, so an honest resume reports HEAD plus generation plus
+    /// the in-flight set. A poisoned pending row fails the whole resume
+    /// (fail closed, rows preserved) with zero row writes. `generation` is
+    /// the live task-engine generation re-read at resume time (`0` when the
+    /// HEAD checkpoint's task names no task row).
     pub fn resume_session(
         &mut self,
         ref_or_branch: &str,
@@ -803,6 +858,10 @@ impl WheelKernel {
             // link, missing blob, or undecodable tree refuses here with zero
             // row writes, so the same claim stays admissible for retry.
             let tree = self.load_tree_for(&tip)?;
+            // The pending read is fallible too (poison fails closed), so it
+            // also runs before the bump: a corrupt log refuses with zero row
+            // writes.
+            let pending = Self::pending_unknowns_for_session(&self.content_store, &id)?;
             let advanced = bump_session_epoch(
                 &self.content_store,
                 &id,
@@ -820,8 +879,8 @@ impl WheelKernel {
                 branch: advanced.branch,
                 checkpoint: tip,
                 generation,
-                pending_unknowns: Vec::new(),
-                pending_log_absent: true,
+                pending_unknowns: pending,
+                pending_log_absent: false,
                 fence_token: advanced.epoch,
             });
         }
@@ -858,14 +917,18 @@ impl WheelKernel {
             }
         };
         let generation = self.live_task_generation(&checkpoint)?;
+        // The pending read is fallible (poison fails closed), so it runs
+        // before the working-tree sync: a corrupt log refuses with the
+        // in-memory tree untouched.
+        let pending = Self::pending_unknowns_for_branch(&self.content_store, &branch_text)?;
         self.sync_working_tree_to(&tip)?;
         Ok(ResumeReport {
             session_id: None,
             branch: branch_text,
             checkpoint: tip,
             generation,
-            pending_unknowns: Vec::new(),
-            pending_log_absent: true,
+            pending_unknowns: pending,
+            pending_log_absent: false,
             fence_token: 0,
         })
     }

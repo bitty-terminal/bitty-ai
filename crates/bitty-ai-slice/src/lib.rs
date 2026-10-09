@@ -69,6 +69,7 @@ pub mod live_host;
 pub mod local_provider;
 pub mod merge;
 pub mod network_adapter;
+pub mod pending_host;
 pub mod session_refs;
 pub mod snapshot_ingest;
 pub mod task_dag;
