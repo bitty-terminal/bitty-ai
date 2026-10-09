@@ -919,8 +919,9 @@ fn session_binding_to_value(binding: &SessionBinding) -> serde_json::Value {
 /// Render a [`ResumeReport`] as a bridge JSON value with stable field names.
 ///
 /// `session_id` is null on the unfenced branch/`HEAD` path; `fence_token` is
-/// `0` there (no fence admitted). `pending_unknowns` is always empty with
-/// `pending_log_absent = true` (no durable pending log exists).
+/// `0` there (no fence admitted). `pending_unknowns` names the open entries
+/// of the durable pending log with `pending_log_absent = false` (the log
+/// exists; see the session-plane pending docs).
 fn resume_report_to_value(report: &ResumeReport) -> serde_json::Value {
     serde_json::json!({
         "session_id": report.session_id.as_ref().map(|id| id.as_str()),

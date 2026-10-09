@@ -15,6 +15,7 @@
 
 pub mod content_hash;
 pub mod content_store;
+pub mod pending;
 pub mod session_refs;
 pub mod sessions;
 
@@ -24,6 +25,11 @@ pub use content_store::{
     DURABLE_PROFILE, MAX_AGENT_ID_BYTES, MAX_BLOB_BYTES, MAX_CHECKPOINT_PARENTS,
     MAX_RATIONALE_FIELD_BYTES, MAX_RATIONALE_TOTAL_BYTES, MAX_REF_NAME_BYTES, MAX_SUMMARY_BYTES,
     MAX_TASK_ID_BYTES, Rationale,
+};
+pub use pending::{
+    MAX_OPEN_PENDING_PER_SESSION, MAX_PENDING_CALL_ID, MAX_PENDING_TOOL_NAME, MAX_RESOLVED_RECENT,
+    PendingBegin, PendingDisposition, PendingEntry, PendingError, PendingResolve, PendingStatus,
+    PendingStore,
 };
 pub use session_refs::{
     BranchName, MAX_REFLOG_ACTOR_BYTES, MAX_REFLOG_PRUNE_ROWS, MAX_REFLOG_READ_LIMIT,

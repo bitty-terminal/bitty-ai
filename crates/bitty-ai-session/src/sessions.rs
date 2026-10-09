@@ -53,9 +53,9 @@
 //! ## Scope
 //!
 //! The session list is global to the database file: there is no directory or
-//! project-root field (owner decision, AI-0197). There is no durable pending
-//! tool-call log anywhere in this tree, so resume reports always carry an
-//! empty pending set with an explicit absent flag at the kernel layer.
+//! project-root field (owner decision, AI-0197). The durable pending
+//! tool-call log lives in [`crate::pending`]: resume reports name its open
+//! entries with an explicit present flag at the kernel layer.
 //!
 //! Errors never echo caller-supplied text: every [`SessionError`] display
 //! string is a static literal except [`SessionError::StaleEpoch`], which

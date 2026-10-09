@@ -71,10 +71,12 @@
 //!
 //! ## Garbage collection
 //!
-//! Roots are the union of all [`ContentStore::list_refs`] targets and every
+//! Roots are the union of all [`ContentStore::list_refs`] targets, every
 //! reflog `old_hash`/`new_hash` with `at_ms >= now_ms - reflog_grace_ms`
-//! (saturating). All-zero tombstone hashes are skipped as roots: they have no
-//! payload to keep. Reachability is a BFS over `parents_json` from those
+//! (saturating), and every open pending-effect args digest (AI-0199: an
+//! in-flight call pins the blob its digest names, so a crash-reopen resume
+//! can still reconcile against the payload). All-zero tombstone hashes are
+//! skipped as roots: they have no payload to keep. Reachability is a BFS over `parents_json` from those
 //! roots. Unreachable checkpoints are pruned; blobs referenced by no surviving
 //! (reachable) checkpoint are pruned. A surviving checkpoint references its
 //! `tree_hash` blob, and each surviving tree references every entry hash named
@@ -93,7 +95,9 @@
 //! [`GcOptions::max_deletes_per_call`] rows (checkpoints first, then blobs, in
 //! ascending hash order) inside a single SQLite transaction and reports
 //! [`GcReport::truncated`] when garbage remains, so the caller resumes by
-//! calling again. [`GcOptions::max_deletes_per_call`] of `0` deletes nothing
+//! calling again. The open-pending root read follows the same discipline:
+//! it is one bounded read over the open rows (like the ref and reflog root
+//! reads) and changes no delete bound. [`GcOptions::max_deletes_per_call`] of `0` deletes nothing
 //! and reports `truncated` whenever garbage remains (no progress; supply at
 //! least `1` to reclaim). [`gc_preview`] is read-only and byte-matches the
 //! next destructive call's sets under the same options (same order, same
@@ -103,6 +107,19 @@
 //! Reflog rows are never pruned here; reflog expiry is a separate future
 //! operation. GC writes no reflog rows and reads no blob payloads for
 //! tombstones (zero-hash entries are skipped before any read).
+//!
+//! ## Pending-open pinning vs tombstones (AI-0199)
+//!
+//! An open pending entry pins the blob its args digest names: GC retains
+//! such blobs even when no surviving tree references them, so a referenced
+//! payload cannot vanish under an in-flight call. The tombstone path is
+//! untouched by this slice -- reflog deletion tombstones still carry no
+//! payload and are still never roots, and no pending path writes or deletes
+//! reflog rows. Resolved entries pin nothing (only `status = 'open'` rows
+//! join the roots). Follow-up if needed: an explicit tombstone-vs-pending
+//! refusal (deleting a payload out from under an open entry at a layer that
+//! deletes single blobs outside GC) does not exist yet; GC-level retention
+//! is the minimal fail-closed cover.
 //!
 //! Standalone blobs are NOT retained: content blobs referenced by no surviving
 //! tree — for example action auto-spillover payloads (stored via
@@ -384,6 +401,18 @@ fn map_store(err: ContentStoreError) -> MergeError {
     }
 }
 
+/// Map a pending-plane error to [`MergeError`], dropping untrusted payloads.
+///
+/// The root read only fails as `Corrupt` (poisoned row) or `Storage` (store
+/// failure); any other shape is unreachable and fails closed as `Corrupt`.
+fn map_pending(err: bitty_ai_session::pending::PendingError) -> MergeError {
+    match err {
+        bitty_ai_session::pending::PendingError::Corrupt => MergeError::Corrupt,
+        bitty_ai_session::pending::PendingError::Storage(_) => MergeError::Storage,
+        _ => MergeError::Corrupt,
+    }
+}
+
 /// Map a branch-verb error to [`MergeError`].
 fn map_ref_err(err: RefError) -> MergeError {
     match err {
@@ -658,7 +687,9 @@ const GC_MAX_NESTED_TREE_DEPTH: usize = 8;
 ///
 /// Roots are live ref targets (verified to exist; a dangling ref is
 /// [`MergeError::Corrupt`]) plus in-window reflog hashes (stale pins for
-/// already-collected rows are skipped; zero-hash tombstones are never roots).
+/// already-collected rows are skipped; zero-hash tombstones are never roots)
+/// plus open pending-effect args digests (AI-0199: in-flight calls pin the
+/// blobs their digests name; a poisoned pending row is [`MergeError::Corrupt`]).
 /// A reachable checkpoint whose parent row is absent is [`MergeError::Corrupt`]
 /// (dangling DAG link): the closure check after the lenient BFS enforces it.
 /// Blob retention covers each surviving checkpoint's `tree_hash` blob plus
@@ -777,6 +808,15 @@ fn gc_compute(store: &ContentStore, options: &GcOptions) -> Result<GcPlan, Merge
         }
     }
     let all_blobs = list_all_blob_hashes(store)?;
+    // AI-0199: open pending entries pin the blobs their args digests name.
+    // Digests naming no blob row fall out in the set difference below; the
+    // zero hash never arrives (the pending plane skips it as a root,
+    // reusing the tombstone convention).
+    let pending_roots =
+        bitty_ai_session::pending::PendingStore::open_blob_roots(store).map_err(map_pending)?;
+    for root in pending_roots {
+        surviving_blobs.insert(root);
+    }
     let mut unreferenced_blobs = Vec::new();
     for hash in all_blobs {
         if !surviving_blobs.contains(&hash) {
