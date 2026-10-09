@@ -7,8 +7,10 @@
 //! captures the session id from the response, and queues the decoded answer
 //! lines; `recv_line` pops the queue else waits a bounded slice before
 //! reporting `Ok(None)`. `shutdown`
-//! best-effort DELETEs the session. There is deliberately no background GET
-//! listener in v1 (poll-per-request only) and no auto-reconnect: failures
+//! best-effort DELETEs the session. Host-driven server-message polling lives
+//! in [`HttpLineTransport::poll_server_messages`] (explicit `GET` with
+//! `Accept: text/event-stream`, no background listener, no auto-reconnect):
+//! failures
 //! surface as [`McpFailure::TransportClosed`], [`McpFailure::Timeout`],
 //! [`McpFailure::FrameTooLarge`], [`McpFailure::HandshakeRejected`], or
 //! [`McpFailure::Io`] (operation name only), and the [`crate::supervise`]
@@ -38,6 +40,7 @@
 //!   [`McpFailure::FrameTooLarge`] (frame-reject for `tools/list`; `Unknown`
 //!   for `tools/call` through the existing wrapper).
 //! - [`NetworkError::Tls`]: [`McpFailure::Io`] with context `"http post"`
+//!   (`"http get"` on the poll path)
 //!   (operation name only; the TLS category never enters the diagnostic).
 //! - Non-2xx or bad/missing `Content-Type` or malformed bodies: a synthetic
 //!   JSON-RPC error frame carrying the outgoing `id` is queued, so the
@@ -69,6 +72,8 @@ use crate::remote::RemoteServerConfig;
 
 /// `Accept` advertised on every POST (single JSON or SSE per reply).
 pub const HTTP_ACCEPT: &str = "application/json, text/event-stream";
+/// `Accept` advertised on every poll GET (SSE stream only).
+pub const HTTP_POLL_ACCEPT: &str = "text/event-stream";
 /// `Content-Type` sent on every POST (frames are JSON).
 pub const HTTP_CONTENT_TYPE: &str = "application/json";
 /// Session header read on responses and sent once known.
@@ -112,6 +117,15 @@ fn io_post() -> McpError {
     )
 }
 
+fn io_get() -> McpError {
+    McpError::new(
+        McpStage::Frame,
+        McpFailure::Io {
+            context: bound_error_text("http get", crate::error::MAX_ERROR_TEXT_BYTES),
+        },
+    )
+}
+
 fn handshake_rejected(detail: &str) -> McpError {
     McpError::new(
         McpStage::Frame,
@@ -128,6 +142,16 @@ fn map_network_error(error: NetworkError, timeout_ms: u64) -> McpError {
         NetworkError::Timeout { .. } => timeout_error(timeout_ms),
         NetworkError::Budget { .. } | NetworkError::CountBudget { .. } => frame_too_large(),
         NetworkError::Tls { .. } => io_post(),
+    }
+}
+
+fn map_poll_network_error(error: NetworkError, timeout_ms: u64) -> McpError {
+    match error {
+        NetworkError::Offline => transport_closed(),
+        NetworkError::Denied { .. } => transport_closed(),
+        NetworkError::Timeout { .. } => timeout_error(timeout_ms),
+        NetworkError::Budget { .. } | NetworkError::CountBudget { .. } => frame_too_large(),
+        NetworkError::Tls { .. } => io_get(),
     }
 }
 
@@ -148,6 +172,55 @@ fn is_sse_media_type(value: &str) -> bool {
 fn is_json_object(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with('{') && trimmed.ends_with('}')
+}
+
+/// Dispatch SSE `data:` payloads in order, sharing the POST/poll accumulation.
+///
+/// Joins the `data:` fields of one event with `"\n"` into one payload at the
+/// blank-line separator (trailing event without separator still flushes);
+/// other SSE fields and comment lines are ignored. Enforces the per-event
+/// frame cap ([`MAX_FRAME_BYTES`]) during accumulation. Calls `emit` once per
+/// dispatched event (moving the joined payload); an `emit` error aborts with
+/// prior emits kept, mirroring the POST path partial-queue behavior.
+fn dispatch_sse_payloads(
+    text: &str,
+    emit: &mut dyn FnMut(String) -> Result<(), McpError>,
+) -> Result<(), McpError> {
+    let mut event_data = String::new();
+    let mut has_data = false;
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            if has_data {
+                let payload = std::mem::take(&mut event_data);
+                has_data = false;
+                emit(payload)?;
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("data:") {
+            continue;
+        }
+        let mut payload = &trimmed["data:".len()..];
+        if let Some(stripped) = payload.strip_prefix(' ') {
+            payload = stripped;
+        }
+        let payload = payload.trim();
+        let additional = payload.len() + usize::from(has_data);
+        if event_data.len().saturating_add(additional) > MAX_FRAME_BYTES {
+            return Err(frame_too_large());
+        }
+        if has_data {
+            event_data.push('\n');
+        }
+        event_data.push_str(payload);
+        has_data = true;
+    }
+    if has_data {
+        emit(event_data)?;
+    }
+    Ok(())
 }
 
 /// Outgoing JSON-RPC `id` token (`None` for notifications).
@@ -202,15 +275,17 @@ fn valid_session_id(value: &str) -> bool {
 /// [`McpTransport`] over Streamable HTTP/SSE, backed by a sync service.
 ///
 /// Owns the [`RemoteServerConfig`], the service, a line queue, the optional
-/// session id, and a closed flag. Synchronous only (`&mut self`, no threads,
-/// no async). Whole-operation deadlines come from the config: each POST sets
-/// `Request::timeout` to `timeout_ms` and `max_body_bytes` to the frame cap.
+/// session id, a closed flag, and a sticky poll-disabled flag. Synchronous
+/// only (`&mut self`, no threads, no async). Whole-operation deadlines come
+/// from the config: each POST and each poll GET sets `Request::timeout` to
+/// `timeout_ms` and `max_body_bytes` to the frame cap.
 pub struct HttpLineTransport<S> {
     config: RemoteServerConfig,
     service: S,
     queue: VecDeque<String>,
     session_id: Option<String>,
     closed: bool,
+    poll_disabled: bool,
 }
 
 impl<S> HttpLineTransport<S> {
@@ -227,6 +302,7 @@ impl<S> HttpLineTransport<S> {
             queue: VecDeque::new(),
             session_id: None,
             closed: false,
+            poll_disabled: false,
         })
     }
 
@@ -258,6 +334,16 @@ impl<S> HttpLineTransport<S> {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Whether server-message polling is stickily disabled.
+    ///
+    /// Set on HTTP `405`, empty poll bodies, and poll transport timeouts;
+    /// once set, [`HttpLineTransport::poll_server_messages`] returns `Ok(0)`
+    /// with zero I/O. Re-enable needs a new transport (no auto-retry).
+    #[must_use]
+    pub fn is_poll_disabled(&self) -> bool {
+        self.poll_disabled
     }
 
     /// Queued line count (unread responses).
@@ -311,6 +397,20 @@ impl<S> HttpLineTransport<S> {
             .with_max_body_bytes(MAX_FRAME_BYTES as u64)
             .with_header("accept", HTTP_ACCEPT)
             .with_header("content-type", HTTP_CONTENT_TYPE);
+        for (name, value) in &self.config.headers {
+            request = request.with_header(name, value);
+        }
+        if let Some(session) = self.session_id.as_ref() {
+            request = request.with_header(SESSION_HEADER, session);
+        }
+        request
+    }
+
+    fn get_request(&self) -> Request {
+        let mut request = Request::get(self.config.url.clone())
+            .with_timeout(Duration::from_millis(self.config.effective_timeout_ms()))
+            .with_max_body_bytes(MAX_FRAME_BYTES as u64)
+            .with_header("accept", HTTP_POLL_ACCEPT);
         for (name, value) in &self.config.headers {
             request = request.with_header(name, value);
         }
@@ -392,41 +492,7 @@ impl<S> HttpLineTransport<S> {
                 return self.enqueue_or_reject(id, "malformed event-stream body");
             }
         };
-        let mut event_data = String::new();
-        let mut has_data = false;
-        for raw_line in text.split('\n') {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            if line.is_empty() {
-                if has_data {
-                    self.enqueue_sse_payload(&event_data)?;
-                    event_data.clear();
-                    has_data = false;
-                }
-                continue;
-            }
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with("data:") {
-                continue;
-            }
-            let mut payload = &trimmed["data:".len()..];
-            if let Some(stripped) = payload.strip_prefix(' ') {
-                payload = stripped;
-            }
-            let payload = payload.trim();
-            let additional = payload.len() + usize::from(has_data);
-            if event_data.len().saturating_add(additional) > MAX_FRAME_BYTES {
-                return Err(frame_too_large());
-            }
-            if has_data {
-                event_data.push('\n');
-            }
-            event_data.push_str(payload);
-            has_data = true;
-        }
-        if has_data {
-            self.enqueue_sse_payload(&event_data)?;
-        }
-        Ok(())
+        dispatch_sse_payloads(text, &mut |payload| self.enqueue_sse_payload(&payload))
     }
 
     fn handle_response(
@@ -456,6 +522,136 @@ impl<S> HttpLineTransport<S> {
                 }
             }
         }
+    }
+
+    /// Poll the server for host-routed messages over a `GET` event stream.
+    ///
+    /// Host-driven (no thread, no background loop, no auto-reconnect): the
+    /// host calls this when it wants server-initiated lines, then drains them
+    /// with [`McpTransport::recv_line`]. Sends `GET` to the same URL with
+    /// `Accept: text/event-stream` plus the session header when known, bounded
+    /// by the config whole-operation timeout and the frame cap.
+    ///
+    /// SSE `data:` frames reuse the POST-path bounds: per-event frame cap and
+    /// fan-out bound ([`MAX_SSE_FRAMES_PER_RESPONSE`] counting dispatched
+    /// events, so at most that many answer `POST`s per poll), JSON-object
+    /// filtering, and `[DONE]`/comment ignoring via the shared dispatcher.
+    ///
+    /// Server requests (a `method` with an `id`) are answered inline with the
+    /// same logic as the handshake path by reusing
+    /// [`crate::handshake::handle_server_request`] (no duplication): `ping`
+    /// gets an empty result, `roots/list` gets exactly `cwd` as a `file://`
+    /// URI (never the wider filesystem), `sampling/*` and `elicitation/*`
+    /// are refused with their distinct `-32601` messages (never-sample /
+    /// never-elicit, no param echo), anything else gets `-32601`. Replies are
+    /// `POST`ed like [`McpTransport::send_line`]; nested server requests
+    /// inside answer-`POST` responses are not recursed into (they queue for
+    /// the host) to keep the op bounded to one `GET` plus at most fan-out
+    /// answer `POST`s.
+    ///
+    /// Notifications and other non-request frames (a `method` without an `id`,
+    /// or responses) are queued as lines for the host to route: routing is
+    /// host duty, the transport never routes.
+    ///
+    /// Returns the number of lines newly queued by this poll (GET
+    /// notifications plus any answer-`POST` responses; typically `202` empty
+    /// answers queue nothing, so the count is the notification count).
+    ///
+    /// Sticky-disable: HTTP `405`, an empty poll body, or a transport timeout
+    /// (on the `GET` or an answer `POST`) sets an internal disabled flag;
+    /// later polls return `Ok(0)` with zero I/O (no service call, no
+    /// capability check). Re-enable needs a new transport (no auto-retry, no
+    /// auto-reconnect). [`HttpLineTransport::is_poll_disabled`] observes it.
+    /// A closed transport still fails with [`McpFailure::TransportClosed`]
+    /// (closed takes precedence over disabled).
+    ///
+    /// Capability, secret, and error-mapping conventions mirror `send_line`:
+    /// capability deny is [`McpFailure::TransportClosed`] with zero service
+    /// calls (no disable); timeouts, budgets, TLS map names-only (`"http
+    /// get"` for I/O context, never payloads, URLs, or header values);
+    /// non-`405` statuses, bad content types, and malformed bodies fail as
+    /// [`McpFailure::HandshakeRejected`] (poll carries no outgoing `id`);
+    /// oversize/fan-out fails as [`McpFailure::FrameTooLarge`]. Caller clocks
+    /// only: deadlines come from the config timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpFailure::TransportClosed`] when closed or capability
+    /// denied, [`McpFailure::Timeout`] on transport timeouts (also disabling),
+    /// [`McpFailure::HandshakeRejected`] on non-SSE or malformed answers, and
+    /// [`McpFailure::FrameTooLarge`] on bound excess.
+    pub fn poll_server_messages(&mut self, cwd: &str) -> Result<usize, McpError>
+    where
+        S: NetworkService,
+    {
+        if self.closed {
+            return Err(transport_closed());
+        }
+        if self.poll_disabled {
+            return Ok(0);
+        }
+        let request = self.get_request();
+        // Capability first: zero service calls on deny (no disable).
+        if self.config.capability.check_request(&request).is_err() {
+            return Err(transport_closed());
+        }
+        let timeout_ms = self.config.effective_timeout_ms();
+        let response = match self.service.request(&request) {
+            Err(error) => {
+                let mapped = map_poll_network_error(error, timeout_ms);
+                if matches!(mapped.failure, McpFailure::Timeout { .. }) {
+                    self.poll_disabled = true;
+                }
+                return Err(mapped);
+            }
+            Ok(response) => response,
+        };
+        self.note_session(&response);
+        // Sticky-disable signals: the server does not speak GET streams
+        // (`405`) or has nothing to say (empty body). Both become `Ok(0)`.
+        if response.status == 405 {
+            self.poll_disabled = true;
+            return Ok(0);
+        }
+        if response.body.is_empty() {
+            self.poll_disabled = true;
+            return Ok(0);
+        }
+        if !(200..300).contains(&response.status) {
+            let message = format!("http status {}", response.status);
+            return Err(handshake_rejected(&message));
+        }
+        match response.header("content-type") {
+            Some(content_type) if is_sse_media_type(content_type) => {}
+            _ => return Err(handshake_rejected("unsupported content type")),
+        }
+        let text = match std::str::from_utf8(&response.body) {
+            Ok(text) => text,
+            Err(_) => return Err(handshake_rejected("malformed event-stream body")),
+        };
+        let before = self.queue.len();
+        let mut events: usize = 0;
+        let poll_result = dispatch_sse_payloads(text, &mut |payload| {
+            if events >= MAX_SSE_FRAMES_PER_RESPONSE {
+                return Err(frame_too_large());
+            }
+            events += 1;
+            if let Some(reply) = crate::handshake::handle_server_request(&payload, cwd) {
+                match <Self as McpTransport>::send_line(self, &reply) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        if matches!(error.failure, McpFailure::Timeout { .. }) {
+                            self.poll_disabled = true;
+                        }
+                        Err(error)
+                    }
+                }
+            } else {
+                self.enqueue_sse_payload(&payload)
+            }
+        });
+        poll_result?;
+        Ok(self.queue.len().saturating_sub(before))
     }
 }
 
