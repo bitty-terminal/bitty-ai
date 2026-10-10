@@ -737,6 +737,128 @@ fn mid_wait_negatives_never_stale_over_stdio() {
     assert_eq!(adapter.list_version(), 1);
 }
 
+// ── AI-0212 fix round (PR #359 review): failed-relist routing + cap ─────────
+// Fix A: a failed re-list routes its surfaced frames before returning the
+// error, so a mid-flight `list_changed` keeps the deny-stale gate
+// fail-closed. Fix B: the surfaced buffer caps at MAX_SURFACED_FRAMES —
+// beyond the cap frames drop but the wait still matches the response.
+
+#[test]
+fn failed_relist_routes_mid_wait_signal_before_returning_error() {
+    // Fix A: non-stale adapter + failing `list_tools` + mid-wait
+    // `list_changed` → Err returned AND stale==true AND snapshot unchanged.
+    // The version bumps only via `mark_stale` for the routed signal.
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".to_owned();
+    let error_frame =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"boom\"}}"
+            .to_owned();
+    let (transport, sent) = FakeTransport::fresh(vec![signal, error_frame]);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let before = adapter.snapshot();
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 0);
+    adapter.relist(&["echo".to_owned()]).expect_err("must fail");
+    assert!(
+        adapter.is_stale(),
+        "routed signal must stale even on failure"
+    );
+    assert_eq!(adapter.list_version(), 1);
+    assert_eq!(adapter.snapshot(), before);
+    // The routed stale denies the next call with zero further contact.
+    let denied = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect_err("still stale");
+    assert!(matches!(
+        denied,
+        bitty_ai_runtime::tool::ToolError::Denied { .. }
+    ));
+    assert_eq!(sent.borrow().len(), 1);
+}
+
+#[test]
+fn surfaced_buffer_caps_but_response_still_matches() {
+    // Fix B: cap+1 mid-wait notifications then the awaited answer →
+    // surfaced holds exactly MAX_SURFACED_FRAMES and the import itself is
+    // unchanged.
+    use bitty_ai_mcp::handshake::MAX_SURFACED_FRAMES;
+
+    let page = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+    let mut inbound: Vec<String> = (0..=MAX_SURFACED_FRAMES)
+        .map(|_| "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}".to_owned())
+        .collect();
+    inbound.push(page);
+    let (mut transport, _sent) = FakeTransport::fresh(inbound);
+    let mut next_id = 2;
+    let mut surfaced = Vec::new();
+    let imported = list_tools(
+        &mut transport,
+        "demo",
+        "/tmp/bitty",
+        &["echo".to_owned()],
+        &mut next_id,
+        1_000,
+        &mut surfaced,
+    )
+    .expect("import");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].spec.name, "mcp_demo_echo");
+    assert_eq!(next_id, 3);
+    assert_eq!(surfaced.len(), MAX_SURFACED_FRAMES);
+}
+
+#[test]
+fn relist_stale_marks_only_signals_within_surfaced_cap() {
+    // Fix B residual: a `list_changed` within the cap stales; one pushed
+    // past the cap by earlier frames is dropped and never stales. The
+    // refresh itself still bumps the version and returns its diff normally
+    // in both cases.
+    use bitty_ai_mcp::handshake::MAX_SURFACED_FRAMES;
+
+    let ping = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}".to_owned();
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".to_owned();
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+
+    // Within cap: the signal arrives first, so it is kept and routed.
+    let mut inbound = vec![signal.clone()];
+    inbound.extend(std::iter::repeat_n(ping.clone(), MAX_SURFACED_FRAMES));
+    inbound.push(list_frame.clone());
+    let (transport, _sent) = FakeTransport::fresh(inbound);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(
+        adapter.is_stale(),
+        "signal within the cap must preserve stale"
+    );
+    // Refresh bump (0 -> 1) plus the routed signal's mark bump (1 -> 2).
+    assert_eq!(adapter.list_version(), 2);
+
+    // Beyond cap: the cap fills with pings first, so the signal is dropped.
+    let mut inbound: Vec<String> = std::iter::repeat_n(ping, MAX_SURFACED_FRAMES).collect();
+    inbound.push(signal);
+    inbound.push(list_frame);
+    let (transport, _sent) = FakeTransport::fresh(inbound);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(
+        !adapter.is_stale(),
+        "signal beyond the cap is dropped, never stales"
+    );
+    assert_eq!(adapter.list_version(), 1);
+}
+
 // ── Unix live-spawn tests (bounded fixtures) ──────────────────────────────────
 
 #[cfg(unix)]

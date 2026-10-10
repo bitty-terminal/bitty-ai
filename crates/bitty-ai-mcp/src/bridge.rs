@@ -236,7 +236,7 @@ impl McpToolAdapter {
     /// current snapshot, and on success swaps the snapshot, bumps the
     /// version saturating, clears stale, and returns the diff. On failure
     /// the old snapshot is kept and the adapter stays stale (version
-    /// unchanged). No [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec)
+    /// unchanged apart from routed signals below). No [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec)
     /// registry mutation: the host owns the registry and re-registers from
     /// [`McpToolAdapter::imported`] under its own refusal-only policy.
     ///
@@ -249,9 +249,13 @@ impl McpToolAdapter {
     /// while the diff for the completed refresh returns normally. Any other
     /// surfaced frame (ping, resources/prompts signals, `id`-carrying
     /// echoes) never stales. On a failed re-list the surfaced frames are
-    /// dropped with the failure: snapshot, version, and stale stay exactly
-    /// as before (PX-0913: only frames observed during this call are
-    /// routable; nothing reconciles against server state beyond them).
+    /// still routed through [`McpToolAdapter::observe_notification`] before
+    /// the error returns: the snapshot stays old (no swap) and the version
+    /// bumps only via `mark_stale` for observed signals, so a mid-flight
+    /// `list_changed` keeps a non-stale adapter fail-closed instead of
+    /// fail-open on the deny-stale gate (PX-0913: only frames observed
+    /// during this call are routable; nothing reconciles against server
+    /// state beyond them).
     ///
     /// # Errors
     ///
@@ -261,7 +265,7 @@ impl McpToolAdapter {
         self.next_id = self.next_id.max(2);
         let before = ToolListSnapshot::from_imported(&self.tools);
         let mut surfaced: Vec<String> = Vec::new();
-        let fresh = list_tools(
+        let fresh = match list_tools(
             self.transport.as_mut(),
             &self.server_id,
             &self.params.cwd,
@@ -269,7 +273,18 @@ impl McpToolAdapter {
             &mut self.next_id,
             self.params.timeout_ms,
             &mut surfaced,
-        )?;
+        ) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                // Route first, then fail: a `list_changed` seen before the
+                // failure must still stale the adapter (fail-closed), even
+                // when the adapter was not stale going in.
+                for line in &surfaced {
+                    self.observe_notification(line);
+                }
+                return Err(error);
+            }
+        };
         self.next_id = self.next_id.max(2);
         let after = ToolListSnapshot::from_imported(&fresh);
         let diff = diff_tool_snapshots(&before, &after);
