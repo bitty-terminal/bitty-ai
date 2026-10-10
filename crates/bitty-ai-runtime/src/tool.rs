@@ -1017,6 +1017,59 @@ impl ToolBus {
         Ok(())
     }
 
+    /// Whether `tool` is narrowed away by a per-call allow-set (AI-0216,
+    /// OpenAI cookbook-201 equivalent).
+    ///
+    /// `None` constrains nothing; `Some(list)` admits only the listed names
+    /// (an explicit empty list narrows everything away). Pure predicate, no
+    /// state.
+    fn narrowing_omits(allowed: Option<&[String]>, tool: &str) -> bool {
+        match allowed {
+            None => false,
+            Some(list) => !list.iter().any(|entry| entry == tool),
+        }
+    }
+
+    /// Typed narrowing refusal for one call: [`ToolError::Denied`] naming the
+    /// tool (never `UnknownTool`/`Failed`/`EffectUnknown`/`ProtocolRejected`,
+    /// no new variant).
+    fn narrowing_denial(call: &ToolCall) -> ToolError {
+        ToolError::Denied {
+            name: call.name.clone(),
+            reason: format!("tool '{}' omitted by per-call narrowing", call.name),
+        }
+        .normalized()
+    }
+
+    /// Whole-batch admission with read-only per-call narrowing (AI-0216).
+    ///
+    /// Checks the caller-scoped allow-set first (`None` = no constraint):
+    /// any omitted call fails the batch with [`ToolError::Denied`] before
+    /// any registry lookup, so a narrowed-away name reports narrowing even
+    /// when it is also unregistered. Otherwise delegates to
+    /// [`ToolBus::precheck`] unchanged (no registry mutation, no counter
+    /// change). [`ExecutionContext`] is untouched (no borrowed data): the
+    /// allow-set travels as this separate `allowed` parameter only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first narrowing [`ToolError::Denied`], else the first
+    /// [`ToolBus::precheck`] error; no call is dispatched.
+    pub fn precheck_narrowed(
+        &self,
+        calls: &[ToolCall],
+        base: &AuthBase,
+        configured_limit: usize,
+        allowed: Option<&[String]>,
+    ) -> Result<(), ToolError> {
+        for call in calls {
+            if Self::narrowing_omits(allowed, &call.name) {
+                return Err(Self::narrowing_denial(call));
+            }
+        }
+        self.precheck(calls, base, configured_limit)
+    }
+
     /// Validate, re-authorize at this dispatch boundary (`PP-6`), and
     /// dispatch one call through `executor`.
     ///
@@ -1174,6 +1227,41 @@ impl ToolBus {
             }),
             Err(error) => Err(error),
         }
+    }
+
+    /// Validate with read-only per-call narrowing, then dispatch (AI-0216).
+    ///
+    /// Checks the caller-scoped allow-set first (`None` = no constraint): a
+    /// narrowed-away call returns [`ToolStatus::Refused`] carrying the typed
+    /// [`ToolError::Denied`] cause with zero executor contact, zero
+    /// `calls_this_turn` increment, and `is_untrusted_surface == false`
+    /// (admission-only: status stays [`ToolStatus::Refused`], never
+    /// `Failed`/`Unknown`; the carried cause is [`ToolError::Denied`]).
+    /// Otherwise delegates to [`ToolBus::dispatch`] unchanged. [`ExecutionContext`]
+    /// is untouched (no borrowed data): the allow-set travels as this
+    /// separate `allowed` parameter only.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed only for the same non-[`ToolSuccess`] executor errors as
+    /// [`ToolBus::dispatch`].
+    pub fn dispatch_narrowed(
+        &mut self,
+        executor: &mut dyn ToolExecutor,
+        call: &ToolCall,
+        base: &AuthBase,
+        execution_id: crate::session::ExecutionId,
+        now_ms: u64,
+        allowed: Option<&[String]>,
+    ) -> Result<ToolExecution, ToolError> {
+        if Self::narrowing_omits(allowed, &call.name) {
+            return Ok(Self::refused(
+                execution_id,
+                call,
+                Self::narrowing_denial(call),
+            ));
+        }
+        self.dispatch(executor, call, base, execution_id, now_ms)
     }
 
     /// Record a call refused at the dispatch boundary before any executor
@@ -2168,5 +2256,131 @@ mod tests {
             }
         }
         assert_eq!(ToolStatus::Success.normalized(), ToolStatus::Success);
+    }
+
+    #[test]
+    fn precheck_narrowed_denies_omitted_before_registry_lookup() {
+        // AI-0216: per-call narrowing denies before any registry lookup, so
+        // a narrowed-away name reports `Denied` even when it is also
+        // unregistered (never `UnknownTool`), with no counter change.
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let ghost = ToolCall {
+            name: "workspace_ghost".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let omitted = vec!["workspace_other".to_owned()];
+        let error = bus
+            .precheck_narrowed(
+                std::slice::from_ref(&ghost),
+                &base(),
+                MAX_TOOL_CALLS_PER_TURN,
+                Some(&omitted),
+            )
+            .expect_err("narrowed-away must deny");
+        match &error {
+            ToolError::Denied { name, reason } => {
+                assert_eq!(name, "workspace_ghost");
+                assert!(reason.contains("workspace_ghost"));
+                assert!(reason.contains("narrowing"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert!(!matches!(error, ToolError::UnknownTool { .. }));
+        assert_eq!(bus.calls_this_turn(), 0);
+
+        // Allowed names still run the normal gate (unknown still fails as
+        // `UnknownTool` when not narrowed away).
+        let allowed = vec!["workspace_ghost".to_owned()];
+        let error = bus
+            .precheck_narrowed(
+                std::slice::from_ref(&ghost),
+                &base(),
+                MAX_TOOL_CALLS_PER_TURN,
+                Some(&allowed),
+            )
+            .expect_err("unregistered but allowed must stay UnknownTool");
+        assert!(matches!(error, ToolError::UnknownTool { .. }));
+
+        // `None` constrains nothing: a registered tool passes.
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        bus.precheck_narrowed(
+            std::slice::from_ref(&call),
+            &base(),
+            MAX_TOOL_CALLS_PER_TURN,
+            None,
+        )
+        .expect("None must not narrow");
+    }
+
+    #[test]
+    fn dispatch_narrowed_refuses_pre_contact_without_counting() {
+        // AI-0216 bus threading: narrowed-away is `Refused{Denied}`
+        // pre-contact (never `Failed`/`Denied` status, never `Unknown`),
+        // with zero executor calls and zero turn counting.
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut ids = crate::session::IdIssuer::default();
+        let omitted = vec!["workspace_other".to_owned()];
+        let execution = bus
+            .dispatch_narrowed(
+                &mut executor,
+                &call,
+                &base(),
+                ids.execution(),
+                1_000,
+                Some(&omitted),
+            )
+            .expect("narrowed refusal is a recorded status, not a bus error");
+        assert!(execution.status.is_admission_refusal());
+        match &execution.status {
+            ToolStatus::Refused {
+                cause: ToolError::Denied { name, reason },
+            } => {
+                assert_eq!(name, "workspace_read");
+                assert!(reason.contains("narrowing"), "got {reason:?}");
+            }
+            other => panic!("expected Refused{{Denied}}, got {other:?}"),
+        }
+        assert_eq!(execution.result_disposition, ResultDisposition::Accepted);
+        assert!(execution.data.is_empty());
+        assert!(!execution.is_untrusted_surface);
+        assert!(executor.calls().is_empty(), "refusal never reaches host");
+        assert_eq!(bus.calls_this_turn(), 0);
+
+        // Allowed dispatches normally through the same entry point.
+        let allowed = vec!["workspace_read".to_owned()];
+        let execution = bus
+            .dispatch_narrowed(
+                &mut executor,
+                &call,
+                &base(),
+                ids.execution(),
+                1_000,
+                Some(&allowed),
+            )
+            .expect("allowed must dispatch");
+        assert_eq!(execution.status, ToolStatus::Success);
+        assert_eq!(executor.calls().len(), 1);
+        assert_eq!(bus.calls_this_turn(), 1);
     }
 }
