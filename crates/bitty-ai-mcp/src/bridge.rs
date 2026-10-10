@@ -1182,12 +1182,27 @@ mod tests {
         assert_eq!(bus.calls_this_turn(), 0);
     }
 
+    /// Determinism pin for identical canonical bytes (not a narrowing
+    /// invariance proof).
+    ///
+    /// Stability-by-construction: the narrowed allow-set travels as a
+    /// separate `execute_narrowed`/`dispatch_narrowed` parameter (this file,
+    /// `execute_narrowed` takes `allowed: Option<&[String]>` alongside
+    /// `tool`/`arguments`/`now_ms`) and never enters `CacheKey` inputs:
+    /// `CacheKey::new` takes only `(provider_id, model_id, scope,
+    /// canonical: &[u8])` and hashes exactly the leading `prefix_len`
+    /// canonical bytes (`crates/bitty-ai-runtime/src/cache_key.rs:154-186`,
+    /// `stable_prefix_len` at `:202-220`, key fields at `:128-140`). There
+    /// is therefore no narrowing input to vary here by construction, so
+    /// re-keying identical bytes asserts determinism only. State
+    /// immutability under narrowing is covered by the snapshot-digest
+    /// assertions in the sibling narrowing tests
+    /// (`narrowed_away_denies_with_zero_contact_and_unchanged_state`,
+    /// `narrowing_never_relists_or_mutates_snapshot`); the digest check
+    /// below is retained as a local pin that the denial leaves this
+    /// adapter's imports untouched.
     #[test]
-    fn cache_key_stable_across_narrowing() {
-        // Per-call narrowing is execute-time only: the prompt canonical
-        // bytes (the `CacheKey` input) never carry the allow-set, so the
-        // same bytes key identically with and without narrowing, and the
-        // narrowed denial leaves the adapter digest untouched.
+    fn cache_key_deterministic_for_identical_canonical_bytes() {
         use bitty_ai_runtime::{CacheKey, CacheScope, LayerInput, PromptLayer, PromptSnapshot};
         let snapshot = PromptSnapshot::new(
             "bitty-core-prompt@1",
@@ -1201,13 +1216,15 @@ mod tests {
             .expect("assembles")
             .canonical_bytes()
             .to_vec();
-        let without_narrowing =
+        let first =
             CacheKey::new("bitty-fake", "fake-chat", CacheScope::Session, &bytes).expect("key");
-        // The allow-set lives outside the canonical bytes: re-keying the
-        // same bytes (the narrowed call's view) hits the same key.
-        let with_narrowing =
+        // Determinism only: same inputs key identically. This does not vary
+        // narrowing (there is no narrowing input to `CacheKey::new`); the
+        // canonical bytes above are built by `assemble_prompt(&snapshot)`
+        // with no allow-set in scope.
+        let second =
             CacheKey::new("bitty-fake", "fake-chat", CacheScope::Session, &bytes).expect("key");
-        assert_eq!(without_narrowing, with_narrowing);
+        assert_eq!(first, second);
 
         let (transport, _) = FakeTransport::fresh(Vec::new());
         let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
