@@ -211,7 +211,8 @@ fn single_json_handshake_list_call_reuses_transport() {
     let config = remote_config("https://mcp.example.com/rpc");
     let mut transport = HttpLineTransport::new(config, service).expect("transport");
 
-    let negotiated = handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+    let negotiated =
+        handshake(&mut transport, "/tmp/bitty", 1_000, &mut Vec::new()).expect("handshake");
     assert!(negotiated.tools_supported);
     assert_eq!(transport.session_id(), Some("sess-abc"));
 
@@ -223,6 +224,7 @@ fn single_json_handshake_list_call_reuses_transport() {
         &["echo".to_owned()],
         &mut next_id,
         1_000,
+        &mut Vec::new(),
     )
     .expect("import");
     assert_eq!(imported.len(), 1);
@@ -236,6 +238,7 @@ fn single_json_handshake_list_call_reuses_transport() {
         b"{}",
         "/tmp/bitty",
         1_000,
+        &mut Vec::new(),
     )
     .expect("call");
     assert_eq!(success.data, b"hi");
@@ -317,6 +320,7 @@ fn sse_cut_before_match_resolves_to_unknown_on_call() {
         b"{}",
         "/tmp/bitty",
         200,
+        &mut Vec::new(),
     );
     match outcome {
         Err(bitty_ai_mcp::McpCallError::Unknown { .. }) => {}
@@ -535,6 +539,7 @@ fn unrelated_sse_id_still_resolves_to_unknown_within_deadline() {
         b"{}",
         "/tmp/bitty",
         200,
+        &mut Vec::new(),
     );
     let elapsed = start.elapsed();
     match outcome {
@@ -567,7 +572,8 @@ fn non_2xx_rejects_handshake_and_fails_call() {
     let mut transport =
         HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
             .expect("transport");
-    let handshake_error = handshake(&mut transport, "/tmp/bitty", 1_000).expect_err("401 rejects");
+    let handshake_error =
+        handshake(&mut transport, "/tmp/bitty", 1_000, &mut Vec::new()).expect_err("401 rejects");
     assert!(matches!(
         handshake_error.failure,
         McpFailure::HandshakeRejected { .. }
@@ -582,6 +588,7 @@ fn non_2xx_rejects_handshake_and_fails_call() {
         b"{}",
         "/tmp/bitty",
         1_000,
+        &mut Vec::new(),
     )
     .expect_err("404 fails call");
     assert!(matches!(
@@ -883,7 +890,8 @@ fn loopback_wire_shape_posts_accept_session_and_json() {
     let host = "127.0.0.1";
     let config = loopback_config(&url, host);
     let mut transport = HttpLineTransport::new(config, LoopbackService).expect("transport");
-    let negotiated = handshake(&mut transport, "/tmp/bitty", 5_000).expect("handshake");
+    let negotiated =
+        handshake(&mut transport, "/tmp/bitty", 5_000, &mut Vec::new()).expect("handshake");
     assert!(negotiated.tools_supported);
     assert_eq!(transport.session_id(), Some("loop-1"));
     server.join().expect("server thread");
@@ -1656,6 +1664,195 @@ fn failed_relist_keeps_snapshot_and_stays_stale_over_http() {
     assert_eq!(adapter.snapshot(), before);
 }
 
+// ── AI-0212: mid-round-trip notifications over HTTP ─────────────────────────
+// The list POST answers with an SSE body carrying the notification ahead of
+// the response: `wait_for_response` surfaces it instead of dropping it, and
+// `relist` preserves stale. No auto-relist, no retry.
+
+#[test]
+fn http_wait_surfaces_notification_before_response() {
+    // AI-0212 (b) over HTTP: the skipped frame reaches the caller alongside
+    // the import; the import itself is unchanged, with a single POST.
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
+    let body = format!("data: {signal}\n\ndata: {}\n\n", list_answer(2));
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let mut transport =
+        HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+            .expect("transport");
+    let mut next_id = 2;
+    let mut surfaced = Vec::new();
+    let imported = list_tools(
+        &mut transport,
+        "demo",
+        "/tmp/bitty",
+        &["echo".to_owned()],
+        &mut next_id,
+        1_000,
+        &mut surfaced,
+    )
+    .expect("import");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].spec.name, "mcp_demo_echo");
+    assert_eq!(next_id, 3);
+    assert_eq!(surfaced, vec![signal.to_owned()]);
+    assert_eq!(transport.service().recorded_count(), 1);
+}
+
+#[test]
+fn http_relist_preserves_stale_on_mid_round_trip_signal() {
+    // AI-0212 (a) over HTTP: the same SSE shape through the adapter — the
+    // completed refresh bumps the version and returns its diff normally, but
+    // the mid-round-trip signal keeps the adapter stale for the next call.
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+
+    struct Allow;
+    impl ToolAuthorizer for Allow {
+        fn authorize(
+            &self,
+            _ctx: &bitty_ai_runtime::tool::AuthContext,
+        ) -> bitty_ai_runtime::tool::AuthDecision {
+            bitty_ai_runtime::tool::AuthDecision::Allow
+        }
+    }
+
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
+    let body = format!("data: {signal}\n\ndata: {}\n\n", list_answer(2));
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let transport = HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+        .expect("transport");
+    let spec = ToolSpec::new(
+        "mcp_demo_echo",
+        "Echo",
+        br#"{"type":"object"}"#.to_vec(),
+        "mcp.demo",
+        true,
+    )
+    .expect("spec");
+    let imported = bitty_ai_mcp::ImportedTool {
+        digest: spec.schema_digest(),
+        server_id: "demo".to_owned(),
+        raw_name: "echo".to_owned(),
+        spec,
+    };
+    let mut ledger = bitty_ai_runtime::bridge::FakeConsentLedger::new();
+    ledger
+        .grant("local.assistant", "mcp_demo_echo", "mcp.demo", 90_000)
+        .expect("grant");
+    let mut issuer = bitty_ai_runtime::session::IdIssuer::default();
+    let mut adapter = McpToolAdapter::new(
+        "demo",
+        vec![imported],
+        Box::new(transport),
+        Box::new(Allow),
+        Box::new(ledger),
+        McpAdapterParams {
+            protocol_id: "local.assistant".to_owned(),
+            base: bitty_ai_runtime::tool::AuthBase {
+                agent_instance_id: issuer.agent_instance(),
+                session_id: issuer.session(),
+                level: bitty_ai_runtime::session::AgentLevel::Workspace,
+            },
+            cwd: "/tmp/bitty".to_owned(),
+            timeout_ms: 1_000,
+        },
+    )
+    .expect("adapter");
+    assert_eq!(adapter.list_version(), 0);
+    assert!(!adapter.is_stale());
+
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(
+        adapter.is_stale(),
+        "mid-round-trip signal must preserve stale"
+    );
+    // Refresh bump plus the routed signal's mark bump.
+    assert_eq!(adapter.list_version(), 2);
+    assert_eq!(adapter.next_id(), 3);
+}
+
+#[test]
+fn http_mid_wait_negatives_never_stale() {
+    // AI-0212 (e) over HTTP: bare non-list notifications ahead of the list
+    // answer surface without staling the adapter.
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+
+    struct Allow;
+    impl ToolAuthorizer for Allow {
+        fn authorize(
+            &self,
+            _ctx: &bitty_ai_runtime::tool::AuthContext,
+        ) -> bitty_ai_runtime::tool::AuthDecision {
+            bitty_ai_runtime::tool::AuthDecision::Allow
+        }
+    }
+
+    let body = format!(
+        "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}}\n\ndata: {}\n\n",
+        list_answer(2)
+    );
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let transport = HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+        .expect("transport");
+    let spec = ToolSpec::new(
+        "mcp_demo_echo",
+        "Echo",
+        br#"{"type":"object"}"#.to_vec(),
+        "mcp.demo",
+        true,
+    )
+    .expect("spec");
+    let imported = bitty_ai_mcp::ImportedTool {
+        digest: spec.schema_digest(),
+        server_id: "demo".to_owned(),
+        raw_name: "echo".to_owned(),
+        spec,
+    };
+    let mut ledger = bitty_ai_runtime::bridge::FakeConsentLedger::new();
+    ledger
+        .grant("local.assistant", "mcp_demo_echo", "mcp.demo", 90_000)
+        .expect("grant");
+    let mut issuer = bitty_ai_runtime::session::IdIssuer::default();
+    let mut adapter = McpToolAdapter::new(
+        "demo",
+        vec![imported],
+        Box::new(transport),
+        Box::new(Allow),
+        Box::new(ledger),
+        McpAdapterParams {
+            protocol_id: "local.assistant".to_owned(),
+            base: bitty_ai_runtime::tool::AuthBase {
+                agent_instance_id: issuer.agent_instance(),
+                session_id: issuer.session(),
+                level: bitty_ai_runtime::session::AgentLevel::Workspace,
+            },
+            cwd: "/tmp/bitty".to_owned(),
+            timeout_ms: 1_000,
+        },
+    )
+    .expect("adapter");
+
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 1);
+}
+
 // ── secrets never in errors ────────────────────────────────────────────────
 
 #[test]
@@ -1675,7 +1872,7 @@ fn secrets_never_enter_errors_or_debug() {
         "config debug leaked: {rendered}"
     );
     let mut transport = HttpLineTransport::new(config, service).expect("transport");
-    let error = handshake(&mut transport, "/tmp/bitty", 1_000).expect_err("401");
+    let error = handshake(&mut transport, "/tmp/bitty", 1_000, &mut Vec::new()).expect_err("401");
     let text = error.to_string();
     let debug = format!("{error:?}");
     assert!(!text.contains(canary), "error leaked: {text}");

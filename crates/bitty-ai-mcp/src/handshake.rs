@@ -13,9 +13,12 @@
 //! `elicitation/*` are refused with their own fixed messages (the client
 //! never samples and never elicits; see [`SAMPLING_REFUSED_MESSAGE`] and
 //! [`ELICITATION_REFUSED_MESSAGE`]), and any other method gets JSON-RPC
-//! `-32601` (Method not found). Server notifications (no `id`)
-//! are ignored here; `notifications/tools/list_changed` in particular is
-//! never answered inline — the host routes polled lines through
+//! `-32601` (Method not found). Server notifications (no `id`) are never
+//! answered inline; every method frame [`handle_server_request`] declines
+//! is stashed into the caller's `surfaced` buffer by
+//! [`wait_for_response`] instead of being dropped (AI-0212) —
+//! `notifications/tools/list_changed` in particular reaches the host, which
+//! routes it through
 //! [`crate::tools::is_tools_list_changed_notification`] and marks that
 //! server's adapter stale (AI-0211).
 
@@ -230,8 +233,23 @@ fn render_id_token(token: &str) -> Option<String> {
 /// `-32601`).
 ///
 /// `deadline` bounds the whole wait; each transport poll uses the remaining
-/// time. Responses for other ids and server notifications are ignored.
-/// Malformed lines never arrive (the transport drops and counts them).
+/// time. Responses for other ids are ignored. Every skipped method frame
+/// [`handle_server_request`] declines (server notifications, which carry no
+/// `id`) is pushed onto `surfaced` in arrival order and returned to the
+/// caller alongside the response — synchronously, no threads (AI-0212).
+/// Filtering is caller duty: the host routes each surfaced line through
+/// [`crate::tools::is_tools_list_changed_notification`] (via
+/// [`crate::bridge::McpToolAdapter::observe_notification`]). `surfaced`
+/// keeps whatever arrived even when the wait itself fails, so a signal seen
+/// before a timeout is still routable. Malformed lines never arrive (the
+/// transport drops and counts them).
+///
+/// Recovery limit (PX-0913): a notification discarded before AI-0212 — or on
+/// a failed wait whose caller drops `surfaced` — is unrecoverable unless the
+/// server re-sends it. A later poll cannot resurrect it, and the list
+/// version cannot expose the missed transition. No server-state
+/// reconciliation (digest compare, periodic re-list) is attempted here:
+/// only frames observed during this wait are surfaced.
 ///
 /// # Errors
 ///
@@ -243,6 +261,7 @@ pub fn wait_for_response(
     cwd: &str,
     deadline: Instant,
     budget_ms: u64,
+    surfaced: &mut Vec<String>,
 ) -> Result<String, McpError> {
     let want = want_id.to_string();
     loop {
@@ -263,6 +282,12 @@ pub fn wait_for_response(
                 if has_method(&line) {
                     if let Some(reply) = handle_server_request(&line, cwd) {
                         transport.send_line(&reply)?;
+                    } else {
+                        // No answerable `id`: a server notification. Stash
+                        // the exact frame for the caller instead of
+                        // dropping it; non-notification behavior below is
+                        // unchanged.
+                        surfaced.push(line);
                     }
                     if Instant::now() >= deadline {
                         return Err(McpError::new(
@@ -277,8 +302,8 @@ pub fn wait_for_response(
                 if response_id_matches(&line, &want) {
                     return Ok(line);
                 }
-                // A response for another id or a server notification:
-                // ignore and keep waiting within the deadline.
+                // A response for another id: ignore and keep waiting within
+                // the deadline (unchanged; responses are never surfaced).
                 if Instant::now() >= deadline {
                     return Err(McpError::new(
                         McpStage::Handshake,
@@ -320,6 +345,12 @@ fn response_id_matches(line: &str, want: &str) -> bool {
 /// construction of validated configs; unvalidated callers are clamped to at
 /// least 1ms so the wait cannot block without bound).
 ///
+/// Notifications observed while waiting for the `initialize` answer are
+/// pushed onto `surfaced` (see [`wait_for_response`]) for the caller to
+/// route. No adapter — and therefore no tool snapshot — exists yet, so the
+/// handshake itself takes no staleness action; the follow-up `tools/list`
+/// import is already a fresh read of post-signal state.
+///
 /// # Errors
 ///
 /// Returns handshake, version, capability, timeout, or transport errors.
@@ -327,11 +358,12 @@ pub fn handshake(
     transport: &mut dyn McpTransport,
     cwd: &str,
     timeout_ms: u64,
+    surfaced: &mut Vec<String>,
 ) -> Result<InitializeResult, McpError> {
     let bound = timeout_ms.max(1);
     let deadline = Instant::now() + std::time::Duration::from_millis(bound);
     transport.send_line(&initialize_request(1, cwd))?;
-    let answer = wait_for_response(transport, 1, cwd, deadline, bound)?;
+    let answer = wait_for_response(transport, 1, cwd, deadline, bound, surfaced)?;
     let negotiated = parse_initialize_result(&answer)?;
     transport.send_line(&initialized_notification())?;
     Ok(negotiated)
@@ -528,7 +560,9 @@ mod tests {
     #[test]
     fn handshake_sequence_sends_initialized() {
         let mut transport = FakeTransport::new(vec![ok_result("{}")]);
-        let negotiated = handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+        let mut surfaced = Vec::new();
+        let negotiated =
+            handshake(&mut transport, "/tmp/bitty", 1_000, &mut surfaced).expect("handshake");
         assert!(negotiated.tools_supported);
         assert_eq!(transport.sent.len(), 2);
         assert!(transport.sent[0].contains("\"method\":\"initialize\""));
@@ -541,7 +575,8 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}".to_owned(),
             ok_result("{}"),
         ]);
-        handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+        let mut surfaced = Vec::new();
+        handshake(&mut transport, "/tmp/bitty", 1_000, &mut surfaced).expect("handshake");
         assert_eq!(transport.sent.len(), 3);
         assert!(transport.sent[1].contains("\"id\":9"));
         assert!(transport.sent[1].contains("\"result\":{}"));

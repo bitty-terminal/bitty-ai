@@ -141,7 +141,8 @@ fn full_handshake_against_fake_transport() {
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}"
     );
     let (mut transport, sent) = FakeTransport::fresh(vec![answer]);
-    let negotiated = handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+    let negotiated =
+        handshake(&mut transport, "/tmp/bitty", 1_000, &mut Vec::new()).expect("handshake");
     assert!(negotiated.tools_supported);
     let sent = sent.borrow();
     assert_eq!(sent.len(), 2);
@@ -163,7 +164,8 @@ fn handshake_refuses_sampling_and_elicitation_inline() {
             .to_owned(),
         answer,
     ]);
-    let negotiated = handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+    let negotiated =
+        handshake(&mut transport, "/tmp/bitty", 1_000, &mut Vec::new()).expect("handshake");
     assert!(negotiated.tools_supported);
     let sent = sent.borrow();
     assert_eq!(sent.len(), 4);
@@ -202,7 +204,7 @@ fn handshake_unknown_method_still_32601_ping_roots_unaffected() {
         "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/frobnicate\"}".to_owned(),
         answer,
     ]);
-    handshake(&mut transport, "/tmp/bitty", 1_000).expect("handshake");
+    handshake(&mut transport, "/tmp/bitty", 1_000, &mut Vec::new()).expect("handshake");
     let sent = sent.borrow();
     assert_eq!(sent.len(), 5);
     assert_eq!(sent[1], "{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}");
@@ -541,6 +543,200 @@ fn failed_relist_keeps_snapshot_and_stays_stale_over_stdio() {
     assert_eq!(sent.borrow().len(), 1);
 }
 
+// ── AI-0212: mid-round-trip notifications surface; stale preserved ──────────
+// `wait_for_response` stashes skipped notification frames into the caller's
+// buffer instead of dropping them; `relist`/`execute` route them through
+// `observe_notification`. No auto-relist, no retry, no registry mutation.
+
+#[test]
+fn wait_surfaces_notifications_to_caller_over_stdio() {
+    // AI-0212 (b): a notification skipped mid-wait reaches the caller; the
+    // import itself is unchanged.
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".to_owned();
+    let page = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+    let (mut transport, _sent) = FakeTransport::fresh(vec![signal.clone(), page]);
+    let mut next_id = 2;
+    let mut surfaced = Vec::new();
+    let imported = list_tools(
+        &mut transport,
+        "demo",
+        "/tmp/bitty",
+        &["echo".to_owned()],
+        &mut next_id,
+        1_000,
+        &mut surfaced,
+    )
+    .expect("import");
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0].spec.name, "mcp_demo_echo");
+    assert_eq!(next_id, 3);
+    assert_eq!(surfaced, vec![signal]);
+
+    // The call wait surfaces too, without changing the outcome.
+    let ping = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}".to_owned();
+    let answer = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"
+        .to_owned();
+    let (mut transport, _sent) = FakeTransport::fresh(vec![ping.clone(), answer]);
+    let mut surfaced = Vec::new();
+    let success = call_tool(
+        &mut transport,
+        2,
+        "echo",
+        "mcp_demo_echo",
+        b"{}",
+        "/tmp/bitty",
+        1_000,
+        &mut surfaced,
+    )
+    .expect("call");
+    assert_eq!(success.data, b"hi");
+    assert_eq!(surfaced, vec![ping]);
+}
+
+#[test]
+fn wait_without_notifications_surfaces_nothing() {
+    // AI-0212 (d): the clean path leaves the buffer empty — non-notification
+    // behavior is byte-identical to before.
+    let page = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+    let (mut transport, _sent) = FakeTransport::fresh(vec![page]);
+    let mut next_id = 2;
+    let mut surfaced = Vec::new();
+    list_tools(
+        &mut transport,
+        "demo",
+        "/tmp/bitty",
+        &["echo".to_owned()],
+        &mut next_id,
+        1_000,
+        &mut surfaced,
+    )
+    .expect("import");
+    assert!(surfaced.is_empty());
+
+    let answer = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"
+        .to_owned();
+    let (mut transport, _sent) = FakeTransport::fresh(vec![answer]);
+    let mut surfaced = Vec::new();
+    call_tool(
+        &mut transport,
+        2,
+        "echo",
+        "mcp_demo_echo",
+        b"{}",
+        "/tmp/bitty",
+        1_000,
+        &mut surfaced,
+    )
+    .expect("call");
+    assert!(surfaced.is_empty());
+}
+
+#[test]
+fn relist_preserves_stale_on_mid_round_trip_list_changed() {
+    // AI-0212 (a): a `list_changed` arriving during the relist round-trip
+    // keeps the adapter stale. The completed refresh still bumps the version
+    // and returns its diff normally.
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".to_owned();
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+    let (transport, sent) = FakeTransport::fresh(vec![signal, list_frame]);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    assert_eq!(adapter.list_version(), 0);
+    assert!(!adapter.is_stale());
+
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(
+        adapter.is_stale(),
+        "mid-round-trip signal must preserve stale"
+    );
+    // Refresh bump (0 -> 1) plus the routed signal's mark bump (1 -> 2).
+    assert_eq!(adapter.list_version(), 2);
+    assert_eq!(adapter.next_id(), 3);
+    assert_eq!(sent.borrow().len(), 1);
+
+    // The preserved stale denies the next call with zero contact, as usual.
+    let denied = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect_err("stale must deny");
+    assert!(matches!(
+        denied,
+        bitty_ai_runtime::tool::ToolError::Denied { .. }
+    ));
+    assert_eq!(sent.borrow().len(), 1);
+}
+
+#[test]
+fn call_wait_notification_marks_stale_without_changing_result() {
+    // AI-0212 (c): a `list_changed` seen during a call wait marks the adapter
+    // stale for the *next* call; this call's result is unchanged. No
+    // auto-relist, no retry: exactly one call frame went out.
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".to_owned();
+    let call_frame =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"
+            .to_owned();
+    let (transport, sent) = FakeTransport::fresh(vec![signal, call_frame]);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let success = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect("call succeeds");
+    assert_eq!(success.data, b"hi");
+    assert_eq!(sent.borrow().len(), 1);
+    assert!(adapter.is_stale());
+    assert_eq!(adapter.list_version(), 1);
+}
+
+#[test]
+fn mid_wait_negatives_never_stale_over_stdio() {
+    // AI-0212 (e): non-list notifications seen mid-wait never stale — on both
+    // the call and the relist paths. The `id`-carrying echo is answered
+    // inline like any other server request, never routed as a notification.
+    let negatives = vec![
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"notifications/tools/list_changed\"}".to_owned(),
+    ];
+    let call_frame =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"
+            .to_owned();
+    let mut inbound = negatives.clone();
+    inbound.push(call_frame);
+    let (transport, _sent) = FakeTransport::fresh(inbound);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let success = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect("call succeeds");
+    assert_eq!(success.data, b"hi");
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 0);
+
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+    let mut inbound = negatives.clone();
+    inbound.push(list_frame);
+    let (transport, _sent) = FakeTransport::fresh(inbound);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 1);
+}
+
 // ── Unix live-spawn tests (bounded fixtures) ──────────────────────────────────
 
 #[cfg(unix)]
@@ -581,7 +777,8 @@ mod unix {
         let mut server = spawn_server(&config, &no_env).expect("spawn fixture");
         assert!(server.is_alive());
 
-        let negotiated = handshake(&mut server, &config.cwd, 5_000).expect("handshake");
+        let negotiated =
+            handshake(&mut server, &config.cwd, 5_000, &mut Vec::new()).expect("handshake");
         assert!(negotiated.tools_supported);
 
         let mut next_id = 2;
@@ -592,6 +789,7 @@ mod unix {
             &config.tool_allowlist,
             &mut next_id,
             5_000,
+            &mut Vec::new(),
         )
         .expect("import");
         assert_eq!(imported.len(), 2);
@@ -676,6 +874,7 @@ mod unix {
             b"{}",
             &config.cwd,
             300,
+            &mut Vec::new(),
         );
         let elapsed = started.elapsed();
         match outcome {

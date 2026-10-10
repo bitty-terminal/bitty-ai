@@ -277,6 +277,14 @@ fn collect_text_parts(result: &str) -> CollectedText {
 /// `raw_tool` is the server-side name, `tool` the sanitized display name
 /// for errors, `arguments` the opaque JSON argument bytes.
 ///
+/// Notifications observed while waiting for the answer are pushed onto
+/// `surfaced` in arrival order (see
+/// [`crate::handshake::wait_for_response`]) for the caller to route through
+/// [`crate::tools::is_tools_list_changed_notification`]; the call outcome
+/// itself is unchanged — no auto-relist, no retry. `surfaced` keeps whatever
+/// arrived even when the call fails (a signal seen before a deadline is
+/// still routable).
+///
 /// # Errors
 ///
 /// Returns [`McpCallError::ArgumentsTooLarge`] before any transport contact,
@@ -285,6 +293,7 @@ fn collect_text_parts(result: &str) -> CollectedText {
 /// [`McpCallError::ResultRejected`] past 16 KiB, [`McpCallError::Unknown`]
 /// on deadline or mid-call close, and [`McpCallError::Transport`] for
 /// frame-level faults.
+#[allow(clippy::too_many_arguments)]
 pub fn call_tool(
     transport: &mut dyn McpTransport,
     id: u64,
@@ -293,6 +302,7 @@ pub fn call_tool(
     arguments: &[u8],
     cwd: &str,
     timeout_ms: u64,
+    surfaced: &mut Vec<String>,
 ) -> Result<ToolSuccess, McpCallError> {
     if arguments.len() > MAX_CALL_ARGUMENTS_BYTES {
         return Err(McpCallError::ArgumentsTooLarge {
@@ -305,25 +315,26 @@ pub fn call_tool(
     transport
         .send_line(&call_request(id, raw_tool, arguments))
         .map_err(McpCallError::Transport)?;
-    let answer = wait_for_response(transport, id, cwd, deadline, bound).map_err(|error| {
-        if matches!(error.failure, McpFailure::Timeout { .. }) {
-            McpCallError::Unknown {
-                tool: tool.to_owned(),
-                reason: bound_error_text(
-                    &format!("no answer within {bound}ms"),
-                    crate::error::MAX_ERROR_TEXT_BYTES,
-                ),
+    let answer =
+        wait_for_response(transport, id, cwd, deadline, bound, surfaced).map_err(|error| {
+            if matches!(error.failure, McpFailure::Timeout { .. }) {
+                McpCallError::Unknown {
+                    tool: tool.to_owned(),
+                    reason: bound_error_text(
+                        &format!("no answer within {bound}ms"),
+                        crate::error::MAX_ERROR_TEXT_BYTES,
+                    ),
+                }
+            } else {
+                McpCallError::Unknown {
+                    tool: tool.to_owned(),
+                    reason: bound_error_text(
+                        &format!("transport closed mid-call: {error}"),
+                        crate::error::MAX_ERROR_TEXT_BYTES,
+                    ),
+                }
             }
-        } else {
-            McpCallError::Unknown {
-                tool: tool.to_owned(),
-                reason: bound_error_text(
-                    &format!("transport closed mid-call: {error}"),
-                    crate::error::MAX_ERROR_TEXT_BYTES,
-                ),
-            }
-        }
-    })?;
+        })?;
     let (text, observed) = parse_call_result(&answer, tool).map_err(|error| match error {
         McpCallError::Transport(inner) => McpCallError::Unknown {
             tool: tool.to_owned(),
@@ -553,6 +564,7 @@ mod tests {
             &big,
             "/tmp/bitty",
             1_000,
+            &mut Vec::new(),
         )
         .expect_err("oversize args");
         assert!(matches!(error, McpCallError::ArgumentsTooLarge { .. }));
@@ -578,6 +590,7 @@ mod tests {
             b"{}",
             "/tmp/bitty",
             1_000,
+            &mut Vec::new(),
         )
         .expect_err("oversize result");
         assert!(matches!(error, McpCallError::ResultRejected { .. }));
@@ -598,6 +611,7 @@ mod tests {
             b"{}",
             "/tmp/bitty",
             1_000,
+            &mut Vec::new(),
         )
         .expect("empty success");
         assert!(success.data.is_empty());

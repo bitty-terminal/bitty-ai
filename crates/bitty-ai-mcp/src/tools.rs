@@ -312,6 +312,12 @@ pub fn list_request(id: u64, cursor: Option<&str>) -> String {
 /// must be observed or the import fails with [`McpFailure::UnknownTool`].
 /// `timeout_ms` bounds the whole import.
 ///
+/// Notifications observed while waiting for page answers are pushed onto
+/// `surfaced` in arrival order (see
+/// [`crate::handshake::wait_for_response`]) for the caller to route through
+/// [`is_tools_list_changed_notification`]; the import result itself is
+/// unchanged. `surfaced` keeps whatever arrived even when the import fails.
+///
 /// # Errors
 ///
 /// Returns pagination, bound, collision, unknown-tool, timeout, or
@@ -324,6 +330,7 @@ pub fn list_tools(
     allowlist: &[String],
     next_id: &mut u64,
     timeout_ms: u64,
+    surfaced: &mut Vec<String>,
 ) -> Result<Vec<ImportedTool>, McpError> {
     let bound = timeout_ms.clamp(1, MAX_TIMEOUT_MS);
     let deadline = Instant::now() + std::time::Duration::from_millis(bound);
@@ -341,7 +348,7 @@ pub fn list_tools(
         if let Some(spent) = cursor.as_ref() {
             used_cursors.push(spent.clone());
         }
-        let answer = wait_for_response(transport, id, cwd, deadline, bound)
+        let answer = wait_for_response(transport, id, cwd, deadline, bound, surfaced)
             .map_err(|error| McpError::new(McpStage::ListTools, error.failure))?;
         let (mut entries, next) = parse_tools_page(&answer)?;
         raws.append(&mut entries);
@@ -608,6 +615,7 @@ mod tests {
             &["a".to_owned()],
             &mut next_id,
             1_000,
+            &mut Vec::new(),
         )
         .expect_err("repeated cursor must fail");
         assert!(matches!(error.failure, McpFailure::DuplicateCursor { .. }));
@@ -632,6 +640,7 @@ mod tests {
             &["echo".to_owned()],
             &mut next_id,
             1_000,
+            &mut Vec::new(),
         )
         .expect("import");
         assert_eq!(imported.len(), 1);
@@ -655,6 +664,7 @@ mod tests {
             &["echo".to_owned(), "ghost".to_owned()],
             &mut next_id,
             1_000,
+            &mut Vec::new(),
         )
         .expect_err("unseen allowlist entry must fail");
         assert!(matches!(error.failure, McpFailure::UnknownTool { .. }));
@@ -676,6 +686,7 @@ mod tests {
             &["a.b".to_owned(), "a_b".to_owned()],
             &mut next_id,
             1_000,
+            &mut Vec::new(),
         )
         .expect_err("collision must fail");
         assert!(matches!(error.failure, McpFailure::DuplicateTool { .. }));
