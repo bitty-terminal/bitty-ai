@@ -568,22 +568,49 @@ fn parse_response_body(
         }
     }
 
-    let text = if let Some(content) = value
+    let content = value
         .pointer("/choices/0/message/content")
-        .and_then(|c| c.as_str())
-    {
-        content.to_owned()
-    } else if let Some(content) = value.pointer("/message/content").and_then(|c| c.as_str()) {
-        content.to_owned()
-    } else if let Some(resp) = value.get("response").and_then(|r| r.as_str()) {
-        resp.to_owned()
-    } else if !tool_calls.is_empty() {
-        String::new()
-    } else {
-        return Err(ProviderError::Transport {
-            provider: provider_id.to_owned(),
-            reason: "response JSON has no recognizable assistant content".to_owned(),
+        .and_then(|c| c.as_str());
+
+    // OpenRouter reasoning extension (AI-0218, live-probed 2026-10-10):
+    // reasoning models answer in `choices[0].message.reasoning` while
+    // `content` stays empty (`""` or null) and
+    // `usage.completion_tokens_details.reasoning_tokens > 0`. The
+    // DeepSeek-direct shape names the same field `reasoning_content`.
+    // `ProviderTurn` (runtime boundary) carries no dedicated reasoning
+    // slot, so a non-empty reasoning trace becomes the turn text; an
+    // empty-string `content` with no reasoning still yields `""` (the
+    // tool-call-adjacent contract below is unchanged).
+    let reasoning = value
+        .pointer("/choices/0/message/reasoning")
+        .and_then(|r| r.as_str())
+        .or_else(|| {
+            value
+                .pointer("/choices/0/message/reasoning_content")
+                .and_then(|r| r.as_str())
         });
+
+    let text = match content {
+        Some(c) if !c.is_empty() => c.to_owned(),
+        _ => {
+            if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+                r.to_owned()
+            } else if let Some(c) = content {
+                c.to_owned()
+            } else if let Some(content) = value.pointer("/message/content").and_then(|c| c.as_str())
+            {
+                content.to_owned()
+            } else if let Some(resp) = value.get("response").and_then(|r| r.as_str()) {
+                resp.to_owned()
+            } else if !tool_calls.is_empty() {
+                String::new()
+            } else {
+                return Err(ProviderError::Transport {
+                    provider: provider_id.to_owned(),
+                    reason: "response JSON has no recognizable assistant content".to_owned(),
+                });
+            }
+        }
     };
 
     let input_tokens = value
@@ -1379,5 +1406,239 @@ mod tests {
 
         let turn = adapter.complete(&req).expect("JSON with parameters parses");
         assert_eq!(turn.text, "Parametric.");
+    }
+
+    /// Reasoning-shaped bodies surface the trace as the turn text (AI-0218,
+    /// offline fixture — no network): `content` empty while `reasoning` is
+    /// present, mirroring the live OpenRouter shape (`reasoning_tokens > 0`).
+    #[test]
+    fn surfaces_reasoning_when_content_empty() {
+        // Trimmed live shape (deepseek/deepseek-v4.1-flash via OpenRouter,
+        // 2026-10-10): empty content, reasoning trace, usage with cache +
+        // cost detail fields the adapter observes but does not carry (no
+        // `ProviderTurn` slot — runtime boundary, out of scope here).
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "think: probe ok",
+                    "reasoning_details": [{"type": "reasoning.text", "text": "think: probe ok"}]
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 36,
+                "completion_tokens": 26,
+                "total_tokens": 62,
+                "cost": 0.0000412236,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 21}
+            }
+        });
+
+        let service = RecordingNetworkService::new();
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: serde_json::to_vec(&response_body).unwrap(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        let turn = adapter.complete(&req).expect("reasoning turn parses");
+        assert_eq!(turn.text, "think: probe ok");
+        assert_eq!(turn.usage.input_tokens, 36);
+        assert_eq!(turn.usage.output_tokens, 26);
+    }
+
+    /// DeepSeek-direct `reasoning_content` shape surfaces the same way.
+    #[test]
+    fn surfaces_reasoning_content_variant() {
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "trace variant"
+                }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+        });
+
+        let service = RecordingNetworkService::new();
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: serde_json::to_vec(&response_body).unwrap(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        let turn = adapter.complete(&req).expect("reasoning_content parses");
+        assert_eq!(turn.text, "trace variant");
+    }
+
+    /// Pass-through [`NetworkService`] that clones each successful response
+    /// for post-hoc raw-body assertions while the inner service performs
+    /// the real I/O. Test-only; the adapter under probe never sees it.
+    #[derive(Debug)]
+    struct CapturingService<S> {
+        inner: S,
+        last_status: Mutex<Option<u16>>,
+        last_body: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl<S> CapturingService<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                last_status: Mutex::new(None),
+                last_body: Mutex::new(None),
+            }
+        }
+
+        fn captured(&self) -> Option<(u16, Vec<u8>)> {
+            let status = (*self.last_status.lock().ok()?)?;
+            let body = self.last_body.lock().ok()?.clone()?;
+            Some((status, body))
+        }
+    }
+
+    impl<S: NetworkService> NetworkService for CapturingService<S> {
+        type Socket = S::Socket;
+
+        fn request(&self, request: &Request) -> Result<Response, NetworkError> {
+            let response = self.inner.request(request)?;
+            if let Ok(mut slot) = self.last_status.lock() {
+                *slot = Some(response.status);
+            }
+            if let Ok(mut slot) = self.last_body.lock() {
+                *slot = Some(response.body.clone());
+            }
+            Ok(response)
+        }
+
+        fn websocket(&self, request: &WebSocketRequest) -> Result<Self::Socket, NetworkError> {
+            self.inner.websocket(request)
+        }
+    }
+
+    /// Live OpenRouter probe (manual only, AI-0218): drives the
+    /// [`NetworkConsumerAdapter`] end to end over real HTTPS via
+    /// `bitty-network::HttpNetworkService` (dev-dependency, test-only).
+    /// Requires `OPENROUTER_API_KEY` in the environment; without it the
+    /// test prints a skip note and passes without asserting (never panics,
+    /// never logs the key). Never runs in CI (`#[ignore]`).
+    ///
+    /// Cost: model `deepseek/deepseek-v4.1-flash` ($0.3/M in, $1.2/M out),
+    /// `max_tokens: 64`, one fixed tiny prompt — measured ~$0.00004/run
+    /// (2026-10-10 curl baseline: 36 prompt + 26 completion tokens,
+    /// $0.0000412236, 1.5 s wall). The `proxy` feature lets the probe
+    /// inherit standard proxy env (`HTTPS_PROXY`/`NO_PROXY`) in sandboxes.
+    ///
+    /// Run: `OPENROUTER_API_KEY=... cargo test -p bitty-ai-slice
+    /// live_openrouter_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_openrouter_probe() {
+        let key = match std::env::var("OPENROUTER_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("live_openrouter_probe: SKIP (OPENROUTER_API_KEY unset)");
+                return;
+            }
+        };
+
+        let capability = NetworkCapability::offline().with_domain("openrouter.ai");
+        // The service enforces the same allowlist on the socket path, so
+        // both gates (adapter pre-I/O + service pre-socket) must grant the
+        // domain; anything else fails closed with zero packets.
+        let service =
+            CapturingService::new(bitty_network::HttpNetworkService::new(capability.clone()));
+        let secret =
+            SecretField::new(key.into_bytes()).expect("env key material forms a secret field");
+        let config = NetworkConsumerAdapterConfig::new(
+            "openrouter-live",
+            "deepseek/deepseek-v4.1-flash",
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+        .expect("probe endpoint config")
+        .with_api_key(secret)
+        .with_capability(capability);
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let mut req = sample_turn_request("deepseek/deepseek-v4.1-flash", 32_768, 25_000);
+        req.messages = vec![Message::user("Reply with exactly: probe ok")];
+        let mut sampling = blank_sampling();
+        sampling.max_tokens = Some(64);
+        req.sampling = Some(sampling);
+
+        let started = std::time::Instant::now();
+        let turn = adapter.complete(&req).expect("live turn succeeds");
+        let latency_ms = started.elapsed().as_millis();
+
+        // Adapter-level assertions: the turn parsed with text or reasoning.
+        assert!(
+            !turn.text.is_empty(),
+            "live turn carries content or reasoning"
+        );
+        assert!(turn.usage.input_tokens > 0, "live usage reports input");
+        assert!(turn.usage.output_tokens > 0, "live usage reports output");
+
+        // Raw-body assertions on the captured live bytes: HTTP-level success
+        // plus the OpenRouter usage detail fields (`cached_tokens` /
+        // `cache_write_tokens` / `cost`) the adapter observes but cannot
+        // carry (`ProviderUsage` is runtime-owned with no slot for them).
+        let (status, body) = adapter
+            .service()
+            .captured()
+            .expect("captured live response");
+        assert_eq!(status, 200, "live HTTP status");
+        let raw: serde_json::Value = serde_json::from_slice(&body).expect("live body is JSON");
+        let msg = &raw["choices"][0]["message"];
+        let has_content = msg["content"].as_str().is_some_and(|c| !c.is_empty());
+        let has_reasoning = msg["reasoning"].as_str().is_some_and(|r| !r.is_empty());
+        assert!(
+            has_content || has_reasoning,
+            "live message carries content or reasoning"
+        );
+        let details = &raw["usage"]["prompt_tokens_details"];
+        assert!(
+            details["cached_tokens"].as_u64().is_some(),
+            "live usage exposes cached_tokens"
+        );
+        assert!(
+            details["cache_write_tokens"].as_u64().is_some(),
+            "live usage exposes cache_write_tokens"
+        );
+        let cost = raw["usage"]["cost"].as_f64().unwrap_or(0.0);
+
+        eprintln!(
+            "live_openrouter_probe: ok latency_ms={latency_ms} text_len={} \
+             input_tokens={} output_tokens={} cached_tokens={} cost=${cost:.8}",
+            turn.text.len(),
+            turn.usage.input_tokens,
+            turn.usage.output_tokens,
+            details["cached_tokens"],
+        );
     }
 }

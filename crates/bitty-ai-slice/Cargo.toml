@@ -42,3 +42,11 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled
 # vocabulary for TurnRequest mapping into Request with budget_bytes, timeout_ms,
 # and secret redaction.
 bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "f3c313244667e5dca910b4f7cd8e9d9447dce9a7" }
+
+[dev-dependencies]
+# AI-0218 live-probe only (#[ignore]d OpenRouter probe in network_adapter
+# tests): the real HTTPS NetworkService. Test-only, so it never enters the
+# shipped graph; same repo+rev as bitty-network-api above. `http` enables the
+# reqwest/rustls backend, `proxy` lets the probe inherit standard proxy env
+# (HTTPS_PROXY/NO_PROXY) in sandboxed runs. bitty-ai-runtime stays std-only.
+bitty-network = { git = "https://github.com/bitty-terminal/bitty-network", rev = "f3c313244667e5dca910b4f7cd8e9d9447dce9a7", features = ["http", "proxy"] }
