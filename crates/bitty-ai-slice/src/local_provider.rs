@@ -362,7 +362,8 @@ fn validate_keep_alive_shape(value: &str) -> Result<(), &'static str> {
 /// in `Debug`/`Display`, and never carried in any error reason.
 ///
 /// The optional `keep_alive` (AI-0217) is an Ollama model-retention hint sent
-/// as `"keep_alive":"<v>"` in the chat body when present. It is not a secret:
+/// as `"keep_alive":"<v>"` in the chat body when present (except the
+/// indefinite sentinel, sent as numeric `"keep_alive":-1`). It is not a secret:
 /// `Debug` shows the value. `None` (the default) omits the field entirely, so
 /// the wire bytes are byte-identical to before AI-0217.
 #[derive(Clone)]
@@ -478,7 +479,8 @@ impl LocalEndpoint {
     /// Accepted shape mirrors [`KeepAlive`]: the allowlist
     /// `^[0-9]+(ms|s|m|h)$` plus [`KEEP_ALIVE_INDEFINITE`] (`"-1"`) and
     /// [`KEEP_ALIVE_IMMEDIATE`] (`"0"`). The value is sent as
-    /// `"keep_alive":"<v>"` in the chat body; `None` (the default) omits the
+    /// `"keep_alive":"<v>"` in the chat body (except the indefinite sentinel,
+    /// sent as numeric `"keep_alive":-1`); `None` (the default) omits the
     /// field entirely. Not a secret: the value appears in `Debug`.
     ///
     /// # Errors
@@ -989,7 +991,8 @@ fn append_sampling_fields(out: &mut String, params: &SamplingParams) {
 ///
 /// Byte order is pinned: `{"model","messages","stream":false}` then the mapped
 /// sampling fields in [`append_sampling_fields`] order, then
-/// `,"keep_alive":"<v>"` only when `keep_alive` is `Some`. `None` (the
+/// `,"keep_alive":"<v>"` only when `keep_alive` is `Some` (except the
+/// indefinite sentinel, which emits numeric `,"keep_alive":-1`). `None` (the
 /// default) omits the field entirely, so the wire bytes are byte-identical to
 /// before AI-0217. The value charset is JSON-string-safe by construction
 /// (see [`KeepAlive`]), so it is written directly without further escaping.
@@ -1020,9 +1023,15 @@ fn build_chat_body(
         append_sampling_fields(&mut out, params);
     }
     if let Some(keep) = keep_alive {
-        out.push_str(",\"keep_alive\":\"");
-        out.push_str(keep.value());
-        out.push('"');
+        // Ollama Duration.UnmarshalJSON takes negative NUMBERS as indefinite but runs strings through Go time.ParseDuration, which rejects unitless "-1".
+        // Durations stay quoted strings (accepted on all Ollama versions); "0" stays the string "0" (Go ParseDuration accepts bare "0").
+        if keep.value() == KEEP_ALIVE_INDEFINITE {
+            out.push_str(",\"keep_alive\":-1");
+        } else {
+            out.push_str(",\"keep_alive\":\"");
+            out.push_str(keep.value());
+            out.push('"');
+        }
     }
     out.push('}');
     out.into_bytes()
@@ -3801,21 +3810,24 @@ mod tests {
 
     #[test]
     fn keep_alive_sentinels_ai_0217() {
-        // Both sentinels are pinned: `"-1"` (indefinite) and `"0"`
-        // (immediate). They serialize byte-exact like durations and show in
-        // `Debug` (not a secret).
+        // Both sentinels are pinned: `"-1"` (indefinite, numeric wire form)
+        // and `"0"` (immediate, quoted form). They show in `Debug` (not a
+        // secret).
         assert_eq!(KEEP_ALIVE_INDEFINITE, "-1");
         assert_eq!(KEEP_ALIVE_IMMEDIATE, "0");
+        let indefinite = KeepAlive::new(KEEP_ALIVE_INDEFINITE).expect("sentinel");
+        assert_eq!(indefinite.value(), "-1");
+        assert_eq!(
+            body_with_keep_alive(None, Some(&indefinite)),
+            "{\"model\":\"llama3.1:8b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"keep_alive\":-1}"
+        );
+        let immediate = KeepAlive::new(KEEP_ALIVE_IMMEDIATE).expect("sentinel");
+        assert_eq!(immediate.value(), "0");
+        assert_eq!(
+            body_with_keep_alive(None, Some(&immediate)),
+            "{\"model\":\"llama3.1:8b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"keep_alive\":\"0\"}"
+        );
         for sentinel in [KEEP_ALIVE_INDEFINITE, KEEP_ALIVE_IMMEDIATE] {
-            let keep = KeepAlive::new(sentinel).expect("sentinel");
-            assert_eq!(keep.value(), sentinel);
-            let text = body_with_keep_alive(None, Some(&keep));
-            assert_eq!(
-                text,
-                format!(
-                    "{{\"model\":\"llama3.1:8b\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":false,\"keep_alive\":\"{sentinel}\"}}"
-                )
-            );
             let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
                 .expect("endpoint")
                 .with_keep_alive(sentinel)
