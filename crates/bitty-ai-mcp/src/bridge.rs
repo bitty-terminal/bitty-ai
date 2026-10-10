@@ -1,13 +1,14 @@
 //! [`McpToolAdapter`]: the runtime [`ToolExecutor`] seam over MCP tools.
 //!
 //! Gate order per call (fail-closed, zero transport contact on refusal):
-//! tool-list staleness (AI-0211 deny-stale), allowlisted import lookup,
-//! `inspect`-tier read-only gate, runtime [`ToolAuthorizer`], runtime
-//! [`ConsentLedger`] (exact `(protocol, tool, scope=spec.required_scope)`
-//! triple at `now_ms`), then bounded `tools/call` dispatch. Secrets never
-//! pass through the adapter: child environments are built once by
-//! [`crate::supervise::spawn_server`] from [`CredentialRef`] names, and
-//! every error below quotes names only.
+//! tool-list staleness (AI-0211 deny-stale), read-only per-call narrowing
+//! (AI-0216 [`McpToolAdapter::execute_narrowed`], OpenAI cookbook-201
+//! equivalent), allowlisted import lookup, `inspect`-tier read-only gate,
+//! runtime [`ToolAuthorizer`], runtime [`ConsentLedger`] (exact `(protocol,
+//! tool, scope=spec.required_scope)` triple at `now_ms`), then bounded
+//! `tools/call` dispatch. Secrets never pass through the adapter: child
+//! environments are built once by [`crate::supervise::spawn_server`] from
+//! [`CredentialRef`] names, and every error below quotes names only.
 //!
 //! Dynamic invalidation (AI-0211, AIQ-08 facet): the host polls for server
 //! messages (HTTP `poll_server_messages` first; stdio drains inline), routes
@@ -38,8 +39,8 @@
 //! [`ToolError::Failed`] with the reason
 //! `tool reported failure: <bounded server text>`. `Failed` means the tool
 //! executed and the host reported failure, distinct from [`ToolError::Denied`]
-//! (a policy refusal with no effect: allowlist miss, `inspect`-tier,
-//! authorizer, or consent). A JSON-RPC `error` answer with code `-32600`,
+//! (a policy refusal with no effect: per-call narrowing omission, allowlist
+//! miss, `inspect`-tier, authorizer, or consent). A JSON-RPC `error` answer with code `-32600`,
 //! `-32601`, or `-32602` maps to [`ToolError::ProtocolRejected`]: the server
 //! refused the frame before any effect, so the call never executed: never
 //! `Denied` (policy), never `EffectUnknown` (uncertain effect, reconcile),
@@ -316,43 +317,59 @@ impl McpToolAdapter {
         self.tools.iter().find(|entry| entry.spec.name == tool)
     }
 
-    fn deny(&self, tool: &str, reason: &str) -> ToolError {
-        ToolError::Denied {
-            name: tool.to_owned(),
-            reason: reason.to_owned(),
-        }
-        .normalized()
-    }
-
-    fn failed(&self, tool: &str, reason: &str) -> ToolError {
-        ToolError::Failed {
-            name: tool.to_owned(),
-            reason: reason.to_owned(),
-        }
-        .normalized()
-    }
-
-    fn protocol_rejected(&self, tool: &str, code: i32, message: &str) -> ToolError {
-        ToolError::ProtocolRejected {
-            name: tool.to_owned(),
-            reason: format!("protocol rejected before execution (code {code}): {message}"),
-        }
-        .normalized()
-    }
-}
-
-impl ToolExecutor for McpToolAdapter {
-    fn execute(
+    /// Read-only per-call tool narrowing at execute time (AI-0216, OpenAI
+    /// cookbook-201 equivalent).
+    ///
+    /// `allowed` is the caller-scoped allow-set for this call only
+    /// (`None` = no constraint, same as [`ToolExecutor::execute`];
+    /// `Some(list)` = only the listed sanitized names may dispatch). A tool
+    /// omitted from a constrained set denies with [`ToolError::Denied`]
+    /// (never `UnknownTool`/`Failed`/`EffectUnknown`/`ProtocolRejected`, no
+    /// new variant) with zero transport contact and no state mutation:
+    /// snapshot, digests, `list_version`, `list_stale`, and `next_id` are
+    /// unchanged, and narrowing never re-lists. Gate order is
+    /// stale -> per-call-omit -> allowlist-lookup -> inspect-tier ->
+    /// authorizer -> consent -> dispatch, so a stale adapter still reports
+    /// the stale denial first and `relist` stays the sole un-staling path.
+    pub fn execute_narrowed(
         &mut self,
         tool: &str,
         arguments: &[u8],
         now_ms: u64,
+        allowed: Option<&[String]>,
+    ) -> Result<ToolSuccess, ToolError> {
+        self.execute_inner(tool, arguments, now_ms, allowed)
+    }
+
+    /// Whether `tool` is narrowed away by a per-call allow-set.
+    fn narrowing_omits(allowed: Option<&[String]>, tool: &str) -> bool {
+        match allowed {
+            None => false,
+            Some(list) => !list.iter().any(|entry| entry == tool),
+        }
+    }
+
+    fn execute_inner(
+        &mut self,
+        tool: &str,
+        arguments: &[u8],
+        now_ms: u64,
+        allowed: Option<&[String]>,
     ) -> Result<ToolSuccess, ToolError> {
         // AI-0211 deny-stale first gate: whole-list stale denies with
         // `Denied` (never `EffectUnknown`/`ProtocolRejected`) and zero
         // transport contact. The host must `relist` explicitly.
         if self.list_stale {
             return Err(self.deny(tool, "tool list stale; re-list required"));
+        }
+        // AI-0216 per-call narrowing gate (read-only, zero contact): a tool
+        // omitted from the caller-scoped allow-set denies before any
+        // allowlist lookup, with the reason naming the tool.
+        if Self::narrowing_omits(allowed, tool) {
+            return Err(self.deny(
+                tool,
+                &format!("tool '{tool}' omitted by per-call narrowing"),
+            ));
         }
         let (raw_name, required_scope, read_only) = match self.lookup(tool) {
             Some(entry) => (
@@ -440,6 +457,46 @@ impl ToolExecutor for McpToolAdapter {
                 reason,
             }),
         }
+    }
+
+    fn deny(&self, tool: &str, reason: &str) -> ToolError {
+        ToolError::Denied {
+            name: tool.to_owned(),
+            reason: reason.to_owned(),
+        }
+        .normalized()
+    }
+
+    fn failed(&self, tool: &str, reason: &str) -> ToolError {
+        ToolError::Failed {
+            name: tool.to_owned(),
+            reason: reason.to_owned(),
+        }
+        .normalized()
+    }
+
+    fn protocol_rejected(&self, tool: &str, code: i32, message: &str) -> ToolError {
+        ToolError::ProtocolRejected {
+            name: tool.to_owned(),
+            reason: format!("protocol rejected before execution (code {code}): {message}"),
+        }
+        .normalized()
+    }
+}
+
+impl ToolExecutor for McpToolAdapter {
+    fn execute(
+        &mut self,
+        tool: &str,
+        arguments: &[u8],
+        now_ms: u64,
+    ) -> Result<ToolSuccess, ToolError> {
+        // Shared gate chain with no per-call constraint (`None`): stale ->
+        // per-call-omit (inactive) -> allowlist-lookup -> inspect-tier ->
+        // authorizer -> consent -> dispatch. The [`ToolExecutor`] trait stays
+        // frozen (v0.1); narrowing travels only on the adapter-native
+        // [`McpToolAdapter::execute_narrowed`].
+        self.execute_narrowed(tool, arguments, now_ms, None)
     }
 }
 
@@ -884,5 +941,298 @@ mod tests {
             .expect_err("still stale");
         assert!(matches!(denied, ToolError::Denied { .. }));
         assert_eq!(sent.borrow().len(), 1);
+    }
+
+    // ── AI-0216: read-only per-call narrowing (cookbook-201 equivalent) ──
+
+    #[test]
+    fn narrowed_away_denies_with_zero_contact_and_unchanged_state() {
+        // Omission denies as `Denied` (never `UnknownTool`/`Failed`/
+        // `EffectUnknown`/`ProtocolRejected`, no new variant) with zero
+        // transport contact and no state mutation.
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let before_snapshot = adapter.snapshot();
+        let before_digest = before_snapshot.digest_of("mcp_demo_echo");
+        let before_version = adapter.list_version();
+        let before_next_id = adapter.next_id();
+        assert!(!adapter.is_stale());
+
+        let allowed = vec!["mcp_demo_other".to_owned()];
+        let error = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&allowed))
+            .expect_err("narrowed-away must deny");
+        match &error {
+            ToolError::Denied { name, reason } => {
+                assert_eq!(name, "mcp_demo_echo");
+                assert!(
+                    reason.contains("mcp_demo_echo"),
+                    "reason must name tool: {reason:?}"
+                );
+                assert!(
+                    reason.contains("narrowing"),
+                    "reason must mark narrowing: {reason:?}"
+                );
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert!(!matches!(error, ToolError::UnknownTool { .. }));
+        assert!(!matches!(error, ToolError::Failed { .. }));
+        assert!(!matches!(error, ToolError::EffectUnknown { .. }));
+        assert!(!matches!(error, ToolError::ProtocolRejected { .. }));
+        assert!(sent.borrow().is_empty(), "zero transport contact");
+        assert_eq!(adapter.snapshot(), before_snapshot);
+        assert_eq!(adapter.snapshot().digest_of("mcp_demo_echo"), before_digest);
+        assert_eq!(adapter.list_version(), before_version);
+        assert!(!adapter.is_stale());
+        assert_eq!(adapter.next_id(), before_next_id);
+
+        // Explicit empty allow-set narrows everything away the same way.
+        let empty: Vec<String> = Vec::new();
+        let error = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&empty))
+            .expect_err("empty set must deny");
+        assert!(matches!(error, ToolError::Denied { .. }));
+        assert!(sent.borrow().is_empty());
+        assert_eq!(adapter.snapshot(), before_snapshot);
+        assert_eq!(adapter.list_version(), before_version);
+        assert!(!adapter.is_stale());
+    }
+
+    #[test]
+    fn narrowed_allowed_dispatches_and_none_matches_execute() {
+        let allowed = vec!["mcp_demo_echo".to_owned()];
+        let (transport, sent) = FakeTransport::fresh(vec![FakeTransport::ok_answer(2, "hi")]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let success = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&allowed))
+            .expect("allowed must dispatch");
+        assert_eq!(success.data, b"hi");
+        assert_eq!(sent.borrow().len(), 1);
+
+        // `None` behaves exactly like `execute` (shared gate chain).
+        let (transport, sent) = FakeTransport::fresh(vec![FakeTransport::ok_answer(2, "hi")]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let via_narrowed = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, None)
+            .expect("None dispatches");
+        assert_eq!(via_narrowed.data, b"hi");
+        assert_eq!(sent.borrow().len(), 1);
+
+        let (transport, sent) = FakeTransport::fresh(vec![FakeTransport::ok_answer(2, "hi")]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let via_execute = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect("execute dispatches");
+        assert_eq!(via_execute, via_narrowed);
+        assert_eq!(sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn stale_wins_over_narrowing() {
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        adapter.mark_stale();
+        let version = adapter.list_version();
+
+        // Omitted tool still reports stale first (relist is the sole
+        // un-staling path).
+        let omitted = vec!["mcp_demo_other".to_owned()];
+        let error = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&omitted))
+            .expect_err("stale must win");
+        match &error {
+            ToolError::Denied { reason, .. } => {
+                assert!(reason.contains("stale"), "stale must win: {reason:?}");
+                assert!(
+                    !reason.contains("narrowing"),
+                    "narrowing must not win: {reason:?}"
+                );
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        // Even an allowed tool reports stale first.
+        let allowed = vec!["mcp_demo_echo".to_owned()];
+        let error = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&allowed))
+            .expect_err("stale must win");
+        match &error {
+            ToolError::Denied { reason, .. } => assert!(reason.contains("stale")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(adapter.list_version(), version);
+        assert!(adapter.is_stale());
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn narrowed_mid_call_list_changed_stales_next_call_only() {
+        // Allowed narrowed call with a `list_changed` mid-wait succeeds; the
+        // signal stales only the next call (AI-0212 preserved under
+        // narrowing). Narrowing itself never re-lists.
+        let signal =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".to_owned();
+        let call_frame = FakeTransport::ok_answer(2, "hi");
+        let (transport, sent) = FakeTransport::fresh(vec![signal, call_frame]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let allowed = vec!["mcp_demo_echo".to_owned()];
+        let success = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&allowed))
+            .expect("narrowed call succeeds");
+        assert_eq!(success.data, b"hi");
+        assert_eq!(sent.borrow().len(), 1);
+        assert!(adapter.is_stale());
+        assert_eq!(adapter.list_version(), 1);
+
+        let error = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&allowed))
+            .expect_err("next call must deny stale");
+        match &error {
+            ToolError::Denied { reason, .. } => assert!(reason.contains("stale")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(sent.borrow().len(), 1);
+    }
+
+    #[test]
+    fn narrowing_never_relists_or_mutates_snapshot() {
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let before_snapshot = adapter.snapshot();
+        let before_version = adapter.list_version();
+        let before_next_id = adapter.next_id();
+
+        // Repeated narrowed-away denials mutate nothing.
+        let omitted = vec!["mcp_demo_other".to_owned()];
+        for _ in 0..3 {
+            let error = adapter
+                .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&omitted))
+                .expect_err("narrowed-away must deny");
+            assert!(matches!(error, ToolError::Denied { .. }));
+        }
+        assert_eq!(adapter.snapshot(), before_snapshot);
+        assert_eq!(adapter.list_version(), before_version);
+        assert!(!adapter.is_stale());
+        assert_eq!(adapter.next_id(), before_next_id);
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn bus_dispatch_narrowed_refuses_pre_contact_with_denied_cause() {
+        // Bus threading: a narrowed-away call is an admission refusal
+        // (`Refused{Denied}`) before any executor contact.
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "mcp_demo_echo",
+                    "Echo",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "mcp.demo",
+                    true,
+                )
+                .expect("valid"),
+            )
+            .expect("capacity");
+        let mut bus = ToolBus::new(registry).with_authorizer(Allow);
+        let call = ToolCall {
+            name: "mcp_demo_echo".to_owned(),
+            arguments: b"{}".to_vec(),
+        };
+        let mut ids = IdIssuer::default();
+        let base_workspace = base(AgentLevel::Workspace);
+        let omitted = vec!["mcp_demo_other".to_owned()];
+        let execution = bus
+            .dispatch_narrowed(
+                &mut adapter,
+                &call,
+                &base_workspace,
+                ids.execution(),
+                1_000,
+                Some(&omitted),
+            )
+            .expect("narrowed refusal is a recorded status, not a bus error");
+        match &execution.status {
+            ToolStatus::Refused {
+                cause: ToolError::Denied { name, reason },
+            } => {
+                assert_eq!(name, "mcp_demo_echo");
+                assert!(reason.contains("narrowing"), "got {reason:?}");
+            }
+            other => panic!("expected Refused{{Denied}}, got {other:?}"),
+        }
+        assert!(!execution.is_untrusted_surface);
+        assert!(execution.data.is_empty());
+        assert!(sent.borrow().is_empty(), "zero executor contact");
+        assert_eq!(bus.calls_this_turn(), 0);
+
+        // The narrowed precheck mirrors the same taxonomy without dispatch.
+        let error = bus
+            .precheck_narrowed(
+                std::slice::from_ref(&call),
+                &base_workspace,
+                8,
+                Some(&omitted),
+            )
+            .expect_err("precheck must deny narrowed-away");
+        assert!(matches!(error, ToolError::Denied { .. }));
+        assert_eq!(bus.calls_this_turn(), 0);
+    }
+
+    /// Determinism pin for identical canonical bytes (not a narrowing
+    /// invariance proof).
+    ///
+    /// Stability-by-construction: the narrowed allow-set travels as a
+    /// separate `execute_narrowed`/`dispatch_narrowed` parameter (this file,
+    /// `execute_narrowed` takes `allowed: Option<&[String]>` alongside
+    /// `tool`/`arguments`/`now_ms`) and never enters `CacheKey` inputs:
+    /// `CacheKey::new` takes only `(provider_id, model_id, scope,
+    /// canonical: &[u8])` and hashes exactly the leading `prefix_len`
+    /// canonical bytes (`crates/bitty-ai-runtime/src/cache_key.rs:154-186`,
+    /// `stable_prefix_len` at `:202-220`, key fields at `:128-140`). There
+    /// is therefore no narrowing input to vary here by construction, so
+    /// re-keying identical bytes asserts determinism only. State
+    /// immutability under narrowing is covered by the snapshot-digest
+    /// assertions in the sibling narrowing tests
+    /// (`narrowed_away_denies_with_zero_contact_and_unchanged_state`,
+    /// `narrowing_never_relists_or_mutates_snapshot`); the digest check
+    /// below is retained as a local pin that the denial leaves this
+    /// adapter's imports untouched.
+    #[test]
+    fn cache_key_deterministic_for_identical_canonical_bytes() {
+        use bitty_ai_runtime::{CacheKey, CacheScope, LayerInput, PromptLayer, PromptSnapshot};
+        let snapshot = PromptSnapshot::new(
+            "bitty-core-prompt@1",
+            vec![
+                LayerInput::text_only(PromptLayer::CoreContract, "stable core"),
+                LayerInput::text_only(PromptLayer::RuntimeTurn, "turn"),
+            ],
+        )
+        .expect("valid snapshot");
+        let bytes = bitty_ai_runtime::assemble_prompt(&snapshot)
+            .expect("assembles")
+            .canonical_bytes()
+            .to_vec();
+        let first =
+            CacheKey::new("bitty-fake", "fake-chat", CacheScope::Session, &bytes).expect("key");
+        // Determinism only: same inputs key identically. This does not vary
+        // narrowing (there is no narrowing input to `CacheKey::new`); the
+        // canonical bytes above are built by `assemble_prompt(&snapshot)`
+        // with no allow-set in scope.
+        let second =
+            CacheKey::new("bitty-fake", "fake-chat", CacheScope::Session, &bytes).expect("key");
+        assert_eq!(first, second);
+
+        let (transport, _) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let digest_before = adapter.snapshot().digest_of("mcp_demo_echo");
+        let omitted = vec!["mcp_demo_other".to_owned()];
+        let _ = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&omitted))
+            .expect_err("narrowed-away must deny");
+        assert_eq!(adapter.snapshot().digest_of("mcp_demo_echo"), digest_before);
     }
 }
