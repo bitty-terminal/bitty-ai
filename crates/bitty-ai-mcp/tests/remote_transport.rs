@@ -1519,6 +1519,133 @@ fn poll_negatives_never_stale_over_http() {
 }
 
 #[test]
+fn resources_prompts_positives_never_stale_over_http() {
+    // AI-0214 (Option A): classifier-positive resources/prompts lines
+    // polled over HTTP still never stale — routing stays tools-only.
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+
+    struct Allow;
+    impl ToolAuthorizer for Allow {
+        fn authorize(
+            &self,
+            _ctx: &bitty_ai_runtime::tool::AuthContext,
+        ) -> bitty_ai_runtime::tool::AuthDecision {
+            bitty_ai_runtime::tool::AuthDecision::Allow
+        }
+    }
+
+    fn fresh_adapter(service: FakeService) -> McpToolAdapter {
+        let spec = ToolSpec::new(
+            "mcp_demo_echo",
+            "Echo",
+            br#"{"type":"object"}"#.to_vec(),
+            "mcp.demo",
+            true,
+        )
+        .expect("spec");
+        let imported = bitty_ai_mcp::ImportedTool {
+            digest: spec.schema_digest(),
+            server_id: "demo".to_owned(),
+            raw_name: "echo".to_owned(),
+            spec,
+        };
+        let mut ledger = bitty_ai_runtime::bridge::FakeConsentLedger::new();
+        ledger
+            .grant("local.assistant", "mcp_demo_echo", "mcp.demo", 90_000)
+            .expect("grant");
+        let mut issuer = bitty_ai_runtime::session::IdIssuer::default();
+        McpToolAdapter::new(
+            "demo",
+            vec![imported],
+            Box::new(
+                HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+                    .expect("transport"),
+            ),
+            Box::new(Allow),
+            Box::new(ledger),
+            McpAdapterParams {
+                protocol_id: "local.assistant".to_owned(),
+                base: bitty_ai_runtime::tool::AuthBase {
+                    agent_instance_id: issuer.agent_instance(),
+                    session_id: issuer.session(),
+                    level: bitty_ai_runtime::session::AgentLevel::Workspace,
+                },
+                cwd: "/tmp/bitty".to_owned(),
+                timeout_ms: 1_000,
+            },
+        )
+        .expect("adapter")
+    }
+
+    for (body, is_resources) in [
+        (
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}\n\n",
+            true,
+        ),
+        (
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\",\"params\":{}}\n\n",
+            true,
+        ),
+        (
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}\n\n",
+            false,
+        ),
+        (
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{}}\n\n",
+            false,
+        ),
+    ] {
+        let service = FakeService::new();
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+            body: body.as_bytes().to_vec(),
+        });
+        service.queue_response(Response {
+            status: 202,
+            headers: Vec::new(),
+            body: Vec::new(),
+        });
+        let mut transport =
+            HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+                .expect("transport");
+        let queued = transport.poll_server_messages("/tmp/bitty").expect("poll");
+        let mut lines = Vec::new();
+        while let Some(line) = transport.recv_line(10).expect("recv") {
+            lines.push(line);
+        }
+        let _ = queued;
+        assert_eq!(lines.len(), 1, "one notification line for body {body:?}");
+        if is_resources {
+            assert!(bitty_ai_mcp::is_resources_list_changed_notification(
+                &lines[0]
+            ));
+            assert!(!bitty_ai_mcp::is_prompts_list_changed_notification(
+                &lines[0]
+            ));
+        } else {
+            assert!(bitty_ai_mcp::is_prompts_list_changed_notification(
+                &lines[0]
+            ));
+            assert!(!bitty_ai_mcp::is_resources_list_changed_notification(
+                &lines[0]
+            ));
+        }
+        assert!(!bitty_ai_mcp::is_tools_list_changed_notification(&lines[0]));
+        let mut adapter = fresh_adapter(FakeService::new());
+        let mut marked = false;
+        for line in &lines {
+            if adapter.observe_notification(line) {
+                marked = true;
+            }
+        }
+        assert!(!marked, "must not stale for body {body:?}");
+        assert!(!adapter.is_stale());
+        assert_eq!(adapter.list_version(), 0);
+    }
+}
+
+#[test]
 fn poll_405_and_disabled_never_stale_over_http() {
     use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
 
@@ -1799,6 +1926,78 @@ fn http_mid_wait_negatives_never_stale() {
 
     let body = format!(
         "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}}\n\ndata: {}\n\n",
+        list_answer(2)
+    );
+    let service = FakeService::new();
+    service.queue_response(Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.into_bytes(),
+    });
+    let transport = HttpLineTransport::new(remote_config("https://mcp.example.com/rpc"), service)
+        .expect("transport");
+    let spec = ToolSpec::new(
+        "mcp_demo_echo",
+        "Echo",
+        br#"{"type":"object"}"#.to_vec(),
+        "mcp.demo",
+        true,
+    )
+    .expect("spec");
+    let imported = bitty_ai_mcp::ImportedTool {
+        digest: spec.schema_digest(),
+        server_id: "demo".to_owned(),
+        raw_name: "echo".to_owned(),
+        spec,
+    };
+    let mut ledger = bitty_ai_runtime::bridge::FakeConsentLedger::new();
+    ledger
+        .grant("local.assistant", "mcp_demo_echo", "mcp.demo", 90_000)
+        .expect("grant");
+    let mut issuer = bitty_ai_runtime::session::IdIssuer::default();
+    let mut adapter = McpToolAdapter::new(
+        "demo",
+        vec![imported],
+        Box::new(transport),
+        Box::new(Allow),
+        Box::new(ledger),
+        McpAdapterParams {
+            protocol_id: "local.assistant".to_owned(),
+            base: bitty_ai_runtime::tool::AuthBase {
+                agent_instance_id: issuer.agent_instance(),
+                session_id: issuer.session(),
+                level: bitty_ai_runtime::session::AgentLevel::Workspace,
+            },
+            cwd: "/tmp/bitty".to_owned(),
+            timeout_ms: 1_000,
+        },
+    )
+    .expect("adapter");
+
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 1);
+}
+
+#[test]
+fn http_mid_wait_resources_prompts_positives_never_stale() {
+    // AI-0214 (Option A) over HTTP: classifier-positive resources/prompts
+    // lines ahead of the list answer surface without staling the adapter.
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+
+    struct Allow;
+    impl ToolAuthorizer for Allow {
+        fn authorize(
+            &self,
+            _ctx: &bitty_ai_runtime::tool::AuthContext,
+        ) -> bitty_ai_runtime::tool::AuthDecision {
+            bitty_ai_runtime::tool::AuthDecision::Allow
+        }
+    }
+
+    let body = format!(
+        "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{{}}}}\n\ndata: {}\n\n",
         list_answer(2)
     );
     let service = FakeService::new();

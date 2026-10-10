@@ -518,6 +518,46 @@ fn stale_negatives_never_mark_over_stdio() {
 }
 
 #[test]
+fn resources_prompts_classifier_positives_never_mark_over_stdio() {
+    // AI-0214 (Option A): the resources/prompts classifiers accept their
+    // bare signals, but `observe_notification` stays tools-only — even
+    // classifier-positive lines never stale and never bump the version.
+    use bitty_ai_mcp::{
+        is_prompts_list_changed_notification, is_resources_list_changed_notification,
+        is_tools_list_changed_notification,
+    };
+    let (transport, _sent) = FakeTransport::fresh(Vec::new());
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    for line in [
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\",\"params\":{}}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{}}",
+    ] {
+        if line.contains("notifications/resources/") {
+            assert!(is_resources_list_changed_notification(line));
+            assert!(!is_prompts_list_changed_notification(line));
+        } else {
+            assert!(is_prompts_list_changed_notification(line));
+            assert!(!is_resources_list_changed_notification(line));
+        }
+        assert!(
+            !is_tools_list_changed_notification(line),
+            "cross-kind must stay negative: {line:?}"
+        );
+        assert!(
+            !adapter.observe_notification(line),
+            "must not stale: {line:?}"
+        );
+    }
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 0);
+}
+
+#[test]
 fn failed_relist_keeps_snapshot_and_stays_stale_over_stdio() {
     let error_frame =
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"boom\"}}";
@@ -725,6 +765,48 @@ fn mid_wait_negatives_never_stale_over_stdio() {
     let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
         .to_owned();
     let mut inbound = negatives.clone();
+    inbound.push(list_frame);
+    let (transport, _sent) = FakeTransport::fresh(inbound);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 1);
+}
+
+#[test]
+fn resources_prompts_positives_mid_wait_never_stale_over_stdio() {
+    // AI-0214 (Option A): classifier-positive resources/prompts lines seen
+    // mid-wait surface without staling — on both the call and the relist
+    // paths. Routing stays tools-only.
+    let positives = vec![
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}".to_owned(),
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{}}"
+            .to_owned(),
+    ];
+    let call_frame =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}"
+            .to_owned();
+    let mut inbound = positives.clone();
+    inbound.push(call_frame);
+    let (transport, _sent) = FakeTransport::fresh(inbound);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let success = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect("call succeeds");
+    assert_eq!(success.data, b"hi");
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 0);
+
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+        .to_owned();
+    let mut inbound = positives.clone();
     inbound.push(list_frame);
     let (transport, _sent) = FakeTransport::fresh(inbound);
     let mut adapter = test_adapter(

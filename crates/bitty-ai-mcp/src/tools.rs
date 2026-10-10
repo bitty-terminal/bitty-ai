@@ -418,8 +418,9 @@ pub fn list_tools(
 /// (HTTP `poll_server_messages` first; stdio drains inline), routes each
 /// queued line through this classifier, and marks that server's adapter
 /// stale on true. Whole-list stale: one signal stales the full tool list,
-/// never a single tool. No auto-relist, no background work, no
-/// resources/prompts versioning.
+/// never a single tool. No auto-relist, no background work;
+/// resources/prompts classifiers only; no version/stale/relist until a
+/// consumer exists.
 ///
 /// The check is syntactic only (method plus id absence) and never touches
 /// the transport.
@@ -431,6 +432,58 @@ pub fn is_tools_list_changed_notification(line: &str) -> bool {
     matches!(
         crate::json::find_string_field(line, "method").as_deref(),
         Some("notifications/tools/list_changed")
+    )
+}
+
+/// Whether `line` is a `notifications/resources/list_changed` signal
+/// (AI-0214, AIQ-08 dynamic-invalidation facet).
+///
+/// Taxonomy symmetry with [`is_tools_list_changed_notification`]: true only
+/// for a notification frame with `method` exactly
+/// `notifications/resources/list_changed` and no `id` member. Pure bool
+/// classifier only — no version, no stale, no re-list: nothing fetches or
+/// caches resources lists today, so no consumer exists to drive them
+/// (Option B parked until a real `resources/list` consumer lands). The host
+/// keeps routing only tools signals through
+/// [`crate::bridge::McpToolAdapter::observe_notification`]; even
+/// classifier-positive resources lines never stale the adapter.
+///
+/// The check is syntactic only (method plus id absence) and never touches
+/// the transport.
+#[must_use]
+pub fn is_resources_list_changed_notification(line: &str) -> bool {
+    if crate::json::find_raw_field(line, "id").is_some() {
+        return false;
+    }
+    matches!(
+        crate::json::find_string_field(line, "method").as_deref(),
+        Some("notifications/resources/list_changed")
+    )
+}
+
+/// Whether `line` is a `notifications/prompts/list_changed` signal
+/// (AI-0214, AIQ-08 dynamic-invalidation facet).
+///
+/// Taxonomy symmetry with [`is_tools_list_changed_notification`]: true only
+/// for a notification frame with `method` exactly
+/// `notifications/prompts/list_changed` and no `id` member. Pure bool
+/// classifier only — no version, no stale, no re-list: nothing fetches or
+/// caches prompts lists today, so no consumer exists to drive them
+/// (Option B parked until a real `prompts/list` consumer lands). The host
+/// keeps routing only tools signals through
+/// [`crate::bridge::McpToolAdapter::observe_notification`]; even
+/// classifier-positive prompts lines never stale the adapter.
+///
+/// The check is syntactic only (method plus id absence) and never touches
+/// the transport.
+#[must_use]
+pub fn is_prompts_list_changed_notification(line: &str) -> bool {
+    if crate::json::find_raw_field(line, "id").is_some() {
+        return false;
+    }
+    matches!(
+        crate::json::find_string_field(line, "method").as_deref(),
+        Some("notifications/prompts/list_changed")
     )
 }
 
@@ -748,6 +801,78 @@ mod tests {
             assert!(
                 !is_tools_list_changed_notification(line),
                 "must not stale: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resources_classifier_accepts_only_bare_resources_notification() {
+        assert!(is_resources_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}"
+        ));
+        assert!(is_resources_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\",\"params\":{}}"
+        ));
+    }
+
+    #[test]
+    fn resources_classifier_rejects_negatives() {
+        // Cross-kind first: the tools signal is positive for the tools
+        // classifier and negative here, and vice versa.
+        assert!(is_tools_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
+        ));
+        for line in [
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"notifications/resources/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"notifications/resources/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            "not json at all",
+            "",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changedX\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list-changed\"}",
+        ] {
+            assert!(
+                !is_resources_list_changed_notification(line),
+                "must stay classifier-only: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompts_classifier_accepts_only_bare_prompts_notification() {
+        assert!(is_prompts_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}"
+        ));
+        assert!(is_prompts_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{}}"
+        ));
+    }
+
+    #[test]
+    fn prompts_classifier_rejects_negatives() {
+        // Cross-kind first: the tools signal is positive for the tools
+        // classifier and negative here, and vice versa.
+        assert!(is_tools_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
+        ));
+        for line in [
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"notifications/prompts/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"notifications/prompts/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            "not json at all",
+            "",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changedX\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list-changed\"}",
+        ] {
+            assert!(
+                !is_prompts_list_changed_notification(line),
+                "must stay classifier-only: {line:?}"
             );
         }
     }

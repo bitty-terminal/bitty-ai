@@ -63,6 +63,7 @@ pub use remote::{
 pub use supervise::{McpHost, SupervisedServer};
 pub use tools::{
     ImportedTool, MAX_TOOL_PAGES, ToolListDiff, ToolListSnapshot, diff_tool_snapshots,
+    is_prompts_list_changed_notification, is_resources_list_changed_notification,
     is_tools_list_changed_notification, list_tools, sanitize_mcp_name,
 };
 
