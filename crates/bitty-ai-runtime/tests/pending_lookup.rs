@@ -76,6 +76,7 @@ fn tool_turn(text: &str, input_tokens: u32, output_tokens: u32) -> ProviderTurn 
         usage: ProviderUsage {
             input_tokens,
             output_tokens,
+            ..Default::default()
         },
     }
 }
@@ -88,6 +89,7 @@ fn final_turn(text: &str, input_tokens: u32, output_tokens: u32) -> ProviderTurn
         usage: ProviderUsage {
             input_tokens,
             output_tokens,
+            ..Default::default()
         },
     }
 }

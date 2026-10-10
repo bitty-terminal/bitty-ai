@@ -474,12 +474,28 @@ impl TurnRequest {
 /// means unreported: the turn loop falls back to a deterministic byte-based
 /// estimate so an uncalibrated provider cannot bypass a cost ceiling by
 /// reporting nothing.
+///
+/// Cache slots (`cached_tokens` / `cache_write_tokens`) are provider-reported
+/// prompt-cache accounting in whole tokens; `0` means unreported (absent
+/// `prompt_tokens_details`), never a measured zero-hit. They are informational
+/// only: cost accounting (`round_usage`) still uses `input_tokens` /
+/// `output_tokens`, so cache behavior never changes the ceiling.
+///
+/// Cost (`usage.cost`, OpenRouter) is intentionally not carried: this struct
+/// derives `PartialEq`/`Eq` and an `f64` field would break `Eq` (plus ordering
+/// hazards); currency stays out of the runtime boundary (AI-0219).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderUsage {
     /// Estimated input tokens observed for this turn.
     pub input_tokens: u32,
     /// Estimated output tokens observed for this turn.
     pub output_tokens: u32,
+    /// Prompt tokens served from cache, in whole tokens (provider-reported,
+    /// `0` = unreported).
+    pub cached_tokens: u32,
+    /// Prompt tokens written to cache, in whole tokens (provider-reported,
+    /// `0` = unreported).
+    pub cache_write_tokens: u32,
 }
 
 /// One scripted provider turn: assistant text plus follow-up tool calls.
@@ -1116,5 +1132,32 @@ mod tests {
             provider.complete(&too_big),
             Err(ProviderError::TimeoutTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn usage_default_has_zero_cache_slots() {
+        // AI-0219: additive cache/accounting slots default to unreported (0)
+        // so every existing `::default()` site keeps compiling unchanged.
+        let usage = ProviderUsage::default();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn usage_cache_slots_round_trip() {
+        // AI-0219: cache slots are plain `u32` token counts that survive copy
+        // and equality (no `PartialEq`/`Eq` hazard, unlike a parked `f64`
+        // cost field).
+        let usage = ProviderUsage {
+            input_tokens: 36,
+            output_tokens: 26,
+            cached_tokens: 12,
+            cache_write_tokens: 4,
+        };
+        assert_eq!(usage.cached_tokens, 12);
+        assert_eq!(usage.cache_write_tokens, 4);
+        assert_eq!(usage, usage);
     }
 }
