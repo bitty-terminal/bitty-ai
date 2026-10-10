@@ -630,6 +630,20 @@ fn parse_response_body(
         .and_then(|t| t.as_u64())
         .unwrap_or(0) as u32;
 
+    // AI-0219: prompt-cache accounting slots (provider-reported, `0` =
+    // unreported when `prompt_tokens_details` is absent). `cost`
+    // (`usage.cost`) is intentionally not carried: `ProviderUsage` derives
+    // `PartialEq`/`Eq` and an `f64` field would break `Eq`.
+    let cached_tokens = value
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0) as u32;
+
+    let cache_write_tokens = value
+        .pointer("/usage/prompt_tokens_details/cache_write_tokens")
+        .and_then(|t| t.as_u64())
+        .unwrap_or(0) as u32;
+
     Ok(ProviderTurn {
         text,
         tool_calls,
@@ -637,6 +651,8 @@ fn parse_response_body(
         usage: ProviderUsage {
             input_tokens,
             output_tokens,
+            cached_tokens,
+            cache_write_tokens,
         },
     })
 }
@@ -1419,9 +1435,10 @@ mod tests {
     #[test]
     fn surfaces_reasoning_when_content_empty() {
         // Trimmed live shape (deepseek/deepseek-v4.1-flash via OpenRouter,
-        // 2026-10-10): empty content, reasoning trace, usage with cache +
-        // cost detail fields the adapter observes but does not carry (no
-        // `ProviderTurn` slot — runtime boundary, out of scope here).
+        // 2026-10-10): empty content, reasoning trace, usage with cache
+        // detail fields the adapter carries (AI-0219) plus `cost`, which
+        // stays uncarried (no `ProviderUsage` slot — `PartialEq`/`Eq`
+        // hazard, runtime boundary).
         let response_body = serde_json::json!({
             "choices": [{
                 "message": {
@@ -1464,6 +1481,94 @@ mod tests {
         assert_eq!(turn.text, "think: probe ok");
         assert_eq!(turn.usage.input_tokens, 36);
         assert_eq!(turn.usage.output_tokens, 26);
+        // AI-0219: zero-valued cache details still flow (unreported = 0).
+        assert_eq!(turn.usage.cached_tokens, 0);
+        assert_eq!(turn.usage.cache_write_tokens, 0);
+    }
+
+    /// Non-zero `prompt_tokens_details` flow into `ProviderTurn.usage`
+    /// (AI-0219, offline fixture — no network).
+    #[test]
+    fn fills_cache_slots_from_prompt_details() {
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Cached."
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 36,
+                "completion_tokens": 26,
+                "prompt_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 4}
+            }
+        });
+
+        let service = RecordingNetworkService::new();
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: serde_json::to_vec(&response_body).unwrap(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        let turn = adapter.complete(&req).expect("cached turn parses");
+        assert_eq!(turn.usage.input_tokens, 36);
+        assert_eq!(turn.usage.output_tokens, 26);
+        assert_eq!(turn.usage.cached_tokens, 12);
+        assert_eq!(turn.usage.cache_write_tokens, 4);
+    }
+
+    /// Missing `prompt_tokens_details` yields zero cache slots (AI-0219,
+    /// offline fixture — `0` = unreported, never a measured zero-hit).
+    #[test]
+    fn missing_cache_details_yield_zero() {
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Plain."
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        });
+
+        let service = RecordingNetworkService::new();
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: serde_json::to_vec(&response_body).unwrap(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        let turn = adapter.complete(&req).expect("plain turn parses");
+        assert_eq!(turn.usage.input_tokens, 10);
+        assert_eq!(turn.usage.output_tokens, 5);
+        assert_eq!(turn.usage.cached_tokens, 0);
+        assert_eq!(turn.usage.cache_write_tokens, 0);
     }
 
     /// DeepSeek-direct `reasoning_content` shape surfaces the same way.
@@ -1740,9 +1845,10 @@ mod tests {
         assert!(turn.usage.output_tokens > 0, "live usage reports output");
 
         // Raw-body assertions on the captured live bytes: HTTP-level success
-        // plus the OpenRouter usage detail fields (`cached_tokens` /
-        // `cache_write_tokens` / `cost`) the adapter observes but cannot
-        // carry (`ProviderUsage` is runtime-owned with no slot for them).
+        // plus the OpenRouter usage detail fields. `cached_tokens` /
+        // `cache_write_tokens` now flow into `ProviderUsage` (AI-0219);
+        // `cost` stays observed-only (no `ProviderUsage` slot —
+        // `PartialEq`/`Eq` hazard, runtime boundary).
         let (status, body) = adapter
             .service()
             .captured()

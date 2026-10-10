@@ -241,9 +241,13 @@ impl ChatCompletionStreamParser {
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok())
                 .unwrap_or(0);
+            // AI-0219: stream path carries no cache slots (network adapter
+            // fills them from `prompt_tokens_details`); defaults keep the
+            // stream boundary behavior unchanged.
             let usage = ProviderUsage {
                 input_tokens,
                 output_tokens,
+                ..Default::default()
             };
             self.usage = Some(usage);
             deltas.push(ChatStreamDelta::Usage(usage));
