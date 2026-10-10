@@ -18,7 +18,12 @@
 //! with [`ToolError::Denied`] (`tool list stale; re-list required`) and zero
 //! transport contact. An explicit host-driven [`McpToolAdapter::relist`]
 //! re-runs `tools/list`, diffs digests, swaps the snapshot on success,
-//! bumps the version, and clears stale. No auto-relist, no background
+//! bumps the version, and clears stale — unless a
+//! `notifications/tools/list_changed` arrived mid-round-trip, in which case
+//! the surfaced frame is routed through
+//! [`McpToolAdapter::observe_notification`] after the refresh and stale is
+//! preserved (AI-0212). Mid-call notifications are likewise routed on the
+//! adapter without changing the call's outcome. No auto-relist, no background
 //! threads, no [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec) registry
 //! mutation, no resources/prompts versioning.
 //!
@@ -224,16 +229,33 @@ impl McpToolAdapter {
         }
     }
 
-    /// Explicit host-driven re-list (AI-0211).
+    /// Explicit host-driven re-list (AI-0211, AI-0212).
     ///
     /// Re-runs `tools/list` with `allowlist` over the owned transport using
     /// the shared `next_id` counter discipline, diffs digests against the
     /// current snapshot, and on success swaps the snapshot, bumps the
     /// version saturating, clears stale, and returns the diff. On failure
     /// the old snapshot is kept and the adapter stays stale (version
-    /// unchanged). No [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec)
+    /// unchanged apart from routed signals below). No [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec)
     /// registry mutation: the host owns the registry and re-registers from
     /// [`McpToolAdapter::imported`] under its own refusal-only policy.
+    ///
+    /// Mid-round-trip signals (AI-0212): notifications observed while
+    /// waiting for the `tools/list` answers are routed through
+    /// [`McpToolAdapter::observe_notification`] after the refresh clears
+    /// stale. A `notifications/tools/list_changed` seen mid-round-trip
+    /// therefore keeps `list_stale` true — the completed refresh still bumps
+    /// the version, and routing marks stale with a second saturating bump —
+    /// while the diff for the completed refresh returns normally. Any other
+    /// surfaced frame (ping, resources/prompts signals, `id`-carrying
+    /// echoes) never stales. On a failed re-list the surfaced frames are
+    /// still routed through [`McpToolAdapter::observe_notification`] before
+    /// the error returns: the snapshot stays old (no swap) and the version
+    /// bumps only via `mark_stale` for observed signals, so a mid-flight
+    /// `list_changed` keeps a non-stale adapter fail-closed instead of
+    /// fail-open on the deny-stale gate (PX-0913: only frames observed
+    /// during this call are routable; nothing reconciles against server
+    /// state beyond them).
     ///
     /// # Errors
     ///
@@ -242,20 +264,36 @@ impl McpToolAdapter {
     pub fn relist(&mut self, allowlist: &[String]) -> Result<ToolListDiff, McpError> {
         self.next_id = self.next_id.max(2);
         let before = ToolListSnapshot::from_imported(&self.tools);
-        let fresh = list_tools(
+        let mut surfaced: Vec<String> = Vec::new();
+        let fresh = match list_tools(
             self.transport.as_mut(),
             &self.server_id,
             &self.params.cwd,
             allowlist,
             &mut self.next_id,
             self.params.timeout_ms,
-        )?;
+            &mut surfaced,
+        ) {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                // Route first, then fail: a `list_changed` seen before the
+                // failure must still stale the adapter (fail-closed), even
+                // when the adapter was not stale going in.
+                for line in &surfaced {
+                    self.observe_notification(line);
+                }
+                return Err(error);
+            }
+        };
         self.next_id = self.next_id.max(2);
         let after = ToolListSnapshot::from_imported(&fresh);
         let diff = diff_tool_snapshots(&before, &after);
         self.tools = fresh;
         self.list_version = self.list_version.saturating_add(1);
         self.list_stale = false;
+        for line in &surfaced {
+            self.observe_notification(line);
+        }
         Ok(diff)
     }
 
@@ -352,7 +390,8 @@ impl ToolExecutor for McpToolAdapter {
         }
         let id = self.next_id.max(2);
         self.next_id = id.wrapping_add(1).max(2);
-        match call_tool(
+        let mut surfaced: Vec<String> = Vec::new();
+        let outcome = call_tool(
             self.transport.as_mut(),
             id,
             &raw_name,
@@ -360,7 +399,15 @@ impl ToolExecutor for McpToolAdapter {
             arguments,
             &self.params.cwd,
             self.params.timeout_ms,
-        ) {
+            &mut surfaced,
+        );
+        // AI-0212: mid-call notifications reach the adapter instead of being
+        // dropped. Routing marks stale for the *next* call; this call's
+        // outcome is unchanged — no auto-relist, no retry.
+        for line in &surfaced {
+            self.observe_notification(line);
+        }
+        match outcome {
             Ok(success) => Ok(success),
             Err(McpCallError::Transport(_)) => Err(ToolError::EffectUnknown {
                 name: tool.to_owned(),
