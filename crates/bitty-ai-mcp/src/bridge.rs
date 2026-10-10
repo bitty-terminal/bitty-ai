@@ -25,7 +25,13 @@
 //! preserved (AI-0212). Mid-call notifications are likewise routed on the
 //! adapter without changing the call's outcome. No auto-relist, no background
 //! threads, no [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec) registry
-//! mutation, no resources/prompts versioning.
+//! mutation. `notifications/resources/list_changed` and
+//! `notifications/prompts/list_changed` have pure classifiers
+//! ([`crate::tools::is_resources_list_changed_notification`],
+//! [`crate::tools::is_prompts_list_changed_notification`]) for taxonomy
+//! symmetry only — [`McpToolAdapter::observe_notification`], `relist`, and
+//! `execute` stay tools-only with no version/stale/relist until a consumer
+//! exists.
 //!
 //! Seam mapping for server answers: an MCP `isError: true` answer (or a
 //! JSON-RPC `error` answer outside the pre-execution protocol set) maps to

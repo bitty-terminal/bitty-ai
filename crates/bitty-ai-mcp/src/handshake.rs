@@ -20,7 +20,10 @@
 //! `notifications/tools/list_changed` in particular reaches the host, which
 //! routes it through
 //! [`crate::tools::is_tools_list_changed_notification`] and marks that
-//! server's adapter stale (AI-0211).
+//! server's adapter stale (AI-0211). The resources/prompts sibling
+//! classifiers ([`crate::tools::is_resources_list_changed_notification`],
+//! [`crate::tools::is_prompts_list_changed_notification`]) exist for
+//! taxonomy symmetry only (AI-0214): routing stays tools-only.
 
 use std::time::Instant;
 
