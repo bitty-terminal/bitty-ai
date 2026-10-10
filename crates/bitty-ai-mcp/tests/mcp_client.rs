@@ -435,6 +435,112 @@ fn mcp_invoke_is_param_required_shaped() {
     assert!(adapter.execute("mcp_demo", b"{}", 1_000).is_err());
 }
 
+// ── AI-0211: versioned re-list + deny-stale over stdio/FakeTransport ─────────
+
+#[test]
+fn stale_deny_relist_allow_with_next_id_continuity() {
+    use bitty_ai_mcp::is_tools_list_changed_notification;
+
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+    let call_frame = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}";
+    let (transport, sent) =
+        FakeTransport::fresh(vec![list_frame.to_owned(), call_frame.to_owned()]);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    assert_eq!(adapter.list_version(), 0);
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.next_id(), 2);
+
+    let signal = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}";
+    assert!(is_tools_list_changed_notification(signal));
+    assert!(adapter.observe_notification(signal));
+    assert!(adapter.is_stale());
+    assert_eq!(adapter.list_version(), 1);
+
+    let denied = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect_err("stale must deny");
+    match &denied {
+        bitty_ai_runtime::tool::ToolError::Denied { reason, .. } => {
+            assert!(reason.contains("tool list stale; re-list required"));
+        }
+        other => panic!("expected Denied, got {other:?}"),
+    }
+    assert!(!matches!(
+        denied,
+        bitty_ai_runtime::tool::ToolError::EffectUnknown { .. }
+            | bitty_ai_runtime::tool::ToolError::ProtocolRejected { .. }
+    ));
+    assert!(sent.borrow().is_empty());
+
+    let diff = adapter.relist(&["echo".to_owned()]).expect("relist");
+    assert!(diff.is_empty());
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 2);
+    assert_eq!(adapter.next_id(), 3);
+    assert_eq!(sent.borrow().len(), 1);
+    assert!(sent.borrow()[0].contains("\"id\":2"));
+
+    let success = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect("post-relist allows");
+    assert_eq!(success.data, b"hi");
+    assert_eq!(sent.borrow().len(), 2);
+    assert!(sent.borrow()[1].contains("\"id\":3"));
+}
+
+#[test]
+fn stale_negatives_never_mark_over_stdio() {
+    let (transport, _sent) = FakeTransport::fresh(Vec::new());
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    for line in [
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}",
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"notifications/tools/list_changed\"}",
+        "not json",
+        "",
+    ] {
+        assert!(
+            !adapter.observe_notification(line),
+            "must not stale: {line:?}"
+        );
+    }
+    assert!(!adapter.is_stale());
+    assert_eq!(adapter.list_version(), 0);
+}
+
+#[test]
+fn failed_relist_keeps_snapshot_and_stays_stale_over_stdio() {
+    let error_frame =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"boom\"}}";
+    let (transport, sent) = FakeTransport::fresh(vec![error_frame.to_owned()]);
+    let mut adapter = test_adapter(
+        transport,
+        consented_ledger(&[("mcp_demo_echo", "mcp.demo")]),
+    );
+    let before = adapter.snapshot();
+    adapter.mark_stale();
+    let version = adapter.list_version();
+    adapter.relist(&["echo".to_owned()]).expect_err("must fail");
+    assert!(adapter.is_stale());
+    assert_eq!(adapter.list_version(), version);
+    assert_eq!(adapter.snapshot(), before);
+    let denied = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect_err("still stale");
+    assert!(matches!(
+        denied,
+        bitty_ai_runtime::tool::ToolError::Denied { .. }
+    ));
+    assert_eq!(sent.borrow().len(), 1);
+}
+
 // ── Unix live-spawn tests (bounded fixtures) ──────────────────────────────────
 
 #[cfg(unix)]

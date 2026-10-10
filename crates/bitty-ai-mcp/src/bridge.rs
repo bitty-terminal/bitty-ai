@@ -1,12 +1,26 @@
 //! [`McpToolAdapter`]: the runtime [`ToolExecutor`] seam over MCP tools.
 //!
 //! Gate order per call (fail-closed, zero transport contact on refusal):
-//! allowlisted import lookup, `inspect`-tier read-only gate, runtime
-//! [`ToolAuthorizer`], runtime [`ConsentLedger`] (exact
-//! `(protocol, tool, scope=spec.required_scope)` triple at `now_ms`), then
-//! bounded `tools/call` dispatch. Secrets never pass through the adapter:
-//! child environments are built once by [`crate::supervise::spawn_server`]
-//! from [`CredentialRef`] names, and every error below quotes names only.
+//! tool-list staleness (AI-0211 deny-stale), allowlisted import lookup,
+//! `inspect`-tier read-only gate, runtime [`ToolAuthorizer`], runtime
+//! [`ConsentLedger`] (exact `(protocol, tool, scope=spec.required_scope)`
+//! triple at `now_ms`), then bounded `tools/call` dispatch. Secrets never
+//! pass through the adapter: child environments are built once by
+//! [`crate::supervise::spawn_server`] from [`CredentialRef`] names, and
+//! every error below quotes names only.
+//!
+//! Dynamic invalidation (AI-0211, AIQ-08 facet): the host polls for server
+//! messages (HTTP `poll_server_messages` first; stdio drains inline), routes
+//! each queued line through
+//! [`crate::tools::is_tools_list_changed_notification`], and marks that
+//! server's adapter stale via [`McpToolAdapter::mark_stale`] (or
+//! [`McpToolAdapter::observe_notification`]). While stale, `execute` denies
+//! with [`ToolError::Denied`] (`tool list stale; re-list required`) and zero
+//! transport contact. An explicit host-driven [`McpToolAdapter::relist`]
+//! re-runs `tools/list`, diffs digests, swaps the snapshot on success,
+//! bumps the version, and clears stale. No auto-relist, no background
+//! threads, no [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec) registry
+//! mutation, no resources/prompts versioning.
 //!
 //! Seam mapping for server answers: an MCP `isError: true` answer (or a
 //! JSON-RPC `error` answer outside the pre-execution protocol set) maps to
@@ -35,7 +49,10 @@ use bitty_ai_runtime::tool::{
 
 use crate::call::{McpCallError, call_tool};
 use crate::error::{McpError, McpFailure, McpStage, bound_error_text};
-use crate::tools::ImportedTool;
+use crate::tools::{
+    ImportedTool, ToolListDiff, ToolListSnapshot, diff_tool_snapshots,
+    is_tools_list_changed_notification, list_tools,
+};
 use crate::{MAX_TIMEOUT_MS, McpTransport};
 
 /// Adapter construction parameters (keeps [`McpToolAdapter::new`] under the
@@ -66,6 +83,8 @@ pub struct McpToolAdapter {
     consent: Box<dyn ConsentLedger>,
     params: McpAdapterParams,
     next_id: u64,
+    list_version: u64,
+    list_stale: bool,
 }
 
 impl McpToolAdapter {
@@ -127,6 +146,8 @@ impl McpToolAdapter {
             consent,
             params,
             next_id: 2,
+            list_version: 0,
+            list_stale: false,
         })
     }
 
@@ -140,6 +161,102 @@ impl McpToolAdapter {
     #[must_use]
     pub fn server_id(&self) -> &str {
         &self.server_id
+    }
+
+    /// Monotonic tool-list version (AI-0211).
+    ///
+    /// Starts at `0`. Each host-detected `notifications/tools/list_changed`
+    /// bumps it saturating, and each successful explicit [`McpToolAdapter::relist`]
+    /// bumps it saturating. Failed re-lists leave it unchanged.
+    #[must_use]
+    pub fn list_version(&self) -> u64 {
+        self.list_version
+    }
+
+    /// Whether the tool list is stale (AI-0211 deny-stale).
+    ///
+    /// While true, [`ToolExecutor::execute`] denies with
+    /// [`ToolError::Denied`] and zero transport contact until an explicit
+    /// [`McpToolAdapter::relist`] succeeds.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.list_stale
+    }
+
+    /// Next JSON-RPC request id (counter discipline probe for tests).
+    #[must_use]
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Host-side digest snapshot of the current imports (AI-0211 diff
+    /// handle; see [`ToolListSnapshot`]).
+    #[must_use]
+    pub fn snapshot(&self) -> ToolListSnapshot {
+        ToolListSnapshot::from_imported(&self.tools)
+    }
+
+    /// Mark the tool list stale after a host-routed
+    /// `notifications/tools/list_changed` signal.
+    ///
+    /// Whole-list stale, monotonic saturating version bump, idempotent
+    /// effect (repeated signals keep bumping the version while staying
+    /// stale). Synchronous, no transport contact, no auto-relist.
+    pub fn mark_stale(&mut self) {
+        self.list_version = self.list_version.saturating_add(1);
+        self.list_stale = true;
+    }
+
+    /// Route one host-polled line through the shared
+    /// [`is_tools_list_changed_notification`] classifier, marking stale on
+    /// true.
+    ///
+    /// Returns whether the line marked the list stale. Host duty: poll
+    /// (`poll_server_messages` first on HTTP; stdio drains inline), drain
+    /// with `recv_line`, and call this per line. `405`/disabled polls queue
+    /// nothing, so they never reach here and never stale.
+    pub fn observe_notification(&mut self, line: &str) -> bool {
+        if is_tools_list_changed_notification(line) {
+            self.mark_stale();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Explicit host-driven re-list (AI-0211).
+    ///
+    /// Re-runs `tools/list` with `allowlist` over the owned transport using
+    /// the shared `next_id` counter discipline, diffs digests against the
+    /// current snapshot, and on success swaps the snapshot, bumps the
+    /// version saturating, clears stale, and returns the diff. On failure
+    /// the old snapshot is kept and the adapter stays stale (version
+    /// unchanged). No [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec)
+    /// registry mutation: the host owns the registry and re-registers from
+    /// [`McpToolAdapter::imported`] under its own refusal-only policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns pagination, bound, collision, unknown-tool, timeout, or
+    /// transport errors from [`list_tools`].
+    pub fn relist(&mut self, allowlist: &[String]) -> Result<ToolListDiff, McpError> {
+        self.next_id = self.next_id.max(2);
+        let before = ToolListSnapshot::from_imported(&self.tools);
+        let fresh = list_tools(
+            self.transport.as_mut(),
+            &self.server_id,
+            &self.params.cwd,
+            allowlist,
+            &mut self.next_id,
+            self.params.timeout_ms,
+        )?;
+        self.next_id = self.next_id.max(2);
+        let after = ToolListSnapshot::from_imported(&fresh);
+        let diff = diff_tool_snapshots(&before, &after);
+        self.tools = fresh;
+        self.list_version = self.list_version.saturating_add(1);
+        self.list_stale = false;
+        Ok(diff)
     }
 
     /// Credential discipline pin: secrets resolve into the closed child
@@ -187,6 +304,12 @@ impl ToolExecutor for McpToolAdapter {
         arguments: &[u8],
         now_ms: u64,
     ) -> Result<ToolSuccess, ToolError> {
+        // AI-0211 deny-stale first gate: whole-list stale denies with
+        // `Denied` (never `EffectUnknown`/`ProtocolRejected`) and zero
+        // transport contact. The host must `relist` explicitly.
+        if self.list_stale {
+            return Err(self.deny(tool, "tool list stale; re-list required"));
+        }
         let (raw_name, required_scope, read_only) = match self.lookup(tool) {
             Some(entry) => (
                 entry.raw_name.clone(),
@@ -619,5 +742,94 @@ mod tests {
     fn credential_discipline_names_only() {
         // Pin the credential-discipline invariant wording.
         assert!(McpToolAdapter::credential_discipline().contains("names only"));
+    }
+
+    #[test]
+    fn stale_gate_denies_with_zero_contact_and_version_bump() {
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        assert_eq!(adapter.list_version(), 0);
+        assert!(!adapter.is_stale());
+        adapter.mark_stale();
+        assert!(adapter.is_stale());
+        assert_eq!(adapter.list_version(), 1);
+        let error = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("stale must deny");
+        match &error {
+            ToolError::Denied { reason, .. } => {
+                assert!(reason.contains("tool list stale; re-list required"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert!(!matches!(error, ToolError::EffectUnknown { .. }));
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn observe_notification_routes_only_bare_list_changed() {
+        let (transport, _sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        assert!(adapter.observe_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
+        ));
+        assert!(adapter.is_stale());
+        let version = adapter.list_version();
+        for line in [
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"notifications/tools/list_changed\"}",
+            "not json",
+        ] {
+            assert!(!adapter.observe_notification(line));
+        }
+        assert_eq!(adapter.list_version(), version);
+    }
+
+    #[test]
+    fn relist_swaps_snapshot_bumps_version_and_keeps_next_id() {
+        let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+        let call_frame = FakeTransport::ok_answer(3, "hi");
+        let (transport, sent) = FakeTransport::fresh(vec![list_frame.to_owned(), call_frame]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        adapter.mark_stale();
+        assert_eq!(adapter.next_id(), 2);
+        let diff = adapter
+            .relist(&["echo".to_owned()])
+            .expect("relist succeeds");
+        assert!(diff.is_empty());
+        assert!(!adapter.is_stale());
+        assert_eq!(adapter.list_version(), 2);
+        assert_eq!(adapter.next_id(), 3);
+        let sent_before_call = sent.borrow().len();
+        assert_eq!(sent_before_call, 1);
+        assert!(sent.borrow()[0].contains("\"id\":2"));
+        let success = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect("post-relist allows");
+        assert_eq!(success.data, b"hi");
+        assert!(sent.borrow()[1].contains("\"id\":3"));
+    }
+
+    #[test]
+    fn failed_relist_keeps_snapshot_and_stays_stale() {
+        let error_frame =
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32603,\"message\":\"boom\"}}";
+        let (transport, sent) = FakeTransport::fresh(vec![error_frame.to_owned()]);
+        let mut adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        let before = adapter.snapshot();
+        adapter.mark_stale();
+        let version = adapter.list_version();
+        let error = adapter.relist(&["echo".to_owned()]).expect_err("must fail");
+        let _ = error;
+        assert!(adapter.is_stale());
+        assert_eq!(adapter.list_version(), version);
+        assert_eq!(adapter.snapshot(), before);
+        let denied = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("still stale");
+        assert!(matches!(denied, ToolError::Denied { .. }));
+        assert_eq!(sent.borrow().len(), 1);
     }
 }

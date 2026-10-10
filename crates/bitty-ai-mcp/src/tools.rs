@@ -398,6 +398,144 @@ pub fn list_tools(
     Ok(imported)
 }
 
+/// Whether `line` is a host-routed `notifications/tools/list_changed`
+/// signal (AI-0211, AIQ-08 dynamic-invalidation facet).
+///
+/// True only for a notification frame: `method` exactly
+/// `notifications/tools/list_changed` with no `id` member. Every other
+/// shape is false: `notifications/ping`,
+/// `notifications/resources/list_changed`,
+/// `notifications/prompts/list_changed`, any frame carrying an `id`
+/// (requests and responses, including an `id`-carrying `list_changed`
+/// echo), and malformed lines. The host polls for server messages
+/// (HTTP `poll_server_messages` first; stdio drains inline), routes each
+/// queued line through this classifier, and marks that server's adapter
+/// stale on true. Whole-list stale: one signal stales the full tool list,
+/// never a single tool. No auto-relist, no background work, no
+/// resources/prompts versioning.
+///
+/// The check is syntactic only (method plus id absence) and never touches
+/// the transport.
+#[must_use]
+pub fn is_tools_list_changed_notification(line: &str) -> bool {
+    if crate::json::find_raw_field(line, "id").is_some() {
+        return false;
+    }
+    matches!(
+        crate::json::find_string_field(line, "method").as_deref(),
+        Some("notifications/tools/list_changed")
+    )
+}
+
+/// Immutable host-side digest snapshot of one server's imported tool list
+/// (AI-0211 diff handle).
+///
+/// Holds `(sanitized name, schema digest)` pairs sorted by name, built from
+/// [`ImportedTool`] slices via [`ToolListSnapshot::from_imported`]. The
+/// digest is [`ToolSpec::schema_digest`](bitty_ai_runtime::tool::ToolSpec::schema_digest)
+/// at import time: same bytes give the same digest, any byte moves it. The
+/// host compares snapshots across an explicit re-list to detect drift; the
+/// registry keeps refusing same-name re-registration, so the digest never
+/// smuggles a replacement (refusal-only stands).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolListSnapshot {
+    entries: Vec<(String, u64)>,
+}
+
+impl ToolListSnapshot {
+    /// Build a snapshot from imported tools, sorted by sanitized name for
+    /// deterministic diffs.
+    #[must_use]
+    pub fn from_imported(tools: &[ImportedTool]) -> Self {
+        let mut entries: Vec<(String, u64)> = tools
+            .iter()
+            .map(|entry| (entry.spec.name.clone(), entry.digest))
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Self { entries }
+    }
+
+    /// Snapshot entries as `(sanitized name, digest)` pairs in name order.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, u64)] {
+        &self.entries
+    }
+
+    /// Digest for `name`, when present.
+    #[must_use]
+    pub fn digest_of(&self, name: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, digest)| *digest)
+    }
+
+    /// Entry count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the snapshot holds no entry.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Pure diff between two [`ToolListSnapshot`] values (AI-0211 re-list
+/// handle).
+///
+/// `added` holds names only in `new`, `removed` only in `old`, `changed`
+/// holds names in both with different digests. All three lists sort by
+/// name. Empty diff means the re-list observed the same digests under the
+/// same names.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolListDiff {
+    /// Names only in the new snapshot.
+    pub added: Vec<String>,
+    /// Names only in the old snapshot.
+    pub removed: Vec<String>,
+    /// Names in both with different digests.
+    pub changed: Vec<String>,
+}
+
+impl ToolListDiff {
+    /// Whether the diff reports no change.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+}
+
+/// Diff `old` against `new` (pure, no I/O).
+#[must_use]
+pub fn diff_tool_snapshots(old: &ToolListSnapshot, new: &ToolListSnapshot) -> ToolListDiff {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    for (name, old_digest) in old.entries() {
+        match new.digest_of(name) {
+            None => removed.push(name.clone()),
+            Some(new_digest) if new_digest != *old_digest => changed.push(name.clone()),
+            Some(_) => {}
+        }
+    }
+    for (name, _) in new.entries() {
+        if old.digest_of(name).is_none() {
+            added.push(name.clone());
+        }
+    }
+    added.sort();
+    removed.sort();
+    changed.sort();
+    ToolListDiff {
+        added,
+        removed,
+        changed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +708,68 @@ mod tests {
             imported.spec.description.len(),
             bitty_ai_runtime::tool::MAX_TOOL_DESCRIPTION_LEN
         );
+    }
+
+    #[test]
+    fn list_changed_classifier_accepts_only_bare_tools_notification() {
+        assert!(is_tools_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
+        ));
+        assert!(is_tools_list_changed_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}"
+        ));
+    }
+
+    #[test]
+    fn list_changed_classifier_rejects_negatives() {
+        for line in [
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"notifications/tools/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":\"abc-1\",\"method\":\"notifications/tools/list_changed\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            "not json at all",
+            "",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changedX\"}",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list-changed\"}",
+        ] {
+            assert!(
+                !is_tools_list_changed_notification(line),
+                "must not stale: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_diff_detects_added_removed_changed() {
+        fn imported(name: &str, raw: &str, schema: &[u8]) -> ImportedTool {
+            let spec =
+                ToolSpec::new(name, "test", schema.to_vec(), "mcp.demo", true).expect("valid");
+            ImportedTool {
+                digest: spec.schema_digest(),
+                server_id: "demo".to_owned(),
+                raw_name: raw.to_owned(),
+                spec,
+            }
+        }
+        let old = ToolListSnapshot::from_imported(&[
+            imported("mcp_demo_a", "a", br#"{"type":"object"}"#),
+            imported("mcp_demo_b", "b", br#"{"type":"object"}"#),
+            imported("mcp_demo_c", "c", br#"{"type":"object","v":1}"#),
+        ]);
+        let new = ToolListSnapshot::from_imported(&[
+            imported("mcp_demo_b", "b", br#"{"type":"object"}"#),
+            imported("mcp_demo_c", "c", br#"{"type":"object","v":2}"#),
+            imported("mcp_demo_d", "d", br#"{"type":"object"}"#),
+        ]);
+        assert_eq!(old.len(), 3);
+        let diff = diff_tool_snapshots(&old, &new);
+        assert_eq!(diff.added, vec!["mcp_demo_d".to_owned()]);
+        assert_eq!(diff.removed, vec!["mcp_demo_a".to_owned()]);
+        assert_eq!(diff.changed, vec!["mcp_demo_c".to_owned()]);
+        assert!(!diff.is_empty());
+        let same = diff_tool_snapshots(&old, &old);
+        assert!(same.is_empty());
     }
 }

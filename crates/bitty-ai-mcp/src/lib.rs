@@ -61,7 +61,10 @@ pub use remote::{
     MAX_REMOTE_HOST_LEN, MAX_REMOTE_URL_LEN, RemoteServerConfig,
 };
 pub use supervise::{McpHost, SupervisedServer};
-pub use tools::{ImportedTool, MAX_TOOL_PAGES, list_tools, sanitize_mcp_name};
+pub use tools::{
+    ImportedTool, MAX_TOOL_PAGES, ToolListDiff, ToolListSnapshot, diff_tool_snapshots,
+    is_tools_list_changed_notification, list_tools, sanitize_mcp_name,
+};
 
 /// Capability placement label for this client (`mcp.invoke` host side).
 pub const PLACEMENT: &str = "mcp";
