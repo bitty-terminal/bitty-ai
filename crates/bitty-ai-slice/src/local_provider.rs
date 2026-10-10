@@ -182,6 +182,14 @@ pub const DEFAULT_LOCAL_READ_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_LOCAL_PATH: &str = "/v1/chat/completions";
 /// Default provider id (`MP-2` shape).
 pub const DEFAULT_LOCAL_PROVIDER_ID: &str = "local-ollama";
+/// Maximum `keep_alive` string length: 32 bytes policy bound (AI-0217).
+pub const MAX_KEEP_ALIVE_LEN: usize = 32;
+/// `keep_alive` indefinite sentinel (AI-0217): Ollama keeps the model loaded
+/// indefinitely.
+pub const KEEP_ALIVE_INDEFINITE: &str = "-1";
+/// `keep_alive` immediate sentinel (AI-0217): Ollama unloads the model
+/// immediately after the request.
+pub const KEEP_ALIVE_IMMEDIATE: &str = "0";
 
 /// Adapter-owned monotonic clock seam for one request's deadline.
 ///
@@ -257,12 +265,106 @@ fn effective_allowance_ms(endpoint_ms: u64, remaining_ms: u64) -> u64 {
     endpoint_ms.min(remaining_ms).max(1)
 }
 
+/// Validated Ollama `keep_alive` value (AI-0217, slice experiment only).
+///
+/// Accepted shape is the allowlist `^[0-9]+(ms|s|m|h)$` (for example `"500ms"`,
+/// `"30s"`, `"10m"`, `"1h"`) plus two pinned sentinels:
+/// [`KEEP_ALIVE_INDEFINITE`] (`"-1"`, keep the model loaded indefinitely) and
+/// [`KEEP_ALIVE_IMMEDIATE`] (`"0"`, unload the model immediately after the
+/// request). The sentinels mirror Ollama's `keep_alive` duration-string
+/// contract, where a plain duration keeps the model loaded for that long.
+///
+/// Construction rejects empty values, values longer than
+/// [`MAX_KEEP_ALIVE_LEN`] (32 bytes), values carrying CR/LF (header/body
+/// injection refusal), and non-ASCII values, all with
+/// [`ProviderError::Transport`] and a static reason (no caller value echoed).
+/// The accepted charset (`0-9`, `m`, `s`, `h`, `-`) is JSON-string-safe, so
+/// the body emitter writes the value directly without further escaping.
+///
+/// Not a secret: `Debug` shows the value (unlike the redacted `api_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeepAlive {
+    value: String,
+}
+
+impl KeepAlive {
+    /// Build a validated `keep_alive` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Transport`] with a static reason for an empty,
+    /// over-long (`> MAX_KEEP_ALIVE_LEN`), CR/LF-bearing, non-ASCII, or
+    /// non-allowlist value. The `provider` label is
+    /// [`DEFAULT_LOCAL_PROVIDER_ID`]; endpoint builders re-label failures with
+    /// the endpoint's own provider id.
+    pub fn new(value: impl Into<String>) -> Result<Self, ProviderError> {
+        let value = value.into();
+        validate_keep_alive_shape(&value).map_err(|reason| ProviderError::Transport {
+            provider: DEFAULT_LOCAL_PROVIDER_ID.to_owned(),
+            reason: reason.to_owned(),
+        })?;
+        Ok(Self { value })
+    }
+
+    /// Borrow the validated `keep_alive` string.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Validate a `keep_alive` candidate (AI-0217).
+///
+/// Returns `Ok(())` for the allowlist `^[0-9]+(ms|s|m|h)$` and the two pinned
+/// sentinels [`KEEP_ALIVE_INDEFINITE`] / [`KEEP_ALIVE_IMMEDIATE`]; otherwise a
+/// static reason (never the caller value, so CR/LF material cannot reach a
+/// log or error string).
+fn validate_keep_alive_shape(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return Err("keep_alive must not be empty");
+    }
+    if value.len() > MAX_KEEP_ALIVE_LEN {
+        return Err("keep_alive length out of bounds");
+    }
+    if value.bytes().any(|b| b == b'\r' || b == b'\n') {
+        return Err("keep_alive carries CR/LF");
+    }
+    if !value.is_ascii() {
+        return Err("keep_alive must be ASCII");
+    }
+    if value == KEEP_ALIVE_INDEFINITE || value == KEEP_ALIVE_IMMEDIATE {
+        return Ok(());
+    }
+    // Allowlist `^[0-9]+(ms|s|m|h)$`: check the two-byte `ms` suffix first so
+    // `"500ms"` is not misread as a one-byte `s` suffix with a `"500m"` stem.
+    let stem = if let Some(stripped) = value.strip_suffix("ms") {
+        stripped
+    } else if let Some(stripped) = value
+        .strip_suffix('s')
+        .or_else(|| value.strip_suffix('m'))
+        .or_else(|| value.strip_suffix('h'))
+    {
+        stripped
+    } else {
+        return Err("invalid keep_alive shape");
+    };
+    if stem.is_empty() || !stem.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid keep_alive shape");
+    }
+    Ok(())
+}
+
 /// Localhost-only endpoint configuration.
 ///
 /// The optional `api_key` is caller-supplied only (for key-bearing
 /// OpenAI-compatible endpoints; local Ollama needs none). It is sent as
 /// `Authorization: Bearer` when present, and is never logged, never included
 /// in `Debug`/`Display`, and never carried in any error reason.
+///
+/// The optional `keep_alive` (AI-0217) is an Ollama model-retention hint sent
+/// as `"keep_alive":"<v>"` in the chat body when present. It is not a secret:
+/// `Debug` shows the value. `None` (the default) omits the field entirely, so
+/// the wire bytes are byte-identical to before AI-0217.
 #[derive(Clone)]
 pub struct LocalEndpoint {
     host: String,
@@ -273,20 +375,21 @@ pub struct LocalEndpoint {
     connect_timeout_ms: u64,
     read_timeout_ms: u64,
     api_key: Option<String>,
+    keep_alive: Option<KeepAlive>,
 }
 
 impl LocalEndpoint {
     /// Build a localhost-only endpoint with defaults
     /// (`path=/v1/chat/completions`, provider id `local-ollama`,
-    /// connect 2s / read 5s, no key).
+    /// connect 2s / read 5s, no key, no `keep_alive`).
     ///
     /// # Errors
     ///
     /// Returns [`ProviderError::InvalidProviderId`] for a malformed default
     /// provider id (unreachable) and [`ProviderError::Transport`] for a
     /// non-loopback host, bad port, bad model name, or (via builders) bad
-    /// path/timeouts/key. [`ProviderError::TimeoutTooLarge`] when a timeout
-    /// exceeds `MAX_REQUEST_TIMEOUT_MS`.
+    /// path/timeouts/key/`keep_alive`. [`ProviderError::TimeoutTooLarge`]
+    /// when a timeout exceeds `MAX_REQUEST_TIMEOUT_MS`.
     pub fn new(
         host: impl Into<String>,
         port: u16,
@@ -301,6 +404,7 @@ impl LocalEndpoint {
             connect_timeout_ms: DEFAULT_LOCAL_CONNECT_TIMEOUT_MS,
             read_timeout_ms: DEFAULT_LOCAL_READ_TIMEOUT_MS,
             api_key: None,
+            keep_alive: None,
         };
         endpoint.validate()?;
         Ok(endpoint)
@@ -369,6 +473,30 @@ impl LocalEndpoint {
         Ok(self)
     }
 
+    /// Attach an Ollama `keep_alive` model-retention hint (AI-0217).
+    ///
+    /// Accepted shape mirrors [`KeepAlive`]: the allowlist
+    /// `^[0-9]+(ms|s|m|h)$` plus [`KEEP_ALIVE_INDEFINITE`] (`"-1"`) and
+    /// [`KEEP_ALIVE_IMMEDIATE`] (`"0"`). The value is sent as
+    /// `"keep_alive":"<v>"` in the chat body; `None` (the default) omits the
+    /// field entirely. Not a secret: the value appears in `Debug`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Transport`] with a static reason (mirroring
+    /// [`Self::with_api_key`]) when the value is empty,
+    /// over-long (`> MAX_KEEP_ALIVE_LEN`), CR/LF-bearing, non-ASCII, or a
+    /// non-allowlist shape.
+    pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Result<Self, ProviderError> {
+        let raw = keep_alive.into();
+        validate_keep_alive_shape(&raw).map_err(|reason| ProviderError::Transport {
+            provider: self.provider_id.clone(),
+            reason: reason.to_owned(),
+        })?;
+        self.keep_alive = Some(KeepAlive { value: raw });
+        Ok(self)
+    }
+
     /// Endpoint host (bare, localhost-only).
     #[must_use]
     pub fn host(&self) -> &str {
@@ -403,6 +531,12 @@ impl LocalEndpoint {
     #[must_use]
     pub fn has_api_key(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    /// Borrow the configured `keep_alive` hint, if any (AI-0217).
+    #[must_use]
+    pub fn keep_alive(&self) -> Option<&KeepAlive> {
+        self.keep_alive.as_ref()
     }
 
     fn validate(&self) -> Result<(), ProviderError> {
@@ -526,6 +660,8 @@ impl fmt::Debug for LocalEndpoint {
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("read_timeout_ms", &self.read_timeout_ms)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            // `keep_alive` is not a secret: the validated value shows (AI-0217).
+            .field("keep_alive", &self.keep_alive)
             .finish()
     }
 }
@@ -700,6 +836,7 @@ impl ModelProvider for LocalProvider {
             &self.endpoint.model,
             &request.messages,
             request.sampling.as_ref(),
+            self.endpoint.keep_alive(),
         );
         if body.len() > MAX_LOCAL_REQUEST_BYTES {
             return Err(ProviderError::Transport {
@@ -842,16 +979,25 @@ fn append_sampling_fields(out: &mut String, params: &SamplingParams) {
     }
 }
 
-/// Build the minimal OpenAI-compatible chat body plus mapped sampling.
+/// Build the minimal OpenAI-compatible chat body plus mapped sampling and
+/// the optional Ollama `keep_alive` hint (AI-0217).
 ///
 /// `Role::Tool` observations are folded into `user` messages with a `[tool] `
 /// prefix so no OpenAI tool protocol is required; the untrusted surface stays
 /// labeled in the text itself. Declared sampling fields emit only when
 /// present; undeclared fields never become defaults.
+///
+/// Byte order is pinned: `{"model","messages","stream":false}` then the mapped
+/// sampling fields in [`append_sampling_fields`] order, then
+/// `,"keep_alive":"<v>"` only when `keep_alive` is `Some`. `None` (the
+/// default) omits the field entirely, so the wire bytes are byte-identical to
+/// before AI-0217. The value charset is JSON-string-safe by construction
+/// (see [`KeepAlive`]), so it is written directly without further escaping.
 fn build_chat_body(
     model: &str,
     messages: &[bitty_ai_runtime::provider::Message],
     sampling: Option<&SamplingParams>,
+    keep_alive: Option<&KeepAlive>,
 ) -> Vec<u8> {
     let mut out = String::from("{\"model\":\"");
     out.push_str(&json_escape(model));
@@ -872,6 +1018,11 @@ fn build_chat_body(
     out.push_str("],\"stream\":false");
     if let Some(params) = sampling {
         append_sampling_fields(&mut out, params);
+    }
+    if let Some(keep) = keep_alive {
+        out.push_str(",\"keep_alive\":\"");
+        out.push_str(keep.value());
+        out.push('"');
     }
     out.push('}');
     out.into_bytes()
@@ -2770,7 +2921,15 @@ mod tests {
     }
 
     fn body_with(sampling: Option<&SamplingParams>) -> String {
-        let body = build_chat_body("llama3.1:8b", &[Message::user("hi")], sampling);
+        let body = build_chat_body("llama3.1:8b", &[Message::user("hi")], sampling, None);
+        String::from_utf8(body).expect("utf-8 body")
+    }
+
+    fn body_with_keep_alive(
+        sampling: Option<&SamplingParams>,
+        keep_alive: Option<&KeepAlive>,
+    ) -> String {
+        let body = build_chat_body("llama3.1:8b", &[Message::user("hi")], sampling, keep_alive);
         String::from_utf8(body).expect("utf-8 body")
     }
 
@@ -3435,5 +3594,238 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── AI-0217: optional `keep_alive` (Ollama retention hint) ──────────────
+    //
+    // `network_adapter.rs` is intentionally untouched: it speaks the
+    // `bitty-network-api` transport-adapter contract (a second protocol path
+    // with its own capability/request mapping), not the raw localhost HTTP
+    // body built here. Scoping `keep_alive` to `local_provider.rs` keeps the
+    // change to one wire emitter and one offline stub harness.
+
+    #[test]
+    fn default_omits_keep_alive_ai_0217() {
+        // Default (`None`) omits the field entirely: unit body and wire bytes
+        // are byte-identical to before AI-0217.
+        let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint");
+        assert!(endpoint.keep_alive().is_none());
+        let text = body_with(None);
+        assert_eq!(
+            text,
+            r#"{"model":"llama3.1:8b","messages":[{"role":"user","content":"hi"}],"stream":false}"#
+        );
+        assert!(!text.contains("keep_alive"));
+
+        let json = r#"{"choices":[{"message":{"content":"omitted"}}]}"#;
+        let (port, handle, req_rx) = stub_capture_once(http_ok(json));
+        let mut provider = LocalProvider::new(endpoint_for(port));
+        assert!(provider.endpoint().keep_alive().is_none());
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "omitted");
+        assert_eq!(provider.complete_calls(), 1);
+        let raw = req_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request bytes");
+        let wire = String::from_utf8_lossy(&raw);
+        assert!(
+            !wire.contains("keep_alive"),
+            "default wire bytes must omit keep_alive, got: {wire}"
+        );
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn keep_alive_serialized_byte_exact_ai_0217() {
+        // `"10m"` serializes byte-exact as the final body field, after
+        // `"stream":false` (and after any sampling fields when present).
+        let keep = KeepAlive::new("10m").expect("keep_alive");
+        assert_eq!(keep.value(), "10m");
+        let text = body_with_keep_alive(None, Some(&keep));
+        assert_eq!(
+            text,
+            r#"{"model":"llama3.1:8b","messages":[{"role":"user","content":"hi"}],"stream":false,"keep_alive":"10m"}"#
+        );
+
+        // Sampling fields keep their order; `keep_alive` stays last.
+        let mut params = blank_sampling();
+        params.temperature = Some(0.7);
+        let mixed = body_with_keep_alive(Some(&params), Some(&keep));
+        assert_eq!(
+            mixed,
+            r#"{"model":"llama3.1:8b","messages":[{"role":"user","content":"hi"}],"stream":false,"temperature":0.7,"keep_alive":"10m"}"#
+        );
+
+        // Debug is not a secret channel: the value shows.
+        let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_keep_alive("10m")
+            .expect("keep_alive");
+        assert_eq!(endpoint.keep_alive().expect("hint").value(), "10m");
+        assert!(format!("{endpoint:?}").contains("10m"));
+        assert!(format!("{keep:?}").contains("10m"));
+
+        // Wire carries the exact field.
+        let json = r#"{"choices":[{"message":{"content":"kept"}}]}"#;
+        let (port, handle, req_rx) = stub_capture_once(http_ok(json));
+        let endpoint = LocalEndpoint::new("127.0.0.1", port, "llama3.1:8b")
+            .expect("endpoint")
+            .with_keep_alive("10m")
+            .expect("keep_alive");
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("llama3.1:8b", "hi"))
+            .expect("turn");
+        assert_eq!(turn.text, "kept");
+        assert_eq!(provider.complete_calls(), 1);
+        let raw = req_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request bytes");
+        let wire = String::from_utf8_lossy(&raw);
+        assert!(
+            wire.contains(r#""keep_alive":"10m""#),
+            "wire bytes must carry exact keep_alive field, got: {wire}"
+        );
+        assert!(
+            wire.find(r#""stream":false"#).expect("stream")
+                < wire.find(r#""keep_alive":"10m""#).expect("keep_alive"),
+            "keep_alive must emit after stream, got: {wire}"
+        );
+        handle.join().expect("stub");
+    }
+
+    #[test]
+    fn malformed_keep_alive_refused_without_io_ai_0217() {
+        // Empty, CRLF-bearing, over-long (>32 B), non-ASCII, and
+        // non-allowlist values fail closed at construction with `Transport`.
+        // No stub is bound, so zero sockets can open.
+        let over_long = "s".repeat(MAX_KEEP_ALIVE_LEN + 1);
+        assert!(over_long.len() > MAX_KEEP_ALIVE_LEN);
+        let bad: Vec<String> = vec![
+            String::new(),
+            "10m\r\nx".to_owned(),
+            "10\nm".to_owned(),
+            "10\rm".to_owned(),
+            over_long,
+            "10m\u{e9}".to_owned(),
+            "abc".to_owned(),
+            "10x".to_owned(),
+            "ms".to_owned(),
+        ];
+        for value in &bad {
+            let err = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_keep_alive(value.clone())
+                .expect_err("malformed keep_alive must fail");
+            assert!(
+                matches!(err, ProviderError::Transport { .. }),
+                "keep_alive {value:?} must be Transport, got: {err}"
+            );
+            // Refusal reasons are static: caller material never echoes.
+            if !value.is_empty() {
+                assert!(
+                    !err.to_string().contains(value),
+                    "refusal must not echo caller value for {value:?}, got: {err}"
+                );
+            }
+            let err = KeepAlive::new(value.clone()).expect_err("KeepAlive must fail");
+            assert!(
+                matches!(err, ProviderError::Transport { .. }),
+                "KeepAlive {value:?} must be Transport, got: {err}"
+            );
+        }
+        // The 32-byte boundary itself still holds (`30 digits + "ms"`).
+        let boundary = format!("{}ms", "1".repeat(30));
+        assert_eq!(boundary.len(), MAX_KEEP_ALIVE_LEN);
+        assert!(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_keep_alive(boundary)
+                .is_ok(),
+            "32-byte keep_alive must be accepted"
+        );
+        let probe = LocalProvider::new(
+            LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint"),
+        );
+        assert_eq!(probe.complete_calls(), 0);
+    }
+
+    #[test]
+    fn pre_io_checks_mirror_with_keep_alive_ai_0217() {
+        // With `keep_alive` set, every pre-I/O refusal still fires before any
+        // socket opens (no stub bound): model, budget, timeout ceiling, and
+        // unsupported sampling. Zero turns complete.
+        let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+            .expect("endpoint")
+            .with_keep_alive("10m")
+            .expect("keep_alive");
+        let mut provider = LocalProvider::new(endpoint);
+        let unknown = TurnRequest {
+            model: "no-such-model".to_owned(),
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        assert!(matches!(
+            provider.complete(&unknown),
+            Err(ProviderError::UnknownModel { .. })
+        ));
+        let over = TurnRequest {
+            budget_bytes: 1,
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        assert!(matches!(
+            provider.complete(&over),
+            Err(ProviderError::BudgetExceeded { .. })
+        ));
+        let too_big = TurnRequest {
+            timeout_ms: 60_000,
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        assert!(matches!(
+            provider.complete(&too_big),
+            Err(ProviderError::TimeoutTooLarge { .. })
+        ));
+        let mut params = blank_sampling();
+        params.top_k = Some(40);
+        let unsupported = TurnRequest {
+            sampling: Some(params),
+            ..turn_request("llama3.1:8b", "hi")
+        };
+        assert!(matches!(
+            provider.complete(&unsupported),
+            Err(ProviderError::UnsupportedSampling { field: "top_k" })
+        ));
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn keep_alive_sentinels_ai_0217() {
+        // Both sentinels are pinned: `"-1"` (indefinite) and `"0"`
+        // (immediate). They serialize byte-exact like durations and show in
+        // `Debug` (not a secret).
+        assert_eq!(KEEP_ALIVE_INDEFINITE, "-1");
+        assert_eq!(KEEP_ALIVE_IMMEDIATE, "0");
+        for sentinel in [KEEP_ALIVE_INDEFINITE, KEEP_ALIVE_IMMEDIATE] {
+            let keep = KeepAlive::new(sentinel).expect("sentinel");
+            assert_eq!(keep.value(), sentinel);
+            let text = body_with_keep_alive(None, Some(&keep));
+            assert_eq!(
+                text,
+                format!(
+                    "{{\"model\":\"llama3.1:8b\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":false,\"keep_alive\":\"{sentinel}\"}}"
+                )
+            );
+            let endpoint = LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                .expect("endpoint")
+                .with_keep_alive(sentinel)
+                .expect("sentinel");
+            assert_eq!(endpoint.keep_alive().expect("hint").value(), sentinel);
+            assert!(format!("{endpoint:?}").contains(sentinel));
+        }
+        // `"0s"` stays a duration under the allowlist, distinct from the
+        // immediate `"0"` sentinel.
+        let duration = KeepAlive::new("0s").expect("duration");
+        assert_eq!(duration.value(), "0s");
     }
 }
