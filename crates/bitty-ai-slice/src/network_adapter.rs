@@ -580,20 +580,25 @@ fn parse_response_body(
     // `ProviderTurn` (runtime boundary) carries no dedicated reasoning
     // slot, so a non-empty reasoning trace becomes the turn text; an
     // empty-string `content` with no reasoning still yields `""` (the
-    // tool-call-adjacent contract below is unchanged).
+    // tool-call-adjacent contract below is unchanged: reasoning never
+    // leaks into tool-call turns, which keep `""` text).
     let reasoning = value
         .pointer("/choices/0/message/reasoning")
         .and_then(|r| r.as_str())
+        .filter(|r| !r.is_empty())
         .or_else(|| {
             value
                 .pointer("/choices/0/message/reasoning_content")
                 .and_then(|r| r.as_str())
+                .filter(|r| !r.is_empty())
         });
 
     let text = match content {
         Some(c) if !c.is_empty() => c.to_owned(),
         _ => {
-            if let Some(r) = reasoning.filter(|r| !r.is_empty()) {
+            // Reasoning fallback is text-only: tool-call responses keep `""`
+            // text even when a reasoning trace is present.
+            if let Some(r) = reasoning.filter(|_| tool_calls.is_empty()) {
                 r.to_owned()
             } else if let Some(c) = content {
                 c.to_owned()
@@ -1497,6 +1502,108 @@ mod tests {
         assert_eq!(turn.text, "trace variant");
     }
 
+    /// Empty `reasoning` falls through to non-empty `reasoning_content`
+    /// (CodeRabbit PR #365 Fix 1): `""` must not shadow the variant field.
+    #[test]
+    fn empty_reasoning_falls_back_to_reasoning_content() {
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "",
+                    "reasoning_content": "trace"
+                }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+        });
+
+        let service = RecordingNetworkService::new();
+        service.queue_response(Response {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: serde_json::to_vec(&response_body).unwrap(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        let turn = adapter.complete(&req).expect("reasoning fallback parses");
+        assert_eq!(turn.text, "trace");
+    }
+
+    /// Reasoning fallback is text-only (CodeRabbit PR #365 Fix 2): a
+    /// tool-call response keeps `""` text even when a reasoning trace is
+    /// present, while a reasoning-only response still surfaces the trace.
+    #[test]
+    fn reasoning_fallback_skipped_for_tool_calls() {
+        fn drive(response_body: serde_json::Value) -> ProviderTurn {
+            let service = RecordingNetworkService::new();
+            service.queue_response(Response {
+                status: 200,
+                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                body: serde_json::to_vec(&response_body).unwrap(),
+            });
+            let config = NetworkConsumerAdapterConfig::new(
+                "test-provider",
+                "test-model",
+                "https://api.example.com/v1/chat/completions",
+            )
+            .unwrap()
+            .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+            let mut adapter = NetworkConsumerAdapter::new(config, service);
+            let req = sample_turn_request("test-model", 4096, 5000);
+            adapter.complete(&req).expect("turn parses")
+        }
+
+        // Tool-call + reasoning + empty content: empty text preserved.
+        let tool_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "think: must not leak",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"location\":\"Paris\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 20}
+        });
+        let tool_turn = drive(tool_body);
+        assert_eq!(tool_turn.text, "");
+        assert_eq!(tool_turn.tool_calls.len(), 1);
+        assert_eq!(tool_turn.tool_calls[0].name, "lookup_weather");
+
+        // Reasoning-only (no tool calls): trace still surfaces as text.
+        let text_body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "think: visible"
+                }
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7}
+        });
+        let text_turn = drive(text_body);
+        assert_eq!(text_turn.text, "think: visible");
+        assert!(text_turn.tool_calls.is_empty());
+    }
+
     /// Pass-through [`NetworkService`] that clones each successful response
     /// for post-hoc raw-body assertions while the inner service performs
     /// the real I/O. Test-only; the adapter under probe never sees it.
@@ -1539,6 +1646,34 @@ mod tests {
 
         fn websocket(&self, request: &WebSocketRequest) -> Result<Self::Socket, NetworkError> {
             self.inner.websocket(request)
+        }
+    }
+
+    /// Extract the numeric OpenRouter `usage.cost` for the live-probe
+    /// report (CodeRabbit PR #365 Fix 3, test-only). Returns `None` when
+    /// the field is absent or non-numeric so the probe fails loudly
+    /// instead of printing a default `$0.00000000` success line.
+    fn live_usage_cost(raw: &serde_json::Value) -> Option<f64> {
+        raw.pointer("/usage/cost").and_then(|c| c.as_f64())
+    }
+
+    /// Missing/invalid `usage.cost` never reports `$0.00` (offline fixture
+    /// for Fix 3 — the live probe itself is never re-run here).
+    #[test]
+    fn live_usage_cost_requires_numeric_cost() {
+        let with_cost = serde_json::json!({"usage": {"cost": 0.0000412236}});
+        let got = live_usage_cost(&with_cost).expect("numeric cost extracts");
+        assert!(
+            (got - 0.0000412236).abs() < 1e-12,
+            "numeric cost round-trips, got {got}"
+        );
+        for missing in [
+            serde_json::json!({"usage": {}}),
+            serde_json::json!({"usage": {"cost": null}}),
+            serde_json::json!({"usage": {"cost": "0.00004"}}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(live_usage_cost(&missing), None);
         }
     }
 
@@ -1630,7 +1765,9 @@ mod tests {
             details["cache_write_tokens"].as_u64().is_some(),
             "live usage exposes cache_write_tokens"
         );
-        let cost = raw["usage"]["cost"].as_f64().unwrap_or(0.0);
+        // Numeric cost is required: absent/invalid cost fails the probe
+        // instead of reporting a default $0.00000000 success line.
+        let cost = live_usage_cost(&raw).expect("live usage exposes numeric cost");
 
         eprintln!(
             "live_openrouter_probe: ok latency_ms={latency_ms} text_len={} \
