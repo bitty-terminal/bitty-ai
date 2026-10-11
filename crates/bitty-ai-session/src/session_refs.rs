@@ -713,6 +713,78 @@ pub fn get_branch(store: &ContentStore, name: &str) -> Result<Option<ContentHash
     store.get_ref(branch.as_str()).map_err(map_store_err)
 }
 
+/// Uniform absence taxonomy for one branch name (AI-0233, R3-V4/V5).
+///
+/// Distinguishes a live branch from an explicitly deleted one (reflog
+/// deletion tombstone: all-zero `new_hash`, mirroring git) from a name the
+/// store never recorded. Every variant is fail-closed absence metadata only:
+/// `Deleted` carries the deleted tip hash plus the tombstone's bounded
+/// `reason`/`actor`/`at_ms` strings — never checkpoint, tree, or blob
+/// payload bytes — so tombstones prove removal without retaining content.
+///
+/// Read-only and bounded: one live-ref read plus one single-row reflog read
+/// (capped, newest-first). No clock is read; all timestamps ride along from
+/// stored rows. Reflog pruning bounds durability: once an out-of-grace
+/// tombstone row is pruned via [`prune_reflog`], the name reports
+/// `NeverExisted` instead of `Deleted` — still fail-closed (both refuse
+/// resolution), only less specific, mirroring the artifact tombstone-cap
+/// fallback.
+///
+/// Time/Space: O(1) indexed reads; space is O(1) besides the bounded
+/// reason/actor strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchAbsence {
+    /// The branch is live at the carried tip.
+    Live(ContentHash),
+    /// The branch was explicitly deleted (or renamed away): the newest
+    /// reflog row is a deletion tombstone. Carries absence metadata only.
+    Deleted {
+        /// Tip the branch pointed at before deletion.
+        tip: ContentHash,
+        /// Tombstone reason string (bounded, caller-supplied at delete).
+        reason: String,
+        /// Tombstone actor string (bounded, caller-supplied at delete).
+        actor: String,
+        /// Tombstone timestamp (caller-supplied at delete, ms since epoch).
+        at_ms: u64,
+    },
+    /// No live ref and no tombstone row: the store never recorded this name
+    /// (or its tombstone was pruned; still fail-closed).
+    NeverExisted,
+}
+
+/// Classify one branch name as live, deleted, or never-recorded.
+///
+/// Fail-closed: a live branch reports `Live` regardless of history; a gone
+/// branch with a newest-row tombstone reports `Deleted` with absence
+/// metadata only; any other gone branch reports `NeverExisted`. Stored-data
+/// failures (bad hex, bad shape) report [`RefError::Corrupt`] like
+/// [`read_reflog`]; caller-input failures use the namespace variants like
+/// [`get_branch`].
+pub fn branch_absence(store: &ContentStore, name: &str) -> Result<BranchAbsence, RefError> {
+    let branch = BranchName::parse(name)?;
+    if let Some(tip) = store.get_ref(branch.as_str()).map_err(map_store_err)? {
+        return Ok(BranchAbsence::Live(tip));
+    }
+    let newest = read_reflog(store, branch.as_str(), 1)?;
+    match newest.first() {
+        Some(entry) if entry.new_hash == tombstone_hash() => {
+            // Delete/rename tombstones always carry the removed tip as
+            // `old_hash` through the typed verbs; a hand-planted tombstone
+            // with no tip still reports Deleted (fail-closed) with the
+            // zero hash standing in for the unknown tip.
+            let tip = entry.old_hash.unwrap_or_else(tombstone_hash);
+            Ok(BranchAbsence::Deleted {
+                tip,
+                reason: entry.reason.clone(),
+                actor: entry.actor.clone(),
+                at_ms: entry.at_ms,
+            })
+        }
+        _ => Ok(BranchAbsence::NeverExisted),
+    }
+}
+
 /// Read reflog history for any well-formed ref name, newest-first.
 ///
 /// The name is validated for shape only (HEAD and deleted-branch names
