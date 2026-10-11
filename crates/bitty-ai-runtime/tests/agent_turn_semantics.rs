@@ -39,8 +39,8 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ExecOutcome, FakeProvider,
     FakeReconciler, FakeToolExecutor, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
     ProviderUsage, ReconcileOutcome, SessionError, SessionState, StreamSink, ToolAuthorizer,
-    ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, TurnRequest, VecSink,
-    validate_chunk,
+    ToolBus, ToolCallRequest, ToolError, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus,
+    TurnRequest, VecSink, validate_chunk,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -130,6 +130,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

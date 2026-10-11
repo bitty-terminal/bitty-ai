@@ -10,8 +10,8 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ExecOutcome, ExecutionId,
     FakeProvider, FakeReconciler, FakeToolExecutor, ModelProvider, ProviderTurn, ProviderUsage,
     ReconcileOutcome, ReconcileStatus, RecordingExecutor, SessionState, ToolAuthorizer, ToolBus,
-    ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus, UnknownReconciler, VecSink,
-    reconcile_delay_ms,
+    ToolCallRequest, ToolError, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus,
+    UnknownReconciler, VecSink, reconcile_delay_ms,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -66,6 +66,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

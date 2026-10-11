@@ -18,7 +18,7 @@
 
 use std::time::Instant;
 
-use bitty_ai_runtime::tool::{ToolSpec, validate_tool_name};
+use bitty_ai_runtime::tool::{ToolPlacement, ToolSpec, validate_tool_name};
 
 use crate::error::{McpError, McpFailure, McpStage, bound_error_name, bound_error_text};
 use crate::handshake::wait_for_response;
@@ -257,6 +257,8 @@ pub fn import_tool(server_id: &str, raw: &RawMcpTool) -> Result<ImportedTool, Mc
         raw.schema_json.clone(),
         format!("mcp.{server_id}"),
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .map_err(|error| {
         McpError::new(
@@ -703,6 +705,40 @@ mod tests {
     }
 
     #[test]
+    fn import_carries_mcp_placement_by_construction() {
+        // AIQ-33 S3: every imported tool is MCP by construction — the spec
+        // carries `placement = Mcp` with no native detail, so registry
+        // refuse-undeclared never fires on the import path.
+        let raw = RawMcpTool {
+            name: "echo".to_owned(),
+            description: "Echo".to_owned(),
+            schema_json: br#"{"type":"object"}"#.to_vec(),
+        };
+        let imported = import_tool("demo", &raw).expect("import");
+        assert_eq!(imported.spec.placement, Some(ToolPlacement::Mcp));
+        assert_eq!(imported.spec.native, None);
+    }
+
+    #[test]
+    fn relist_preserves_mcp_placement_across_snapshot_diff() {
+        // Re-listing the same entry (the explicit re-list path) stamps the
+        // same placement: the snapshot diff is empty and both specs still
+        // carry Mcp with no additional threading.
+        let raw = RawMcpTool {
+            name: "echo".to_owned(),
+            description: "Echo".to_owned(),
+            schema_json: br#"{"type":"object"}"#.to_vec(),
+        };
+        let first = import_tool("demo", &raw).expect("first import");
+        let second = import_tool("demo", &raw).expect("re-list import");
+        assert_eq!(first.spec.placement, Some(ToolPlacement::Mcp));
+        assert_eq!(second.spec.placement, Some(ToolPlacement::Mcp));
+        let old = ToolListSnapshot::from_imported(std::slice::from_ref(&first));
+        let new = ToolListSnapshot::from_imported(std::slice::from_ref(&second));
+        assert!(diff_tool_snapshots(&old, &new).is_empty());
+    }
+
+    #[test]
     fn allowlist_gaps_fail_closed() {
         let frame = page(1, "{\"name\":\"echo\"}", None);
         let mut transport = FakeTransport {
@@ -880,8 +916,16 @@ mod tests {
     #[test]
     fn snapshot_diff_detects_added_removed_changed() {
         fn imported(name: &str, raw: &str, schema: &[u8]) -> ImportedTool {
-            let spec =
-                ToolSpec::new(name, "test", schema.to_vec(), "mcp.demo", true).expect("valid");
+            let spec = ToolSpec::new(
+                name,
+                "test",
+                schema.to_vec(),
+                "mcp.demo",
+                true,
+                ToolPlacement::Mcp,
+                None,
+            )
+            .expect("valid");
             ImportedTool {
                 digest: spec.schema_digest(),
                 server_id: "demo".to_owned(),

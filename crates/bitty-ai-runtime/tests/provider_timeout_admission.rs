@@ -19,7 +19,7 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ContextPriority, ContextRecord,
     ExecOutcome, FakeProvider, FakeToolExecutor, ModelProvider, ProviderTurn, ProviderUsage,
     RecordBody, SessionError, SessionState, StableId, ToolAuthorizer, ToolBus, ToolError,
-    ToolRegistry, ToolSpec, VecSink,
+    ToolPlacement, ToolRegistry, ToolSpec, VecSink,
 };
 
 // Hard ceiling from `provider.rs` (`MAX_REQUEST_TIMEOUT_MS`); the constant is
@@ -63,6 +63,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

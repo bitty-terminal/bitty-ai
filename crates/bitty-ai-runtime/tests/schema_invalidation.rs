@@ -45,7 +45,7 @@ use std::rc::Rc;
 
 use bitty_ai_runtime::{
     AgentLevel, AuthBase, AuthContext, AuthDecision, FakeToolExecutor, IdIssuer, ToolAuthorizer,
-    ToolBus, ToolCall, ToolError, ToolRegistry, ToolSpec, ToolStatus,
+    ToolBus, ToolCall, ToolError, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -76,6 +76,8 @@ fn spec_n() -> ToolSpec {
         SCHEMA_N.to_vec(),
         "workspace.read",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("test spec N is valid")
 }
@@ -87,6 +89,8 @@ fn spec_n_plus_1() -> ToolSpec {
         SCHEMA_N_PLUS_1.to_vec(),
         "workspace.write",
         false,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("test spec N+1 is valid")
 }
@@ -151,6 +155,8 @@ fn schema_digest_is_deterministic_and_sensitive() {
         one_byte_off.clone(),
         "workspace.read",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("one-byte-off spec is valid");
     assert_ne!(first.schema_digest(), off_spec.schema_digest());
@@ -162,6 +168,8 @@ fn schema_digest_is_deterministic_and_sensitive() {
         Vec::new(),
         "workspace.read",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("empty-schema spec is valid");
     assert_ne!(first.schema_digest(), empty.schema_digest());

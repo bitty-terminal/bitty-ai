@@ -54,7 +54,8 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AgentLevel, AuthBase, AuthContext, AuthDecision, ExecOutcome,
     FakeProvider, FakeToolExecutor, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage,
     RecordingExecutor, ResultDisposition, SessionState, ToolAuthorizer, ToolBus, ToolCall,
-    ToolCallRequest, ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus, VecSink,
+    ToolCallRequest, ToolError, ToolExecutor, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus,
+    VecSink,
 };
 
 /// Hard bus ceiling mirrored from the `TB-6` contract (`tool.rs`). Asserted
@@ -115,6 +116,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

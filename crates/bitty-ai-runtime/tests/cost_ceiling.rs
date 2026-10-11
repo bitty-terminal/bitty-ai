@@ -8,7 +8,7 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AuthContext, AuthDecision, ContextPriority, ContextRecord,
     ExecOutcome, FakeProvider, FakeToolExecutor, ModelProvider, ProviderTurn, ProviderUsage,
     RecordBody, SessionState, StableId, StreamSink, ToolAuthorizer, ToolBus, ToolCallRequest,
-    ToolRegistry, ToolSpec, ToolStatus, VecSink, estimate_cost,
+    ToolPlacement, ToolRegistry, ToolSpec, ToolStatus, VecSink, estimate_cost,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -63,6 +63,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )
