@@ -192,6 +192,40 @@ pub fn reconcile_delay_ms(attempt: usize, base_delay_ms: u64, max_delay_ms: u64)
     delay.min(ceiling)
 }
 
+/// Whether a reconcile answer is terminal (R5/R6 taxonomy, AI-0234).
+///
+/// `Unknown` stays `Unknown` (never `Failed`): a `Resolved(Unknown)` answer is
+/// treated as still pending by the driver (fail closed, never accepted as
+/// resolved). Pure, no clock, no I/O. Centralizes the terminal check so the
+/// agent driver and tests share one taxonomy instead of inline matches.
+#[must_use]
+pub fn is_reconcile_terminal(status: &ToolStatus) -> bool {
+    matches!(
+        status,
+        ToolStatus::Success
+            | ToolStatus::Failed { .. }
+            | ToolStatus::Denied { .. }
+            | ToolStatus::Refused { .. }
+    )
+}
+
+/// Whether a retry is eligible (R6 retry-eligibility, AI-0234).
+///
+/// Eligible only when all three hold: the effect reached a terminal status
+/// (never `Unknown`), the host reconciled by inspection or user direction
+/// (`inspected_or_directed`), and current grants authorize a new submission
+/// (`has_current_grant`). The log's existence never grants eligibility, and a
+/// retry is always a new submission under current grants (never a deduped
+/// replay of the old effect; exactly-once is never claimed). Pure, no clock.
+#[must_use]
+pub fn is_retry_eligible(
+    status: &ToolStatus,
+    inspected_or_directed: bool,
+    has_current_grant: bool,
+) -> bool {
+    inspected_or_directed && has_current_grant && is_reconcile_terminal(status)
+}
+
 /// Apply the one outbound diagnostic policy (`AI-RUN-008`) to a pending
 /// reconcile reason: scrub every character outside printable ASCII
 /// (`0x20..=0x7E`) to `?` and stop at [`MAX_RECONCILE_REASON_BYTES`].
