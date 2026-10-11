@@ -1982,4 +1982,184 @@ mod tests {
             details["cached_tokens"],
         );
     }
+
+    /// Live OpenRouter stable-prefix cache corroboration (manual only,
+    /// AI-0231 S2): two turns sharing one byte-identical stable prefix
+    /// (contract + schemas + digest-like stable content) with a different
+    /// tail per turn, driven end to end via
+    /// `bitty-network::HttpNetworkService` (dev-dependency, test-only).
+    /// Requires `OPENROUTER_API_KEY` in the environment; without it the
+    /// test prints a skip note and passes without asserting (never panics,
+    /// never logs the key). Never runs in CI (`#[ignore]`).
+    ///
+    /// Turn-2 `cached_tokens > 0` is OBSERVED-ONLY: recorded in the
+    /// evidence lines, never asserted (no hit-rate claim, no threshold).
+    ///
+    /// Cost: model `deepseek/deepseek-v4.1-flash`, `max_tokens: 64` per
+    /// turn, two turns per run.
+    ///
+    /// Run: `OPENROUTER_API_KEY=... cargo test -p bitty-ai-slice
+    /// live_openrouter_prefix_cache_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_openrouter_prefix_cache_probe() {
+        let key = match std::env::var("OPENROUTER_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("live_openrouter_prefix_cache_probe: SKIP (OPENROUTER_API_KEY unset)");
+                return;
+            }
+        };
+
+        // Fixed stable prefix: contract + schemas + digest-like stable
+        // content. Built once and cloned byte-identical into both turns;
+        // only the tail message differs per turn.
+        let prefix = String::from(
+            "STABLE-PREFIX-CONTRACT v1 (AI-0231 S2 corroboration).\n\
+             This block is byte-identical on both turns; only the trailing tail differs.\n\
+             Contract: the assistant answers the trailing tail instruction in one short line;\n\
+             the prefix carries no per-turn state and never changes mid-run.\n\
+             Schema customer: {\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"tier\":{\"type\":\"string\"}},\"required\":[\"id\"]}.\n\
+             Schema ticket: {\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"priority\":{\"type\":\"string\"}},\"required\":[\"id\",\"priority\"]}.\n\
+             Digest: sha256:9f2c4a7e1b5d8f0a3c6e9b2d5f8a1c4e7b0d3f6a9c2e5b8d1f4a7c0e3b6d9f2c (stable fixture, not computed).\n\
+             Stable row 01: alpha bravo charlie delta echo foxtrot golf hotel india juliet.\n\
+             Stable row 02: kilo lima mike november oscar papa quebec romeo sierra tango.\n\
+             Stable row 03: uniform victor whiskey xray yankee zulu one two three four.\n\
+             Stable row 04: red orange yellow green blue indigo violet black white gray.\n\
+             Stable row 05: mercury venus earth mars jupiter saturn uranus neptune pluto.\n\
+             Stable row 06: spring summer autumn winter dawn noon dusk midnight equinox.\n\
+             Stable row 07: cedar birch aspen maple oak pine spruce willow alder elm.\n\
+             Stable row 08: wren finch sparrow robin heron egret ibis crane stork gull.\n\
+             Stable row 09: basalt granite marble slate shale gneiss quartz feldspar mica.\n\
+             Stable row 10: anvil hammer tongs bellows forge crucible ingot slag flux.\n",
+        );
+
+        let capability = NetworkCapability::offline().with_domain("openrouter.ai");
+        // Same dual-gate discipline as the single-turn probe: both the
+        // adapter pre-I/O gate and the service pre-socket gate grant the
+        // domain; anything else fails closed with zero packets.
+        let service =
+            CapturingService::new(bitty_network::HttpNetworkService::new(capability.clone()));
+        let secret =
+            SecretField::new(key.into_bytes()).expect("env key material forms a secret field");
+        let config = NetworkConsumerAdapterConfig::new(
+            "openrouter-live",
+            "deepseek/deepseek-v4.1-flash",
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+        .expect("probe endpoint config")
+        .with_api_key(secret)
+        .with_capability(capability);
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let mut sampling = blank_sampling();
+        sampling.max_tokens = Some(64);
+
+        // Turn 1: stable prefix + first tail.
+        let mut req1 = sample_turn_request("deepseek/deepseek-v4.1-flash", 32_768, 25_000);
+        req1.messages = vec![
+            Message::user(prefix.clone()),
+            Message::user("TURN-TAIL 1: Reply with exactly: cache turn one"),
+        ];
+        req1.sampling = Some(sampling.clone());
+
+        let started1 = std::time::Instant::now();
+        let turn1 = adapter.complete(&req1).expect("live turn 1 succeeds");
+        let latency1_ms = started1.elapsed().as_millis();
+
+        assert!(
+            !turn1.text.is_empty(),
+            "live turn 1 carries content or reasoning"
+        );
+        assert!(turn1.usage.input_tokens > 0, "live turn 1 reports input");
+        assert!(turn1.usage.output_tokens > 0, "live turn 1 reports output");
+        // Capture turn-1 raw bytes BEFORE turn 2 overwrites the slot.
+        let (status1, body1) = adapter
+            .service()
+            .captured()
+            .expect("captured live response 1");
+        assert_eq!(status1, 200, "live turn 1 HTTP status");
+        let raw1: serde_json::Value = serde_json::from_slice(&body1).expect("live body 1 is JSON");
+        let msg1 = &raw1["choices"][0]["message"];
+        let has_content1 = msg1["content"].as_str().is_some_and(|c| !c.is_empty());
+        let has_reasoning1 = msg1["reasoning"].as_str().is_some_and(|r| !r.is_empty());
+        assert!(
+            has_content1 || has_reasoning1,
+            "live turn 1 message carries content or reasoning"
+        );
+        let details1 = &raw1["usage"]["prompt_tokens_details"];
+        assert!(
+            details1["cached_tokens"].as_u64().is_some(),
+            "live turn 1 exposes cached_tokens"
+        );
+        assert!(
+            details1["cache_write_tokens"].as_u64().is_some(),
+            "live turn 1 exposes cache_write_tokens"
+        );
+        let cost1 = live_usage_cost(&raw1).expect("live turn 1 exposes numeric cost");
+
+        // Turn 2: byte-identical prefix + different tail.
+        let mut req2 = sample_turn_request("deepseek/deepseek-v4.1-flash", 32_768, 25_000);
+        req2.messages = vec![
+            Message::user(prefix.clone()),
+            Message::user("TURN-TAIL 2: Reply with exactly: cache turn two"),
+        ];
+        req2.sampling = Some(sampling);
+
+        let started2 = std::time::Instant::now();
+        let turn2 = adapter.complete(&req2).expect("live turn 2 succeeds");
+        let latency2_ms = started2.elapsed().as_millis();
+
+        assert!(
+            !turn2.text.is_empty(),
+            "live turn 2 carries content or reasoning"
+        );
+        assert!(turn2.usage.input_tokens > 0, "live turn 2 reports input");
+        assert!(turn2.usage.output_tokens > 0, "live turn 2 reports output");
+        let (status2, body2) = adapter
+            .service()
+            .captured()
+            .expect("captured live response 2");
+        assert_eq!(status2, 200, "live turn 2 HTTP status");
+        let raw2: serde_json::Value = serde_json::from_slice(&body2).expect("live body 2 is JSON");
+        let msg2 = &raw2["choices"][0]["message"];
+        let has_content2 = msg2["content"].as_str().is_some_and(|c| !c.is_empty());
+        let has_reasoning2 = msg2["reasoning"].as_str().is_some_and(|r| !r.is_empty());
+        assert!(
+            has_content2 || has_reasoning2,
+            "live turn 2 message carries content or reasoning"
+        );
+        let details2 = &raw2["usage"]["prompt_tokens_details"];
+        let cached2 = details2["cached_tokens"]
+            .as_u64()
+            .expect("live turn 2 exposes cached_tokens");
+        assert!(
+            details2["cache_write_tokens"].as_u64().is_some(),
+            "live turn 2 exposes cache_write_tokens"
+        );
+        let cost2 = live_usage_cost(&raw2).expect("live turn 2 exposes numeric cost");
+        // OBSERVED-ONLY: recorded below, never asserted (no hit-rate claim).
+        let cached_hit = cached2 > 0;
+
+        eprintln!(
+            "live_openrouter_prefix_cache_probe: turn1 ok latency_ms={latency1_ms} text_len={} \
+             input_tokens={} output_tokens={} cached_tokens={} cost=${cost1:.8}",
+            turn1.text.len(),
+            turn1.usage.input_tokens,
+            turn1.usage.output_tokens,
+            details1["cached_tokens"],
+        );
+        eprintln!(
+            "live_openrouter_prefix_cache_probe: turn2 ok latency_ms={latency2_ms} text_len={} \
+             input_tokens={} output_tokens={} cached_tokens={} cost=${cost2:.8}",
+            turn2.text.len(),
+            turn2.usage.input_tokens,
+            turn2.usage.output_tokens,
+            details2["cached_tokens"],
+        );
+        eprintln!(
+            "live_openrouter_prefix_cache_probe: observed turn2_cached_hit={cached_hit} \
+             (observed-only, never gates)"
+        );
+    }
 }
