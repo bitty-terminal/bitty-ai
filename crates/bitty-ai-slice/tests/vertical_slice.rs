@@ -23,7 +23,7 @@ use bitty_ai_runtime::{
     AgentError, AgentLevel, AuthBase, ContextError, ExecOutcome, FakeConsentLedger,
     FakeToolExecutor, Fragment, FragmentKind, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage,
     RecordBody, StreamChunk, StreamError, StreamSink, ToolBus, ToolCall, ToolCallRequest,
-    ToolError, ToolRegistry, ToolSpec, ToolStatus, VecSink,
+    ToolError, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus, VecSink,
 };
 use bitty_ai_slice::{
     AllowReadOnly, HARNESS_MODEL, HARNESS_PROVIDER_ID, HARNESS_TOOL, HostPeer, IpcBridge,
@@ -474,6 +474,8 @@ fn write_tool_is_denied_by_default() {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.write",
                 false,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("spec"),
         )

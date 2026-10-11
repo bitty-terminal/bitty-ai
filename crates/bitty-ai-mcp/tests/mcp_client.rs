@@ -21,7 +21,7 @@ use bitty_ai_mcp::{
     call_tool, handshake, list_tools, sanitize_mcp_name,
 };
 use bitty_ai_mcp::{McpError, McpTransport};
-use bitty_ai_runtime::tool::ToolExecutor;
+use bitty_ai_runtime::tool::{ToolExecutor, ToolPlacement};
 
 // ── shared fakes ─────────────────────────────────────────────────────────────
 
@@ -246,6 +246,8 @@ fn echo_import() -> bitty_ai_mcp::ImportedTool {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("valid spec");
     bitty_ai_mcp::ImportedTool {

@@ -78,7 +78,8 @@ use bitty_ai_runtime::{
     ContextRequest, ElevationGrant, ExecOutcome, FakeProvider, FakeToolExecutor, IdIssuer,
     LayerInput, ModelProvider, PromptLayer, PromptSnapshot, ProviderTurn, ProviderUsage,
     RecordBody, StableId, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolExecutor,
-    ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, VecSink, assemble, assemble_prompt,
+    ToolPlacement, ToolRegistry, ToolSpec, ToolStatus, ToolSuccess, VecSink, assemble,
+    assemble_prompt,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -188,6 +189,8 @@ fn read_write_tool_bus(authorizer: AllowWrites) -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )
@@ -200,6 +203,8 @@ fn read_write_tool_bus(authorizer: AllowWrites) -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.write",
                 false,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

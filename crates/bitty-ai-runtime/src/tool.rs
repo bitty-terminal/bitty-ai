@@ -44,6 +44,12 @@ pub const MAX_TOOL_CALLS_PER_TURN: usize = 8;
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 16 * 1024;
 /// Maximum tool result bytes (`TB-6`).
 pub const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
+/// Maximum native placement reason/backend length in bytes (AIQ-33 S3,
+/// `TB-2` shape).
+///
+/// Mirrors [`MAX_TOOL_DESCRIPTION_LEN`]: short owner-supplied opaque strings
+/// share the 512-byte inclusive bound (`len() > LIMIT` refuses).
+pub const MAX_NATIVE_PLACEMENT_BYTES: usize = 512;
 
 /// FNV-1a-64 offset basis (deterministic across processes and platforms;
 /// mirrors the `cache_key.rs` precedent).
@@ -116,6 +122,16 @@ pub enum ToolError {
         limit: usize,
         /// Observed bytes.
         actual: usize,
+    },
+    /// Placement declaration missing, outside the owner-approved vocabulary,
+    /// or native without reason/backend (AIQ-33 S3, refuse-undeclared).
+    /// Registration refusal (`TB-2` shape, like [`ToolError::DuplicateTool`]
+    /// and [`ToolError::RegistryFull`): never [`ToolError::Denied`], which
+    /// is dispatch-time.
+    UndeclaredPlacement {
+        /// Rejected tool name (registration boundary) or rejected placement
+        /// string (vocabulary parse boundary).
+        name: String,
     },
     /// Authorization hook refused the call (`TB-4`).
     Denied {
@@ -192,6 +208,9 @@ impl Display for ToolError {
                 f,
                 "tool schema of {actual} bytes exceeds {limit} byte limit"
             ),
+            Self::UndeclaredPlacement { name } => {
+                write!(f, "undeclared tool placement: {name}")
+            }
             Self::Denied { name, reason } => write!(f, "tool {name} denied: {reason}"),
             Self::Failed { name, reason } => write!(f, "tool {name} failed: {reason}"),
             Self::ProtocolRejected { name, reason } => {
@@ -229,6 +248,9 @@ impl ToolError {
                 name: bound_reason(&name),
             },
             Self::DuplicateTool { name } => Self::DuplicateTool {
+                name: bound_reason(&name),
+            },
+            Self::UndeclaredPlacement { name } => Self::UndeclaredPlacement {
                 name: bound_reason(&name),
             },
             Self::Denied { name, reason } => Self::Denied {
@@ -285,6 +307,67 @@ pub fn validate_tool_name(name: &str) -> Result<(), ToolError> {
     }
 }
 
+/// Closed tool-placement vocabulary (AIQ-33 S3, owner-approved 2026-10-11).
+///
+/// Data-only declaration: routing is unchanged — [`ToolBus::precheck`],
+/// [`ToolBus::dispatch`], and the MCP adapter execute path never branch on
+/// placement. [`ToolPlacement::Mcp`] marks tools imported over MCP (the
+/// import path carries it by construction); [`ToolPlacement::Native`] marks
+/// host-native tools and additionally requires [`NativePlacement`]
+/// reason/backend. Closed like [`crate::provider::ModelCapability`]:
+/// unknown strings never synthesize a placement
+/// ([`ToolPlacement::parse`] fails closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPlacement {
+    /// Tool imported over MCP.
+    Mcp,
+    /// Host-native tool (requires [`ToolSpec::native`] reason/backend).
+    Native,
+}
+
+impl ToolPlacement {
+    /// Parse the owner-approved vocabulary strings (`mcp`/`native`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::UndeclaredPlacement`] carrying the rejected
+    /// (bounded, scrubbed) string for anything else.
+    pub fn parse(value: &str) -> Result<Self, ToolError> {
+        match value {
+            "mcp" => Ok(Self::Mcp),
+            "native" => Ok(Self::Native),
+            // AI-RUN-008: the rejected string is externally supplied, so it
+            // is bounded and scrubbed at this conversion boundary like every
+            // other outbound diagnostic string.
+            _ => Err(ToolError::UndeclaredPlacement {
+                name: bound_reason(value),
+            }),
+        }
+    }
+
+    /// Owner-approved vocabulary string for this placement.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Native => "native",
+        }
+    }
+}
+
+/// Native-placement reason/backend (AIQ-33 S3).
+///
+/// Data-only: stored on the declaration, never interpreted — dispatch
+/// routing is unchanged. Required exactly when [`ToolSpec::placement`] is
+/// [`ToolPlacement::Native`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePlacement {
+    /// Why this tool is host-native (owner-supplied, opaque).
+    pub reason: String,
+    /// Which native backend serves it (owner-supplied label, opaque).
+    pub backend: String,
+}
+
 /// A bounded tool declaration (`TB-2`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
@@ -299,6 +382,15 @@ pub struct ToolSpec {
     /// Whether the tool is side-effect free. The default profile allows only
     /// these at the `inspect` tier (read-only by default).
     pub read_only: bool,
+    /// Declared placement (AIQ-33 S3, refuse-undeclared): `None` is
+    /// undeclared and [`ToolRegistry::register`] refuses it fail-closed
+    /// with [`ToolError::UndeclaredPlacement`].
+    pub placement: Option<ToolPlacement>,
+    /// Native reason/backend; required exactly when `placement` is
+    /// [`ToolPlacement::Native`] (refused when missing or empty, and refused
+    /// when present under [`ToolPlacement::Mcp`] as a contradictory
+    /// declaration).
+    pub native: Option<NativePlacement>,
 }
 
 impl ToolSpec {
@@ -306,14 +398,17 @@ impl ToolSpec {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError`] for malformed names or over-bound description
-    /// and schema.
+    /// Returns [`ToolError`] for malformed names, over-bound description
+    /// and schema, undeclared placement, or a native/native-detail mismatch
+    /// (native without reason/backend, or MCP carrying native detail).
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
         schema_json: Vec<u8>,
         required_scope: impl Into<String>,
         read_only: bool,
+        placement: ToolPlacement,
+        native: Option<NativePlacement>,
     ) -> Result<Self, ToolError> {
         let name = name.into();
         let description = description.into();
@@ -330,12 +425,17 @@ impl ToolSpec {
                 actual: schema_json.len(),
             });
         }
+        // The name is shape-checked above, so the refusal carries it raw
+        // (the [`ToolError::DuplicateTool`] precedent).
+        validate_placement(&name, Some(placement), native.as_ref())?;
         Ok(Self {
             name,
             description,
             schema_json,
             required_scope: required_scope.into(),
             read_only,
+            placement: Some(placement),
+            native,
         })
     }
 
@@ -362,6 +462,46 @@ impl ToolSpec {
     }
 }
 
+/// Validate a placement declaration (AIQ-33 S3, refuse-undeclared).
+///
+/// `None` is undeclared; `Native` requires a non-empty reason/backend within
+/// [`MAX_NATIVE_PLACEMENT_BYTES`] bytes each (inclusive bound, the
+/// [`MAX_TOOL_DESCRIPTION_LEN`] convention); `Mcp` carrying native detail is
+/// a contradictory declaration. Every violation fails closed with
+/// [`ToolError::UndeclaredPlacement`]. The caller shape-checks `name` first
+/// (as [`ToolSpec::new`] and [`ToolRegistry::register`] do), so the refusal
+/// carries it raw.
+///
+/// # Errors
+///
+/// Returns [`ToolError::UndeclaredPlacement`] for a missing, mismatched,
+/// contradictory, or over-long declaration.
+fn validate_placement(
+    name: &str,
+    placement: Option<ToolPlacement>,
+    native: Option<&NativePlacement>,
+) -> Result<(), ToolError> {
+    let refused = || ToolError::UndeclaredPlacement {
+        name: name.to_owned(),
+    };
+    let Some(placement) = placement else {
+        return Err(refused());
+    };
+    match (placement, native) {
+        (ToolPlacement::Mcp, None) => Ok(()),
+        (ToolPlacement::Mcp, Some(_)) => Err(refused()),
+        (ToolPlacement::Native, Some(detail))
+            if !detail.reason.is_empty()
+                && !detail.backend.is_empty()
+                && detail.reason.len() <= MAX_NATIVE_PLACEMENT_BYTES
+                && detail.backend.len() <= MAX_NATIVE_PLACEMENT_BYTES =>
+        {
+            Ok(())
+        }
+        (ToolPlacement::Native, _) => Err(refused()),
+    }
+}
+
 /// Bounded per-session tool registry (`TB-2`).
 #[derive(Debug, Default)]
 pub struct ToolRegistry {
@@ -380,16 +520,22 @@ impl ToolRegistry {
     /// Fail-closed: a name that is already registered is refused with
     /// [`ToolError::DuplicateTool`] (no replacement, no shadowing); a
     /// malformed or over-bound spec is refused with its typed error even
-    /// when built without [`ToolSpec::new`]; a full registry refuses with
-    /// [`ToolError::RegistryFull`]. Every refusal leaves the registry
-    /// unchanged: no push, no replacement, no counter increment.
+    /// when built without [`ToolSpec::new`]; an undeclared placement
+    /// (`None`), a native spec without reason/backend, or an MCP spec
+    /// carrying native detail is refused with
+    /// [`ToolError::UndeclaredPlacement`] (AIQ-33 S3, refuse-undeclared —
+    /// never [`ToolError::Denied`], which is dispatch-time); a full
+    /// registry refuses with [`ToolError::RegistryFull`]. Every refusal
+    /// leaves the registry unchanged: no push, no replacement, no counter
+    /// increment.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError::DuplicateTool`] for a re-registered name,
-    /// [`ToolError::InvalidName`], [`ToolError::DescriptionTooLarge`], or
-    /// [`ToolError::SchemaTooLarge`] for a malformed spec, and
-    /// [`ToolError::RegistryFull`] past [`MAX_TOOLS_PER_SESSION`].
+    /// [`ToolError::InvalidName`], [`ToolError::DescriptionTooLarge`],
+    /// [`ToolError::SchemaTooLarge`], or [`ToolError::UndeclaredPlacement`]
+    /// for a malformed spec, and [`ToolError::RegistryFull`] past
+    /// [`MAX_TOOLS_PER_SESSION`].
     pub fn register(&mut self, spec: ToolSpec) -> Result<(), ToolError> {
         if self.specs.iter().any(|kept| kept.name == spec.name) {
             return Err(ToolError::DuplicateTool { name: spec.name });
@@ -407,6 +553,9 @@ impl ToolRegistry {
                 actual: spec.schema_json.len(),
             });
         }
+        // The name is shape-checked above, so the refusal carries it raw
+        // (the [`ToolError::DuplicateTool`] precedent).
+        validate_placement(&spec.name, spec.placement, spec.native.as_ref())?;
         if self.specs.len() >= MAX_TOOLS_PER_SESSION {
             return Err(ToolError::RegistryFull {
                 limit: MAX_TOOLS_PER_SESSION,
@@ -1426,6 +1575,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "workspace.read",
                     true,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid spec"),
             )
@@ -1438,6 +1589,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "workspace.write",
                     false,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid spec"),
             )
@@ -1486,13 +1639,23 @@ mod tests {
                         Vec::new(),
                         "test.scope",
                         true,
+                        ToolPlacement::Mcp,
+                        None,
                     )
                     .expect("valid spec"),
                 )
                 .expect("capacity");
         }
-        let overflow =
-            ToolSpec::new("one_more", "test", Vec::new(), "test.scope", true).expect("valid spec");
+        let overflow = ToolSpec::new(
+            "one_more",
+            "test",
+            Vec::new(),
+            "test.scope",
+            true,
+            ToolPlacement::Mcp,
+            None,
+        )
+        .expect("valid spec");
         assert!(matches!(
             registry.register(overflow),
             Err(ToolError::RegistryFull { .. })
@@ -1510,6 +1673,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "workspace.read",
                     true,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid spec"),
             )
@@ -1520,6 +1685,8 @@ mod tests {
             br#"{"type":"object"}"#.to_vec(),
             "workspace.write",
             false,
+            ToolPlacement::Mcp,
+            None,
         )
         .expect("valid spec");
         let error = registry.register(retry).expect_err("duplicate must fail");
@@ -1550,13 +1717,23 @@ mod tests {
                         Vec::new(),
                         "test.scope",
                         true,
+                        ToolPlacement::Mcp,
+                        None,
                     )
                     .expect("valid spec"),
                 )
                 .expect("capacity");
         }
-        let retry = ToolSpec::new("tool_0", "test tool", Vec::new(), "test.scope", true)
-            .expect("valid spec");
+        let retry = ToolSpec::new(
+            "tool_0",
+            "test tool",
+            Vec::new(),
+            "test.scope",
+            true,
+            ToolPlacement::Mcp,
+            None,
+        )
+        .expect("valid spec");
         let error = registry.register(retry).expect_err("duplicate must fail");
         assert_eq!(
             error,
@@ -1578,6 +1755,8 @@ mod tests {
             schema_json: Vec::new(),
             required_scope: "terminal.inspect".to_owned(),
             read_only: true,
+            placement: Some(ToolPlacement::Mcp),
+            native: None,
         };
         assert_eq!(
             registry
@@ -1593,12 +1772,386 @@ mod tests {
             schema_json: Vec::new(),
             required_scope: "workspace.read".to_owned(),
             read_only: true,
+            placement: Some(ToolPlacement::Mcp),
+            native: None,
         };
         assert!(matches!(
             registry.register(oversized),
             Err(ToolError::DescriptionTooLarge { .. })
         ));
         assert!(registry.is_empty());
+    }
+
+    /// AIQ-33 S3 fixture: owner-approved native reason/backend used by the
+    /// native-placed tests below (data-only, never interpreted).
+    fn native_detail() -> NativePlacement {
+        NativePlacement {
+            reason: "host-native terminal read".to_owned(),
+            backend: "terminal.inspect".to_owned(),
+        }
+    }
+
+    #[test]
+    fn placement_vocabulary_parses_owner_strings_only() {
+        // Owner-approved vocabulary (AIQ-33 S3, 2026-10-11): exactly
+        // `mcp`/`native`, closed like `ModelCapability`.
+        assert_eq!(
+            ToolPlacement::parse("mcp"),
+            Ok(ToolPlacement::Mcp),
+            "mcp must parse"
+        );
+        assert_eq!(
+            ToolPlacement::parse("native"),
+            Ok(ToolPlacement::Native),
+            "native must parse"
+        );
+        assert_eq!(ToolPlacement::Mcp.as_str(), "mcp");
+        assert_eq!(ToolPlacement::Native.as_str(), "native");
+    }
+
+    #[test]
+    fn unknown_placement_string_is_a_typed_refusal() {
+        // Unknown strings never synthesize a placement: a typed
+        // registration-shaped refusal, never dispatch-time `Denied`.
+        for rejected in ["gpu", "MCP", "", "mcp ", "native "] {
+            let error = ToolPlacement::parse(rejected).expect_err("unknown placement must fail");
+            assert!(
+                matches!(error, ToolError::UndeclaredPlacement { .. }),
+                "unknown placement string must fail as UndeclaredPlacement"
+            );
+            assert!(
+                !matches!(error, ToolError::Denied { .. }),
+                "placement refusal must never be dispatch-time Denied"
+            );
+            assert_single_line(&error.to_string());
+        }
+    }
+
+    #[test]
+    fn missing_placement_refuses_without_state_change() {
+        // Refuse-undeclared: a spec bypassing `ToolSpec::new` with no
+        // placement is refused with the typed registration refusal, and the
+        // registry is untouched (no push, no counter increment).
+        let mut registry = ToolRegistry::new();
+        let undeclared = ToolSpec {
+            name: "workspace_read".to_owned(),
+            description: "Read a bounded workspace path".to_owned(),
+            schema_json: br#"{"type":"object"}"#.to_vec(),
+            required_scope: "workspace.read".to_owned(),
+            read_only: true,
+            placement: None,
+            native: None,
+        };
+        let error = registry
+            .register(undeclared)
+            .expect_err("missing placement must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "workspace_read".to_owned(),
+            }
+        );
+        assert!(registry.is_empty());
+        assert!(registry.lookup("workspace_read").is_none());
+    }
+
+    #[test]
+    fn valid_mcp_entry_registers_with_placement_preserved() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "workspace_read",
+                    "Read a bounded workspace path",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "workspace.read",
+                    true,
+                    ToolPlacement::Mcp,
+                    None,
+                )
+                .expect("valid spec"),
+            )
+            .expect("capacity");
+        let kept = registry.lookup("workspace_read").expect("registered");
+        assert_eq!(kept.placement, Some(ToolPlacement::Mcp));
+        assert_eq!(kept.native, None);
+    }
+
+    #[test]
+    fn valid_native_entry_with_reason_backend_registers() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "terminal_read_zone",
+                    "Native zone read",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "terminal.inspect",
+                    true,
+                    ToolPlacement::Native,
+                    Some(native_detail()),
+                )
+                .expect("valid native spec"),
+            )
+            .expect("capacity");
+        let kept = registry.lookup("terminal_read_zone").expect("registered");
+        assert_eq!(kept.placement, Some(ToolPlacement::Native));
+        assert_eq!(kept.native, Some(native_detail()));
+    }
+
+    #[test]
+    fn native_without_reason_backend_refuses_without_state_change() {
+        // `ToolSpec::new` refuses a native declaration without detail.
+        let error = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            None,
+        )
+        .expect_err("native without detail must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        // Empty reason/backend is missing detail, not a declaration.
+        for detail in [
+            NativePlacement {
+                reason: String::new(),
+                backend: "terminal.inspect".to_owned(),
+            },
+            NativePlacement {
+                reason: "host-native terminal read".to_owned(),
+                backend: String::new(),
+            },
+        ] {
+            assert!(matches!(
+                ToolSpec::new(
+                    "terminal_read_zone",
+                    "Native zone read",
+                    Vec::new(),
+                    "terminal.inspect",
+                    true,
+                    ToolPlacement::Native,
+                    Some(detail),
+                ),
+                Err(ToolError::UndeclaredPlacement { .. })
+            ));
+        }
+        // The registry refuses the same shape built without `new`, with no
+        // state change.
+        let mut registry = ToolRegistry::new();
+        let undeclared = ToolSpec {
+            name: "terminal_read_zone".to_owned(),
+            description: "Native zone read".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+            placement: Some(ToolPlacement::Native),
+            native: None,
+        };
+        let error = registry
+            .register(undeclared)
+            .expect_err("native without detail must fail");
+        assert!(
+            matches!(error, ToolError::UndeclaredPlacement { .. }),
+            "native without detail must fail as UndeclaredPlacement"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn native_overlong_reason_refuses_without_state_change() {
+        // Over-long native reason is an undeclared placement: `ToolSpec::new`
+        // refuses with the typed registration refusal, and the registry
+        // refuses the same shape built without `new` with no state change.
+        let overlong = NativePlacement {
+            reason: "r".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+            backend: "terminal.inspect".to_owned(),
+        };
+        let error = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            Some(overlong),
+        )
+        .expect_err("over-long native reason must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        let mut registry = ToolRegistry::new();
+        let undeclared = ToolSpec {
+            name: "terminal_read_zone".to_owned(),
+            description: "Native zone read".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+            placement: Some(ToolPlacement::Native),
+            native: Some(NativePlacement {
+                reason: "r".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+                backend: "terminal.inspect".to_owned(),
+            }),
+        };
+        let error = registry
+            .register(undeclared)
+            .expect_err("over-long native reason must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        assert!(registry.is_empty());
+        assert!(registry.lookup("terminal_read_zone").is_none());
+    }
+
+    #[test]
+    fn native_overlong_backend_refuses_without_state_change() {
+        // Over-long native backend refuses exactly like the reason case.
+        let overlong = NativePlacement {
+            reason: "host-native terminal read".to_owned(),
+            backend: "b".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+        };
+        let error = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            Some(overlong),
+        )
+        .expect_err("over-long native backend must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        let mut registry = ToolRegistry::new();
+        let undeclared = ToolSpec {
+            name: "terminal_read_zone".to_owned(),
+            description: "Native zone read".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+            placement: Some(ToolPlacement::Native),
+            native: Some(NativePlacement {
+                reason: "host-native terminal read".to_owned(),
+                backend: "b".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+            }),
+        };
+        let error = registry
+            .register(undeclared)
+            .expect_err("over-long native backend must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        assert!(registry.is_empty());
+        assert!(registry.lookup("terminal_read_zone").is_none());
+    }
+
+    #[test]
+    fn native_placement_at_bound_accepts() {
+        // Inclusive bound (`len() > LIMIT` refuses): exactly-at-limit
+        // reason/backend registers through both the constructor and the
+        // registry path.
+        let at_bound = NativePlacement {
+            reason: "r".repeat(MAX_NATIVE_PLACEMENT_BYTES),
+            backend: "b".repeat(MAX_NATIVE_PLACEMENT_BYTES),
+        };
+        let spec = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            Some(at_bound),
+        )
+        .expect("exactly-at-limit native detail must accept");
+        let mut registry = ToolRegistry::new();
+        registry.register(spec).expect("capacity");
+        let kept = registry.lookup("terminal_read_zone").expect("registered");
+        assert_eq!(
+            kept.native.as_ref().expect("detail").reason.len(),
+            MAX_NATIVE_PLACEMENT_BYTES
+        );
+        assert_eq!(
+            kept.native.as_ref().expect("detail").backend.len(),
+            MAX_NATIVE_PLACEMENT_BYTES
+        );
+    }
+
+    #[test]
+    fn mcp_with_native_detail_refuses_as_contradictory() {
+        // An MCP declaration carrying native detail contradicts itself and
+        // is refused with the same typed registration refusal.
+        let error = ToolSpec::new(
+            "workspace_read",
+            "Read a bounded workspace path",
+            Vec::new(),
+            "workspace.read",
+            true,
+            ToolPlacement::Mcp,
+            Some(native_detail()),
+        )
+        .expect_err("contradictory declaration must fail");
+        assert!(
+            matches!(error, ToolError::UndeclaredPlacement { .. }),
+            "contradictory declaration must fail as UndeclaredPlacement"
+        );
+    }
+
+    #[test]
+    fn dispatch_admission_accepts_native_placed_tools_unchanged() {
+        // AIQ-33 S3 is data-only: admission never branches on placement, so
+        // a native-placed registration prechecks exactly like an MCP one.
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "terminal_read_zone",
+                    "Native zone read",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "terminal.inspect",
+                    true,
+                    ToolPlacement::Native,
+                    Some(native_detail()),
+                )
+                .expect("valid native spec"),
+            )
+            .expect("capacity");
+        let bus = ToolBus::new(registry).with_authorizer(Allow);
+        let call = ToolCall {
+            name: "terminal_read_zone".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        bus.precheck(
+            std::slice::from_ref(&call),
+            &base(),
+            MAX_TOOL_CALLS_PER_TURN,
+        )
+        .expect("native-placed tool prechecks");
     }
 
     #[test]
@@ -2094,8 +2647,9 @@ mod tests {
 
     #[test]
     fn tool_error_normalization_covers_every_external_branch() {
-        // AI-RUN-008 table: malformed-name, unknown, duplicate, denial,
-        // failure, protocol-rejection, and uncertainty errors normalize at
+        // AI-RUN-008 table: malformed-name, unknown, duplicate,
+        // undeclared-placement, denial, failure, protocol-rejection, and
+        // uncertainty errors normalize at
         // the boundary;
         // bound-arithmetic variants (no external text) pass through
         // unchanged.
@@ -2108,6 +2662,9 @@ mod tests {
             },
             ToolError::DuplicateTool {
                 name: hostile("dup "),
+            },
+            ToolError::UndeclaredPlacement {
+                name: hostile("placement "),
             },
             ToolError::Denied {
                 name: hostile("deny "),
@@ -2134,7 +2691,8 @@ mod tests {
             match &normalized {
                 ToolError::InvalidName { name }
                 | ToolError::UnknownTool { name }
-                | ToolError::DuplicateTool { name } => assert_display_safe(name),
+                | ToolError::DuplicateTool { name }
+                | ToolError::UndeclaredPlacement { name } => assert_display_safe(name),
                 ToolError::Denied { name, reason }
                 | ToolError::Failed { name, reason }
                 | ToolError::ProtocolRejected { name, reason }

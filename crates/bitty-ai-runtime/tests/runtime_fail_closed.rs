@@ -9,8 +9,8 @@ use bitty_ai_runtime::{
     ContextPriority, ContextRecord, ElevationGrant, ExecOutcome, FakeProvider, FakeToolExecutor,
     FragmentKind, ModelProvider, ProviderError, ProviderTurn, ProviderUsage, RecordBody,
     RecordingExecutor, ResultDisposition, SessionState, StableId, StreamSink, ToolAuthorizer,
-    ToolBus, ToolCallRequest, ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus,
-    ToolSuccess, VecSink,
+    ToolBus, ToolCallRequest, ToolError, ToolExecutor, ToolPlacement, ToolRegistry, ToolSpec,
+    ToolStatus, ToolSuccess, VecSink,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -66,6 +66,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )
@@ -85,6 +87,8 @@ fn read_write_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )
@@ -97,6 +101,8 @@ fn read_write_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.write",
                 false,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )
@@ -367,6 +373,8 @@ fn deny_by_default_without_authorizer() {
                 Vec::new(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

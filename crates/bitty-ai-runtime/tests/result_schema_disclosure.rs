@@ -29,8 +29,8 @@ use bitty_ai_runtime::{
     ContextPriority, ContextRecord, ContextRequest, ExecOutcome, FakeProvider, FakeToolExecutor,
     FragmentKind, IdIssuer, ModelDescriptor, ModelProvider, ProviderError, ProviderTurn,
     ProviderUsage, RecordBody, ResultDisposition, SessionState, StableId, StreamSink,
-    ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus,
-    TurnRequest, VecSink, assemble, validate_chunk,
+    ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolPlacement, ToolRegistry, ToolSpec,
+    ToolStatus, TurnRequest, VecSink, assemble, validate_chunk,
 };
 use bitty_ai_runtime::{AgentSession, MAX_RECONCILE_REASON_BYTES};
 
@@ -132,6 +132,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

@@ -909,7 +909,7 @@ fn loopback_wire_shape_posts_accept_session_and_json() {
 
 #[test]
 fn bridge_allowlist_miss_is_zero_contact_over_http() {
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -927,6 +927,8 @@ fn bridge_allowlist_miss_is_zero_contact_over_http() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {
@@ -1309,7 +1311,7 @@ fn poll_refuses_sampling_with_distinct_message() {
 #[test]
 fn poll_stale_deny_relist_allow_over_http() {
     use bitty_ai_mcp::is_tools_list_changed_notification;
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1351,6 +1353,8 @@ fn poll_stale_deny_relist_allow_over_http() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {
@@ -1420,7 +1424,7 @@ fn poll_stale_deny_relist_allow_over_http() {
 
 #[test]
 fn poll_negatives_never_stale_over_http() {
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1439,6 +1443,8 @@ fn poll_negatives_never_stale_over_http() {
             br#"{"type":"object"}"#.to_vec(),
             "mcp.demo",
             true,
+            ToolPlacement::Mcp,
+            None,
         )
         .expect("spec");
         let imported = bitty_ai_mcp::ImportedTool {
@@ -1522,7 +1528,7 @@ fn poll_negatives_never_stale_over_http() {
 fn resources_prompts_positives_never_stale_over_http() {
     // AI-0214 (Option A): classifier-positive resources/prompts lines
     // polled over HTTP still never stale — routing stays tools-only.
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1541,6 +1547,8 @@ fn resources_prompts_positives_never_stale_over_http() {
             br#"{"type":"object"}"#.to_vec(),
             "mcp.demo",
             true,
+            ToolPlacement::Mcp,
+            None,
         )
         .expect("spec");
         let imported = bitty_ai_mcp::ImportedTool {
@@ -1647,7 +1655,7 @@ fn resources_prompts_positives_never_stale_over_http() {
 
 #[test]
 fn poll_405_and_disabled_never_stale_over_http() {
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1685,6 +1693,8 @@ fn poll_405_and_disabled_never_stale_over_http() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {
@@ -1722,7 +1732,7 @@ fn poll_405_and_disabled_never_stale_over_http() {
 
 #[test]
 fn failed_relist_keeps_snapshot_and_stays_stale_over_http() {
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1749,6 +1759,8 @@ fn failed_relist_keeps_snapshot_and_stays_stale_over_http() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {
@@ -1835,7 +1847,7 @@ fn http_relist_preserves_stale_on_mid_round_trip_signal() {
     // AI-0212 (a) over HTTP: the same SSE shape through the adapter — the
     // completed refresh bumps the version and returns its diff normally, but
     // the mid-round-trip signal keeps the adapter stale for the next call.
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1863,6 +1875,8 @@ fn http_relist_preserves_stale_on_mid_round_trip_signal() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {
@@ -1912,7 +1926,7 @@ fn http_relist_preserves_stale_on_mid_round_trip_signal() {
 fn http_mid_wait_negatives_never_stale() {
     // AI-0212 (e) over HTTP: bare non-list notifications ahead of the list
     // answer surface without staling the adapter.
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -1942,6 +1956,8 @@ fn http_mid_wait_negatives_never_stale() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {
@@ -1984,7 +2000,7 @@ fn http_mid_wait_negatives_never_stale() {
 fn http_mid_wait_resources_prompts_positives_never_stale() {
     // AI-0214 (Option A) over HTTP: classifier-positive resources/prompts
     // lines ahead of the list answer surface without staling the adapter.
-    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolSpec};
+    use bitty_ai_runtime::tool::{ToolAuthorizer, ToolPlacement, ToolSpec};
 
     struct Allow;
     impl ToolAuthorizer for Allow {
@@ -2014,6 +2030,8 @@ fn http_mid_wait_resources_prompts_positives_never_stale() {
         br#"{"type":"object"}"#.to_vec(),
         "mcp.demo",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("spec");
     let imported = bitty_ai_mcp::ImportedTool {

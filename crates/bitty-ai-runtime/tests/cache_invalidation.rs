@@ -44,8 +44,8 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentLevel, AgentSession, ArtifactStore, AuthContext, AuthDecision,
     ContextError, ContextPriority, ContextRecord, ContextRequest, ElevationGrant, ExecOutcome,
     FakeProvider, IdIssuer, ProviderTurn, ProviderUsage, RecordBody, StableId, ToolAuthorizer,
-    ToolBus, ToolCallRequest, ToolError, ToolExecutor, ToolRegistry, ToolSpec, ToolStatus,
-    ToolSuccess, VecSink, assemble,
+    ToolBus, ToolCallRequest, ToolError, ToolExecutor, ToolPlacement, ToolRegistry, ToolSpec,
+    ToolStatus, ToolSuccess, VecSink, assemble,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -244,6 +244,8 @@ fn mid_turn_rotation_is_visible_as_tier_downgrade_at_each_dispatch() {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.write",
                 false,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )
@@ -256,6 +258,8 @@ fn mid_turn_rotation_is_visible_as_tier_downgrade_at_each_dispatch() {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

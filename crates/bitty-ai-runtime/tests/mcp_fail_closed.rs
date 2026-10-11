@@ -59,7 +59,7 @@
 
 use bitty_ai_runtime::{
     AgentLevel, AuthBase, AuthContext, AuthDecision, FakeToolExecutor, IdIssuer, ToolAuthorizer,
-    ToolBus, ToolCall, ToolError, ToolRegistry, ToolSpec, ToolStatus,
+    ToolBus, ToolCall, ToolError, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -97,6 +97,8 @@ fn versioned_spec() -> ToolSpec {
         SCHEMA_N.to_vec(),
         "workspace.read",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("test spec is valid")
 }
@@ -111,6 +113,8 @@ fn foreign_spec() -> ToolSpec {
         SCHEMA_DRIFTED.to_vec(),
         "workspace.read",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("test foreign spec is valid")
 }
@@ -142,6 +146,8 @@ fn externally_supplied_spec_still_refuses_same_name_reregistration() {
         SCHEMA_N.to_vec(),
         "workspace.write",
         false,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("test drifted spec is valid");
     let error = registry
@@ -218,6 +224,8 @@ fn every_spec_carries_a_digest_by_construction() {
         schema_json: SCHEMA_N.to_vec(),
         required_scope: "workspace.read".to_owned(),
         read_only: true,
+        placement: Some(ToolPlacement::Mcp),
+        native: None,
     };
     assert_eq!(via_new.schema_digest(), via_fields.schema_digest());
     let drifted = ToolSpec {
@@ -226,6 +234,8 @@ fn every_spec_carries_a_digest_by_construction() {
         schema_json: SCHEMA_DRIFTED.to_vec(),
         required_scope: "workspace.read".to_owned(),
         read_only: true,
+        placement: Some(ToolPlacement::Mcp),
+        native: None,
     };
     assert_ne!(via_new.schema_digest(), drifted.schema_digest());
     // The empty-schema edge still has a digest (never an absent version).
@@ -235,6 +245,8 @@ fn every_spec_carries_a_digest_by_construction() {
         Vec::new(),
         "workspace.read",
         true,
+        ToolPlacement::Mcp,
+        None,
     )
     .expect("empty-schema spec is valid");
     assert_ne!(via_new.schema_digest(), empty.schema_digest());

@@ -22,7 +22,7 @@ use bitty_ai_runtime::{
     Agent, AgentConfig, AgentSession, AuthContext, AuthDecision, ContextError, ContextPriority,
     ContextRecord, FakeConsentLedger, FakeProvider, IdIssuer, ProviderError, ProviderTurn,
     ProviderUsage, RecordBody, StableId, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError,
-    ToolRegistry, ToolSpec,
+    ToolPlacement, ToolRegistry, ToolSpec,
 };
 
 use crate::bridge::{HostPeer, IpcBridge};
@@ -201,6 +201,8 @@ pub fn test_tool_registry() -> Result<ToolRegistry, ToolError> {
         br#"{"type":"object"}"#.to_vec(),
         "terminal.inspect",
         true,
+        ToolPlacement::Mcp,
+        None,
     )?)?;
     Ok(registry)
 }

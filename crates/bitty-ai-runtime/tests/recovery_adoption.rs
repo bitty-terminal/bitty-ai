@@ -62,7 +62,7 @@ use bitty_ai_runtime::{
     ClaimedUnknownEffect, ExecOutcome, ExecutionId, ExecutionRecord, FakeProvider, FakeReconciler,
     FakeToolExecutor, IdIssuer, MAX_ADOPTION_SURVIVORS, ProviderTurn, ProviderUsage,
     ReconcileOutcome, SessionState, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError,
-    ToolRegistry, ToolSpec, ToolStatus, UnknownDisposition, VecSink, check_adoption,
+    ToolPlacement, ToolRegistry, ToolSpec, ToolStatus, UnknownDisposition, VecSink, check_adoption,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -120,6 +120,8 @@ fn read_tool_bus() -> ToolBus {
                 br#"{"type":"object"}"#.to_vec(),
                 "workspace.read",
                 true,
+                ToolPlacement::Mcp,
+                None,
             )
             .expect("valid spec"),
         )

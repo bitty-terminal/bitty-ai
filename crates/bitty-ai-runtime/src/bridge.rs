@@ -1289,7 +1289,7 @@ mod tests {
         // consent, then run one deterministic FakeProvider turn. The bridge
         // never executes a tool; it only gates the turn that does.
         use crate::provider::{FakeProvider, ModelProvider, ProviderTurn, ProviderUsage};
-        use crate::tool::{AuthBase, ToolBus, ToolRegistry, ToolSpec};
+        use crate::tool::{AuthBase, ToolBus, ToolPlacement, ToolRegistry, ToolSpec};
 
         let mut ids = crate::session::IdIssuer::default();
         let bound_instance = ids.agent_instance();
@@ -1367,6 +1367,8 @@ mod tests {
             br#"{"type":"object"}"#.to_vec(),
             "workspace.read",
             true,
+            ToolPlacement::Mcp,
+            None,
         )
         .expect("valid spec");
     }

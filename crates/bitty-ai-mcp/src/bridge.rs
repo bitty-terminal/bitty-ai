@@ -510,8 +510,8 @@ mod tests {
     use bitty_ai_runtime::bridge::FakeConsentLedger;
     use bitty_ai_runtime::session::IdIssuer;
     use bitty_ai_runtime::tool::{
-        AuthContext, FakeToolExecutor, ToolBus, ToolCall, ToolError, ToolRegistry, ToolSpec,
-        ToolStatus,
+        AuthContext, FakeToolExecutor, ToolBus, ToolCall, ToolError, ToolPlacement, ToolRegistry,
+        ToolSpec, ToolStatus,
     };
     use std::collections::VecDeque;
 
@@ -573,6 +573,8 @@ mod tests {
             br#"{"type":"object"}"#.to_vec(),
             "mcp.demo",
             true,
+            ToolPlacement::Mcp,
+            None,
         )
         .expect("valid");
         ImportedTool {
@@ -778,6 +780,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "mcp.demo",
                     true,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid"),
             )
@@ -823,6 +827,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "mcp.demo",
                     true,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid"),
             )
@@ -1142,6 +1148,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "mcp.demo",
                     true,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid"),
             )
@@ -1301,6 +1309,8 @@ mod tests {
                         br#"{"type":"object"}"#.to_vec(),
                         "mcp.demo",
                         true,
+                        ToolPlacement::Mcp,
+                        None,
                     )
                     .expect("valid"),
                 )
@@ -1397,6 +1407,8 @@ mod tests {
                     br#"{"type":"object"}"#.to_vec(),
                     "mcp.demo",
                     true,
+                    ToolPlacement::Mcp,
+                    None,
                 )
                 .expect("valid"),
             )
