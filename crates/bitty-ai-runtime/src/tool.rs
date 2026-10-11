@@ -44,6 +44,12 @@ pub const MAX_TOOL_CALLS_PER_TURN: usize = 8;
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 16 * 1024;
 /// Maximum tool result bytes (`TB-6`).
 pub const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
+/// Maximum native placement reason/backend length in bytes (AIQ-33 S3,
+/// `TB-2` shape).
+///
+/// Mirrors [`MAX_TOOL_DESCRIPTION_LEN`]: short owner-supplied opaque strings
+/// share the 512-byte inclusive bound (`len() > LIMIT` refuses).
+pub const MAX_NATIVE_PLACEMENT_BYTES: usize = 512;
 
 /// FNV-1a-64 offset basis (deterministic across processes and platforms;
 /// mirrors the `cache_key.rs` precedent).
@@ -458,16 +464,18 @@ impl ToolSpec {
 
 /// Validate a placement declaration (AIQ-33 S3, refuse-undeclared).
 ///
-/// `None` is undeclared; `Native` requires a non-empty reason/backend;
-/// `Mcp` carrying native detail is a contradictory declaration. Every
-/// violation fails closed with [`ToolError::UndeclaredPlacement`]. The
-/// caller shape-checks `name` first (as [`ToolSpec::new`] and
-/// [`ToolRegistry::register`] do), so the refusal carries it raw.
+/// `None` is undeclared; `Native` requires a non-empty reason/backend within
+/// [`MAX_NATIVE_PLACEMENT_BYTES`] bytes each (inclusive bound, the
+/// [`MAX_TOOL_DESCRIPTION_LEN`] convention); `Mcp` carrying native detail is
+/// a contradictory declaration. Every violation fails closed with
+/// [`ToolError::UndeclaredPlacement`]. The caller shape-checks `name` first
+/// (as [`ToolSpec::new`] and [`ToolRegistry::register`] do), so the refusal
+/// carries it raw.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::UndeclaredPlacement`] for a missing, mismatched, or
-/// contradictory declaration.
+/// Returns [`ToolError::UndeclaredPlacement`] for a missing, mismatched,
+/// contradictory, or over-long declaration.
 fn validate_placement(
     name: &str,
     placement: Option<ToolPlacement>,
@@ -483,7 +491,10 @@ fn validate_placement(
         (ToolPlacement::Mcp, None) => Ok(()),
         (ToolPlacement::Mcp, Some(_)) => Err(refused()),
         (ToolPlacement::Native, Some(detail))
-            if !detail.reason.is_empty() && !detail.backend.is_empty() =>
+            if !detail.reason.is_empty()
+                && !detail.backend.is_empty()
+                && detail.reason.len() <= MAX_NATIVE_PLACEMENT_BYTES
+                && detail.backend.len() <= MAX_NATIVE_PLACEMENT_BYTES =>
         {
             Ok(())
         }
@@ -1951,6 +1962,138 @@ mod tests {
             "native without detail must fail as UndeclaredPlacement"
         );
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn native_overlong_reason_refuses_without_state_change() {
+        // Over-long native reason is an undeclared placement: `ToolSpec::new`
+        // refuses with the typed registration refusal, and the registry
+        // refuses the same shape built without `new` with no state change.
+        let overlong = NativePlacement {
+            reason: "r".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+            backend: "terminal.inspect".to_owned(),
+        };
+        let error = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            Some(overlong),
+        )
+        .expect_err("over-long native reason must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        let mut registry = ToolRegistry::new();
+        let undeclared = ToolSpec {
+            name: "terminal_read_zone".to_owned(),
+            description: "Native zone read".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+            placement: Some(ToolPlacement::Native),
+            native: Some(NativePlacement {
+                reason: "r".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+                backend: "terminal.inspect".to_owned(),
+            }),
+        };
+        let error = registry
+            .register(undeclared)
+            .expect_err("over-long native reason must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        assert!(registry.is_empty());
+        assert!(registry.lookup("terminal_read_zone").is_none());
+    }
+
+    #[test]
+    fn native_overlong_backend_refuses_without_state_change() {
+        // Over-long native backend refuses exactly like the reason case.
+        let overlong = NativePlacement {
+            reason: "host-native terminal read".to_owned(),
+            backend: "b".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+        };
+        let error = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            Some(overlong),
+        )
+        .expect_err("over-long native backend must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        let mut registry = ToolRegistry::new();
+        let undeclared = ToolSpec {
+            name: "terminal_read_zone".to_owned(),
+            description: "Native zone read".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+            placement: Some(ToolPlacement::Native),
+            native: Some(NativePlacement {
+                reason: "host-native terminal read".to_owned(),
+                backend: "b".repeat(MAX_NATIVE_PLACEMENT_BYTES + 1),
+            }),
+        };
+        let error = registry
+            .register(undeclared)
+            .expect_err("over-long native backend must fail");
+        assert_eq!(
+            error,
+            ToolError::UndeclaredPlacement {
+                name: "terminal_read_zone".to_owned(),
+            }
+        );
+        assert!(registry.is_empty());
+        assert!(registry.lookup("terminal_read_zone").is_none());
+    }
+
+    #[test]
+    fn native_placement_at_bound_accepts() {
+        // Inclusive bound (`len() > LIMIT` refuses): exactly-at-limit
+        // reason/backend registers through both the constructor and the
+        // registry path.
+        let at_bound = NativePlacement {
+            reason: "r".repeat(MAX_NATIVE_PLACEMENT_BYTES),
+            backend: "b".repeat(MAX_NATIVE_PLACEMENT_BYTES),
+        };
+        let spec = ToolSpec::new(
+            "terminal_read_zone",
+            "Native zone read",
+            Vec::new(),
+            "terminal.inspect",
+            true,
+            ToolPlacement::Native,
+            Some(at_bound),
+        )
+        .expect("exactly-at-limit native detail must accept");
+        let mut registry = ToolRegistry::new();
+        registry.register(spec).expect("capacity");
+        let kept = registry.lookup("terminal_read_zone").expect("registered");
+        assert_eq!(
+            kept.native.as_ref().expect("detail").reason.len(),
+            MAX_NATIVE_PLACEMENT_BYTES
+        );
+        assert_eq!(
+            kept.native.as_ref().expect("detail").backend.len(),
+            MAX_NATIVE_PLACEMENT_BYTES
+        );
     }
 
     #[test]
