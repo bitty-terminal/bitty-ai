@@ -2138,8 +2138,8 @@ mod tests {
             "live turn 2 exposes cache_write_tokens"
         );
         let cost2 = live_usage_cost(&raw2).expect("live turn 2 exposes numeric cost");
-        // OBSERVED-ONLY: recorded below, never asserted (no hit-rate claim).
-        let cached_hit = cached2 > 0;
+        // OBSERVED-ONLY: recorded below, never asserted (0 means unreported, no hit-rate claim).
+        let cached_tokens_positive = cached2 > 0;
 
         eprintln!(
             "live_openrouter_prefix_cache_probe: turn1 ok latency_ms={latency1_ms} text_len={} \
@@ -2158,8 +2158,8 @@ mod tests {
             details2["cached_tokens"],
         );
         eprintln!(
-            "live_openrouter_prefix_cache_probe: observed turn2_cached_hit={cached_hit} \
-             (observed-only, never gates)"
+            "live_openrouter_prefix_cache_probe: observed turn2_cached_tokens={cached2} \
+             turn2_cached_tokens_positive={cached_tokens_positive} (observed-only, never gates; 0 means unreported)"
         );
     }
 }
