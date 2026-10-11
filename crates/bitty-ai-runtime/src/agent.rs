@@ -24,6 +24,7 @@ use crate::context::{
     ArtifactStore, AssembledContent, BYTES_PER_TOKEN_ESTIMATE, ContextError, ContextRecord,
     ContextRequest, RecordBody, StableId, assemble,
 };
+use crate::prompt::{AssembledPrompt, check_dispatch, dispatch_denial_cause};
 use crate::provider::{
     DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, MAX_REQUEST_TIMEOUT_MS, Message,
     ModelProvider, ProviderError, ProviderTurn, TurnRequest,
@@ -403,6 +404,13 @@ pub struct Agent<P: ModelProvider> {
     artifacts: ArtifactStore,
     ids: IdIssuer,
     config: AgentConfig,
+    /// Assembled prompt installed by the host for the AIQ-33 S1 pre-contact
+    /// dispatch gate (`None` = no prompt constraint; the gate is skipped and
+    /// dispatch falls through to the [`ToolBus`] authorization path
+    /// unchanged). The prompt never grants: it only narrows what the
+    /// dispatcher (capability registry plus the [`ToolBus`] tier/hook
+    /// policy) would allow.
+    prompt: Option<AssembledPrompt>,
     executions: Vec<ExecutionRecord>,
     tool_history: Vec<ContextRecord>,
     /// Attribution for effects whose outcome stayed `Unknown` when their
@@ -430,12 +438,25 @@ impl<P: ModelProvider> Agent<P> {
             artifacts: ArtifactStore::new(),
             ids: IdIssuer::default(),
             config,
+            prompt: None,
             executions: Vec::new(),
             tool_history: Vec::new(),
             pending_unknown: Vec::new(),
             turn_cost: 0,
             next_seq: 0,
         }
+    }
+
+    /// Install the assembled prompt for the pre-contact dispatch gate
+    /// (AIQ-33 S1). The next [`Agent::run_turn`] checks every requested
+    /// call with [`check_dispatch`](crate::prompt::check_dispatch) before
+    /// [`ToolBus`](crate::tool::ToolBus) precheck; a prompt denial, an
+    /// allow-set omission, or a missing dispatcher grant refuses the turn
+    /// pre-contact with zero executor contact. Replaces any previously
+    /// installed prompt. The default (never installed) leaves dispatch
+    /// exactly as before.
+    pub fn set_prompt(&mut self, prompt: AssembledPrompt) {
+        self.prompt = Some(prompt);
     }
 
     /// Request cancellation (idempotent, visible at the next dispatch or
@@ -529,6 +550,69 @@ impl<P: ModelProvider> Agent<P> {
             agent_instance_id: self.session.agent_instance_id(),
             session_id: self.session.session_id(),
             level: self.session.level(),
+        }
+    }
+
+    /// Whether the dispatcher grants `tool` for one pre-contact check
+    /// (AIQ-33 S1 grant input).
+    ///
+    /// The dispatcher is the capability registry plus runtime policy: this
+    /// half observes the registry (a name the bus never registered is not
+    /// granted, so [`check_dispatch`](crate::prompt::check_dispatch)
+    /// reports [`PromptError::DispatcherDenied`](crate::prompt::PromptError::DispatcherDenied)
+    /// for it before any authorizer, budget, or executor contact). The
+    /// runtime-policy half — the tier floor and the authorization hook, both
+    /// keyed by `base` — keeps enforcing behind [`ToolBus::precheck`] and
+    /// [`dispatch`](crate::tool::ToolBus::dispatch) as defense in depth;
+    /// this crate changes no [`ToolBus`] signature to re-expose it here.
+    /// Evaluated live every round (never cached) alongside
+    /// [`Agent::auth_base`], so the grant input cannot go stale across the
+    /// round boundary.
+    fn dispatcher_grants(&self, tool: &str) -> bool {
+        self.tools.tool_names().iter().any(|name| name == tool)
+    }
+
+    /// First prompt-gate denial for one batch, if any (AIQ-33 S1).
+    ///
+    /// Returns `None` when no prompt is installed (gate skipped) or every
+    /// call passes [`check_dispatch`](crate::prompt::check_dispatch);
+    /// otherwise the refused call name plus its pre-contact
+    /// [`ToolError::Denied`] cause (see
+    /// [`dispatch_denial_cause`](crate::prompt::dispatch_denial_cause)).
+    /// Pure observation: no dispatch, no counter change, no session effect.
+    fn prompt_gate_denial(&self, calls: &[crate::tool::ToolCall]) -> Option<(String, ToolError)> {
+        let prompt = self.prompt.as_ref()?;
+        calls.iter().find_map(|call| {
+            let dispatcher_grants = self.dispatcher_grants(&call.name);
+            match check_dispatch(prompt, &call.name, dispatcher_grants) {
+                Ok(()) => None,
+                Err(error) => {
+                    let tool = call.name.clone();
+                    Some((tool.clone(), dispatch_denial_cause(&tool, &error)))
+                }
+            }
+        })
+    }
+
+    /// Synthesize the pre-contact prompt refusal record (AIQ-33 S1).
+    ///
+    /// Same admission-only shape as [`ToolBus`](crate::tool::ToolBus)
+    /// refusals: [`ToolStatus::Refused`](crate::tool::ToolStatus::Refused)
+    /// carrying the typed [`ToolError::Denied`] cause, nothing accepted or
+    /// rejected (no result exists), empty data, and
+    /// `is_untrusted_surface == false` because no host bytes are involved.
+    /// Callers attribute it with [`Agent::attribute_execution`] and fail the
+    /// turn with the carried cause, exactly like a dispatch-time admission
+    /// refusal.
+    fn prompt_refusal(execution_id: ExecutionId, tool: &str, cause: ToolError) -> ToolExecution {
+        ToolExecution {
+            execution_id,
+            tool: tool.to_owned(),
+            status: ToolStatus::Refused { cause },
+            result_disposition: ResultDisposition::Accepted,
+            summary: "refused before dispatch".to_owned(),
+            data: Vec::new(),
+            is_untrusted_surface: false,
         }
     }
 
@@ -787,6 +871,21 @@ impl<P: ModelProvider> Agent<P> {
             // Fresh base per round so a rotation that landed between rounds
             // is already visible here.
             let precheck_base = self.auth_base();
+            // AIQ-33 S1: prompt-dispatch composition at the agent boundary,
+            // pre-contact. When the host installed an assembled prompt, gate
+            // the whole batch on it before `ToolBus` precheck: a prompt
+            // denial, an allow-set omission, or a missing dispatcher grant
+            // refuses with zero executor contact and nothing dispatched
+            // (the `Denied` pre-contact precedent: `Refused` status plus the
+            // typed cause, never `Failed`/`Unknown`/`ProtocolRejected`).
+            // The refusal is attributed like a dispatch-time admission
+            // refusal and fails the turn with the carried cause; without an
+            // installed prompt this gate is skipped entirely.
+            if let Some((tool, cause)) = self.prompt_gate_denial(&calls) {
+                let execution = Self::prompt_refusal(self.ids.execution(), &tool, cause.clone());
+                self.attribute_execution(&execution);
+                return self.fail(cause.into());
+            }
             if let Err(error) =
                 self.tools
                     .precheck(&calls, &precheck_base, self.config.max_tool_calls_per_turn)
