@@ -91,6 +91,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
+use crate::tool::ToolError;
+
 /// Maximum prompt text bytes per layer.
 pub const MAX_LAYER_TEXT_BYTES: usize = 16 * 1024;
 /// Maximum directives per layer.
@@ -1393,6 +1395,45 @@ pub fn check_dispatch(
         }
     }
     Ok(())
+}
+
+/// Map a dispatch refusal to its pre-contact [`ToolError::Denied`] cause.
+///
+/// Pure error mapping for the AIQ-33 S1 agent-boundary composition
+/// ([`Agent::run_turn`](crate::agent::Agent::run_turn) checks every call of
+/// a batch with [`check_dispatch`] before [`ToolBus`](crate::tool::ToolBus)
+/// precheck): the refusal keeps its tool identity and carries its display
+/// text as the reason, so the boundary can attribute
+/// [`ToolStatus::Refused`](crate::tool::ToolStatus::Refused) with the exact
+/// typed cause and zero executor contact. This function changes no
+/// [`check_dispatch`] logic; it only translates the refusal vocabulary.
+///
+/// The tool identity comes from the variant when it carries one
+/// ([`PromptError::DispatcherDenied`], [`PromptError::PromptDenied`],
+/// [`PromptError::PromptNotAllowed`] — including the
+/// [`EMPTY_ALLOW_SET_SENTINEL`] assembly-time empty allow-set, whose
+/// sentinel text is preserved verbatim in the reason so the origin stays
+/// unambiguous). Any other variant is unreachable from `check_dispatch`;
+/// it still maps to [`ToolError::Denied`] naming the refused call with its
+/// display text, so the function is total without inventing tool identity.
+/// The cause is [`normalized`](ToolError::normalized) because the refused
+/// name reaches this boundary model-supplied (before ToolBus validation),
+/// exactly like the narrowing denial. Never [`ToolError::Failed`],
+/// [`ToolError::EffectUnknown`], or [`ToolError::ProtocolRejected`]: a
+/// pre-contact refusal executed nothing.
+#[must_use]
+pub fn dispatch_denial_cause(tool: &str, error: &PromptError) -> ToolError {
+    let name = match error {
+        PromptError::DispatcherDenied { tool }
+        | PromptError::PromptDenied { tool }
+        | PromptError::PromptNotAllowed { tool } => tool.clone(),
+        _ => tool.to_owned(),
+    };
+    ToolError::Denied {
+        name,
+        reason: error.to_string(),
+    }
+    .normalized()
 }
 
 // ---------------------------------------------------------------------------
