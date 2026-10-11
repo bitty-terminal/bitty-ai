@@ -14,7 +14,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::content_hash::ContentHash;
-use crate::content_store::Checkpoint;
+use crate::content_store::{Checkpoint, ContentStore, Rationale};
 use crate::merge::{ContextTreeMerge, MergeError};
 use crate::task_dag::TaskNode;
 
@@ -819,4 +819,314 @@ impl ContextCompiler {
         }
         &s[..boundary]
     }
+}
+
+// ── Candidate falsifiability helpers (AI-0236, beyond-v0.1) ────────────────
+//
+// Candidate wording only: everything below is a reviewable-test harness for
+// Wheel verification items W-V1 (finding survives raw demotion), W-V3
+// (temperature orthogonality), W-V4 (per-claim bytes-at-revision), W-V5
+// (rationale-alone reconstruction), W-V8 (lossy projection with reversible
+// provenance), and the W-V10 boundary-matrix compiler half. Beyond the v0.1
+// scope: NOTHING here is promotable to accepted architecture or to the v0.1
+// contract, and no comment below makes an accepted-status claim. No schema
+// change, no package split, no new dependency/thread/network; clocks stay
+// caller-supplied and every fallible helper fails closed with static text
+// (caller-supplied strings are never echoed). Temperature items use
+// caller-supplied labels only: W-V2 stays owner-pending and uncalibrated, so
+// no defaults, policies, or thresholds are defined here; demotion reuses the
+// existing Tier-1 `scratch/*` + `temp/*` rule and the existing
+// pinned-surface/cache-affinity hints only.
+
+/// Candidate (beyond-v0.1): answer a question from finding text plus its
+/// reference only, ignoring raw evidence by construction.
+///
+/// Pins W-V1 falsifiability: the harness answers from `finding_text` alone,
+/// so demoting raw evidence cannot change the answer. Deterministic pure
+/// function; no store I/O.
+#[must_use]
+pub fn candidate_answer_with_finding(question: &str, finding_text: &str) -> String {
+    format!(
+        "Q: {}\nA (from finding): {}",
+        question.trim(),
+        finding_text.trim()
+    )
+}
+
+/// Candidate (beyond-v0.1): check that a finding slot survived demotion in a
+/// compiled view.
+///
+/// Pins the W-V1 "finding still answers" half: returns true only when the
+/// compiled Zone 2 state still names `finding_slot`. Read-only over an
+/// already-compiled context.
+#[must_use]
+pub fn candidate_finding_present_after_demotion(
+    compiled: &CompiledContext,
+    finding_slot: &str,
+) -> bool {
+    compiled.zone2_state.contains(finding_slot)
+}
+
+/// Candidate (beyond-v0.1): check that demoted raw evidence stays resolvable
+/// by content hash.
+///
+/// Pins the W-V1 "raw stays resolvable" half: pruning removes the slot from
+/// the compiled view but never deletes the blob, so `get_blob` must still
+/// return it. Fail-closed: any store error or absence reports false.
+#[must_use]
+pub fn candidate_raw_still_resolvable(store: &ContentStore, hash: &ContentHash) -> bool {
+    matches!(store.get_blob(hash), Ok(Some(_)))
+}
+
+/// Candidate (beyond-v0.1): caller-supplied temperature label.
+///
+/// Pins W-V3 orthogonality without calibrating anything: the label travels
+/// with the caller's slot assignment and never derives from a threshold,
+/// default, or policy. W-V2 stays owner-pending and uncalibrated; this enum
+/// defines no numbers and no mapping from slots to labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateTemperature {
+    /// Candidate Hot evidence: recent observation the caller treats as live.
+    Hot,
+    /// Candidate Cold knowledge: stable background the caller treats as cool.
+    Cold,
+}
+
+/// Candidate (beyond-v0.1): one temperature-labelled slot assignment.
+///
+/// The `pinned` flag reuses the existing pinned-surface hint only (a slot the
+/// caller already pins outside `scratch/*` + `temp/*`); it grants no new
+/// retention and sets no threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateTempSlot {
+    /// Slot name as stored in the [`ContextTree`].
+    pub slot: String,
+    /// Caller-supplied temperature label (no calibration behind it).
+    pub temperature: CandidateTemperature,
+    /// Whether the caller pins this slot outside the prunable namespace.
+    pub pinned: bool,
+}
+
+/// Candidate (beyond-v0.1): check that Hot evidence and Cold knowledge coexist
+/// in one tree.
+///
+/// Pins W-V3 coexistence: returns true only when both named slots are present
+/// at once. Read-only; asserts nothing about eviction order.
+#[must_use]
+pub fn candidate_hot_cold_coexist(tree: &ContextTree, hot_slot: &str, cold_slot: &str) -> bool {
+    tree.get(hot_slot).is_some() && tree.get(cold_slot).is_some()
+}
+
+/// Candidate (beyond-v0.1): check that Tier-1 demotion kept the pinned slot
+/// while demoting the stale slot.
+///
+/// Pins W-V3 "pinned stays Hot; stale demotes" using the existing Tier-1
+/// `scratch/*` + `temp/*` rule only: returns true when the compiled Zone 2
+/// state still names `pinned_slot` and no longer names `stale_slot`. No new
+/// policy or threshold is consulted.
+#[must_use]
+pub fn candidate_pinned_survives_tier1(
+    compiled: &CompiledContext,
+    pinned_slot: &str,
+    stale_slot: &str,
+) -> bool {
+    compiled.zone2_state.contains(pinned_slot) && !compiled.zone2_state.contains(stale_slot)
+}
+
+/// Candidate (beyond-v0.1): per-claim reference to slot bytes at a revision.
+///
+/// Pins W-V4 addressing: each claim names its slot, the exact content hash it
+/// pins, and the checkpoint revision whose tree must name that hash. No
+/// whole-tree reads are implied; resolution is per claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateClaimRef {
+    /// Claim identifier (caller-supplied, never echoed in errors).
+    pub claim_id: String,
+    /// Slot the claim was read from.
+    pub slot: String,
+    /// Exact content hash the claim pins.
+    pub hash: ContentHash,
+    /// Checkpoint revision whose tree must name (`slot`, `hash`).
+    pub revision: ContentHash,
+}
+
+/// Candidate (beyond-v0.1): fail-closed per-claim resolution failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateClaimError {
+    /// Underlying storage failure. Static text; details are dropped.
+    Store,
+    /// Stored data failed integrity validation. Static text.
+    Corrupt,
+}
+
+impl fmt::Display for CandidateClaimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store => write!(f, "candidate claim storage error"),
+            Self::Corrupt => write!(f, "candidate claim store corrupt or incompatible"),
+        }
+    }
+}
+
+impl std::error::Error for CandidateClaimError {}
+
+/// Candidate (beyond-v0.1): resolve one claim to its bytes at its revision.
+///
+/// Pins W-V4 falsifiability: reads the revision checkpoint, materializes its
+/// tree from durable storage only, checks the tree still names
+/// (`slot`, `hash`), then returns the payload bytes. A claim naming an
+/// unknown revision, a missing slot, or a rotated hash resolves to `Ok(None)`
+/// (not an error); undecodable trees fail closed as [`CandidateClaimError::Corrupt`].
+/// Clocks are caller-supplied throughout (none taken here at all).
+pub fn candidate_resolve_claim(
+    store: &ContentStore,
+    claim: &CandidateClaimRef,
+) -> Result<Option<Vec<u8>>, CandidateClaimError> {
+    let checkpoint = store
+        .get_checkpoint(&claim.revision)
+        .map_err(|_| CandidateClaimError::Store)?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(None);
+    };
+    let Some(tree_hash) = checkpoint.tree_hash else {
+        return Err(CandidateClaimError::Corrupt);
+    };
+    let tree_bytes = store
+        .get_blob(&tree_hash)
+        .map_err(|_| CandidateClaimError::Store)?
+        .ok_or(CandidateClaimError::Corrupt)?;
+    let tree =
+        ContextTree::from_canonical_bytes(&tree_bytes).map_err(|_| CandidateClaimError::Corrupt)?;
+    let Some(entry) = tree.get(claim.slot.as_str()) else {
+        return Ok(None);
+    };
+    if entry.hash != claim.hash {
+        return Ok(None);
+    }
+    let bytes = store
+        .get_blob(&claim.hash)
+        .map_err(|_| CandidateClaimError::Store)?;
+    Ok(bytes)
+}
+
+/// Candidate (beyond-v0.1): reconstruct the "why" of a turn from a stored
+/// [`Rationale`] alone.
+///
+/// Pins W-V5 falsifiability: the reconstruction reads only the six structured
+/// rationale fields and takes no raw-thinking input (there is no parameter
+/// for one), so a later agent holding just the checkpoint rationale gets the
+/// same string. Deterministic pure function.
+#[must_use]
+pub fn candidate_reconstruct_why(rationale: &Rationale) -> String {
+    let mut out = String::from("Why: ");
+    out.push_str(rationale.why.trim());
+    out.push_str("\nWhat: ");
+    out.push_str(rationale.what.trim());
+    if let Some(focus) = &rationale.where_focus {
+        out.push_str("\nWhere: ");
+        out.push_str(focus.trim());
+    }
+    if let Some(how) = &rationale.how {
+        out.push_str("\nHow: ");
+        out.push_str(how.trim());
+    }
+    if let Some(expected) = &rationale.expected {
+        out.push_str("\nExpected: ");
+        out.push_str(expected.trim());
+    }
+    if let Some(observed) = &rationale.observed {
+        out.push_str("\nObserved: ");
+        out.push_str(observed.trim());
+    }
+    out
+}
+
+/// Candidate (beyond-v0.1): lossy projection carrying reversible provenance.
+///
+/// Pins W-V8: `projected` is the lossy text (prefix plus a truncation marker
+/// when the original exceeded `keep_prefix_len`, which is caller-supplied per
+/// call — never a default or threshold), while `provenance` plus
+/// `original_len` reversibly name the exact original bytes in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateProjection {
+    /// Lossy projected text.
+    pub projected: String,
+    /// Content hash of the full original bytes (reversible provenance).
+    pub provenance: ContentHash,
+    /// Byte length of the full original (second half of the provenance).
+    pub original_len: usize,
+}
+
+/// Candidate (beyond-v0.1): project bytes lossily while recording reversible
+/// provenance.
+///
+/// Deterministic pure function; no store I/O. The kept prefix length is
+/// caller-supplied per call: no default, policy, or threshold is defined.
+#[must_use]
+pub fn candidate_project_lossy(original: &[u8], keep_prefix_len: usize) -> CandidateProjection {
+    let provenance = ContentHash::compute(original);
+    let original_len = original.len();
+    let keep = keep_prefix_len.min(original.len());
+    let mut projected = String::from_utf8_lossy(&original[..keep]).into_owned();
+    if keep < original.len() {
+        projected.push_str("\n[...LOSSY PROJECTION TRUNCATED...]");
+    }
+    CandidateProjection {
+        projected,
+        provenance,
+        original_len,
+    }
+}
+
+/// Candidate (beyond-v0.1): reverse a lossy projection to its exact original
+/// bytes via stored provenance.
+///
+/// Pins W-V8 reversibility: resolves `provenance` through the store and
+/// verifies the length before returning. Unknown provenance resolves to
+/// `Ok(None)`; length mismatch (rotated content under a reused projection)
+/// also resolves to `Ok(None)` rather than returning wrong bytes.
+pub fn candidate_reverse_projection(
+    store: &ContentStore,
+    projection: &CandidateProjection,
+) -> Result<Option<Vec<u8>>, CandidateClaimError> {
+    let bytes = store
+        .get_blob(&projection.provenance)
+        .map_err(|_| CandidateClaimError::Store)?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    if bytes.len() != projection.original_len {
+        return Ok(None);
+    }
+    if ContentHash::compute(&bytes) != projection.provenance {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Candidate (beyond-v0.1): check that a terminal-side (Zone 3) change left
+/// the AI contract (Zone 1 stable prefix) byte-identical.
+///
+/// Pins the W-V10 "terminal-change with ai-contract-no-change" half: returns
+/// true only when both the prefix bytes and their digest are unchanged.
+/// Read-only over two already-compiled contexts.
+#[must_use]
+pub fn candidate_zone1_stable_after_terminal_change(
+    before: &CompiledContext,
+    after: &CompiledContext,
+) -> bool {
+    before.prefix_hash == after.prefix_hash && before.zone1_prefix == after.zone1_prefix
+}
+
+/// Candidate (beyond-v0.1): check that a contract-side (Zone 1) change moved
+/// the stable prefix digest.
+///
+/// Pins the W-V10 "contract change moves the prefix" half: returns true only
+/// when the digests differ. Read-only over two already-compiled contexts.
+#[must_use]
+pub fn candidate_zone1_moves_with_contract_change(
+    before: &CompiledContext,
+    after: &CompiledContext,
+) -> bool {
+    before.prefix_hash != after.prefix_hash
 }

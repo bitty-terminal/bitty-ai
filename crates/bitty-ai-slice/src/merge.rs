@@ -900,6 +900,85 @@ pub fn collect_garbage(
     Ok(report)
 }
 
+// ── Candidate falsifiability helpers (AI-0236, beyond-v0.1) ────────────────
+//
+// Candidate wording only: everything below is a reviewable-test harness for
+// Wheel verification items W-V9 (evicted-stays-retrievable-until-retention-ends
+// with deletion/expiry propagating to references) and the W-V10
+// terminal-change/ai-contract-no-change boundary matrix (merge half). Beyond
+// the v0.1 scope: NOTHING here is promotable to accepted architecture or to
+// the v0.1 contract, and no comment below makes an accepted-status claim. No
+// schema change, no package split, no new dependency/thread/network, no new
+// retention policy or threshold: retention reuses the existing GC roots
+// (live refs, in-window reflog, open pending pins) and the existing
+// [`GcOptions`] bounds only. Clocks stay caller-supplied; every helper is
+// read-only and fails closed (store errors report false, never panic).
+
+/// Candidate (beyond-v0.1): check that a checkpoint is still retrievable.
+///
+/// Pins the W-V9 "evicted stays retrievable until retention ends" half for
+/// checkpoints: returns true only when `get_checkpoint` yields a row.
+/// Read-only; any store error reports false.
+#[must_use]
+pub fn candidate_checkpoint_retrievable(store: &ContentStore, hash: &ContentHash) -> bool {
+    matches!(store.get_checkpoint(hash), Ok(Some(_)))
+}
+
+/// Candidate (beyond-v0.1): check that a blob is still retrievable.
+///
+/// Pins the W-V9 "evicted stays retrievable until retention ends" half for
+/// blobs (tree blobs and slot-payload blobs alike): returns true only when
+/// `get_blob` yields digest-verified bytes. Read-only; any store error or
+/// absence reports false.
+#[must_use]
+pub fn candidate_blob_retrievable(store: &ContentStore, hash: &ContentHash) -> bool {
+    matches!(store.get_blob(hash), Ok(Some(_)))
+}
+
+/// Candidate (beyond-v0.1): check that deletion/expiry propagated to a
+/// checkpoint reference.
+///
+/// Pins the W-V9 "deletion propagates to references" half: returns true only
+/// when `get_checkpoint` now yields `Ok(None)` (the row is gone, fail-closed
+/// to absence rather than to an error or stale bytes). Read-only; any store
+/// error reports false so transport failures cannot masquerade as propagation.
+#[must_use]
+pub fn candidate_deletion_propagated_to_checkpoint(
+    store: &ContentStore,
+    hash: &ContentHash,
+) -> bool {
+    matches!(store.get_checkpoint(hash), Ok(None))
+}
+
+/// Candidate (beyond-v0.1): one cell of the terminal-change / AI-contract
+/// boundary matrix.
+///
+/// Both flags are caller-observed per compilation pair (did the terminal-side
+/// Zone 3 input change; did the contract-side Zone 1 input change). The cell
+/// carries no threshold and no policy: it only names which corner of the
+/// matrix a compiled pair belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateBoundaryCell {
+    /// Whether the terminal-side input changed between the two compilations.
+    pub terminal_changed: bool,
+    /// Whether the AI-contract-side input changed between the two compilations.
+    pub contract_changed: bool,
+}
+
+/// Candidate (beyond-v0.1): expected prefix stability for one matrix cell.
+///
+/// Pins the W-V10 rule as a pure function so the matrix is falsifiable by
+/// compilation evidence: the stable prefix is expected to stay byte-identical
+/// exactly when the contract did not change, regardless of terminal change.
+/// No threshold or policy is consulted; callers verify the expectation
+/// against real [`crate::context_compiler::CompiledContext`] digests (see the
+/// compiler-half helpers), which fail the test if terminal text ever leaks
+/// into Zone 1 or a contract edit ever leaves the digest untouched.
+#[must_use]
+pub fn candidate_boundary_expects_stable_prefix(cell: CandidateBoundaryCell) -> bool {
+    !cell.contract_changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
