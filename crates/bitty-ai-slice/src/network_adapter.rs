@@ -788,11 +788,16 @@ impl NetworkService for RecordingNetworkService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        RefreshAuthorization, SnapshotIngestRequest, ingest_snapshot, prompt_snapshot_with_project,
+        snapshot_digest_hex,
+    };
+    use bitty_ai_runtime::assemble_prompt;
     use bitty_ai_runtime::provider::Message;
     use bitty_ai_runtime::provider::{
         DEFAULT_RATE_LIMIT_MAX_MS, MAX_RATE_LIMIT_WAIT_MS, rate_limit_wait_ms,
     };
-    use bitty_ai_runtime::{ReasoningConfig, ResponseFormat};
+    use bitty_ai_runtime::{ArtifactStore, ContextPriority, ReasoningConfig, ResponseFormat};
 
     fn sample_turn_request(model: &str, budget: usize, timeout_ms: u64) -> TurnRequest {
         TurnRequest {
@@ -1815,6 +1820,7 @@ mod tests {
         inner: S,
         last_status: Mutex<Option<u16>>,
         last_body: Mutex<Option<Vec<u8>>>,
+        last_request: Mutex<Option<Request>>,
     }
 
     impl<S> CapturingService<S> {
@@ -1823,6 +1829,7 @@ mod tests {
                 inner,
                 last_status: Mutex::new(None),
                 last_body: Mutex::new(None),
+                last_request: Mutex::new(None),
             }
         }
 
@@ -1831,12 +1838,22 @@ mod tests {
             let body = self.last_body.lock().ok()?.clone()?;
             Some((status, body))
         }
+
+        /// Borrow the last outgoing [`Request`] (mapping evidence for the
+        /// live-wire probes: `max_body_bytes` / `timeout`). Test-only; the
+        /// adapter under probe never sees it.
+        fn captured_request(&self) -> Option<Request> {
+            self.last_request.lock().ok()?.clone()
+        }
     }
 
     impl<S: NetworkService> NetworkService for CapturingService<S> {
         type Socket = S::Socket;
 
         fn request(&self, request: &Request) -> Result<Response, NetworkError> {
+            if let Ok(mut slot) = self.last_request.lock() {
+                *slot = Some(request.clone());
+            }
             let response = self.inner.request(request)?;
             if let Ok(mut slot) = self.last_status.lock() {
                 *slot = Some(response.status);
@@ -2160,6 +2177,171 @@ mod tests {
         eprintln!(
             "live_openrouter_prefix_cache_probe: observed turn2_cached_tokens={cached2} \
              turn2_cached_tokens_positive={cached_tokens_positive} (observed-only, never gates; 0 means unreported)"
+        );
+    }
+
+    /// Live compiler-assembled prompt dispatch (manual only, AI-0232 S3):
+    /// one prompt assembled offline via the `tests/hit_rate.rs`
+    /// `prompt_snapshot_with_project` / `assemble_prompt` path, dispatched
+    /// live via [`NetworkConsumerAdapter`] backed by
+    /// `CapturingService(bitty_network::HttpNetworkService)`
+    /// (dev-dependency, test-only). Asserts the
+    /// budget_bytes-to-`max_body_bytes` / timeout_ms-to-`timeout` mapping
+    /// holds on the live wire (pre-I/O gates fire identically to offline),
+    /// the turn text follows the content||reasoning fallback, and usage
+    /// tokens plus numeric cost are present. Requires `OPENROUTER_API_KEY`
+    /// in the environment; without it the test prints a skip note and
+    /// passes without asserting (never panics, never logs the key). Never
+    /// runs in CI (`#[ignore]`). No hit-rate or acceptance claim.
+    ///
+    /// Cost: model `deepseek/deepseek-v4.1-flash`, `max_tokens: 64`, one
+    /// fixed tiny fixture prompt per run.
+    ///
+    /// Run: `OPENROUTER_API_KEY=... cargo test -p bitty-ai-slice
+    /// live_compiled_prompt_dispatch_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_compiled_prompt_dispatch_probe() {
+        // ---- Offline: assemble one prompt via the pinned offline path ----
+        // Fixture snapshot bytes only (no secrets); mirrors the
+        // `tests/hit_rate.rs` snapshot_bytes/ingest/session_key_for_turn
+        // pattern. Reuses the existing assembler; no new assembly path.
+        let canonical: &[u8] = b"{\"schema\":{\"name\":\"ProjectSnapshot\",\"version\":1,\"canonicalization_version\":1},\"source\":{\"label\":\"demo\",\"revision\":\"ai-0232-s3\"},\"project_units\":[{\"id\":1}],\"entrypoints\":[],\"dependencies\":[]}";
+        let digest = snapshot_digest_hex(canonical);
+        let mut store = ArtifactStore::new();
+        let ingest_req = SnapshotIngestRequest {
+            canonical_bytes: canonical,
+            expected_digest: &digest,
+            record_id: "ai-0232-s3",
+            owner: "term-1",
+            collected_at_ms: 100,
+            priority: ContextPriority::High,
+            refresh: RefreshAuthorization::authorize(1),
+        };
+        let record = ingest_snapshot(&ingest_req, &mut store).expect("fixture snapshot ingests");
+        let snapshot = prompt_snapshot_with_project(
+            &record,
+            &digest,
+            "core contract text",
+            "user text",
+            "skills text",
+            "user: reply with exactly: slice ok",
+            "bitty-core-prompt@1",
+        )
+        .expect("fixture snapshot builds");
+        let assembled = assemble_prompt(&snapshot).expect("fixture prompt assembles");
+        assert!(
+            !assembled.canonical_bytes().is_empty(),
+            "assembled prompt is non-empty"
+        );
+        let prompt_text = String::from_utf8(assembled.canonical_bytes().to_vec())
+            .expect("canonical bytes are UTF-8");
+
+        // ---- Live: dispatch the assembled prompt over real HTTPS ----
+        let key = match std::env::var("OPENROUTER_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => {
+                eprintln!("live_compiled_prompt_dispatch_probe: SKIP (OPENROUTER_API_KEY unset)");
+                return;
+            }
+        };
+
+        let budget_bytes: usize = 32_768;
+        let timeout_ms: u64 = 25_000;
+        let capability = NetworkCapability::offline().with_domain("openrouter.ai");
+        // The service enforces the same allowlist on the socket path, so
+        // both gates (adapter pre-I/O + service pre-socket) must grant the
+        // domain; anything else fails closed with zero packets.
+        let service =
+            CapturingService::new(bitty_network::HttpNetworkService::new(capability.clone()));
+        let secret =
+            SecretField::new(key.into_bytes()).expect("env key material forms a secret field");
+        let config = NetworkConsumerAdapterConfig::new(
+            "openrouter-live",
+            "deepseek/deepseek-v4.1-flash",
+            "https://openrouter.ai/api/v1/chat/completions",
+        )
+        .expect("probe endpoint config")
+        .with_api_key(secret)
+        .with_capability(capability);
+
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let mut req = sample_turn_request("deepseek/deepseek-v4.1-flash", budget_bytes, timeout_ms);
+        req.messages = vec![Message::user(prompt_text)];
+        let mut sampling = blank_sampling();
+        sampling.max_tokens = Some(64);
+        req.sampling = Some(sampling);
+
+        let started = std::time::Instant::now();
+        let turn = adapter.complete(&req).expect("live turn succeeds");
+        let latency_ms = started.elapsed().as_millis();
+
+        // Mapping holds on the live wire: the captured outgoing request
+        // carries the same budget/timeout projection the offline
+        // `maps_budget_and_timeout_into_request` test pins.
+        let live_req = adapter
+            .service()
+            .captured_request()
+            .expect("captured live request");
+        assert_eq!(
+            live_req.max_body_bytes,
+            Some(budget_bytes as u64),
+            "live budget_bytes maps to max_body_bytes"
+        );
+        assert_eq!(
+            live_req.timeout,
+            Some(Duration::from_millis(timeout_ms)),
+            "live timeout_ms maps to timeout"
+        );
+
+        // Adapter-level assertions: the turn parsed with text or reasoning.
+        assert!(
+            !turn.text.is_empty(),
+            "live turn carries content or reasoning"
+        );
+        assert!(turn.usage.input_tokens > 0, "live usage reports input");
+        assert!(turn.usage.output_tokens > 0, "live usage reports output");
+
+        // Raw-body assertions on the captured live bytes: HTTP-level
+        // success plus the content||reasoning fallback the adapter applies
+        // (both OpenRouter `reasoning` and DeepSeek-direct
+        // `reasoning_content` shapes count, mirroring the parse path).
+        let (status, body) = adapter
+            .service()
+            .captured()
+            .expect("captured live response");
+        assert_eq!(status, 200, "live HTTP status");
+        let raw: serde_json::Value = serde_json::from_slice(&body).expect("live body is JSON");
+        let msg = &raw["choices"][0]["message"];
+        let has_content = msg["content"].as_str().is_some_and(|c| !c.is_empty());
+        let has_reasoning = msg["reasoning"].as_str().is_some_and(|r| !r.is_empty())
+            || msg["reasoning_content"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty());
+        assert!(
+            has_content || has_reasoning,
+            "live message carries content or reasoning"
+        );
+        let details = &raw["usage"]["prompt_tokens_details"];
+        assert!(
+            details["cached_tokens"].as_u64().is_some(),
+            "live usage exposes cached_tokens"
+        );
+        assert!(
+            details["cache_write_tokens"].as_u64().is_some(),
+            "live usage exposes cache_write_tokens"
+        );
+        // Numeric cost is required: absent/invalid cost fails the probe
+        // instead of reporting a default $0.00000000 success line.
+        let cost = live_usage_cost(&raw).expect("live usage exposes numeric cost");
+
+        eprintln!(
+            "live_compiled_prompt_dispatch_probe: ok latency_ms={latency_ms} text_len={} \
+             input_tokens={} output_tokens={} cached_tokens={} cost=${cost:.8}",
+            turn.text.len(),
+            turn.usage.input_tokens,
+            turn.usage.output_tokens,
+            details["cached_tokens"],
         );
     }
 }
