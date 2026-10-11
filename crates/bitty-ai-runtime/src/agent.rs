@@ -25,8 +25,8 @@ use crate::context::{
     ContextRequest, RecordBody, StableId, assemble,
 };
 use crate::provider::{
-    DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, Message, ModelProvider,
-    ProviderError, ProviderTurn, TurnRequest,
+    DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_REQUEST_TIMEOUT_MS, MAX_REQUEST_TIMEOUT_MS, Message,
+    ModelProvider, ProviderError, ProviderTurn, TurnRequest,
 };
 use crate::reconcile::{
     DEFAULT_MAX_UNKNOWN_RETRIES, DEFAULT_RECONCILE_BASE_DELAY_MS, DEFAULT_RECONCILE_MAX_DELAY_MS,
@@ -589,6 +589,35 @@ impl<P: ModelProvider> Agent<P> {
             return ExecOutcome::Failed {
                 error: AgentError::Session(SessionError::AlreadyTerminated { state }),
             };
+        }
+        // MP-8 S1 (AI-0223): admission-time provider-timeout ceiling gate.
+        // `provider_timeout_ms` is host-controlled config: refuse out-of-range
+        // values (`0`, or above `MAX_REQUEST_TIMEOUT_MS`) here, before context
+        // assembly and before any provider contact, as a `Denied`-style
+        // pre-contact refusal carrying the `TimeoutTooLarge` ceiling semantics
+        // -- never `Failed`/`EffectUnknown`/`ProtocolRejected`. The reason
+        // reuses the `ProviderError::TimeoutTooLarge` display so the refusal
+        // text stays identical to the provider-I/O refusal; the outcome shape
+        // matches the file's existing `Denied` admission refusals (`self.fail`
+        // with `ToolError::Denied`, session terminal). `check_timeout` stays
+        // the provider-I/O enforcement point: it takes a `TurnRequest` that
+        // does not exist before assembly and does not cover `0`, so the gate
+        // compares against the shared ceiling constant directly.
+        let timeout_ms = self.config.provider_timeout_ms;
+        if timeout_ms == 0 || timeout_ms > MAX_REQUEST_TIMEOUT_MS {
+            return self.fail(
+                ToolError::Denied {
+                    // No tool call exists at this boundary: name the refused
+                    // admission parameter instead (static text, no host input).
+                    name: "provider_timeout_ms".to_owned(),
+                    reason: ProviderError::TimeoutTooLarge {
+                        max: MAX_REQUEST_TIMEOUT_MS,
+                        actual: timeout_ms,
+                    }
+                    .to_string(),
+                }
+                .into(),
+            );
         }
         let effective_budget = self.config.effective_budget_bytes();
         let request = ContextRequest {
