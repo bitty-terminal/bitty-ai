@@ -16,7 +16,7 @@
 //! [`ToolError::Denied`](bitty_ai_runtime::ToolError) cause, with zero
 //! executor contact and no per-turn counter increment.
 //!
-//! Five proofs:
+//! Six proofs:
 //!
 //! 1. Allowed dispatch: a prompt that allows the requested tool dispatches
 //!    normally (executor contacted once, `Success` attribution).
@@ -34,6 +34,12 @@
 //!    refuses as `DispatcherDenied` mapped to `Denied` — the hook would
 //!    allow, so the refusal isolates the dispatcher-grant input — again
 //!    with zero executor contact.
+//! 6. Execution bound: the prompt-gate refusal checks
+//!    `MAX_EXECUTIONS_PER_AGENT` before attributing (mirroring the dispatch
+//!    loop and `provider_unknown` with the identical `CallLimitExceeded`
+//!    constructor), so a full attribution vector fails closed without
+//!    pushing a 33rd record; below the cap the normal `Denied` refusal is
+//!    unchanged and the bound holds.
 //!
 //! Deterministic and offline: caller-built snapshots, scripted
 //! [`FakeProvider`](bitty_ai_runtime::FakeProvider) turns, deterministic
@@ -64,10 +70,11 @@
 
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentError, AgentLevel, AgentSession, AuthContext, AuthDecision,
-    EMPTY_ALLOW_SET_SENTINEL, ElevationGrant, ExecOutcome, FakeProvider, FakeToolExecutor,
-    IdIssuer, LayerInput, ModelProvider, PromptError, PromptLayer, PromptSnapshot, ProviderTurn,
-    ProviderUsage, SessionState, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry,
-    ToolSpec, ToolStatus, VecSink, assemble_prompt, dispatch_denial_cause,
+    EMPTY_ALLOW_SET_SENTINEL, ElevationGrant, ExecOutcome, ExecutionRecord, FakeProvider,
+    FakeToolExecutor, IdIssuer, LayerInput, MAX_EXECUTIONS_PER_AGENT, ModelProvider, PromptError,
+    PromptLayer, PromptSnapshot, ProviderTurn, ProviderUsage, ResultDisposition, SessionState,
+    ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec, ToolStatus,
+    VecSink, assemble_prompt, dispatch_denial_cause,
 };
 
 const NOW_MS: u64 = 1_700_000_000_000;
@@ -503,5 +510,124 @@ fn dispatcher_denied_tool_refuses_precontact_with_denied_cause() {
     );
     assert!(executor.calls().is_empty());
     assert_eq!(agent.provider_mut().complete_calls(), 1);
+    assert_eq!(sess.state(), SessionState::Failed);
+}
+
+// Proof 6: prompt-gate refusal checks the execution bound before attributing.
+
+#[test]
+fn prompt_gate_refusal_checks_execution_bound_before_attributing() {
+    // The cap-full branch (`executions.len() >= MAX_EXECUTIONS_PER_AGENT`
+    // failing with `CallLimitExceeded` carrying that limit, identical to the
+    // dispatch loop and `provider_unknown`) is defense in depth: the bus hard
+    // cap stops reachable turns at eight successes, so no public-API turn can
+    // fill the vector to the shared bound. This test therefore pins both
+    // halves: the guard constructor shape on a locally built full vector, and
+    // the unchanged normal refusal after prior successes on a live turn.
+    let mut issuer = IdIssuer::default();
+    let mut full: Vec<ExecutionRecord> = Vec::with_capacity(MAX_EXECUTIONS_PER_AGENT);
+    for _ in 0..MAX_EXECUTIONS_PER_AGENT {
+        full.push(ExecutionRecord {
+            execution_id: issuer.execution(),
+            tool: "workspace_read".to_owned(),
+            status: ToolStatus::Success,
+            result_disposition: ResultDisposition::Accepted,
+        });
+    }
+    assert_eq!(
+        full.len(),
+        MAX_EXECUTIONS_PER_AGENT,
+        "full vector must meet the shared bound"
+    );
+    assert!(
+        full.len() >= MAX_EXECUTIONS_PER_AGENT,
+        "full vector must trip the guard condition"
+    );
+    let capped = ToolError::CallLimitExceeded {
+        limit: MAX_EXECUTIONS_PER_AGENT,
+    };
+    assert!(
+        matches!(
+            capped,
+            ToolError::CallLimitExceeded { limit } if limit == MAX_EXECUTIONS_PER_AGENT
+        ),
+        "cap refusal must carry the shared bound"
+    );
+    // Live turn below the cap: eight reads succeed, then the denied write
+    // still refuses as the prompt cause (not the cap error), attributing one
+    // more record while staying within the bound. The session stays at
+    // `Inspect` so the prompt refusal fires before the tier floor, as in the
+    // denial proof.
+    let sess = session();
+    let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
+    for _ in 0..8 {
+        provider.push_turn(tool_turn(
+            "prior read",
+            vec![ToolCallRequest {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{"path":"a"}"#.to_vec(),
+            }],
+        ));
+    }
+    provider.push_turn(tool_turn("one write", vec![write_call("a")]));
+    provider.push_turn(tool_turn("unreached", Vec::new()));
+    let config = AgentConfig {
+        max_rounds: 12,
+        ..AgentConfig::default()
+    };
+    let mut agent = Agent::new(
+        provider,
+        read_write_tool_bus(AllowAll),
+        sess.clone(),
+        config,
+    );
+    agent.set_prompt(deny_write_prompt());
+    let mut executor = FakeToolExecutor::new();
+    for _ in 0..8 {
+        executor.push_success("ok", b"data".to_vec());
+    }
+    executor.push_success("must never run", b"nope".to_vec());
+    let mut sink = VecSink::new();
+
+    let outcome = agent.run_turn(&mut executor, "fake-chat", "hi", &[], &mut sink, NOW_MS);
+
+    let error = failed_tool_error(&outcome);
+    assert!(
+        matches!(
+            error,
+            ToolError::Denied { ref name, ref reason }
+            if name == "workspace_write"
+                && reason == "prompt denies tool 'workspace_write'"
+        ),
+        "refusal after prior successes must stay denied"
+    );
+    assert!(
+        !matches!(error, ToolError::CallLimitExceeded { .. }),
+        "refusal below the cap must not report the cap"
+    );
+    assert_eq!(agent.executions().len(), 9);
+    assert!(
+        agent.executions().len() <= MAX_EXECUTIONS_PER_AGENT,
+        "refusal must keep the bound"
+    );
+    assert!(
+        agent.executions()[..8]
+            .iter()
+            .all(|record| matches!(record.status, ToolStatus::Success)),
+        "prior successes must stay recorded"
+    );
+    let status = &agent.executions()[8].status;
+    assert!(status.is_admission_refusal());
+    assert!(
+        matches!(
+            status,
+            ToolStatus::Refused {
+                cause: ToolError::Denied { .. }
+            }
+        ),
+        "final refusal must stay admission-only"
+    );
+    assert_eq!(executor.calls().len(), 8);
+    assert_eq!(agent.provider_mut().complete_calls(), 9);
     assert_eq!(sess.state(), SessionState::Failed);
 }

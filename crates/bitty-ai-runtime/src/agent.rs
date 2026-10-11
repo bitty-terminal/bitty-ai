@@ -882,6 +882,14 @@ impl<P: ModelProvider> Agent<P> {
             // refusal and fails the turn with the carried cause; without an
             // installed prompt this gate is skipped entirely.
             if let Some((tool, cause)) = self.prompt_gate_denial(&calls) {
+                if self.executions.len() >= MAX_EXECUTIONS_PER_AGENT {
+                    return self.fail(
+                        ToolError::CallLimitExceeded {
+                            limit: MAX_EXECUTIONS_PER_AGENT,
+                        }
+                        .into(),
+                    );
+                }
                 let execution = Self::prompt_refusal(self.ids.execution(), &tool, cause.clone());
                 self.attribute_execution(&execution);
                 return self.fail(cause.into());
