@@ -18,8 +18,13 @@
 //! [`crate::compression`] as a fake-verified prototype (host summarizer
 //! seam, deterministic breakpoints, in-memory retention policy); the durable
 //! store stays out of scope (AI-0049). Missing, expired,
-//! or deleted content resolves to typed [`ContextError::ArtifactUnavailable`],
-//! never to a silent substitute.
+//! or deleted content resolves to typed absence, never to a silent
+//! substitute: never-recorded or foreign-missing references fail with
+//! [`ContextError::ArtifactUnavailable`], explicitly deleted references fail
+//! with [`ContextError::ArtifactDeleted`], and out-of-generation references
+//! fail with [`ContextError::ArtifactExpired`]. [`ArtifactStore::absence_reason`]
+//! exposes the four-way taxonomy (`never-recorded` vs `missing` vs `deleted`
+//! vs `expired`) without reading a clock, thread, or network.
 //!
 //! # Injection defense (AIQ-11 enforcement evidence)
 //!
@@ -70,6 +75,17 @@ pub const MAX_ARTIFACTS: usize = 64;
 pub const MAX_ARTIFACT_BYTES: usize = 64 * 1024;
 /// Maximum total artifact bytes per store.
 pub const MAX_ARTIFACT_STORE_BYTES: usize = 256 * 1024;
+/// Maximum explicitly deleted references retained as absence tombstones.
+///
+/// Tombstones hold only the reference string (never payload bytes) so a
+/// deleted reference keeps failing closed as
+/// [`ContextError::ArtifactDeleted`] instead of collapsing back to
+/// [`ContextError::ArtifactUnavailable`]. Bounded like [`MAX_ARTIFACTS`]:
+/// one full store turnover of deletions stays distinguishable. When full,
+/// further invalidations still drop bytes (deletion always wins) but the
+/// new tombstone is not recorded, so the reference falls back to
+/// `ArtifactUnavailable` — still fail-closed, only less specific.
+pub const MAX_DELETED_REFS: usize = 64;
 /// Conservative bytes-per-token estimate for budget math. This is a documented
 /// skeleton heuristic for enforcing a token-first ceiling, not billed usage.
 pub const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
@@ -124,13 +140,28 @@ pub enum ContextError {
         /// Which bound was hit.
         reason: String,
     },
-    /// Reference names no retained artifact. Missing or deleted content is
-    /// explicitly unavailable, never silently substituted. Expired
+    /// Reference names no retained artifact and carries no deletion
+    /// tombstone: never-recorded (`artifact://<n>` with `n` beyond every id
+    /// this store assigned) or foreign-missing (a dangling reference from
+    /// another store scope). Explicitly deleted content fails with
+    /// [`ContextError::ArtifactDeleted`], not this variant, and expired
     /// (out-of-generation) references fail with
-    /// [`ContextError::ArtifactExpired`], not this variant, so callers can
-    /// distinguish gone content from stale content.
+    /// [`ContextError::ArtifactExpired`], so callers can distinguish gone
+    /// content from stale content from removed content. See
+    /// [`ArtifactStore::absence_reason`] for the four-way taxonomy.
     ArtifactUnavailable {
         /// Dangling reference.
+        reference: String,
+    },
+    /// Reference names an explicitly deleted artifact (host-authorized
+    /// [`ArtifactStore::invalidate`]). The bytes are dropped and the budget
+    /// freed; every later `resolve` of the reference fails closed with this
+    /// variant — never stale bytes, never silent substitution, never
+    /// resurrection through re-resolution. Carries the reference only, never
+    /// bytes. Tombstones hold only the reference string (bounded by
+    /// [`MAX_DELETED_REFS`]), so absence metadata never carries payload.
+    ArtifactDeleted {
+        /// Deleted reference.
         reference: String,
     },
     /// Reference names a retained artifact stored at a different generation
@@ -193,6 +224,9 @@ impl Display for ContextError {
             }
             Self::ArtifactUnavailable { reference } => {
                 write!(f, "artifact unavailable: {reference}")
+            }
+            Self::ArtifactDeleted { reference } => {
+                write!(f, "artifact deleted: {reference}")
             }
             Self::ArtifactExpired { reference } => {
                 write!(f, "artifact expired: {reference}")
@@ -346,6 +380,38 @@ impl Display for ArtifactRef {
     }
 }
 
+/// Uniform absence taxonomy for one artifact reference (AI-0233, R6-V2/V3).
+///
+/// Every variant is fail-closed metadata only: the reference string travels,
+/// payload bytes never do. [`ArtifactStore::absence_reason`] computes it
+/// without I/O, clock, threads, or network; [`ArtifactStore::resolve`] maps
+/// it to the matching [`ContextError`] (`Available` is the only `Ok` case).
+/// Time/Space: O(N) scan over at most [`MAX_ARTIFACTS`] live entries plus at
+/// most [`MAX_DELETED_REFS`] tombstones; space is O(1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactAbsence {
+    /// The reference resolves at the caller's generation.
+    Available,
+    /// The reference was never assigned by this store (`artifact://<n>` with
+    /// `n` beyond [`ArtifactStore::next_id`], or a shape this store never
+    /// mints): `resolve` fails with [`ContextError::ArtifactUnavailable`].
+    NeverRecorded,
+    /// The reference carries an id this store assigned (`n <= next_id`) but
+    /// names no live entry and no deletion tombstone: a foreign-scope id
+    /// collision or an eviction without tombstone. `resolve` fails with
+    /// [`ContextError::ArtifactUnavailable`] (same fail-closed variant as
+    /// `NeverRecorded` for backward compatibility); the helper keeps the
+    /// reason distinct so callers can attribute the scope mismatch.
+    Missing,
+    /// The reference was explicitly deleted via [`ArtifactStore::invalidate`]:
+    /// `resolve` fails with [`ContextError::ArtifactDeleted`], never stale
+    /// bytes, and no later GC/compaction/replay resurrects it.
+    Deleted,
+    /// The reference names a live entry stored at another generation:
+    /// `resolve` fails with [`ContextError::ArtifactExpired`].
+    Expired,
+}
+
 /// Bounded in-memory artifact store (L1 externalize target). Retention is
 /// session-scoped and consent-bounded by the host; the store itself only
 /// enforces byte/count caps and typed absence.
@@ -356,12 +422,20 @@ impl Display for ArtifactRef {
 /// payloads instead of leaving them resolvable behind a rotated record pin.
 /// Expiry is fail-closed and typed (`ArtifactExpired`), never silent.
 /// Explicit host-authorized deletion goes through `invalidate`, which drops
-/// the bytes and frees the budget.
+/// the bytes, frees the budget, and records a bounded reference-only
+/// tombstone so later resolves fail with the distinct `ArtifactDeleted`
+/// variant instead of collapsing back to `ArtifactUnavailable`.
 #[derive(Debug, Default)]
 pub struct ArtifactStore {
     entries: Vec<ArtifactEntry>,
     total_bytes: usize,
     next_id: u64,
+    /// Explicit-deletion tombstones: reference strings only, never payload
+    /// bytes. Bounded by [`MAX_DELETED_REFS`], idempotent (no duplicates),
+    /// insertion-ordered for determinism. Deletion always drops bytes even
+    /// when this set is full; only the tombstone record is then skipped, so
+    /// the reference falls back to `ArtifactUnavailable` — still fail-closed.
+    deleted: Vec<String>,
 }
 
 /// One retained artifact: reference name, bytes, and the generation the host
@@ -405,6 +479,66 @@ impl ArtifactStore {
     #[must_use]
     pub fn next_id(&self) -> u64 {
         self.next_id
+    }
+
+    /// Whether `reference` carries an explicit-deletion tombstone.
+    ///
+    /// Tombstones hold only the reference string, never payload bytes.
+    /// Idempotent across double-invalidation: the first `invalidate` records,
+    /// repeats are no-ops.
+    #[must_use]
+    pub fn is_deleted(&self, reference: &ArtifactRef) -> bool {
+        self.deleted.iter().any(|tomb| tomb == &reference.0)
+    }
+
+    /// Count of recorded deletion tombstones (at most [`MAX_DELETED_REFS`]).
+    #[must_use]
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// Classify one reference under `current_generation` without I/O.
+    ///
+    /// Pure, deterministic, offline: no clock, threads, or network. Parses
+    /// only the store-minted `artifact://<n>` shape (anything else is
+    /// `NeverRecorded` when dangling); numeric parsing never panics and
+    /// never allocates beyond the returned enum.
+    #[must_use]
+    pub fn absence_reason(
+        &self,
+        reference: &ArtifactRef,
+        current_generation: u64,
+    ) -> ArtifactAbsence {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.reference == reference.0)
+        {
+            if entry.generation == current_generation {
+                return ArtifactAbsence::Available;
+            }
+            return ArtifactAbsence::Expired;
+        }
+        if self.is_deleted(reference) {
+            return ArtifactAbsence::Deleted;
+        }
+        match reference.0.strip_prefix("artifact://") {
+            Some(tail)
+                if !tail.is_empty()
+                    && tail.bytes().all(|b| b.is_ascii_digit())
+                    && tail.len() <= 20 =>
+            {
+                let mut id: u64 = 0;
+                for b in tail.bytes() {
+                    id = id.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+                }
+                if id != 0 && id <= self.next_id {
+                    return ArtifactAbsence::Missing;
+                }
+                ArtifactAbsence::NeverRecorded
+            }
+            _ => ArtifactAbsence::NeverRecorded,
+        }
     }
 
     /// Retain `bytes` stored at `generation` and return its reference.
@@ -452,42 +586,61 @@ impl ArtifactStore {
     /// `current_generation` resolve. A retained artifact from any other
     /// generation fails closed with [`ContextError::ArtifactExpired`], so a
     /// refreshed pin retires prior payloads instead of leaving them
-    /// resolvable. Dangling references (never stored, or removed via
-    /// `invalidate`) fail with [`ContextError::ArtifactUnavailable`].
+    /// resolvable. Explicitly deleted references (tombstoned via
+    /// `invalidate`) fail with the distinct
+    /// [`ContextError::ArtifactDeleted`], so deletion never collapses back
+    /// to generic absence. All other dangling references fail with
+    /// [`ContextError::ArtifactUnavailable`]; [`absence_reason`](Self::absence_reason)
+    /// further distinguishes `NeverRecorded` from `Missing` without changing
+    /// this fail-closed mapping.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::ArtifactExpired`] for out-of-generation
-    /// references, [`ContextError::ArtifactUnavailable`] for dangling ones.
+    /// Returns [`ContextError::ArtifactDeleted`] for tombstoned references,
+    /// [`ContextError::ArtifactExpired`] for out-of-generation references,
+    /// [`ContextError::ArtifactUnavailable`] for dangling ones.
     pub fn resolve(
         &self,
         reference: &ArtifactRef,
         current_generation: u64,
     ) -> Result<&[u8], ContextError> {
-        let entry = self
+        if let Some(entry) = self
             .entries
             .iter()
             .find(|entry| entry.reference == reference.0)
-            .ok_or_else(|| ContextError::ArtifactUnavailable {
-                reference: reference.0.clone(),
-            })?;
-        if entry.generation != current_generation {
-            return Err(ContextError::ArtifactExpired {
+        {
+            if entry.generation != current_generation {
+                return Err(ContextError::ArtifactExpired {
+                    reference: reference.0.clone(),
+                });
+            }
+            return Ok(entry.bytes.as_slice());
+        }
+        if self.is_deleted(reference) {
+            return Err(ContextError::ArtifactDeleted {
                 reference: reference.0.clone(),
             });
         }
-        Ok(entry.bytes.as_slice())
+        Err(ContextError::ArtifactUnavailable {
+            reference: reference.0.clone(),
+        })
     }
 
     /// Explicit host-authorized invalidation (AIQ-03 deletion facet): drop
     /// the named artifact, freeing its bytes and budget. After invalidation
-    /// the reference is dangling and `resolve` fails with
-    /// [`ContextError::ArtifactUnavailable`].
+    /// the reference is tombstoned and `resolve` fails with the distinct
+    /// [`ContextError::ArtifactDeleted`].
     ///
     /// The host decides what to delete and when; the store only enforces the
     /// removal. Returns `true` when an artifact was removed, `false` when the
     /// reference was already dangling (idempotent: double-invalidate is not
-    /// an error).
+    /// an error and never duplicates the tombstone).
+    ///
+    /// Tombstone bound ([`MAX_DELETED_REFS`]): the tombstone holds only the
+    /// reference string, never payload bytes. When the set is already full,
+    /// the bytes are still dropped (deletion always wins) but no new
+    /// tombstone is recorded, so the reference falls back to
+    /// `ArtifactUnavailable` — still fail-closed, only less specific.
     ///
     /// Deletion-propagation contract (AIQ-03/AIQ-55): invalidation retires
     /// the bytes, and every later `resolve` of the reference fails closed —
@@ -506,6 +659,9 @@ impl ArtifactStore {
         {
             let entry = self.entries.remove(position);
             self.total_bytes -= entry.bytes.len();
+            if !self.is_deleted(reference) && self.deleted.len() < MAX_DELETED_REFS {
+                self.deleted.push(reference.0.clone());
+            }
             true
         } else {
             false
@@ -1111,6 +1267,88 @@ mod tests {
             store.resolve(&missing, 1),
             Err(ContextError::ArtifactUnavailable { .. })
         ));
+        assert_eq!(
+            store.absence_reason(&missing, 1),
+            ArtifactAbsence::NeverRecorded
+        );
+    }
+
+    #[test]
+    fn absence_taxonomy_is_four_way_distinct() {
+        // Uniform typed-unavailable (AI-0233, R6-V2/V3): never-recorded vs
+        // missing vs deleted vs expired each surface a distinct reason, and
+        // resolve maps each to a distinct fail-closed error except
+        // missing/never-recorded sharing ArtifactUnavailable for backward
+        // compatibility (the helper keeps them distinct).
+        let mut store = ArtifactStore::new();
+        let live = store.store(vec![b'x'; 16], 1).expect("store live");
+        let doomed = store.store(vec![b'y'; 16], 1).expect("store doomed");
+        assert!(store.invalidate(&doomed));
+        // Live at pin: Available, resolves.
+        assert_eq!(store.absence_reason(&live, 1), ArtifactAbsence::Available);
+        assert!(store.resolve(&live, 1).is_ok());
+        // Live at wrong generation: Expired, typed expiry.
+        assert_eq!(store.absence_reason(&live, 2), ArtifactAbsence::Expired);
+        assert!(matches!(
+            store.resolve(&live, 2),
+            Err(ContextError::ArtifactExpired { .. })
+        ));
+        // Invalidated: Deleted, typed deletion (no silent recovery).
+        assert_eq!(store.absence_reason(&doomed, 1), ArtifactAbsence::Deleted);
+        assert!(matches!(
+            store.resolve(&doomed, 1),
+            Err(ContextError::ArtifactDeleted { .. })
+        ));
+        // Deleted stays deleted across generations: expiry never masks the
+        // tombstone, and no generation resurrects bytes.
+        assert_eq!(store.absence_reason(&doomed, 2), ArtifactAbsence::Deleted);
+        assert!(matches!(
+            store.resolve(&doomed, 2),
+            Err(ContextError::ArtifactDeleted { .. })
+        ));
+        // Never-recorded: id beyond every assigned id.
+        let never = ArtifactRef("artifact://99".to_owned());
+        assert_eq!(
+            store.absence_reason(&never, 1),
+            ArtifactAbsence::NeverRecorded
+        );
+        assert!(matches!(
+            store.resolve(&never, 1),
+            Err(ContextError::ArtifactUnavailable { .. })
+        ));
+        // Non-shape references are never-recorded, never missing.
+        let odd = ArtifactRef("not-an-artifact-ref".to_owned());
+        assert_eq!(
+            store.absence_reason(&odd, 1),
+            ArtifactAbsence::NeverRecorded
+        );
+    }
+
+    #[test]
+    fn tombstone_capacity_fallback_stays_fail_closed() {
+        // When the bounded tombstone set is full, further invalidations
+        // still drop bytes (deletion always wins) but record no new
+        // tombstone: the reference falls back to Missing/Unavailable —
+        // still fail-closed, never resurrected, only less specific.
+        let mut store = ArtifactStore::new();
+        let mut last = None;
+        for _ in 0..=MAX_DELETED_REFS {
+            let reference = store.store(vec![b'q'; 16], 1).expect("store fits");
+            assert!(store.invalidate(&reference));
+            last = Some(reference);
+        }
+        assert_eq!(store.deleted_count(), MAX_DELETED_REFS);
+        let overflow = last.expect("loop assigns");
+        // No tombstone recorded for the overflow deletion ...
+        assert!(!store.is_deleted(&overflow));
+        // ... yet the bytes are gone and stay gone.
+        assert!(matches!(
+            store.resolve(&overflow, 1),
+            Err(ContextError::ArtifactUnavailable { .. })
+        ));
+        assert_eq!(store.absence_reason(&overflow, 1), ArtifactAbsence::Missing);
+        assert_eq!(store.total_bytes(), 0);
+        assert!(store.is_empty());
     }
 
     #[test]
@@ -1160,20 +1398,34 @@ mod tests {
         assert!(store.invalidate(&first));
         assert_eq!(store.len(), 1);
         assert_eq!(store.total_bytes(), 64);
+        // Deleted references fail with the distinct Deleted variant (AI-0233),
+        // never generic absence: deletion stays distinguishable.
         assert!(matches!(
             store.resolve(&first, 1),
-            Err(ContextError::ArtifactUnavailable { .. })
+            Err(ContextError::ArtifactDeleted { .. })
         ));
+        assert!(store.is_deleted(&first));
+        assert_eq!(store.deleted_count(), 1);
+        // The tombstone carries the reference only, never content.
+        let err = store.resolve(&first, 1).expect_err("deleted must fail");
+        assert_eq!(
+            format!("{err}"),
+            format!("artifact deleted: {}", first.as_str())
+        );
         // The surviving artifact still resolves at its generation.
         assert_eq!(
             store.resolve(&second, 1).expect("survivor resolves").len(),
             64
         );
-        // Idempotent: double-invalidate is not an error.
+        assert!(!store.is_deleted(&second));
+        // Idempotent: double-invalidate is not an error and never duplicates
+        // the tombstone.
         assert!(!store.invalidate(&first));
+        assert_eq!(store.deleted_count(), 1);
         // Dangling references invalidate to false, never panic.
         let missing = ArtifactRef("artifact://9".to_owned());
         assert!(!store.invalidate(&missing));
+        assert!(!store.is_deleted(&missing));
     }
 
     #[test]
@@ -1232,11 +1484,13 @@ mod tests {
         // Host-authorized deletion drops the bytes and frees the budget.
         assert!(store.invalidate(&reference));
         // After invalidation the same derived reference fails closed with
-        // typed absence — no stale bytes, no silent substitution.
+        // the distinct Deleted variant — no stale bytes, no silent
+        // substitution, no collapse back to generic absence.
         assert!(matches!(
             store.resolve(&reference, 1),
-            Err(ContextError::ArtifactUnavailable { .. })
+            Err(ContextError::ArtifactDeleted { .. })
         ));
+        assert!(store.is_deleted(&reference));
         // Host contract: cached AssembledContexts pinning the invalidated
         // generation must be dropped by the host (the store cannot reach
         // into host-held clones). The assembly output itself is inert data;
