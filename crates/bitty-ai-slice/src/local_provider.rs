@@ -3840,4 +3840,122 @@ mod tests {
         let duration = KeepAlive::new("0s").expect("duration");
         assert_eq!(duration.value(), "0s");
     }
+
+    #[test]
+    fn keep_alive_never_changes_deadline_allowance_ai_0225() {
+        // MP-8 S3 (tests only): `keep_alive` is a model-retention hint in the
+        // chat body, never a deadline input. For one fixed `timeout_ms`, every
+        // `keep_alive` value (`None`, duration strings, both sentinels, the
+        // 32-byte boundary) must derive an identical `RequestDeadline`
+        // operation allowance. Offline and deterministic: the fixed clock
+        // drives every derivation, no stub is bound, so zero sockets open.
+        //
+        // If this matrix ever fails, it exposes a real keep_alive/deadline
+        // coupling bug: do NOT fix production semantics here, report as
+        // NEEDS-OWNER-INPUT and keep this test asserting current behavior.
+        const TIMEOUT_MS: u64 = 5_000;
+        const START_MS: u64 = 7_000;
+        let boundary_32b = format!("{}ms", "7".repeat(30));
+        assert_eq!(
+            boundary_32b.len(),
+            MAX_KEEP_ALIVE_LEN,
+            "the boundary case must sit exactly at the 32-byte policy bound"
+        );
+        let variants: Vec<Option<String>> = vec![
+            None,
+            Some("10m".to_owned()),
+            Some("500ms".to_owned()),
+            Some("30s".to_owned()),
+            Some("1h".to_owned()),
+            Some(KEEP_ALIVE_INDEFINITE.to_owned()),
+            Some(KEEP_ALIVE_IMMEDIATE.to_owned()),
+            Some(boundary_32b),
+        ];
+        // Elapsed offsets from arming: open, mid-flight, last millisecond,
+        // and exactly at the deadline (refusal, identical for all variants).
+        for elapsed_ms in [0_u64, 1, 2_000, TIMEOUT_MS - 1, TIMEOUT_MS] {
+            let clock = FixedClock::new(START_MS + elapsed_ms);
+            let deadline = RequestDeadline::armed_at(START_MS, TIMEOUT_MS);
+            let expect_connect =
+                operation_allowance_ms(DEFAULT_LOCAL_CONNECT_TIMEOUT_MS, &deadline, &clock);
+            let expect_read =
+                operation_allowance_ms(DEFAULT_LOCAL_READ_TIMEOUT_MS, &deadline, &clock);
+            let expect_effective = effective_allowance_ms(
+                DEFAULT_LOCAL_CONNECT_TIMEOUT_MS,
+                deadline.remaining_ms(clock.now_ms()),
+            );
+            for keep_alive in &variants {
+                let endpoint = match keep_alive {
+                    None => {
+                        LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b").expect("endpoint")
+                    }
+                    Some(value) => LocalEndpoint::new("127.0.0.1", 11_434, "llama3.1:8b")
+                        .expect("endpoint")
+                        .with_keep_alive(value.clone())
+                        .expect("valid keep_alive matrix value"),
+                };
+                // The hint attaches exactly as configured (body-level state).
+                assert_eq!(
+                    endpoint.keep_alive().map(KeepAlive::value),
+                    keep_alive.as_deref(),
+                    "keep_alive accessor must round-trip {keep_alive:?}"
+                );
+                // Attaching the hint never retunes the endpoint policies.
+                assert_eq!(
+                    endpoint.connect_timeout_ms, DEFAULT_LOCAL_CONNECT_TIMEOUT_MS,
+                    "keep_alive {keep_alive:?} must not retune the connect policy"
+                );
+                assert_eq!(
+                    endpoint.read_timeout_ms, DEFAULT_LOCAL_READ_TIMEOUT_MS,
+                    "keep_alive {keep_alive:?} must not retune the read policy"
+                );
+                // The hint does reach the chat body (or is omitted for None):
+                // this is the only observable keep_alive effect.
+                let body = body_with_keep_alive(None, endpoint.keep_alive());
+                if keep_alive.is_some() {
+                    assert!(
+                        body.contains("keep_alive"),
+                        "keep_alive {keep_alive:?} must serialize into the chat body"
+                    );
+                } else {
+                    assert!(
+                        !body.contains("keep_alive"),
+                        "None keep_alive must omit the chat body field"
+                    );
+                }
+                // ...while the deadline-derived allowances stay identical.
+                let connect =
+                    operation_allowance_ms(endpoint.connect_timeout_ms, &deadline, &clock);
+                let read = operation_allowance_ms(endpoint.read_timeout_ms, &deadline, &clock);
+                let effective = effective_allowance_ms(
+                    endpoint.connect_timeout_ms,
+                    deadline.remaining_ms(clock.now_ms()),
+                );
+                match (&expect_connect, &connect) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(
+                        actual, expected,
+                        "connect allowance must be identical for keep_alive {keep_alive:?} at +{elapsed_ms}ms"
+                    ),
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => panic!(
+                        "connect allowance shape must match for keep_alive {keep_alive:?} at +{elapsed_ms}ms: expected {expected:?}, got {actual:?}"
+                    ),
+                }
+                match (&expect_read, &read) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(
+                        actual, expected,
+                        "read allowance must be identical for keep_alive {keep_alive:?} at +{elapsed_ms}ms"
+                    ),
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => panic!(
+                        "read allowance shape must match for keep_alive {keep_alive:?} at +{elapsed_ms}ms: expected {expected:?}, got {actual:?}"
+                    ),
+                }
+                assert_eq!(
+                    effective, expect_effective,
+                    "effective allowance must be identical for keep_alive {keep_alive:?} at +{elapsed_ms}ms"
+                );
+            }
+        }
+    }
 }
