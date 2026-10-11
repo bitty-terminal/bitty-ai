@@ -1325,7 +1325,17 @@ impl ContentStore {
     }
 
     /// Delete a named reference. Returns `true` if the reference existed and was deleted.
+    ///
+    /// Deletion-propagation note (AI-0233, R3-V4/V5): this raw path deletes
+    /// the live `refs` row only — it writes no reflog tombstone row (typed
+    /// [`delete_branch`](crate::session_refs::delete_branch) does that in
+    /// the same transaction as its move). Callers needing absence metadata
+    /// (deleted-vs-never-recorded) must use the typed refs plane; a raw
+    /// delete leaves no tombstone, so the name reads back as never-recorded.
+    /// The name validates with the store rule first (fail closed, zero
+    /// writes on violation), matching the atomic update paths.
     pub fn delete_ref(&mut self, name: &str) -> Result<bool, ContentStoreError> {
+        Self::validate_ref_name(name)?;
         let guard = self.lock_conn()?;
         let affected = guard
             .execute("DELETE FROM refs WHERE name = ?1", params![name])
@@ -1461,6 +1471,13 @@ impl ContentStore {
     /// delete transaction with identical semantics (checkpoints first, then
     /// blobs, single commit). Empty input performs no write and takes no
     /// transaction.
+    ///
+    /// No-resurrection note (AI-0233, R3-V5): this path deletes object rows
+    /// only — it never writes, prunes, or rewrites `reflog` rows, so
+    /// deletion tombstones survive collection, and it never re-inserts rows.
+    /// Callers must not re-commit deleted payloads under their old hashes
+    /// (content addressing would revive the identical row); absence after
+    /// this call is terminal for the deleted hashes.
     pub fn delete_checkpoints_and_blobs(
         &mut self,
         checkpoints: &[ContentHash],

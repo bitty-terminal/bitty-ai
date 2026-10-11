@@ -194,6 +194,73 @@ pub const MAX_PENDING_CALL_ID: usize = 128;
 /// cannot make a resume load more markers.
 pub const MAX_HEAD_MARKERS: usize = 32;
 
+/// Maximum age for stable-ID duplicate-delivery dedup window in milliseconds
+/// (3_600_000 ms = 1 hour, AI-0234 R5-V5/V7).
+///
+/// Caller-supplied clocks only (`begun_at_ms` vs `now_ms`, saturating, no wall
+/// clock): a duplicate arriving within the window dedups when the payload is
+/// identical or refuses as a payload conflict with zero writes (the first row
+/// wins, never overwritten); a duplicate arriving past the window is expired
+/// and must not dedup (fail closed, never resurrect). The window bounds how
+/// long a stable id stays dedupable; cache eviction (`NotFound` + reusable as
+/// a new call) is the separate bounded-recall expiry for resolved ids.
+pub const MAX_PENDING_DEDUP_AGE_MS: u64 = 3_600_000;
+
+/// Duplicate-delivery classification for one stable call id (R5 critical-message).
+///
+/// Closed vocabulary, pure function of the stored entry plus the new args and
+/// the caller-supplied `now_ms`: no store read, no write, no clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingDuplicateKind {
+    /// Same stable id, identical payload, within the dedup window: dedup (no
+    /// new row, no new effect; the existing row wins).
+    IdenticalWithinWindow,
+    /// Same stable id, conflicting payload, within the window: refuse with
+    /// zero writes (first row preserved, never overwritten).
+    PayloadConflict,
+    /// Same stable id arriving past the dedup window: expired, must not dedup
+    /// (fail closed, never resurrect as the old effect).
+    Expired,
+}
+
+/// Whether an open row is past the dedup window at `now_ms`.
+///
+/// Pure caller-clock comparison (`now_ms.saturating_sub(begun_at_ms)`), no wall
+/// clock, no threads. A future `begun_at_ms` (clock skew) is never expired.
+#[must_use]
+pub fn is_dedup_expired(begun_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(begun_at_ms) > MAX_PENDING_DEDUP_AGE_MS
+}
+
+/// Whether new args conflict with the stored digest (payload-conflict check).
+///
+/// Compares the SHA-256 hex over the dispatched bytes (raw args are never
+/// stored); any byte difference is a conflict. Pure, no clock.
+#[must_use]
+pub fn is_payload_conflict(existing: &PendingEntry, new_args: &[u8]) -> bool {
+    existing.args_digest != ContentHash::compute(new_args)
+}
+
+/// Classify one duplicate delivery for a stored entry plus new args.
+///
+/// Expiry first (expired never dedups, even when the payload is identical),
+/// then payload conflict, else identical-within-window. Pure: no store read,
+/// no write, caller clocks only.
+#[must_use]
+pub fn classify_duplicate(
+    existing: &PendingEntry,
+    new_args: &[u8],
+    now_ms: u64,
+) -> PendingDuplicateKind {
+    if is_dedup_expired(existing.begun_at_ms, now_ms) {
+        PendingDuplicateKind::Expired
+    } else if is_payload_conflict(existing, new_args) {
+        PendingDuplicateKind::PayloadConflict
+    } else {
+        PendingDuplicateKind::IdenticalWithinWindow
+    }
+}
+
 /// Lifecycle status of one pending-effect row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingStatus {

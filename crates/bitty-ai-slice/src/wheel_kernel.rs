@@ -26,7 +26,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitty_ai_session::pending::{PendingError, PendingStore};
+use bitty_ai_session::pending::{
+    MAX_HEAD_MARKERS, MAX_OPEN_PENDING_PER_SESSION, PendingError, PendingStore,
+};
 use bitty_ai_session::sessions::{
     SessionBinding, SessionError, WheelSessionId, bind_session, bump_session_epoch, list_sessions,
     resolve_session,
@@ -51,6 +53,16 @@ use crate::task_dag::{TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, 
 
 /// Maximum retained uncollapsed action outcomes in memory for Zone 3 compilation (64).
 pub const MAX_RECENT_ACTIONS: usize = 64;
+
+/// Maximum pending-Unknown ids a resume may report (AI-0234 R5-V5/V7, R6-V5).
+///
+/// Worst-case fan-out: every HEAD-marked session (`MAX_HEAD_MARKERS`) holding
+/// the session cap (`MAX_OPEN_PENDING_PER_SESSION`) of open rows. Admission
+/// enforces both caps, and the resume read paths below refuse past them (fail
+/// closed, zero writes / untouched tree) so rows planted outside admission
+/// (raw SQL) cannot make a resume fan out without bound. Resume never spawns
+/// another agent: over-cap refuses instead of delegating.
+pub const MAX_RESUME_PENDING_FANOUT: usize = MAX_OPEN_PENDING_PER_SESSION * MAX_HEAD_MARKERS;
 
 /// Reflog reason recorded for branch moves driven by [`WheelKernel::commit_checkpoint`].
 const WHEEL_COMMIT_REFLOG_REASON: &str = "wheel commit";
@@ -704,14 +716,26 @@ impl WheelKernel {
     /// Read the open pending-effect call ids of one session, oldest-first.
     ///
     /// Thin read over the pending plane: any poisoned row fails the whole
-    /// read (fail closed, rows preserved). The session resume path calls
-    /// this BEFORE `bump_session_epoch` so a corrupt log refuses with zero
-    /// row writes and the same claim stays admissible for retry.
+    /// read (fail closed, rows preserved). Past [`MAX_OPEN_PENDING_PER_SESSION`]
+    /// open rows (planted outside admission) refuse as `Store` with zero row
+    /// writes instead of fanning out without bound; resume never spawns
+    /// another agent to absorb over-cap. The session resume path calls
+    /// this BEFORE `bump_session_epoch` so a corrupt or over-cap log refuses
+    /// with zero row writes and the same claim stays admissible for retry.
+    /// Replay preserves `Unknown`: this lists ids only, never resolves or
+    /// re-executes (R6-V5).
     fn pending_unknowns_for_session(
         store: &ContentStore,
         id: &WheelSessionId,
     ) -> Result<Vec<String>, FacadeError> {
         let open = PendingStore::list_open(store, id).map_err(map_pending_err)?;
+        if open.len() > MAX_OPEN_PENDING_PER_SESSION {
+            return Err(FacadeError::Store(format!(
+                "resume refused: session holds {} open pending effects over limit {}",
+                open.len(),
+                MAX_OPEN_PENDING_PER_SESSION
+            )));
+        }
         Ok(open.into_iter().map(|entry| entry.call_id).collect())
     }
 
@@ -728,12 +752,16 @@ impl WheelKernel {
     /// leak into each other, and an unmarked session stays invisible to
     /// `HEAD` even when its branch tip equals `HEAD`. The marker set is
     /// admission-bounded (see [`Self::bind_head_session`]), so this fan-out
-    /// stays bounded. The marker is explicit
+    /// stays bounded by [`MAX_RESUME_PENDING_FANOUT`]: past that bound (rows
+    /// planted outside admission) the read refuses as `Store` with the
+    /// in-memory tree untouched instead of fanning out without bound; resume
+    /// never spawns another agent to absorb over-cap. The marker is explicit
     /// and additive (see [`Self::bind_head_session`]). A poisoned row
     /// anywhere (pending entry or HEAD marker) fails the whole read (fail
     /// closed, rows preserved). The branch resume path calls this before
     /// syncing the working tree so a corrupt log refuses with the in-memory
-    /// tree untouched.
+    /// tree untouched. Replay preserves `Unknown`: this lists ids only, never
+    /// resolves or re-executes (R6-V5).
     fn pending_unknowns_for_branch(
         store: &ContentStore,
         branch: &str,
@@ -744,6 +772,12 @@ impl WheelKernel {
             for id in &head_sessions {
                 let open = PendingStore::list_open(store, id).map_err(map_pending_err)?;
                 unknowns.extend(open.into_iter().map(|entry| entry.call_id));
+                if unknowns.len() > MAX_RESUME_PENDING_FANOUT {
+                    return Err(FacadeError::Store(format!(
+                        "resume refused: HEAD fan-out over limit {}",
+                        MAX_RESUME_PENDING_FANOUT
+                    )));
+                }
             }
             return Ok(unknowns);
         }
@@ -754,6 +788,12 @@ impl WheelKernel {
                 let open =
                     PendingStore::list_open(store, &binding.session_id).map_err(map_pending_err)?;
                 unknowns.extend(open.into_iter().map(|entry| entry.call_id));
+                if unknowns.len() > MAX_RESUME_PENDING_FANOUT {
+                    return Err(FacadeError::Store(format!(
+                        "resume refused: branch fan-out over limit {}",
+                        MAX_RESUME_PENDING_FANOUT
+                    )));
+                }
             }
         }
         Ok(unknowns)
