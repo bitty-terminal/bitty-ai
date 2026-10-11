@@ -705,6 +705,17 @@ impl ToolStatus {
         matches!(self, Self::Refused { .. })
     }
 
+    /// Whether this status is ack-loss (R5/R6 taxonomy, AI-0234).
+    ///
+    /// True only for [`ToolStatus::Unknown`]: a crash between effect and
+    /// acknowledgement. Ack-loss stays `Unknown` through replay and reconcile
+    /// (never `Failed`); reconciled only by inspection or user direction, and
+    /// retried only when eligible (see `reconcile::is_retry_eligible`). Pure.
+    #[must_use]
+    pub fn is_ack_loss(&self) -> bool {
+        matches!(self, Self::Unknown { .. })
+    }
+
     /// Apply the one bounded diagnostic policy (`AI-RUN-008`) to the
     /// host/reconciler-supplied reason carried by a terminal status,
     /// returning the status unchanged when it already fits.
@@ -1419,21 +1430,9 @@ impl ToolBus {
                     is_untrusted_surface: true,
                 })
             }
-            Err(ToolError::EffectUnknown { reason, .. }) => Ok(ToolExecution {
-                execution_id,
-                tool: call.name.clone(),
-                // AI-0077 / AI-RUN-008: host-shaped uncertainty reasons are
-                // scrubbed and bounded at the bus boundary so the recorded
-                // `Unknown` status never carries unbounded or newline-bearing
-                // text into reconcile reports or provider messages.
-                status: ToolStatus::Unknown {
-                    reason: bound_reason(&reason),
-                },
-                result_disposition: ResultDisposition::Accepted,
-                summary: "effect uncertain; reconcile before retry".to_owned(),
-                data: Vec::new(),
-                is_untrusted_surface: true,
-            }),
+            Err(ToolError::EffectUnknown { reason, .. }) => {
+                Ok(Self::ack_loss(execution_id, call, &reason))
+            }
             Err(ToolError::Denied { reason, .. }) => Ok(ToolExecution {
                 execution_id,
                 tool: call.name.clone(),
@@ -1555,6 +1554,33 @@ impl ToolBus {
             status: ToolStatus::Success,
             result_disposition: ResultDisposition::Rejected { cause },
             summary: "executed; result rejected by bus".to_owned(),
+            data: Vec::new(),
+            is_untrusted_surface: true,
+        }
+    }
+
+    /// Record ack-loss (R5/R6 crash window, AI-0234, ack-loss path only).
+    ///
+    /// A crash between effect and acknowledgement stays [`ToolStatus::Unknown`]
+    /// (never `Failed`); reconciled by inspection or user direction only, and
+    /// retried only when eligible (see `reconcile::is_retry_eligible`; no
+    /// exactly-once claim). Host-shaped uncertainty reasons are scrubbed and
+    /// bounded at this boundary (`AI-0077` / `AI-RUN-008`) so the recorded
+    /// `Unknown` never carries unbounded or newline-bearing text into
+    /// reconcile reports or provider messages. Counted, untrusted, empty data.
+    fn ack_loss(
+        execution_id: crate::session::ExecutionId,
+        call: &ToolCall,
+        reason: &str,
+    ) -> ToolExecution {
+        ToolExecution {
+            execution_id,
+            tool: call.name.clone(),
+            status: ToolStatus::Unknown {
+                reason: bound_reason(reason),
+            },
+            result_disposition: ResultDisposition::Accepted,
+            summary: "effect uncertain; reconcile before retry".to_owned(),
             data: Vec::new(),
             is_untrusted_surface: true,
         }
