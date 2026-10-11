@@ -709,6 +709,42 @@ pub fn ensure_consented(
     }
 }
 
+/// Enforce the consent gate for a dispatch path and report denial as the
+/// shared dispatch-path refusal (AI-0227, AIQ-33 S2).
+///
+/// ONE helper for both dispatch paths: after the authorizer allows, the
+/// native [`crate::tool::ToolBus`] dispatch path and the MCP adapter execute
+/// path both call this with the exact `(protocol, tool, scope)` triple at
+/// `now_ms`. Allow returns `Ok(())`; denial returns
+/// [`crate::tool::ToolError::Denied`] (never `Failed`/`Unknown`/
+/// `ProtocolRejected`, no new variant) with a byte-identical reason on both
+/// paths, before any executor or transport contact. The reason keeps the
+/// established `consent denied: ...` wording (the same mapping the MCP
+/// adapter applied inline before this slice), so existing `Denied`-reason
+/// pins keep matching on both paths.
+///
+/// No new types: this reuses [`ConsentLedger::check`], [`ConsentQuery`], and
+/// the [`BridgeError::ConsentDenied`] mapping from [`ensure_consented`],
+/// adding only the dispatch-path [`crate::tool::ToolError::Denied`]
+/// rendering both paths share.
+///
+/// # Errors
+///
+/// Returns [`crate::tool::ToolError::Denied`] when the ledger denies.
+pub fn ensure_consented_for_dispatch(
+    ledger: &dyn ConsentLedger,
+    query: &ConsentQuery,
+) -> Result<(), crate::tool::ToolError> {
+    match ensure_consented(ledger, query) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(crate::tool::ToolError::Denied {
+            name: bound_reason(query.tool),
+            reason: bound_reason(&format!("consent denied: {error}")),
+        }
+        .normalized()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

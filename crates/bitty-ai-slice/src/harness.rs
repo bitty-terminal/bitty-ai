@@ -20,8 +20,9 @@
 
 use bitty_ai_runtime::{
     Agent, AgentConfig, AgentSession, AuthContext, AuthDecision, ContextError, ContextPriority,
-    ContextRecord, FakeProvider, IdIssuer, ProviderError, ProviderTurn, ProviderUsage, RecordBody,
-    StableId, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
+    ContextRecord, FakeConsentLedger, FakeProvider, IdIssuer, ProviderError, ProviderTurn,
+    ProviderUsage, RecordBody, StableId, ToolAuthorizer, ToolBus, ToolCallRequest, ToolError,
+    ToolRegistry, ToolSpec,
 };
 
 use crate::bridge::{HostPeer, IpcBridge};
@@ -258,8 +259,29 @@ pub fn test_session() -> AgentSession {
     AgentSession::new(ids.agent_instance(), ids.run(), ids.session())
 }
 
+/// AI-0227 mechanical fixture: live fake consent grant for the harness
+/// tool triple, valid at any harness `now_ms` (the `u64::MAX` expiry never
+/// lapses within a test). Production wiring installs the host ledger
+/// behind the same [`ToolBus::with_consent`] seam instead.
+fn harness_consent_ledger() -> FakeConsentLedger {
+    let mut ledger = FakeConsentLedger::new();
+    ledger
+        .grant(
+            "local.assistant",
+            HARNESS_TOOL,
+            "terminal.inspect",
+            u64::MAX,
+        )
+        .expect("grant fits");
+    ledger
+}
+
 /// Wire a deterministic single-agent runtime: `provider` plus the harness
 /// read-only tool bus at `context_budget_bytes`.
+///
+/// The bus carries the [`harness_consent_ledger`] fixture (AI-0227) so
+/// deterministic turns can dispatch the harness tool; consent denial stays
+/// fail-closed for any other triple.
 ///
 /// # Errors
 ///
@@ -269,7 +291,9 @@ pub fn harness_agent(
     provider: FakeProvider,
     context_budget_bytes: usize,
 ) -> Result<Agent<FakeProvider>, ToolError> {
-    let tools = ToolBus::new(test_tool_registry()?).with_authorizer(AllowReadOnly);
+    let tools = ToolBus::new(test_tool_registry()?)
+        .with_authorizer(AllowReadOnly)
+        .with_consent(harness_consent_ledger(), "local.assistant");
     let config = AgentConfig {
         context_budget_bytes,
         ..AgentConfig::default()

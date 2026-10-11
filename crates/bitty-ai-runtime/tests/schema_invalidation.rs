@@ -168,6 +168,22 @@ fn schema_digest_is_deterministic_and_sensitive() {
     assert_eq!(empty.schema_digest(), fnv1a64(&[]));
 }
 
+/// AI-0227 mechanical fixture: live consent grants for the tool triples
+/// this file dispatches, valid at `NOW_MS` (the `u64::MAX` expiry never
+/// lapses within a test).
+fn consented_ledger() -> bitty_ai_runtime::FakeConsentLedger {
+    let mut ledger = bitty_ai_runtime::FakeConsentLedger::new();
+    for (tool, scope) in [
+        ("workspace_read", "workspace.read"),
+        ("workspace_write", "workspace.write"),
+    ] {
+        ledger
+            .grant("local.assistant", tool, scope, u64::MAX)
+            .expect("grant fits");
+    }
+    ledger
+}
+
 #[test]
 fn authorize_then_replace_then_dispatch_binds_original_schema() {
     // Register schema N and pin its digest before any authorization.
@@ -197,7 +213,9 @@ fn authorize_then_replace_then_dispatch_binds_original_schema() {
     // A bus over the refused registry authorizes and dispatches against N:
     // the refused N+1 authorizes nothing and executes nothing.
     let recorder = BindingRecorder::default();
-    let mut bus = ToolBus::new(registry).with_authorizer(recorder.clone());
+    let mut bus = ToolBus::new(registry)
+        .with_authorizer(recorder.clone())
+        .with_consent(consented_ledger(), "local.assistant");
     let call = read_call();
     bus.precheck(std::slice::from_ref(&call), &base(), BUS_CALL_CAP)
         .expect("precheck authorizes against N");
@@ -234,7 +252,9 @@ fn inflight_call_binds_the_spec_authorized_at_precheck() {
         .register(spec_n())
         .expect("test registry accepts N");
     let recorder = BindingRecorder::default();
-    let mut bus = ToolBus::new(registry).with_authorizer(recorder.clone());
+    let mut bus = ToolBus::new(registry)
+        .with_authorizer(recorder.clone())
+        .with_consent(consented_ledger(), "local.assistant");
     let call = read_call();
     bus.precheck(std::slice::from_ref(&call), &base(), BUS_CALL_CAP)
         .expect("precheck authorizes the call");

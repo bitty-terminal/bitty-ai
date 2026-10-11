@@ -159,6 +159,17 @@ fn externally_supplied_spec_still_refuses_same_name_reregistration() {
     assert_eq!(registry.len(), 1);
 }
 
+/// AI-0227 mechanical fixture: live consent grant for the registered tool
+/// triple this file dispatches, valid at `NOW_MS` (the `u64::MAX` expiry
+/// never lapses within a test).
+fn consented_ledger() -> bitty_ai_runtime::FakeConsentLedger {
+    let mut ledger = bitty_ai_runtime::FakeConsentLedger::new();
+    ledger
+        .grant("local.assistant", TOOL_NAME, "workspace.read", u64::MAX)
+        .expect("grant fits");
+    ledger
+}
+
 #[test]
 fn dispatch_binds_the_registered_spec_never_a_call_side_schema() {
     // `ToolCall` carries no schema: name plus arguments only. A call naming
@@ -169,7 +180,9 @@ fn dispatch_binds_the_registered_spec_never_a_call_side_schema() {
     registry
         .register(versioned_spec())
         .expect("registry accepts");
-    let mut bus = ToolBus::new(registry).with_authorizer(Allow);
+    let mut bus = ToolBus::new(registry)
+        .with_authorizer(Allow)
+        .with_consent(consented_ledger(), "local.assistant");
     let invocation = call(TOOL_NAME);
     bus.precheck(std::slice::from_ref(&invocation), &base(), BUS_CALL_CAP)
         .expect("precheck authorizes");

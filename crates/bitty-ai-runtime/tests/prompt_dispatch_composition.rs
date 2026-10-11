@@ -93,6 +93,22 @@ fn session() -> AgentSession {
     AgentSession::new(agent, run, session)
 }
 
+/// AI-0227 mechanical fixture: live consent grants for the tool triples
+/// this file dispatches, valid at `NOW_MS` (the `u64::MAX` expiry never
+/// lapses within a test).
+fn consented_ledger() -> bitty_ai_runtime::FakeConsentLedger {
+    let mut ledger = bitty_ai_runtime::FakeConsentLedger::new();
+    for (tool, scope) in [
+        ("workspace_read", "workspace.read"),
+        ("workspace_write", "workspace.write"),
+    ] {
+        ledger
+            .grant("local.assistant", tool, scope, u64::MAX)
+            .expect("grant fits");
+    }
+    ledger
+}
+
 fn read_write_tool_bus(authorizer: AllowAll) -> ToolBus {
     let mut registry = ToolRegistry::new();
     registry
@@ -119,7 +135,9 @@ fn read_write_tool_bus(authorizer: AllowAll) -> ToolBus {
             .expect("valid spec"),
         )
         .expect("capacity");
-    ToolBus::new(registry).with_authorizer(authorizer)
+    ToolBus::new(registry)
+        .with_authorizer(authorizer)
+        .with_consent(consented_ledger(), "local.assistant")
 }
 
 /// Test-only authorizer that allows everything. Denial tests can therefore
