@@ -32,7 +32,7 @@ use crate::provider::{
 use crate::reconcile::{
     DEFAULT_MAX_UNKNOWN_RETRIES, DEFAULT_RECONCILE_BASE_DELAY_MS, DEFAULT_RECONCILE_MAX_DELAY_MS,
     ReconcileConfig, ReconcileOutcome, ReconcileStatus, UnknownEscalation, UnknownReconciler,
-    bound_reason, reconcile_delay_ms,
+    bound_reason, is_reconcile_terminal, reconcile_delay_ms,
 };
 use crate::selection::estimate_cost;
 use crate::session::{AgentSession, ExecutionId, IdIssuer, SessionError, SessionState};
@@ -58,6 +58,19 @@ pub const DEFAULT_MAX_ROUNDS: usize = 4;
 /// configurations never trip it. Exceeding it fails the turn with
 /// [`ToolError::CallLimitExceeded`].
 pub const MAX_EXECUTIONS_PER_AGENT: usize = 32;
+
+/// Whether an [`AgentError`] is explicit capacity backpressure (R5-V5, AI-0234).
+///
+/// True only for [`ToolError::CallLimitExceeded`] (pending `TooManyOpen`,
+/// per-turn execution cap, bus hard ceiling): the turn refused with an
+/// explicit limit instead of shedding silently, and backpressure never spawns
+/// another agent (no new `Agent`, no delegate contact, no row write on the
+/// refusal path). Pure, no clock. Other bounds (`RoundLimitExceeded`,
+/// `CostCeilingExceeded`) are separate fuses, never backpressure.
+#[must_use]
+pub fn is_backpressure(error: &AgentError) -> bool {
+    matches!(error, AgentError::Tool(ToolError::CallLimitExceeded { .. }))
+}
 
 /// Turn-loop configuration. All values are skeleton defaults with documented
 /// provenance, not accepted contracts.
@@ -1395,14 +1408,9 @@ impl<P: ModelProvider> Agent<P> {
                     // the recorded terminal status and the resolved outcome
                     // share the single bounded diagnostic policy.
                     let status = status.normalized();
-                    let terminal = match &status {
-                        ToolStatus::Success
-                        | ToolStatus::Failed { .. }
-                        | ToolStatus::Denied { .. }
-                        | ToolStatus::Refused { .. } => true,
-                        ToolStatus::Unknown { .. } => false,
-                    };
-                    if terminal {
+                    // R5/R6 taxonomy (AI-0234): Unknown stays Unknown, never
+                    // Failed; a Resolved(Unknown) answer is still pending.
+                    if is_reconcile_terminal(&status) {
                         let resolved_id = self.pending_unknown[pending].execution_id;
                         self.pending_unknown.remove(pending);
                         // Keep the current-turn view consistent when it
@@ -1478,14 +1486,9 @@ impl<P: ModelProvider> Agent<P> {
                     // AI-RUN-008: normalize the host reconciler's terminal
                     // status before it is stored and returned.
                     let status = status.normalized();
-                    let terminal = match &status {
-                        ToolStatus::Success
-                        | ToolStatus::Failed { .. }
-                        | ToolStatus::Denied { .. }
-                        | ToolStatus::Refused { .. } => true,
-                        ToolStatus::Unknown { .. } => false,
-                    };
-                    if terminal {
+                    // R5/R6 taxonomy (AI-0234): Unknown stays Unknown, never
+                    // Failed; a Resolved(Unknown) answer is still pending.
+                    if is_reconcile_terminal(&status) {
                         self.executions[index].status = status.clone();
                         // The pending set may hold the same attribution
                         // handle (carried across admission); resolution
