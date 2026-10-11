@@ -789,6 +789,9 @@ impl NetworkService for RecordingNetworkService {
 mod tests {
     use super::*;
     use bitty_ai_runtime::provider::Message;
+    use bitty_ai_runtime::provider::{
+        DEFAULT_RATE_LIMIT_MAX_MS, MAX_RATE_LIMIT_WAIT_MS, rate_limit_wait_ms,
+    };
     use bitty_ai_runtime::{ReasoningConfig, ResponseFormat};
 
     fn sample_turn_request(model: &str, budget: usize, timeout_ms: u64) -> TurnRequest {
@@ -1103,6 +1106,12 @@ mod tests {
             } => {
                 assert_eq!(provider, "test-provider");
                 assert_eq!(retry_after_ms, Some(10_000));
+                // AI-0224 (`MP-8` S2, test-only): the parsed hint feeds the
+                // pure wait helper; production parse above is unchanged.
+                assert_eq!(
+                    rate_limit_wait_ms(retry_after_ms, 0, DEFAULT_RATE_LIMIT_MAX_MS),
+                    10_000
+                );
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
@@ -1113,6 +1122,95 @@ mod tests {
             err_unavail,
             ProviderError::ModelUnavailable { .. }
         ));
+    }
+
+    #[test]
+    fn rate_limited_hint_feeds_wait_helper() {
+        // AI-0224 (`MP-8` S2, test-only): production `Retry-After` parse is
+        // unchanged; this asserts each parsed `retry_after_ms` shape feeds
+        // `rate_limit_wait_ms` to the bounded caller-advance duration.
+        let service = RecordingNetworkService::new();
+        service.queue_response(Response {
+            status: 429,
+            headers: vec![("retry-after".to_owned(), "0".to_owned())],
+            body: b"{\"error\":\"rate_limited\"}".to_vec(),
+        });
+        service.queue_response(Response {
+            status: 429,
+            headers: Vec::new(),
+            body: b"{\"error\":\"rate_limited\"}".to_vec(),
+        });
+        service.queue_response(Response {
+            status: 429,
+            headers: vec![("retry-after".to_owned(), "not-a-number".to_owned())],
+            body: b"{\"error\":\"rate_limited\"}".to_vec(),
+        });
+        service.queue_response(Response {
+            status: 429,
+            headers: vec![("retry-after".to_owned(), u64::MAX.to_string())],
+            body: b"{\"error\":\"rate_limited\"}".to_vec(),
+        });
+
+        let config = NetworkConsumerAdapterConfig::new(
+            "test-provider",
+            "test-model",
+            "https://api.example.com/v1/chat/completions",
+        )
+        .unwrap()
+        .with_capability(NetworkCapability::offline().with_domain("api.example.com"));
+        let mut adapter = NetworkConsumerAdapter::new(config, service);
+        let req = sample_turn_request("test-model", 4096, 5000);
+
+        // `Retry-After: 0` parses to `Some(0)` and waits `0`.
+        match adapter.complete(&req).unwrap_err() {
+            ProviderError::RateLimited { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, Some(0));
+                assert_eq!(
+                    rate_limit_wait_ms(retry_after_ms, 0, DEFAULT_RATE_LIMIT_MAX_MS),
+                    0
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // Absent header parses to `None` and waits the bounded base
+        // (documented default base `0` yields `0`).
+        match adapter.complete(&req).unwrap_err() {
+            ProviderError::RateLimited { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, None);
+                assert_eq!(
+                    rate_limit_wait_ms(retry_after_ms, 0, DEFAULT_RATE_LIMIT_MAX_MS),
+                    0
+                );
+                assert_eq!(
+                    rate_limit_wait_ms(retry_after_ms, 500, DEFAULT_RATE_LIMIT_MAX_MS),
+                    500
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // Unparseable header parses to `None`, same bounded-base mapping.
+        match adapter.complete(&req).unwrap_err() {
+            ProviderError::RateLimited { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, None);
+                assert_eq!(
+                    rate_limit_wait_ms(retry_after_ms, 0, DEFAULT_RATE_LIMIT_MAX_MS),
+                    0
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        // Hostile `u64::MAX` seconds saturate (`saturating_mul`) and the
+        // helper caps to the hard ceiling.
+        match adapter.complete(&req).unwrap_err() {
+            ProviderError::RateLimited { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, Some(u64::MAX));
+                assert_eq!(
+                    rate_limit_wait_ms(retry_after_ms, 0, DEFAULT_RATE_LIMIT_MAX_MS),
+                    MAX_RATE_LIMIT_WAIT_MS
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[test]
