@@ -34,6 +34,14 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_TOOL_STREAM_TIMEOUT_MS: u64 = 10_000;
 /// Hard timeout ceiling in milliseconds (`MP-8`); larger values fail closed.
 pub const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Default base wait in milliseconds for [`rate_limit_wait_ms`] when
+/// `retry_after_ms` is `None` (`MP-8` S2).
+pub const DEFAULT_RATE_LIMIT_BASE_MS: u64 = 0;
+/// Default ceiling in milliseconds for [`rate_limit_wait_ms`] (`MP-8` S2).
+pub const DEFAULT_RATE_LIMIT_MAX_MS: u64 = 30_000;
+/// Hard ceiling in milliseconds for [`rate_limit_wait_ms`] (`MP-8` S2);
+/// mirrors `crate::reconcile::MAX_RECONCILE_DELAY_MS`.
+pub const MAX_RATE_LIMIT_WAIT_MS: u64 = 30_000;
 /// Candidate default context budget in bytes (`CP-5` profile value, not a core
 /// contract).
 pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 32 * 1024;
@@ -680,6 +688,29 @@ impl Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// Compute the caller-advance wait for [`ProviderError::RateLimited`]
+/// (`MP-8` S2).
+///
+/// Pure function of its inputs: no sleep, no retry, no clock read. The
+/// caller advances its own `now_ms` by the returned amount. `RateLimited`
+/// itself stays `Failed` with the `retry_after_ms` hint preserved; this
+/// helper only maps that hint to a bounded duration.
+///
+/// Semantics: the effective ceiling is `max_ms.min(MAX_RATE_LIMIT_WAIT_MS)`;
+/// `Some(v)` maps to `v.min(ceiling)` and `None` maps to
+/// `base_ms.min(ceiling)` (so the documented default `base_ms =
+/// DEFAULT_RATE_LIMIT_BASE_MS = 0` yields `0`). `min` cannot overflow, so
+/// hostile inputs (including `u64::MAX`) saturate to the ceiling instead of
+/// wrapping.
+#[must_use]
+pub fn rate_limit_wait_ms(retry_after_ms: Option<u64>, base_ms: u64, max_ms: u64) -> u64 {
+    let ceiling = max_ms.min(MAX_RATE_LIMIT_WAIT_MS);
+    match retry_after_ms {
+        Some(v) => v.min(ceiling),
+        None => base_ms.min(ceiling),
+    }
+}
+
 /// Validate a provider id (`MP-2`): non-empty, at most 64 bytes,
 /// `^[a-z][a-z0-9_-]*$`.
 ///
@@ -1159,5 +1190,62 @@ mod tests {
         assert_eq!(usage.cached_tokens, 12);
         assert_eq!(usage.cache_write_tokens, 4);
         assert_eq!(usage, usage);
+    }
+
+    #[test]
+    fn rate_limit_wait_maps_hint_to_bounded_duration() {
+        // AI-0224 (`MP-8` S2): pure mapping, no sleep/retry/clock.
+        assert_eq!(
+            rate_limit_wait_ms(None, DEFAULT_RATE_LIMIT_BASE_MS, DEFAULT_RATE_LIMIT_MAX_MS),
+            0
+        );
+        assert_eq!(
+            rate_limit_wait_ms(
+                Some(0),
+                DEFAULT_RATE_LIMIT_BASE_MS,
+                DEFAULT_RATE_LIMIT_MAX_MS
+            ),
+            0
+        );
+        assert_eq!(
+            rate_limit_wait_ms(
+                Some(10_000),
+                DEFAULT_RATE_LIMIT_BASE_MS,
+                DEFAULT_RATE_LIMIT_MAX_MS
+            ),
+            10_000
+        );
+        assert_eq!(
+            rate_limit_wait_ms(Some(u64::MAX), 0, DEFAULT_RATE_LIMIT_MAX_MS),
+            MAX_RATE_LIMIT_WAIT_MS
+        );
+    }
+
+    #[test]
+    fn rate_limit_wait_caps_base_and_max_edges() {
+        // `None` falls back to the bounded base.
+        assert_eq!(rate_limit_wait_ms(None, 500, 5_000), 500);
+        // Base above the caller ceiling caps to the caller ceiling.
+        assert_eq!(rate_limit_wait_ms(None, 10_000, 1_000), 1_000);
+        // Caller ceiling above the hard ceiling clamps to the hard ceiling.
+        assert_eq!(
+            rate_limit_wait_ms(None, 50_000, 100_000),
+            MAX_RATE_LIMIT_WAIT_MS
+        );
+        assert_eq!(
+            rate_limit_wait_ms(Some(50_000), 0, 100_000),
+            MAX_RATE_LIMIT_WAIT_MS
+        );
+        // Hostile bounds saturate instead of overflowing.
+        assert_eq!(
+            rate_limit_wait_ms(Some(u64::MAX), u64::MAX, u64::MAX),
+            MAX_RATE_LIMIT_WAIT_MS
+        );
+        assert_eq!(
+            rate_limit_wait_ms(None, u64::MAX, u64::MAX),
+            MAX_RATE_LIMIT_WAIT_MS
+        );
+        // Hint above the caller ceiling caps to the caller ceiling.
+        assert_eq!(rate_limit_wait_ms(Some(5_000), 0, 1_000), 1_000);
     }
 }
