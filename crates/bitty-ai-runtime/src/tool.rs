@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
-use crate::bridge::bound_reason;
+use crate::bridge::{ConsentLedger, ConsentQuery, bound_reason, ensure_consented_for_dispatch};
 use crate::context::MAX_SUMMARY_BYTES;
 use crate::session::{AgentInstanceId, AgentLevel, AgentSession, SessionId};
 
@@ -875,10 +875,20 @@ impl ToolExecutor for RecordingExecutor {
 }
 
 /// Tool Bus dispatch surface.
+///
+/// The consent gate (AI-0227, AIQ-33 S2) is host-installed alongside the
+/// authorizer via [`ToolBus::with_consent`]: the wire principal charged for
+/// consent plus the [`ConsentLedger`] behind it. Dispatch enforces
+/// authorizer-then-consent at the same relative position as the MCP adapter
+/// execute path, through the ONE shared helper
+/// [`crate::bridge::ensure_consented_for_dispatch`], so both paths report
+/// byte-identical [`ToolError::Denied`] reasons pre-contact.
 #[derive(Default)]
 pub struct ToolBus {
     registry: ToolRegistry,
     authorizer: Option<Box<dyn ToolAuthorizer>>,
+    consent: Option<Box<dyn ConsentLedger>>,
+    protocol_id: Option<String>,
     calls_this_turn: usize,
 }
 
@@ -887,19 +897,23 @@ impl std::fmt::Debug for ToolBus {
         f.debug_struct("ToolBus")
             .field("registry_len", &self.registry.len())
             .field("has_authorizer", &self.authorizer.is_some())
+            .field("has_consent", &self.consent.is_some())
             .field("calls_this_turn", &self.calls_this_turn)
             .finish()
     }
 }
 
 impl ToolBus {
-    /// Construct a bus over `registry` with no authorizer: every call is
-    /// denied until the host installs one (fail closed, `FS-AI7`).
+    /// Construct a bus over `registry` with no authorizer and no consent
+    /// gate: every call is denied until the host installs both (fail
+    /// closed, `FS-AI7`; AI-0227 consent posture).
     #[must_use]
     pub fn new(registry: ToolRegistry) -> Self {
         Self {
             registry,
             authorizer: None,
+            consent: None,
+            protocol_id: None,
             calls_this_turn: 0,
         }
     }
@@ -908,6 +922,27 @@ impl ToolBus {
     #[must_use]
     pub fn with_authorizer(mut self, authorizer: impl ToolAuthorizer + 'static) -> Self {
         self.authorizer = Some(Box::new(authorizer));
+        self
+    }
+
+    /// Install the host consent gate: the wire principal (`owner.name`)
+    /// charged for consent plus the ledger behind it (AI-0227, AIQ-33 S2).
+    ///
+    /// Additive threading: existing `ToolBus::new(registry)` construction
+    /// keeps compiling; dispatch enforces the gate only through this
+    /// builder-installed pair. A bus without an installed pair denies every
+    /// dispatch fail-closed (`no consent ledger installed`), exactly like a
+    /// bus without an authorizer. The ledger decision is evaluated at
+    /// dispatch time against the dispatch `now_ms`, so revocation and expiry
+    /// take effect on the next dispatch with no caching across calls.
+    #[must_use]
+    pub fn with_consent(
+        mut self,
+        ledger: impl ConsentLedger + 'static,
+        protocol_id: impl Into<String>,
+    ) -> Self {
+        self.consent = Some(Box::new(ledger));
+        self.protocol_id = Some(protocol_id.into());
         self
     }
 
@@ -935,6 +970,21 @@ impl ToolBus {
     /// Authorize one call against the tier floor and the hook. The `inspect`
     /// tier may only reach read-only tools (read-only by default); anything
     /// else, a missing hook, or a hook denial refuses.
+    ///
+    /// Gate order (AI-0227, AIQ-33 S2 shared authorizer-then-consent
+    /// position): validation, registry lookup, argument bound, `inspect`-tier
+    /// floor, authorizer hook (here), then — at dispatch time only — the
+    /// consent gate ([`ToolBus::check_consent`]), then the per-turn call cap,
+    /// then executor contact. The consent gate runs after the authorizer on
+    /// purpose, matching the MCP adapter execute path
+    /// (`stale -> narrowing -> lookup -> tier -> authorizer -> consent ->
+    /// dispatch`) through the ONE shared helper
+    /// [`crate::bridge::ensure_consented_for_dispatch`], so both paths
+    /// report byte-identical [`ToolError::Denied`] reasons pre-contact.
+    /// [`ToolBus::precheck`] has no caller-supplied `now_ms`, so it stops
+    /// after the authorizer here; dispatch re-checks both gates at the
+    /// boundary (`PP-6`) with its `now_ms`, and revocation/expiry between
+    /// precheck and dispatch refuses there with zero contact.
     fn authorize_call(&self, base: &AuthBase, call: &ToolCall) -> Result<(), ToolError> {
         validate_tool_name(&call.name)?;
         let spec = self
@@ -976,6 +1026,53 @@ impl ToolBus {
             // runtime error surface, so it is bounded and scrubbed here.
             .normalized()),
         }
+    }
+
+    /// Enforce the consent gate for one dispatch, after [`ToolBus::authorize_call`]
+    /// allowed (AI-0227, AIQ-33 S2 authorizer-then-consent position).
+    ///
+    /// Builds the exact `(protocol, tool, scope)` [`ConsentQuery`] triple —
+    /// installed [`ToolBus::with_consent`] principal, dispatched tool name,
+    /// registry `required_scope` — at the dispatch `now_ms`, and runs it
+    /// through the ONE shared helper
+    /// [`crate::bridge::ensure_consented_for_dispatch`] so this path and the
+    /// MCP adapter execute path deny with byte-identical
+    /// [`ToolError::Denied`] reasons. A missing installed pair denies
+    /// fail-closed (same posture as a missing authorizer); the registry
+    /// re-lookup cannot miss after a successful authorization and fails
+    /// closed as [`ToolError::UnknownTool`] if it ever does.
+    fn check_consent(
+        &self,
+        call: &ToolCall,
+        base: &AuthBase,
+        now_ms: u64,
+    ) -> Result<(), ToolError> {
+        let (ledger, protocol_id) = match (&self.consent, &self.protocol_id) {
+            (Some(ledger), Some(protocol_id)) => (ledger.as_ref(), protocol_id.as_str()),
+            _ => {
+                return Err(ToolError::Denied {
+                    name: call.name.clone(),
+                    reason: "no consent ledger installed (fail closed)".to_owned(),
+                }
+                .normalized());
+            }
+        };
+        let spec = self
+            .registry
+            .lookup(&call.name)
+            .ok_or_else(|| ToolError::UnknownTool {
+                name: call.name.clone(),
+            })?;
+        ensure_consented_for_dispatch(
+            ledger,
+            &ConsentQuery {
+                protocol_id,
+                agent_instance: base.agent_instance_id,
+                tool: &call.name,
+                scope: &spec.required_scope,
+                now_ms,
+            },
+        )
     }
 
     /// Validate and authorize every call without dispatching any, enforcing
@@ -1070,8 +1167,9 @@ impl ToolBus {
         self.precheck(calls, base, configured_limit)
     }
 
-    /// Validate, re-authorize at this dispatch boundary (`PP-6`), and
-    /// dispatch one call through `executor`.
+    /// Validate, re-authorize at this dispatch boundary (`PP-6`), re-check
+    /// consent at this dispatch boundary (AI-0227 authorizer-then-consent),
+    /// and dispatch one call through `executor`.
     ///
     /// Defense in depth behind [`ToolBus::precheck`]: the cumulative
     /// per-turn counter stops at the hard [`MAX_TOOL_CALLS_PER_TURN`]
@@ -1116,6 +1214,14 @@ impl ToolBus {
     ) -> Result<ToolExecution, ToolError> {
         if let Err(error) = self.authorize_call(base, call) {
             return Ok(Self::refused(execution_id, call, error));
+        }
+        // AI-0227 (AIQ-33 S2): authorizer-then-consent, the same relative
+        // position as the MCP adapter execute path. A consent denial is an
+        // admission refusal (`Refused` carrying the typed `Denied` cause,
+        // never `Failed`/`Unknown`/`ProtocolRejected`): zero executor
+        // contact, zero turn counting, `is_untrusted_surface == false`.
+        if let Err(denial) = self.check_consent(call, base, now_ms) {
+            return Ok(Self::refused(execution_id, call, denial));
         }
         if self.calls_this_turn >= MAX_TOOL_CALLS_PER_TURN {
             return Ok(Self::refused(
@@ -1348,6 +1454,17 @@ mod tests {
         }
     }
 
+    /// AI-0227 mechanical fixture: live consent grant for the
+    /// `workspace_read` / `workspace.read` triple dispatched below, valid at
+    /// the `1_000` dispatch `now_ms` used across these tests.
+    fn consented_ledger() -> crate::bridge::FakeConsentLedger {
+        let mut ledger = crate::bridge::FakeConsentLedger::new();
+        ledger
+            .grant("local.assistant", "workspace_read", "workspace.read", 9_000)
+            .expect("grant fits");
+        ledger
+    }
+
     #[test]
     fn tool_name_shape() {
         assert!(validate_tool_name("workspace_read").is_ok());
@@ -1548,7 +1665,9 @@ mod tests {
         // even though the batch itself is under `MAX_TOOL_CALLS_PER_TURN`
         // and a tighter configured limit (four) is already spent. The batch
         // is refused whole with nothing dispatched and the counter unchanged.
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         for _ in 0..7 {
             executor.push_success("ok", b"data".to_vec());
@@ -1584,7 +1703,9 @@ mod tests {
         // a three-call batch exceeds the remaining hard allowance of two.
         // The rejection is whole-batch and admission-only: earlier effects
         // stay recorded and the counter is unchanged.
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         for _ in 0..6 {
             executor.push_success("ok", b"data".to_vec());
@@ -1658,7 +1779,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_error(ToolError::Denied {
             name: "workspace_read".to_owned(),
@@ -1689,7 +1812,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_error(ToolError::Failed {
             name: "workspace_read".to_owned(),
@@ -1785,7 +1910,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = RecordingExecutor::new();
         executor.push_success("ok 1", b"res 1".to_vec());
         executor.push_success("ok 2", b"res 2".to_vec());
@@ -1878,7 +2005,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_success("read ok", vec![b'y'; MAX_TOOL_RESULT_BYTES + 1]);
         let call = ToolCall {
@@ -2096,7 +2225,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_error(ToolError::Denied {
             name: "workspace_read".to_owned(),
@@ -2124,7 +2255,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_error(ToolError::Failed {
             name: "workspace_read".to_owned(),
@@ -2179,7 +2312,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_error(ToolError::ProtocolRejected {
             name: "workspace_read".to_owned(),
@@ -2332,7 +2467,9 @@ mod tests {
                 AuthDecision::Allow
             }
         }
-        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut bus = ToolBus::new(read_only_registry())
+            .with_authorizer(Allow)
+            .with_consent(consented_ledger(), "local.assistant");
         let mut executor = FakeToolExecutor::new();
         executor.push_success("must never run", b"nope".to_vec());
         let call = ToolCall {
@@ -2382,5 +2519,209 @@ mod tests {
         assert_eq!(execution.status, ToolStatus::Success);
         assert_eq!(executor.calls().len(), 1);
         assert_eq!(bus.calls_this_turn(), 1);
+    }
+
+    /// AI-0227 (AIQ-33 S2) native matrix: `FakeConsentLedger`
+    /// grant/revoke/expiry/empty crossed with Allow/Deny authorizer on
+    /// [`ToolBus::dispatch`].
+    ///
+    /// The authorizer runs first: a hook denial refuses before consent is
+    /// consulted on every ledger state. Past the authorizer, only a live
+    /// grant reaches the executor; revoke, expiry (exclusive boundary:
+    /// `now_ms == expires_at_ms` denies), and an empty ledger all refuse as
+    /// `Refused{Denied}` (never `Failed`/`Denied`-status/`Unknown`/
+    /// `ProtocolRejected`) with zero executor contact, zero turn counting,
+    /// and an admission-only surface. The consent-denial wording
+    /// (`consent denied: ...`) is what the cross-path test in
+    /// `bitty-ai-mcp` asserts byte-identical against the adapter.
+    #[test]
+    fn authorizer_then_consent_gate_matrix() {
+        use crate::bridge::FakeConsentLedger;
+
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+
+        struct Deny;
+        impl ToolAuthorizer for Deny {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Deny {
+                    reason: "test denial".to_owned(),
+                }
+            }
+        }
+
+        fn workspace_base() -> AuthBase {
+            let mut ids = crate::session::IdIssuer::default();
+            AuthBase {
+                agent_instance_id: ids.agent_instance(),
+                session_id: ids.session(),
+                level: AgentLevel::Workspace,
+            }
+        }
+
+        fn call() -> ToolCall {
+            ToolCall {
+                name: "workspace_read".to_owned(),
+                arguments: br#"{}"#.to_vec(),
+            }
+        }
+
+        /// Ledger states crossed with the dispatch `now_ms`: a live grant,
+        /// a revoked grant, an expired grant (evaluated exactly at the
+        /// exclusive expiry boundary), and an empty ledger.
+        fn ledgers() -> Vec<(&'static str, FakeConsentLedger, u64)> {
+            let mut granted = FakeConsentLedger::new();
+            granted
+                .grant("local.assistant", "workspace_read", "workspace.read", 9_000)
+                .expect("grant fits");
+            let mut revoked = FakeConsentLedger::new();
+            revoked
+                .grant("local.assistant", "workspace_read", "workspace.read", 9_000)
+                .expect("grant fits");
+            assert!(
+                revoked.revoke("local.assistant", "workspace_read", "workspace.read"),
+                "revocation removes the triple"
+            );
+            let mut expired = FakeConsentLedger::new();
+            expired
+                .grant("local.assistant", "workspace_read", "workspace.read", 2_000)
+                .expect("grant fits");
+            vec![
+                ("granted", granted, 1_000),
+                ("revoked", revoked, 1_000),
+                ("expired", expired, 2_000),
+                ("empty", FakeConsentLedger::new(), 1_000),
+            ]
+        }
+
+        // Allow authorizer: only the live grant reaches the executor.
+        for (state, ledger, now_ms) in ledgers() {
+            let mut bus = ToolBus::new(read_only_registry())
+                .with_authorizer(Allow)
+                .with_consent(ledger, "local.assistant");
+            let mut executor = FakeToolExecutor::new();
+            executor.push_success("ok", b"data".to_vec());
+            let mut ids = crate::session::IdIssuer::default();
+            let execution = bus
+                .dispatch(
+                    &mut executor,
+                    &call(),
+                    &workspace_base(),
+                    ids.execution(),
+                    now_ms,
+                )
+                .expect("admission outcome is a recorded status, not a bus error");
+            if state == "granted" {
+                assert_eq!(execution.status, ToolStatus::Success, "live grant allows");
+                assert_eq!(executor.calls().len(), 1, "live grant contacts once");
+                assert_eq!(bus.calls_this_turn(), 1);
+                assert!(execution.is_untrusted_surface);
+                continue;
+            }
+            match &execution.status {
+                ToolStatus::Refused {
+                    cause: ToolError::Denied { name, reason },
+                } => {
+                    assert_eq!(name, "workspace_read", "state {state}");
+                    assert!(
+                        reason.contains("consent denied"),
+                        "state {state}: consent wording, got {reason:?}"
+                    );
+                }
+                other => panic!("state {state}: expected Refused{{Denied}}, got {other:?}"),
+            }
+            assert_eq!(execution.result_disposition, ResultDisposition::Accepted);
+            assert!(execution.data.is_empty());
+            assert!(
+                !execution.is_untrusted_surface,
+                "state {state}: admission-only"
+            );
+            assert!(
+                executor.calls().is_empty(),
+                "state {state}: zero executor contact"
+            );
+            assert_eq!(bus.calls_this_turn(), 0, "state {state}: uncounted");
+        }
+
+        // Deny authorizer: the hook wins before consent on every ledger
+        // state (live grant included), still `Refused{Denied}` with zero
+        // contact. The hook reason passes through verbatim (no consent
+        // wording), pinning the authorizer-then-consent order.
+        for (state, ledger, now_ms) in ledgers() {
+            let mut bus = ToolBus::new(read_only_registry())
+                .with_authorizer(Deny)
+                .with_consent(ledger, "local.assistant");
+            let mut executor = FakeToolExecutor::new();
+            executor.push_success("must never run", b"nope".to_vec());
+            let mut ids = crate::session::IdIssuer::default();
+            let execution = bus
+                .dispatch(
+                    &mut executor,
+                    &call(),
+                    &workspace_base(),
+                    ids.execution(),
+                    now_ms,
+                )
+                .expect("admission refusal is a recorded status, not a bus error");
+            match &execution.status {
+                ToolStatus::Refused {
+                    cause: ToolError::Denied { name, reason },
+                } => {
+                    assert_eq!(name, "workspace_read", "state {state}");
+                    assert_eq!(reason, "test denial", "state {state}: hook wins first");
+                }
+                other => panic!("state {state}: expected Refused{{Denied}}, got {other:?}"),
+            }
+            assert!(
+                executor.calls().is_empty(),
+                "state {state}: zero executor contact"
+            );
+            assert_eq!(bus.calls_this_turn(), 0, "state {state}: uncounted");
+        }
+    }
+
+    #[test]
+    fn missing_consent_gate_denies_fail_closed() {
+        // AI-0227: a bus with an allowing authorizer but no installed
+        // consent pair still refuses every dispatch (same fail-closed
+        // posture as a missing authorizer), so forgetting `with_consent`
+        // can never fail open into an unconsented effect.
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+        let mut ids = crate::session::IdIssuer::default();
+        let base = AuthBase {
+            agent_instance_id: ids.agent_instance(),
+            session_id: ids.session(),
+            level: AgentLevel::Workspace,
+        };
+        let mut bus = ToolBus::new(read_only_registry()).with_authorizer(Allow);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        let call = ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let execution = bus
+            .dispatch(&mut executor, &call, &base, ids.execution(), 1_000)
+            .expect("admission refusal is a recorded status, not a bus error");
+        match &execution.status {
+            ToolStatus::Refused {
+                cause: ToolError::Denied { reason, .. },
+            } => assert!(
+                reason.contains("no consent ledger installed"),
+                "got {reason:?}"
+            ),
+            other => panic!("expected Refused{{Denied}}, got {other:?}"),
+        }
+        assert!(executor.calls().is_empty(), "zero executor contact");
+        assert_eq!(bus.calls_this_turn(), 0);
     }
 }

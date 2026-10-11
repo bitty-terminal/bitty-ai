@@ -79,7 +79,8 @@ pub use agent::{
 pub use bridge::{
     BridgeError, ConsentDecision, ConsentLedger, ConsentQuery, DenyAllConsent, FakeConsentLedger,
     IdentityBridge, MAX_CONSENT_GRANTS, MAX_CONSENT_SCOPE_LEN, MAX_PROTOCOL_ID_LEN,
-    MAX_PROTOCOL_ID_SEGMENT_LEN, ProtocolAgentId, ensure_consented, validate_protocol_id,
+    MAX_PROTOCOL_ID_SEGMENT_LEN, ProtocolAgentId, ensure_consented, ensure_consented_for_dispatch,
+    validate_protocol_id,
 };
 pub use cache_key::{CacheKey, CacheKeyError, CacheScope};
 pub use compression::{

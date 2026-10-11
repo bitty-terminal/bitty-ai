@@ -208,6 +208,22 @@ impl ToolExecutor for RotatingExecutor {
     }
 }
 
+/// AI-0227 mechanical fixture: live consent grants for the tool triples
+/// this file dispatches, valid at `NOW_MS` (the `u64::MAX` expiry never
+/// lapses within a test).
+fn consented_ledger() -> bitty_ai_runtime::FakeConsentLedger {
+    let mut ledger = bitty_ai_runtime::FakeConsentLedger::new();
+    for (tool, scope) in [
+        ("workspace_read", "workspace.read"),
+        ("workspace_write", "workspace.write"),
+    ] {
+        ledger
+            .grant("local.assistant", tool, scope, u64::MAX)
+            .expect("grant fits");
+    }
+    ledger
+}
+
 #[test]
 fn mid_turn_rotation_is_visible_as_tier_downgrade_at_each_dispatch() {
     // Untouched half beyond the S-1 denial proof in `runtime_fail_closed.rs`
@@ -268,7 +284,9 @@ fn mid_turn_rotation_is_visible_as_tier_downgrade_at_each_dispatch() {
     });
     let mut agent = Agent::new(
         provider,
-        ToolBus::new(registry).with_authorizer(recorder.clone()),
+        ToolBus::new(registry)
+            .with_authorizer(recorder.clone())
+            .with_consent(consented_ledger(), "local.assistant"),
         sess.clone(),
         AgentConfig::default(),
     );

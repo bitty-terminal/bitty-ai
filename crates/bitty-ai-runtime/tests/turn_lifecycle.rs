@@ -43,6 +43,22 @@ fn session() -> bitty_ai_runtime::AgentSession {
     bitty_ai_runtime::AgentSession::new(agent, run, session)
 }
 
+/// AI-0227 mechanical fixture: live consent grants for the tool triples
+/// this file dispatches, valid at `NOW_MS` (the `u64::MAX` expiry never
+/// lapses within a test).
+fn consented_ledger() -> bitty_ai_runtime::FakeConsentLedger {
+    let mut ledger = bitty_ai_runtime::FakeConsentLedger::new();
+    for (tool, scope) in [
+        ("workspace_read", "workspace.read"),
+        ("workspace_write", "workspace.write"),
+    ] {
+        ledger
+            .grant("local.assistant", tool, scope, u64::MAX)
+            .expect("grant fits");
+    }
+    ledger
+}
+
 fn read_tool_bus() -> ToolBus {
     let mut registry = ToolRegistry::new();
     registry
@@ -57,7 +73,9 @@ fn read_tool_bus() -> ToolBus {
             .expect("valid spec"),
         )
         .expect("capacity");
-    ToolBus::new(registry).with_authorizer(AllowAll)
+    ToolBus::new(registry)
+        .with_authorizer(AllowAll)
+        .with_consent(consented_ledger(), "local.assistant")
 }
 
 fn tool_turn(text: &str, input_tokens: u32, output_tokens: u32) -> ProviderTurn {

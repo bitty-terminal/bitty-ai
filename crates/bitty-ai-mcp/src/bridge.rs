@@ -52,7 +52,7 @@
 //! uncertain).
 
 use bitty_ai_runtime::bridge::{
-    ConsentLedger, ConsentQuery, ensure_consented, validate_protocol_id,
+    ConsentLedger, ConsentQuery, ensure_consented_for_dispatch, validate_protocol_id,
 };
 use bitty_ai_runtime::session::AgentLevel;
 use bitty_ai_runtime::tool::{
@@ -399,7 +399,13 @@ impl McpToolAdapter {
         if let AuthDecision::Deny { reason } = decision {
             return Err(self.deny(tool, &format!("authorizer denied: {reason}")));
         }
-        if let Err(error) = ensure_consented(
+        // AI-0227 (AIQ-33 S2): consent runs after the authorizer through the
+        // ONE shared helper, so this path and the native `ToolBus` dispatch
+        // path deny with byte-identical `Denied` reasons (pre-contact, zero
+        // transport contact). The helper already returns the normalized
+        // `Denied` refusal; propagating it directly preserves the established
+        // `consent denied: ...` wording byte-for-byte.
+        ensure_consented_for_dispatch(
             self.consent.as_ref(),
             &ConsentQuery {
                 protocol_id: &self.params.protocol_id,
@@ -408,9 +414,7 @@ impl McpToolAdapter {
                 scope: &required_scope,
                 now_ms,
             },
-        ) {
-            return Err(self.deny(tool, &format!("consent denied: {error}")));
-        }
+        )?;
         let id = self.next_id.max(2);
         self.next_id = id.wrapping_add(1).max(2);
         let mut surfaced: Vec<String> = Vec::new();
@@ -506,7 +510,8 @@ mod tests {
     use bitty_ai_runtime::bridge::FakeConsentLedger;
     use bitty_ai_runtime::session::IdIssuer;
     use bitty_ai_runtime::tool::{
-        AuthContext, ToolBus, ToolCall, ToolRegistry, ToolSpec, ToolStatus,
+        AuthContext, FakeToolExecutor, ToolBus, ToolCall, ToolError, ToolRegistry, ToolSpec,
+        ToolStatus,
     };
     use std::collections::VecDeque;
 
@@ -777,7 +782,9 @@ mod tests {
                 .expect("valid"),
             )
             .expect("capacity");
-        let mut bus = ToolBus::new(registry).with_authorizer(Allow);
+        let mut bus = ToolBus::new(registry)
+            .with_authorizer(Allow)
+            .with_consent(consented(), "local.assistant");
         let call = ToolCall {
             name: "mcp_demo_echo".to_owned(),
             arguments: b"{}".to_vec(),
@@ -820,7 +827,9 @@ mod tests {
                 .expect("valid"),
             )
             .expect("capacity");
-        let mut bus = ToolBus::new(registry).with_authorizer(Allow);
+        let mut bus = ToolBus::new(registry)
+            .with_authorizer(Allow)
+            .with_consent(consented(), "local.assistant");
         let call = ToolCall {
             name: "mcp_demo_echo".to_owned(),
             arguments: b"{}".to_vec(),
@@ -1234,5 +1243,186 @@ mod tests {
             .execute_narrowed("mcp_demo_echo", b"{}", 1_000, Some(&omitted))
             .expect_err("narrowed-away must deny");
         assert_eq!(adapter.snapshot().digest_of("mcp_demo_echo"), digest_before);
+    }
+
+    /// AI-0227 (AIQ-33 S2) cross-path matrix: `FakeConsentLedger`
+    /// revoke/expiry/empty crossed with Allow/Deny authorizer on native
+    /// [`ToolBus::dispatch`] AND [`McpToolAdapter::execute_narrowed`].
+    ///
+    /// Consent-denial cells assert byte-identical `Denied` name+reason on
+    /// both paths (the ONE shared helper
+    /// [`bitty_ai_runtime::bridge::ensure_consented_for_dispatch`]) with
+    /// zero contact on both sides (no executor call, no transport frame,
+    /// no turn counting, admission-only surface, never
+    /// `Failed`/`Unknown`/`ProtocolRejected`). Deny-authorizer cells assert
+    /// both paths deny pre-contact with zero contact; their reasons stay
+    /// path-specific by design (native reports the hook reason verbatim,
+    /// the adapter prefixes `authorizer denied: `), pinning the shared
+    /// authorizer-then-consent order rather than a shared authorizer
+    /// rendering.
+    #[test]
+    fn consent_denial_reasons_match_native_bus_byte_identical() {
+        /// Non-granted ledger states crossed with the dispatch `now_ms`: a
+        /// revoked grant, an expired grant (evaluated exactly at the
+        /// exclusive expiry boundary), and an empty ledger. Mirrors the
+        /// native matrix in `bitty-ai-runtime/src/tool.rs`.
+        fn ledger(state: &str) -> (FakeConsentLedger, u64) {
+            match state {
+                "revoked" => {
+                    let mut ledger = FakeConsentLedger::new();
+                    ledger
+                        .grant("local.assistant", "mcp_demo_echo", "mcp.demo", 9_000)
+                        .expect("grant fits");
+                    assert!(
+                        ledger.revoke("local.assistant", "mcp_demo_echo", "mcp.demo"),
+                        "revocation removes the triple"
+                    );
+                    (ledger, 1_000)
+                }
+                "expired" => {
+                    let mut ledger = FakeConsentLedger::new();
+                    ledger
+                        .grant("local.assistant", "mcp_demo_echo", "mcp.demo", 2_000)
+                        .expect("grant fits");
+                    (ledger, 2_000)
+                }
+                "empty" => (FakeConsentLedger::new(), 1_000),
+                other => panic!("unknown ledger state {other:?}"),
+            }
+        }
+
+        fn native_bus(ledger: FakeConsentLedger) -> ToolBus {
+            let mut registry = ToolRegistry::new();
+            registry
+                .register(
+                    ToolSpec::new(
+                        "mcp_demo_echo",
+                        "Echo",
+                        br#"{"type":"object"}"#.to_vec(),
+                        "mcp.demo",
+                        true,
+                    )
+                    .expect("valid"),
+                )
+                .expect("capacity");
+            ToolBus::new(registry)
+                .with_authorizer(Allow)
+                .with_consent(ledger, "local.assistant")
+        }
+
+        fn native_denial(
+            bus: &mut ToolBus,
+            executor: &mut FakeToolExecutor,
+            now_ms: u64,
+        ) -> (String, String) {
+            let call = ToolCall {
+                name: "mcp_demo_echo".to_owned(),
+                arguments: b"{}".to_vec(),
+            };
+            let mut ids = IdIssuer::default();
+            let execution = bus
+                .dispatch(
+                    executor,
+                    &call,
+                    &base(AgentLevel::Workspace),
+                    ids.execution(),
+                    now_ms,
+                )
+                .expect("admission refusal is a recorded status, not a bus error");
+            match &execution.status {
+                ToolStatus::Refused {
+                    cause: ToolError::Denied { name, reason },
+                } => (name.clone(), reason.clone()),
+                other => panic!("native must refuse with Denied, got {other:?}"),
+            }
+        }
+
+        // Consent-denial cells: byte-identical name+reason, zero contact.
+        for state in ["revoked", "expired", "empty"] {
+            let (bus_ledger, now_ms) = ledger(state);
+            let (adapter_ledger, _) = ledger(state);
+
+            let mut bus = native_bus(bus_ledger);
+            let mut executor = FakeToolExecutor::new();
+            executor.push_success("must never run", b"nope".to_vec());
+            let (native_name, native_reason) = native_denial(&mut bus, &mut executor, now_ms);
+
+            let (transport, sent) = FakeTransport::fresh(Vec::new());
+            let mut adapter = make_adapter(transport, Allow, adapter_ledger, AgentLevel::Workspace);
+            let error = adapter
+                .execute_narrowed("mcp_demo_echo", b"{}", now_ms, None)
+                .expect_err("consent must deny");
+            let (adapter_name, adapter_reason) = match &error {
+                ToolError::Denied { name, reason } => (name.clone(), reason.clone()),
+                other => panic!("state {state}: adapter must deny, got {other:?}"),
+            };
+            assert!(!matches!(error, ToolError::UnknownTool { .. }));
+            assert!(!matches!(error, ToolError::Failed { .. }));
+            assert!(!matches!(error, ToolError::EffectUnknown { .. }));
+            assert!(!matches!(error, ToolError::ProtocolRejected { .. }));
+
+            assert_eq!(native_name, adapter_name, "state {state}: identical tool");
+            assert_eq!(
+                native_reason, adapter_reason,
+                "state {state}: byte-identical denial reason"
+            );
+            assert!(
+                native_reason.contains("consent denied"),
+                "state {state}: consent wording, got {native_reason:?}"
+            );
+            assert!(
+                executor.calls().is_empty(),
+                "state {state}: zero native executor contact"
+            );
+            assert!(
+                sent.borrow().is_empty(),
+                "state {state}: zero adapter transport contact"
+            );
+            assert_eq!(bus.calls_this_turn(), 0, "state {state}: uncounted");
+        }
+
+        // Deny authorizer wins before consent on both paths (live grant
+        // installed on both sides): both deny pre-contact with zero
+        // contact, with path-specific hook renderings.
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        // Denying bus over the same tool triple with a live consent grant:
+        // the hook denial must win before the grant is ever consulted.
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "mcp_demo_echo",
+                    "Echo",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "mcp.demo",
+                    true,
+                )
+                .expect("valid"),
+            )
+            .expect("capacity");
+        let mut denying_bus = ToolBus::new(registry)
+            .with_authorizer(Deny)
+            .with_consent(consented(), "local.assistant");
+        let (native_name, native_reason) = native_denial(&mut denying_bus, &mut executor, 1_000);
+        assert_eq!(native_name, "mcp_demo_echo");
+        assert_eq!(native_reason, "test denial");
+        assert!(executor.calls().is_empty());
+        assert_eq!(denying_bus.calls_this_turn(), 0);
+
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_adapter(transport, Deny, consented(), AgentLevel::Workspace);
+        let error = adapter
+            .execute_narrowed("mcp_demo_echo", b"{}", 1_000, None)
+            .expect_err("authorizer must deny");
+        match &error {
+            ToolError::Denied { name, reason } => {
+                assert_eq!(name, "mcp_demo_echo");
+                assert!(reason.contains("authorizer denied"), "got {reason:?}");
+                assert!(reason.contains("test denial"), "got {reason:?}");
+            }
+            other => panic!("adapter must deny, got {other:?}"),
+        }
+        assert!(sent.borrow().is_empty());
     }
 }

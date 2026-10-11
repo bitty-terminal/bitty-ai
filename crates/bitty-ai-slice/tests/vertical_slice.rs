@@ -20,10 +20,10 @@
 //!   hierarchy level).
 
 use bitty_ai_runtime::{
-    AgentError, AgentLevel, AuthBase, ContextError, ExecOutcome, FakeToolExecutor, Fragment,
-    FragmentKind, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage, RecordBody, StreamChunk,
-    StreamError, StreamSink, ToolBus, ToolCall, ToolCallRequest, ToolError, ToolRegistry, ToolSpec,
-    ToolStatus, VecSink,
+    AgentError, AgentLevel, AuthBase, ContextError, ExecOutcome, FakeConsentLedger,
+    FakeToolExecutor, Fragment, FragmentKind, IdIssuer, ModelProvider, ProviderTurn, ProviderUsage,
+    RecordBody, StreamChunk, StreamError, StreamSink, ToolBus, ToolCall, ToolCallRequest,
+    ToolError, ToolRegistry, ToolSpec, ToolStatus, VecSink,
 };
 use bitty_ai_slice::{
     AllowReadOnly, HARNESS_MODEL, HARNESS_PROVIDER_ID, HARNESS_TOOL, HostPeer, IpcBridge,
@@ -420,6 +420,21 @@ fn host_without_snapshot_handler_fails_closed() {
     );
 }
 
+/// AI-0227 mechanical fixture: live consent grant for the harness tool
+/// triple, valid at `NOW_MS` (the `u64::MAX` expiry never lapses).
+fn consented_ledger() -> FakeConsentLedger {
+    let mut ledger = FakeConsentLedger::new();
+    ledger
+        .grant(
+            "local.assistant",
+            HARNESS_TOOL,
+            "terminal.inspect",
+            u64::MAX,
+        )
+        .expect("grant fits");
+    ledger
+}
+
 fn auth_base() -> AuthBase {
     let mut ids = IdIssuer::default();
     AuthBase {
@@ -476,8 +491,9 @@ fn write_tool_is_denied_by_default() {
 
 #[test]
 fn tool_call_limit_is_enforced() {
-    let mut bus =
-        ToolBus::new(test_tool_registry().expect("registry")).with_authorizer(AllowReadOnly);
+    let mut bus = ToolBus::new(test_tool_registry().expect("registry"))
+        .with_authorizer(AllowReadOnly)
+        .with_consent(consented_ledger(), "local.assistant");
     let mut executor = FakeToolExecutor::new();
     for _ in 0..8 {
         executor.push_success("ok", b"data".to_vec());
