@@ -1882,3 +1882,311 @@ impl TaskGenerationLookup for TaskEngine {
         Ok(node.generation)
     }
 }
+
+// Review-independence negative gate (AI-0235, R5-V4 code half, RFC AIQ-26).
+//
+// Positive shape: an approval is a detached record issued by a separate
+// approval action (`ReviewApproval::issue`) only when all hold: different
+// reviewer agent and session from the executor, plus the requirement
+// reference and the evidence reference in the reviewer's hands (evidence
+// pointers carried on the approval itself).
+//
+// Negatives (each fails closed, never `Ok`): self-review (same agent),
+// same session, shared PASS, cached PASS, self-report, and partial checks
+// (missing or identical requirement/evidence) never equal approval.
+//
+// HARD RULE: same-model-family, shared-base, shared-data, or a cached PASS
+// alone is NOT independence. This gate takes no model, base, data, or cache
+// inputs by design, so no code path can smuggle them into an approval;
+// cached-PASS reuse as approval is refused fail-closed via
+// `CachedPassClaim::into_approval` (likewise `SharedPassClaim` and
+// `SelfReportClaim`).
+//
+// R5-V1 projection rule: an approval is a record, never a transition or a
+// grant. `ReviewApproval::issue` is pure and takes no `TaskEngine` handle:
+// it reads no store, writes no store, and changes no `TaskStatus` or
+// generation. Admission/projection decisions live elsewhere; this type only
+// records that an independent review happened.
+//
+// All inputs are caller-supplied strings validated offline and
+// deterministically: trimming, emptiness, byte bounds, identity comparison,
+// and pointer distinctness. No threads, no network, no wall-clock (the
+// caller supplies `issued_at_ms`).
+//
+// This section is strictly additive: no existing task state machine,
+// schema, or transition is touched.
+/// Maximum allowed byte length for a review agent identity (mirrors task agent bound).
+pub const MAX_REVIEW_AGENT_BYTES: usize = MAX_AGENT_ID_BYTES;
+
+/// Maximum allowed byte length for a review session identity.
+pub const MAX_REVIEW_SESSION_BYTES: usize = 128;
+
+/// Maximum allowed byte length for one evidence pointer
+/// (requirement reference or evidence reference, opaque to this gate).
+pub const MAX_REVIEW_REF_BYTES: usize = 512;
+
+/// Fail-closed refusal for the review-independence gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewApprovalError {
+    /// A mandatory field was empty or whitespace-only.
+    EmptyField(&'static str),
+    /// Field exceeded its strict byte size limit.
+    OversizedField {
+        /// Name of the field.
+        field: &'static str,
+        /// Actual size in bytes.
+        size: usize,
+        /// Maximum allowed bytes.
+        max: usize,
+    },
+    /// Reviewer agent equals the executor agent (self-review).
+    SelfReview,
+    /// Reviewer session equals the executor session (no session independence).
+    SameSession,
+    /// Executor's own report presented as approval (self-report).
+    SelfReport,
+    /// Bare shared PASS presented as approval (no independent evidence in hand).
+    SharedPass,
+    /// Cached PASS reused as approval (cached PASS alone is not independence).
+    CachedPass,
+    /// Requirement/evidence pointers incomplete or indistinguishable
+    /// (missing side or the same pointer supplied as both).
+    PartialChecks,
+}
+
+impl fmt::Display for ReviewApprovalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyField(field) => write!(f, "field '{field}' must not be empty"),
+            Self::OversizedField { field, size, max } => {
+                write!(
+                    f,
+                    "field '{field}' exceeds limit: {size} bytes > {max} bytes"
+                )
+            }
+            Self::SelfReview => write!(
+                f,
+                "reviewer agent equals executor agent; self-review refused"
+            ),
+            Self::SameSession => {
+                write!(
+                    f,
+                    "reviewer session equals executor session; independence refused"
+                )
+            }
+            Self::SelfReport => write!(f, "executor self-report is not approval; refused"),
+            Self::SharedPass => write!(f, "shared PASS is not approval; refused"),
+            Self::CachedPass => write!(f, "cached PASS reuse is not approval; refused"),
+            Self::PartialChecks => {
+                write!(
+                    f,
+                    "partial checks are not approval; requirement and evidence must differ"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReviewApprovalError {}
+
+/// Executor-side identity for the reviewed work (inputs to the gate, not grants).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSubject {
+    /// Reviewed task identifier.
+    pub task_id: TaskId,
+    /// Agent that executed the work.
+    pub executor_agent: String,
+    /// Session the executor acted in.
+    pub executor_session: String,
+}
+
+/// Reviewer-side identity (must differ in both agent and session).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerIdentity {
+    /// Reviewing agent identity.
+    pub agent: String,
+    /// Session the reviewer acted in.
+    pub session: String,
+}
+
+/// Evidence pointers in the reviewer's hands (opaque, bounded, distinct).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewEvidence {
+    /// Pointer to the requirement the reviewer checked against.
+    pub requirement_ref: String,
+    /// Pointer to the evidence the reviewer inspected.
+    pub evidence_ref: String,
+}
+
+/// Detached approval record: proof that a separate independent review action
+/// ran. Carries reviewer agent+session and the requirement+evidence pointers.
+/// Never a status transition and never a grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewApproval {
+    /// Reviewed task identifier.
+    pub task_id: TaskId,
+    /// Executor agent recorded at review time.
+    pub executor_agent: String,
+    /// Executor session recorded at review time.
+    pub executor_session: String,
+    /// Approving reviewer agent (differs from executor).
+    pub reviewer_agent: String,
+    /// Approving reviewer session (differs from executor session).
+    pub reviewer_session: String,
+    /// Requirement pointer the reviewer held.
+    pub requirement_ref: String,
+    /// Evidence pointer the reviewer held.
+    pub evidence_ref: String,
+    /// Caller-supplied issue time in epoch milliseconds.
+    pub issued_at_ms: u64,
+}
+
+fn check_review_field(
+    value: &str,
+    field: &'static str,
+    max: usize,
+) -> Result<String, ReviewApprovalError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ReviewApprovalError::EmptyField(field));
+    }
+    if trimmed.len() > max {
+        return Err(ReviewApprovalError::OversizedField {
+            field,
+            size: trimmed.len(),
+            max,
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+impl ReviewApproval {
+    /// Separate approval action: issue a detached approval record.
+    ///
+    /// Pure and offline: takes no engine handle and mutates nothing. Fails
+    /// closed on every negative (self-review, same session, empty/oversized
+    /// fields, identical pointers). There is deliberately no model, base,
+    /// data, or cache parameter: those can never confer independence.
+    pub fn issue(
+        subject: &ReviewSubject,
+        reviewer: &ReviewerIdentity,
+        evidence: &ReviewEvidence,
+        issued_at_ms: u64,
+    ) -> Result<Self, ReviewApprovalError> {
+        let executor_agent = check_review_field(
+            &subject.executor_agent,
+            "executor_agent",
+            MAX_REVIEW_AGENT_BYTES,
+        )?;
+        let executor_session = check_review_field(
+            &subject.executor_session,
+            "executor_session",
+            MAX_REVIEW_SESSION_BYTES,
+        )?;
+        let reviewer_agent =
+            check_review_field(&reviewer.agent, "reviewer_agent", MAX_REVIEW_AGENT_BYTES)?;
+        let reviewer_session = check_review_field(
+            &reviewer.session,
+            "reviewer_session",
+            MAX_REVIEW_SESSION_BYTES,
+        )?;
+        let requirement_ref = check_review_field(
+            &evidence.requirement_ref,
+            "requirement_ref",
+            MAX_REVIEW_REF_BYTES,
+        )?;
+        let evidence_ref =
+            check_review_field(&evidence.evidence_ref, "evidence_ref", MAX_REVIEW_REF_BYTES)?;
+        if reviewer_agent == executor_agent {
+            return Err(ReviewApprovalError::SelfReview);
+        }
+        if reviewer_session == executor_session {
+            return Err(ReviewApprovalError::SameSession);
+        }
+        if requirement_ref == evidence_ref {
+            return Err(ReviewApprovalError::PartialChecks);
+        }
+        Ok(Self {
+            task_id: subject.task_id.clone(),
+            executor_agent,
+            executor_session,
+            reviewer_agent,
+            reviewer_session,
+            requirement_ref,
+            evidence_ref,
+            issued_at_ms,
+        })
+    }
+}
+
+/// Bare shared PASS verdict: explicitly inadmissible as approval.
+///
+/// A shared PASS carries no reviewer-held requirement+evidence pointers and
+/// no separate approval action, so conversion always refuses fail-closed
+/// with [`ReviewApprovalError::SharedPass`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPassClaim {
+    /// Task the PASS was recorded against.
+    pub task_id: TaskId,
+    /// Agent presenting the shared PASS.
+    pub claimant_agent: String,
+    /// Session presenting the shared PASS.
+    pub claimant_session: String,
+}
+
+impl SharedPassClaim {
+    /// Always refuses: a shared PASS never becomes an approval.
+    pub fn into_approval(self) -> Result<ReviewApproval, ReviewApprovalError> {
+        Err(ReviewApprovalError::SharedPass)
+    }
+}
+
+/// Cached PASS verdict: explicitly inadmissible as approval.
+///
+/// Reusing a cached PASS as approval would smuggle same-data/shared-base
+/// dependence through the cache. Conversion always refuses fail-closed with
+/// [`ReviewApprovalError::CachedPass`]; only a fresh separate
+/// [`ReviewApproval::issue`] with a different agent+session and
+/// reviewer-held pointers can approve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedPassClaim {
+    /// Task the cached PASS was recorded against.
+    pub task_id: TaskId,
+    /// Agent presenting the cached PASS.
+    pub holder_agent: String,
+    /// Session presenting the cached PASS.
+    pub holder_session: String,
+    /// Opaque cache key the PASS was read back under.
+    pub cache_key: String,
+}
+
+impl CachedPassClaim {
+    /// Always refuses: a cached PASS never becomes an approval.
+    pub fn into_approval(self) -> Result<ReviewApproval, ReviewApprovalError> {
+        Err(ReviewApprovalError::CachedPass)
+    }
+}
+
+/// Executor self-report: explicitly inadmissible as approval.
+///
+/// The executor's own report of its work is not an independent review.
+/// Conversion always refuses fail-closed with
+/// [`ReviewApprovalError::SelfReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfReportClaim {
+    /// Task the report describes.
+    pub task_id: TaskId,
+    /// Reporting (executor) agent.
+    pub executor_agent: String,
+    /// Reporting (executor) session.
+    pub executor_session: String,
+    /// Opaque report payload pointer.
+    pub report_ref: String,
+}
+
+impl SelfReportClaim {
+    /// Always refuses: a self-report never becomes an approval.
+    pub fn into_approval(self) -> Result<ReviewApproval, ReviewApprovalError> {
+        Err(ReviewApprovalError::SelfReport)
+    }
+}
