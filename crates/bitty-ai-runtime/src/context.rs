@@ -49,6 +49,10 @@
 //! - Truncation orders by effective priority, which clamps untrusted-surface
 //!   records to at most [`ContextPriority::Normal`]: untrusted observations
 //!   can never outrank host policy records under budget pressure.
+//! - Rendering labels every span with its provenance
+//!   ([`AssembledRecord::span_header`]): the trust prefix branches only on
+//!   the host flag, never on content, so the label is inert metadata and the
+//!   payload stays verbatim inside the Slice-1 fence.
 //!
 //! This module provides enforcement evidence toward AIQ-11; it does not close
 //! the register entry, which additionally spans compression (L2+), retention,
@@ -824,6 +828,27 @@ pub struct AssembledRecord {
     pub content: AssembledContent,
     /// Whether the record arrived via the untrusted surface.
     pub is_untrusted_surface: bool,
+}
+
+impl AssembledRecord {
+    /// Provenance header for the rendered span (AI-0249 Slice 2).
+    ///
+    /// `[trusted:<provider>:<id>]` or `[untrusted:<provider>:<id>]`, branching
+    /// only on the host-assigned [`ContextRecord::is_untrusted_surface`] flag
+    /// carried through [`assemble`]: provenance only, never a judgment about
+    /// malice, and never derived from record content. The provider names the
+    /// closed v1 set (validated at assembly) and the id is the turn-scoped
+    /// record id, so hostile bytes cannot alter the label and appear only
+    /// verbatim inside the Slice-1 fence that follows this header.
+    #[must_use]
+    pub fn span_header(&self) -> String {
+        let trust = if self.is_untrusted_surface {
+            "untrusted"
+        } else {
+            "trusted"
+        };
+        format!("[{trust}:{}:{}]", self.provider, self.id)
+    }
 }
 
 /// Deterministic assembly result for one turn.
