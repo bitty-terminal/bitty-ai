@@ -788,6 +788,7 @@ impl NetworkService for RecordingNetworkService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_ingest::InputCaptureOptIn;
     use crate::{
         RefreshAuthorization, SnapshotIngestRequest, ingest_snapshot, prompt_snapshot_with_project,
         snapshot_digest_hex,
@@ -2217,6 +2218,7 @@ mod tests {
             collected_at_ms: 100,
             priority: ContextPriority::High,
             refresh: RefreshAuthorization::authorize(1),
+            input_capture: InputCaptureOptIn::default(),
         };
         let record = ingest_snapshot(&ingest_req, &mut store).expect("fixture snapshot ingests");
         let snapshot = prompt_snapshot_with_project(

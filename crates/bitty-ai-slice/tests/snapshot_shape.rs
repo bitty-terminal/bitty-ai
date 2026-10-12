@@ -30,6 +30,7 @@ use bitty_ai_runtime::context::{MAX_ARTIFACT_BYTES, MAX_RECORD_BODY_BYTES, MAX_S
 use bitty_ai_runtime::{
     ArtifactStore, AssembledContent, ContextPriority, ContextRequest, RecordBody, assemble,
 };
+use bitty_ai_slice::snapshot_ingest::InputCaptureOptIn;
 use bitty_ai_slice::{
     RefreshAuthorization, SNAPSHOT_DIGEST_PREFIX_LEN, SNAPSHOT_PROVIDER, SnapshotIngestRequest,
     ingest_snapshot, snapshot_digest_hex,
@@ -61,6 +62,7 @@ fn ingest_request<'a>(
         collected_at_ms: COLLECTED_AT_MS,
         priority: ContextPriority::High,
         refresh: RefreshAuthorization::authorize(generation),
+        input_capture: InputCaptureOptIn::default(),
     }
 }
 

@@ -253,6 +253,133 @@ impl Default for RefreshLedger {
     }
 }
 
+/// Which host-captured input category is being admitted (R3-V3).
+///
+/// Clipboard and raw-environment bytes are distinct privacy surfaces. The
+/// kind carries no bytes, only the category, so denial reasons can never
+/// echo captured content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCaptureKind {
+    /// Host clipboard bytes.
+    Clipboard,
+    /// Host raw-environment bytes (unredacted env block).
+    RawEnv,
+}
+
+/// Explicit per-category opt-in for host-captured input bytes (R3-V3).
+///
+/// Default-off deny-by-default gate, following the
+/// [`DenyAllConsent`](bitty_ai_runtime::bridge::DenyAllConsent) posture and
+/// the `ToolRequest::allow_effects` / `EffectRequiresExplicitConsent`
+/// precedent: [`Default`] admits nothing, and [`admit`](Self::admit) fails
+/// closed until the caller enables the matching category with
+/// [`with_clipboard`](Self::with_clipboard) or
+/// [`with_raw_env`](Self::with_raw_env). Per-category isolation: a clipboard
+/// opt-in admits only clipboard, a raw-env opt-in admits only raw-env.
+///
+/// Consent gate only: no capture is performed here, no bytes are stored, no
+/// filesystem, no network, no durable writes. The host captures bytes
+/// out-of-process; the caller admits the kind here and only then passes the
+/// already-held bytes to `put_blob`/commit. Absent-by-default bytes never
+/// reach the store because `admit()` denies before the single store mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InputCaptureOptIn {
+    clipboard: bool,
+    raw_env: bool,
+}
+
+impl InputCaptureOptIn {
+    /// Closed by default: admits neither clipboard nor raw-env.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Explicit clipboard opt-in (explicit consent path, cf.
+    /// `ToolRequest::with_allow_effects`).
+    #[must_use]
+    pub fn with_clipboard(mut self, allow: bool) -> Self {
+        self.clipboard = allow;
+        self
+    }
+
+    /// Explicit raw-env opt-in (explicit consent path, cf.
+    /// `ToolRequest::with_allow_effects`).
+    #[must_use]
+    pub fn with_raw_env(mut self, allow: bool) -> Self {
+        self.raw_env = allow;
+        self
+    }
+
+    /// Whether clipboard capture is opted in.
+    #[must_use]
+    pub fn clipboard(&self) -> bool {
+        self.clipboard
+    }
+
+    /// Whether raw-env capture is opted in.
+    #[must_use]
+    pub fn raw_env(&self) -> bool {
+        self.raw_env
+    }
+
+    /// Admit one capture kind, failing closed with a static reason.
+    ///
+    /// Returns `Ok(())` only when the matching category was explicitly
+    /// opted in; otherwise returns [`InputCaptureError::ConsentRequired`]
+    /// with a static literal that never echoes captured content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputCaptureError::ConsentRequired`] when the requested
+    /// kind was not explicitly opted in.
+    pub fn admit(&self, kind: InputCaptureKind) -> Result<(), InputCaptureError> {
+        let allowed = match kind {
+            InputCaptureKind::Clipboard => self.clipboard,
+            InputCaptureKind::RawEnv => self.raw_env,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(match kind {
+                InputCaptureKind::Clipboard => InputCaptureError::ConsentRequired {
+                    reason: "clipboard capture requires explicit opt-in",
+                },
+                InputCaptureKind::RawEnv => InputCaptureError::ConsentRequired {
+                    reason: "raw-env capture requires explicit opt-in",
+                },
+            })
+        }
+    }
+}
+
+/// Input-capture admission failures.
+///
+/// Every variant fails closed with no store mutation, so absent-by-default
+/// bytes never reach `put_blob`/commit. Reasons are static literals only:
+/// hostile clipboard or environment content is never echoed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCaptureError {
+    /// The requested capture kind was not explicitly opted in. Carries a
+    /// static reason only, never captured content.
+    ConsentRequired {
+        /// What was missing (static, host-neutral).
+        reason: &'static str,
+    },
+}
+
+impl Display for InputCaptureError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::ConsentRequired { reason } => {
+                write!(f, "input capture denied: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InputCaptureError {}
+
 /// One host-supplied snapshot ingestion request.
 ///
 /// The host owns all byte assembly: it spawns `psnap` out-of-process,
@@ -260,6 +387,12 @@ impl Default for RefreshLedger {
 /// record identity (`record_id`, `owner`, `collected_at_ms`, `priority`), and
 /// authorizes the refresh ([`RefreshAuthorization`]). This helper verifies and
 /// adapts; it never re-acquires bytes from anywhere else.
+///
+/// The `input_capture` opt-in (R3-V3) is reserved for host-captured
+/// clipboard / raw-env bytes and defaults off
+/// ([`InputCaptureOptIn::default`]); the snapshot path neither captures nor
+/// consumes those categories, so the field has no effect on snapshot
+/// verification (no behavior change for existing callers).
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotIngestRequest<'a> {
     /// Canonical snapshot bytes exactly as `psnap` emitted them (stdout).
@@ -278,6 +411,9 @@ pub struct SnapshotIngestRequest<'a> {
     pub priority: ContextPriority,
     /// Explicit per-invocation refresh authorization (no refresh without it).
     pub refresh: RefreshAuthorization,
+    /// Input-capture opt-in for clipboard / raw-env bytes (default-off;
+    /// snapshot verification ignores it).
+    pub input_capture: InputCaptureOptIn,
 }
 
 /// Snapshot ingestion failures. Every variant fails closed with no record, so
@@ -943,7 +1079,10 @@ fn check_versions(value: &serde_json::Value) -> Result<(), SnapshotIngestError> 
 ///
 /// Pure bytes-in/record-out: no process spawning, no filesystem, no network,
 /// no caching. Refresh happens only through the per-invocation
-/// [`RefreshAuthorization`] token in `request`.
+/// [`RefreshAuthorization`] token in `request`. The R3-V3
+/// [`InputCaptureOptIn`] in `request.input_capture` is reserved for
+/// clipboard / raw-env bytes and is ignored by this snapshot path, so
+/// existing snapshot callers see no behavior change.
 ///
 /// Atomicity: every validation that can fail runs before the single
 /// [`ArtifactStore`] mutation (large-body externalize), so a failure leaves
@@ -1059,6 +1198,7 @@ mod tests {
             collected_at_ms: 1_000,
             priority: ContextPriority::High,
             refresh: RefreshAuthorization::authorize(generation),
+            input_capture: InputCaptureOptIn::default(),
         }
     }
 
@@ -1212,6 +1352,7 @@ mod tests {
             collected_at_ms: 1_000,
             priority: ContextPriority::High,
             refresh: RefreshAuthorization::authorize(1),
+            input_capture: InputCaptureOptIn::default(),
         };
         assert_eq!(
             ingest_snapshot(&empty, &mut store),
@@ -1360,6 +1501,7 @@ mod tests {
             collected_at_ms: 200,
             priority: ContextPriority::High,
             refresh: token,
+            input_capture: InputCaptureOptIn::default(),
         };
         let record = ingest_snapshot(&request, &mut store).expect("ledger token ingests");
         assert_eq!(record.generation, 2);

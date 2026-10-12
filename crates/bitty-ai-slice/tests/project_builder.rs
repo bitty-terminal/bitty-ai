@@ -7,6 +7,7 @@
 //! changes.
 
 use bitty_ai_runtime::{ArtifactStore, ContextPriority, PromptLayer, assemble_prompt};
+use bitty_ai_slice::snapshot_ingest::InputCaptureOptIn;
 use bitty_ai_slice::{
     ProjectLayerError, RefreshAuthorization, SNAPSHOT_LAYER_MARKER, SNAPSHOT_PROVIDER,
     SnapshotIngestRequest, ingest_snapshot, prompt_snapshot_with_project, snapshot_digest_hex,
@@ -31,6 +32,7 @@ fn ingest(revision: &str) -> (bitty_ai_runtime::ContextRecord, String) {
         collected_at_ms: 100,
         priority: ContextPriority::High,
         refresh: RefreshAuthorization::authorize(1),
+        input_capture: InputCaptureOptIn::default(),
     };
     let record = ingest_snapshot(&request, &mut store).expect("ingests");
     (record, digest)
