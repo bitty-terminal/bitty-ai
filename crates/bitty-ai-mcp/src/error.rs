@@ -150,6 +150,18 @@ pub enum McpFailure {
         /// Bounded detail (protocol facts only, never payloads).
         detail: String,
     },
+    /// Server binary digest pin mismatch (AI-0248 Rank-2 pin).
+    ///
+    /// The pre-configured `sha256` pin on
+    /// [`crate::config::McpServerConfig`] did not match the streamed digest
+    /// of the `command` binary at spawn time, or the binary could not be
+    /// read for verification. Fail-closed, non-retryable: the config pin
+    /// must change, retrying the same binary cannot succeed. Carries the
+    /// server id only — never path bytes, never hash bytes.
+    IdentityMismatch {
+        /// Server id only.
+        server: String,
+    },
     /// A frame exceeds [`crate::frame::MAX_FRAME_BYTES`].
     FrameTooLarge {
         /// Bound in bytes.
@@ -249,7 +261,7 @@ impl McpFailure {
     ///
     /// Timeouts, child exits, closed transports, spawn failures, and unknown
     /// effects are retryable; validation, authorization, consent, bounds,
-    /// duplicates, and tool-reported failures are not.
+    /// duplicates, identity mismatch, and tool-reported failures are not.
     #[must_use]
     pub fn retryable(&self) -> bool {
         matches!(
@@ -284,6 +296,10 @@ impl Display for McpFailure {
             }
             Self::NoToolCapability => write!(f, "server offers no tool capability"),
             Self::CapabilityDrift { detail } => write!(f, "capability drift: {detail}"),
+            Self::IdentityMismatch { server } => write!(
+                f,
+                "server identity mismatch: '{server}' binary digest does not match pin"
+            ),
             Self::FrameTooLarge { limit, actual } => {
                 write!(f, "frame of {actual} bytes exceeds {limit} byte limit")
             }
@@ -413,11 +429,28 @@ mod tests {
                     reason: bound_error_text("command is required", MAX_ERROR_TEXT_BYTES),
                 },
             ),
+            McpError::new(
+                McpStage::Spawn,
+                McpFailure::IdentityMismatch {
+                    server: bound_error_name("demo"),
+                },
+            ),
         ];
         for error in cases {
             assert_display_safe(&error.to_string());
             assert!(error.to_string().starts_with("mcp "));
         }
+        // Identity mismatch names the server only: no path bytes, no hash.
+        let mismatch = McpError::new(
+            McpStage::Spawn,
+            McpFailure::IdentityMismatch {
+                server: bound_error_name("demo"),
+            },
+        );
+        let text = mismatch.to_string();
+        assert!(text.contains("'demo'"));
+        assert!(!text.contains('/'));
+        assert!(!text.contains("e3b0c442"));
     }
 
     #[test]
@@ -451,6 +484,9 @@ mod tests {
             McpFailure::NoToolCapability,
             McpFailure::CapabilityDrift {
                 detail: "protocol pin mismatch".to_owned(),
+            },
+            McpFailure::IdentityMismatch {
+                server: "demo".to_owned(),
             },
             McpFailure::AllowlistDeny {
                 name: "t".to_owned(),

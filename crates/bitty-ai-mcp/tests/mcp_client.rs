@@ -1069,6 +1069,58 @@ fn pinning_observe_notification_refresh_mismatch_keeps_stale() {
     assert_eq!(adapter.list_version(), version);
 }
 
+// ── AI-0248: stdio server-binary digest pin (malformed shape, portable) ─────
+// Malformed pins refuse at config validation (InvalidConfig, never spawn).
+// Spawn-time match/mismatch/absent/oversized live in the Unix module below
+// (they need executable fixtures and `spawn_server`).
+
+#[test]
+fn digest_pin_malformed_refuses_at_config() {
+    use bitty_ai_mcp::McpServerConfig;
+    fn bad_config(pin: Option<String>) -> McpServerConfig {
+        McpServerConfig {
+            id: "demo".to_owned(),
+            command: "/bin/true".to_owned(),
+            args: Vec::new(),
+            env_refs: Vec::new(),
+            cwd: "/tmp/bitty".to_owned(),
+            timeout_ms: 1_000,
+            tool_allowlist: vec!["echo".to_owned()],
+            sha256_pin: pin,
+        }
+    }
+    // Absent pin validates (unpinned keeps current behavior).
+    bad_config(None).validate().expect("absent pin validates");
+    // Well-formed pin validates.
+    bad_config(Some(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+    ))
+    .validate()
+    .expect("well-formed pin validates");
+    // Malformed pins refuse fail-closed.
+    for bad in [
+        "",
+        "abc",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85500",
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+        "0x43b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8",
+    ] {
+        let error = bad_config(Some(bad.to_owned()))
+            .validate()
+            .expect_err("malformed pin must refuse");
+        assert!(
+            matches!(error.failure, McpFailure::InvalidConfig { .. }),
+            "wrong failure for {bad:?}"
+        );
+        assert!(!error.retryable);
+        if !bad.is_empty() {
+            assert!(!error.to_string().contains(bad));
+        }
+    }
+}
+
 // ── Unix live-spawn tests (bounded fixtures) ──────────────────────────────────
 
 #[cfg(unix)]
@@ -1096,6 +1148,7 @@ mod unix {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             timeout_ms: 10_000,
             tool_allowlist: allowlist,
+            sha256_pin: None,
         }
     }
 
@@ -1192,6 +1245,7 @@ mod unix {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             timeout_ms: 10_000,
             tool_allowlist: vec!["echo".to_owned()],
+            sha256_pin: None,
         };
         let mut server = spawn_server(&config, &no_env).expect("spawn sleeper");
         assert!(server.is_alive());
@@ -1264,5 +1318,386 @@ mod unix {
         assert_eq!(cooldown.wait_ms(5_000), 60_000);
         cooldown.record_success();
         assert!(cooldown.may_connect(5_000));
+    }
+
+    // ── AI-0248: stdio server-binary digest pin (spawn-time) ──────────────
+    // Pre-configured `sha256_pin`, streamed through a fixed 64 KiB buffer
+    // BEFORE `Command::new`. Oracle for expected digests is Python
+    // `hashlib.sha256` (system-trusted, independent of the in-crate hasher
+    // pinned by NIST vectors in `supervise.rs` unit tests).
+
+    fn sha256_hex_of(path: &std::path::Path) -> String {
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())",
+                &path.to_string_lossy(),
+            ])
+            .output()
+            .expect("python3 hashlib oracle")
+            .stdout;
+        String::from_utf8(output).expect("utf8").trim().to_owned()
+    }
+
+    fn pin_temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{}-{tag}.sh", std::process::id()))
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod fixture");
+        }
+    }
+
+    fn flip_last_hex_digit(hex: &str) -> String {
+        let mut flipped = hex.to_owned();
+        let last = flipped.pop().expect("non-empty");
+        let replacement = if last == '0' { '1' } else { '0' };
+        flipped.push(replacement);
+        flipped
+    }
+
+    fn pin_config(id: &str, command: &str, pin: Option<String>) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_owned(),
+            command: command.to_owned(),
+            args: Vec::new(),
+            env_refs: Vec::new(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            timeout_ms: 10_000,
+            tool_allowlist: vec!["echo".to_owned()],
+            sha256_pin: pin,
+        }
+    }
+
+    #[test]
+    fn digest_pin_match_spawns() {
+        let path = pin_temp_path("match");
+        write_executable(&path, "#!/bin/sh\nsleep 30\n");
+        let expected = sha256_hex_of(&path);
+        assert_eq!(expected.len(), 64);
+        let config = pin_config("pinmatch", &path.to_string_lossy(), Some(expected.clone()));
+        config.validate().expect("pinned config validates");
+        let mut server = spawn_server(&config, &no_env).expect("pin match spawns");
+        assert!(server.is_alive());
+        server.shutdown();
+        assert!(!server.is_alive());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn digest_pin_mismatch_refuses_with_zero_child() {
+        let path = pin_temp_path("mismatch");
+        let sentinel =
+            std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{}-sentinel", std::process::id()));
+        let _ = std::fs::remove_file(&sentinel);
+        // The script would touch the sentinel if it ever executed: its
+        // absence afterwards proves zero child (refuse happened BEFORE
+        // `Command::new`).
+        write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\ntouch {}\nsleep 30\n",
+                sentinel.to_string_lossy()
+            ),
+        );
+        let expected = sha256_hex_of(&path);
+        let wrong = flip_last_hex_digit(&expected);
+        assert_ne!(expected, wrong);
+        let config = pin_config("pinmismatch", &path.to_string_lossy(), Some(wrong.clone()));
+        config.validate().expect("wrong-but-shaped pin validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(_) => panic!("mismatch must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable, "identity mismatch is non-retryable");
+        let text = error.to_string();
+        // Names-only: server id appears; full path bytes and hash bytes never.
+        assert!(text.contains("pinmismatch"), "{text}");
+        assert!(
+            !text.contains(&path.to_string_lossy().into_owned()),
+            "path leaked: {text}"
+        );
+        assert!(!text.contains(&expected), "hash leaked: {text}");
+        assert!(!text.contains(&wrong), "hash leaked: {text}");
+        assert!(
+            !sentinel.exists(),
+            "child executed despite mismatch (sentinel exists)"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sentinel);
+    }
+
+    #[test]
+    fn digest_pin_absent_keeps_byte_identical_behavior() {
+        // Absent pin skips verification without touching the filesystem:
+        // the same binary spawns exactly as before (Rank-1 capability pin
+        // still applies at relist time, untouched here).
+        let path = pin_temp_path("absent");
+        write_executable(&path, "#!/bin/sh\nsleep 30\n");
+        let config = pin_config("pinabsent", &path.to_string_lossy(), None);
+        config.validate().expect("unpinned validates");
+        let mut server = spawn_server(&config, &no_env).expect("absent pin spawns");
+        assert!(server.is_alive());
+        server.shutdown();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn digest_pin_oversized_binary_streams_without_whole_file_load() {
+        // The fixture exceeds the fixed 64 KiB streaming buffer, so a
+        // correct spawn proves multi-chunk streaming (the whole file is never
+        // loaded: `spawn_server` reads through `[u8; 64 * 1024]` only).
+        let path = pin_temp_path("oversized");
+        let mut body = String::from("#!/bin/sh\n");
+        while body.len() <= bitty_ai_mcp::supervise::BINARY_DIGEST_BUF_LEN + 8_192 {
+            body.push_str("# padding to exceed the 64 KiB streaming buffer...........\n");
+        }
+        body.push_str("sleep 30\n");
+        write_executable(&path, &body);
+        let size = std::fs::metadata(&path).expect("stat").len();
+        assert!(
+            size > bitty_ai_mcp::supervise::BINARY_DIGEST_BUF_LEN as u64,
+            "fixture must exceed the streaming buffer: {size}"
+        );
+        let expected = sha256_hex_of(&path);
+        let config = pin_config("pinoversized", &path.to_string_lossy(), Some(expected));
+        let mut server = spawn_server(&config, &no_env).expect("oversized streams");
+        assert!(server.is_alive());
+        server.shutdown();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── AI-0248 fix round: verified-path reuse (Fix A) + bounded hash (Fix B)
+
+    // Fix A: bare `true` with a non-executable decoy earlier in `PATH`. The
+    // pin is the decoy digest: pre-fix code verified the decoy then
+    // re-resolved the bare name after `env_clear` (default search path) and
+    // launched system `true` (wrong binary, `Ok`); fixed code spawns EXACTLY
+    // the verified decoy path, which fails closed at `exec` (`SpawnFailed`)
+    // and never launches the system binary.
+    //
+    // `unsafe_code` allow: test-only `PATH` swap via `unsafe { set_var }`
+    // (edition 2024). The new `PATH` is `early_dir` plus the original `PATH`,
+    // so `python3`/system lookups still resolve; the window is one spawn;
+    // `RestorePath` restores even on panic. No other test mutates `PATH`.
+    #[test]
+    #[allow(unsafe_code)]
+    fn digest_pin_bare_name_uses_verified_path_never_resolves_again() {
+        struct RestorePath {
+            original: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.original {
+                        Some(orig) => std::env::set_var("PATH", orig),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        let pid = std::process::id();
+        let early_dir = std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{pid}-early"));
+        std::fs::create_dir_all(&early_dir).expect("mkdir early");
+        let decoy = early_dir.join("true");
+        std::fs::write(&decoy, "decoy-not-executable\n").expect("write decoy");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod decoy");
+        }
+        // Pin the decoy digest (the file `resolve_program_path` finds first
+        // in the parent `PATH`).
+        let decoy_pin = sha256_hex_of(&decoy);
+        assert_eq!(decoy_pin.len(), 64);
+
+        let original = std::env::var_os("PATH");
+        {
+            let mut parts = vec![early_dir.clone().into_os_string()];
+            if let Some(ref orig) = original {
+                parts.extend(std::env::split_paths(orig).map(|p| p.into_os_string()));
+            }
+            let joined = std::env::join_paths(parts).expect("join PATH");
+            unsafe {
+                std::env::set_var("PATH", &joined);
+            }
+        }
+        let _restore = RestorePath { original };
+
+        let config = pin_config("pindecoy", "true", Some(decoy_pin));
+        config.validate().expect("pinned bare validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("pinned bare name must not launch a re-resolved binary");
+            }
+            Err(error) => error,
+        };
+        // The verified decoy is non-executable: spawn fails closed at `exec`
+        // (never `IdentityMismatch` — the digest matched — and never `Ok`
+        // launching system `true`).
+        assert!(
+            matches!(error.failure, bitty_ai_mcp::McpFailure::SpawnFailed { .. }),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        let text = error.to_string();
+        assert!(text.contains("true"), "{text}");
+        assert!(
+            !text.contains(&early_dir.to_string_lossy().into_owned()),
+            "path leaked: {text}"
+        );
+
+        let _ = std::fs::remove_file(&decoy);
+        let _ = std::fs::remove_dir(&early_dir);
+    }
+
+    // Fix B (FIFO): a pre-existing FIFO refuses fail-closed without hanging.
+    // The pre-open + opened-handle `is_file` gates refuse before any blocking
+    // read; the test asserts a tight deadline to prove no hang.
+    #[test]
+    fn digest_pin_fifo_refuses_fail_closed_without_hanging() {
+        use std::time::{Duration, Instant};
+        let pid = std::process::id();
+        let fifo = std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{pid}-fifo"));
+        let _ = std::fs::remove_file(&fifo);
+        let fifo_str = fifo.to_string_lossy().into_owned();
+        let status = std::process::Command::new("python3")
+            .args([
+                "-c".to_owned(),
+                "import os,sys; os.mkfifo(sys.argv[1])".to_owned(),
+                fifo_str.clone(),
+            ])
+            .status()
+            .expect("mkfifo via python3");
+        assert!(status.success(), "mkfifo failed");
+        // Well-formed pin (empty digest): the refusal comes from the
+        // non-regular gate, not shape validation.
+        let config = pin_config(
+            "pinfifo",
+            &fifo_str,
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()),
+        );
+        config.validate().expect("fifo config validates");
+        let started = Instant::now();
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("FIFO must refuse");
+            }
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fifo check hung: {elapsed:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("pinfifo"), "{text}");
+        assert!(!text.contains(&fifo_str), "path leaked: {text}");
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    // Fix B (over-cap): a sparse file one byte past
+    // `MAX_PINNED_BINARY_BYTES` refuses fail-closed. The sparse fixture is
+    // instant with no large I/O (metadata length drives the fast refusal);
+    // over-cap never truncates-and-accepts since a partial hash cannot verify
+    // identity.
+    #[test]
+    fn digest_pin_oversized_refuses_fail_closed_over_cap() {
+        use bitty_ai_mcp::supervise::MAX_PINNED_BINARY_BYTES;
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{pid}-overcap"));
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::File::create(&path).expect("create overcap");
+        file.set_len(MAX_PINNED_BINARY_BYTES as u64 + 1)
+            .expect("sparse overcap");
+        drop(file);
+        let size = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(size, MAX_PINNED_BINARY_BYTES as u64 + 1);
+        let config = pin_config(
+            "pinovercap",
+            &path.to_string_lossy(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()),
+        );
+        config.validate().expect("overcap config validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("over-cap must refuse");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable);
+        let text = error.to_string();
+        assert!(text.contains("pinovercap"), "{text}");
+        assert!(
+            !text.contains(&path.to_string_lossy().into_owned()),
+            "path leaked: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Fix B (char device): `/dev/null` would hash to the empty digest if
+    // read, so pinning the empty digest proves the non-regular gate (not the
+    // digest compare) refuses. Never `/dev/zero` in tests (unbounded).
+    #[test]
+    fn digest_pin_char_device_refuses_fail_closed() {
+        let config = pin_config(
+            "pinnull",
+            "/dev/null",
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()),
+        );
+        config.validate().expect("null config validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("char device must refuse");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable);
+        let text = error.to_string();
+        assert!(text.contains("pinnull"), "{text}");
+        assert!(!text.contains("/dev/null"), "path leaked: {text}");
     }
 }
