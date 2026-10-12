@@ -50,6 +50,14 @@ pub const MAX_TOOL_RESULT_BYTES: usize = 16 * 1024;
 /// Mirrors [`MAX_TOOL_DESCRIPTION_LEN`]: short owner-supplied opaque strings
 /// share the 512-byte inclusive bound (`len() > LIMIT` refuses).
 pub const MAX_NATIVE_PLACEMENT_BYTES: usize = 512;
+/// Maximum permission-use audit events retained per bus (AI-0246 Slice 1).
+///
+/// Mirrors `MAX_EXECUTIONS_PER_AGENT` (32, the per-agent attributed-execution
+/// scale): the audit ring covers the same execution population as the turn
+/// attribution it complements. Oldest-evict on insert; read oldest-first via
+/// [`ToolBus::list_usage`]. In-memory only: no durable path, no threads, no
+/// network.
+pub const MAX_USAGE_EVENTS: usize = 32;
 
 /// FNV-1a-64 offset basis (deterministic across processes and platforms;
 /// mirrors the `cache_key.rs` precedent).
@@ -1034,6 +1042,162 @@ impl ToolExecutor for RecordingExecutor {
     }
 }
 
+/// Where a tool call executed (AI-0246 Slice 1, audit site label).
+///
+/// Data-only attribution: `placement` is derived from the registry
+/// ([`ToolSpec::placement`]) at dispatch time, never caller-supplied, so a
+/// row cannot claim a placement the declaration does not carry;
+/// `server_id`/`task_id` are optional host-threaded labels (for example the
+/// MCP `server_id` in `bitty-ai-mcp`, or a task-engine task id) bounded like
+/// every other outbound string on [`ToolBus::push_usage`].
+///
+/// There is deliberately no `cwd`, argument, summary, or result field: raw
+/// arguments never enter the ring (only [`UsageEvent::args_digest` digests
+/// them), and working-directory bytes are never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageSite {
+    /// Declared placement of the dispatched tool (`mcp`/`native`), or `None`
+    /// when the tool was unregistered (admission refusal before lookup).
+    pub placement: Option<ToolPlacement>,
+    /// Owning server label when the host threads one; `None` when
+    /// unthreaded. Bounded to display-safe printable ASCII on push.
+    pub server_id: Option<String>,
+    /// Task label when the host threads one; `None` when unthreaded.
+    /// Bounded to display-safe printable ASCII on push.
+    pub task_id: Option<String>,
+}
+
+/// One per-call permission-use attribution (AI-0246 Slice 1).
+///
+/// Reuses existing types: [`crate::session::ExecutionId`], the tool name,
+/// the `required_scope` threaded from the registry (the [`ToolExecution`]
+/// record drops it), the protocol id installed via [`ToolBus::with_consent`],
+/// the [`AuthBase`] caller triple, the dispatch `now_ms` as
+/// `occurred_at_ms`, the [`UsageSite`] where-label, the
+/// [`ToolStatus`]/[`ResultDisposition`] outcome axes, a bounded `reason`
+/// derived from the status, and an FNV-1a-64 `args_digest` (never raw args).
+///
+/// All variable-length strings are bounded to display-safe printable ASCII
+/// on [`ToolBus::push_usage`] (idempotent: valid names, scopes, and ids pass
+/// through unchanged). The ring carries attribution, never payload: no raw
+/// arguments, no summaries, no result bytes, no cwd, no secrets.
+/// `Clone` exists for read-only [`ToolBus::list_usage`] snapshots; there is
+/// no update or delete API by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageEvent {
+    /// Attribution handle for this dispatch (the same id as the paired
+    /// [`ToolExecution`]).
+    pub execution_id: crate::session::ExecutionId,
+    /// Dispatched tool name (bounded on push).
+    pub tool: String,
+    /// Capability scope the registry declaration requires (`required_scope`
+    /// threaded at dispatch; empty when the tool was unregistered).
+    pub scope: String,
+    /// Wire principal charged for consent (the `with_consent` id; empty when
+    /// no consent pair is installed).
+    pub protocol_id: String,
+    /// Caller identity and tier (who).
+    pub caller: AuthBase,
+    /// Caller-supplied dispatch timestamp in milliseconds (when).
+    pub occurred_at_ms: u64,
+    /// Placement plus optional server/task labels (where; never cwd).
+    pub site: UsageSite,
+    /// Effect axis of the dispatch outcome.
+    pub status: ToolStatus,
+    /// Result-acceptance axis of the dispatch outcome.
+    pub result_disposition: ResultDisposition,
+    /// Bounded diagnostic reason derived from `status` (empty for success).
+    pub reason: String,
+    /// FNV-1a-64 over the raw argument bytes (which-call privacy: digest
+    /// only, never raw args; mirrors the [`ToolSpec::schema_digest`]
+    /// precedent, never `DefaultHasher`/`RandomState`).
+    pub args_digest: u64,
+}
+
+impl UsageEvent {
+    /// Deterministic digest of raw call arguments (AI-0246 Slice 1).
+    ///
+    /// FNV-1a-64 over exactly the argument bytes (inline small hasher
+    /// mirroring the [`ToolSpec::schema_digest`] precedent; never
+    /// `DefaultHasher`/`RandomState`). Same bytes give the same digest on
+    /// every platform and process; any byte change moves it. The digest is
+    /// the privacy handle: the ring stores this `u64`, never the raw bytes
+    /// (which can exceed [`MAX_TOOL_ARGUMENTS_BYTES`] and carry PII).
+    #[must_use]
+    pub fn args_digest(args: &[u8]) -> u64 {
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in args {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+}
+
+/// Read-only filter for [`ToolBus::list_usage`] (AI-0246 Slice 1).
+///
+/// Every `Some` field must match exactly; `None` constrains nothing. The
+/// default (all `None`) matches every event. Pure predicate, no state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageFilter {
+    /// Match the dispatched tool name exactly.
+    pub tool: Option<String>,
+    /// Match the threaded required scope exactly.
+    pub scope: Option<String>,
+    /// Match the wire protocol id exactly.
+    pub protocol_id: Option<String>,
+    /// Match the caller agent-instance id exactly.
+    pub agent_instance_id: Option<crate::session::AgentInstanceId>,
+    /// Match the caller session id exactly.
+    pub session_id: Option<crate::session::SessionId>,
+    /// Match the derived placement exactly.
+    pub placement: Option<ToolPlacement>,
+}
+
+impl UsageFilter {
+    /// Filter matching every event (all fields `None`).
+    #[must_use]
+    pub fn match_all() -> Self {
+        Self::default()
+    }
+
+    /// Whether `event` satisfies every constrained field.
+    #[must_use]
+    pub fn matches(&self, event: &UsageEvent) -> bool {
+        if let Some(tool) = &self.tool {
+            if event.tool != *tool {
+                return false;
+            }
+        }
+        if let Some(scope) = &self.scope {
+            if event.scope != *scope {
+                return false;
+            }
+        }
+        if let Some(protocol_id) = &self.protocol_id {
+            if event.protocol_id != *protocol_id {
+                return false;
+            }
+        }
+        if let Some(agent_instance_id) = &self.agent_instance_id {
+            if event.caller.agent_instance_id != *agent_instance_id {
+                return false;
+            }
+        }
+        if let Some(session_id) = &self.session_id {
+            if event.caller.session_id != *session_id {
+                return false;
+            }
+        }
+        if let Some(placement) = &self.placement {
+            if event.site.placement.as_ref() != Some(placement) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Tool Bus dispatch surface.
 ///
 /// The consent gate (AI-0227, AIQ-33 S2) is host-installed alongside the
@@ -1043,6 +1207,15 @@ impl ToolExecutor for RecordingExecutor {
 /// execute path, through the ONE shared helper
 /// [`crate::bridge::ensure_consented_for_dispatch`], so both paths report
 /// byte-identical [`ToolError::Denied`] reasons pre-contact.
+///
+/// The bus additionally owns the in-memory permission-use audit ring
+/// (AI-0246 Slice 1): every dispatch returning a [`ToolExecution`] —
+/// admission refusals before any executor contact as well as contacted calls
+/// — appends one [`UsageEvent`], oldest-evicting past [`MAX_USAGE_EVENTS`].
+/// This contrasts with the durable pending-effect log (contacted-only: it
+/// opens a row only once the executor is reached, so admission refusals leave
+/// no row): the audit ring exists precisely so refusals stay attributable
+/// (who/when/which-capability/where) instead of unattributable.
 #[derive(Default)]
 pub struct ToolBus {
     registry: ToolRegistry,
@@ -1050,6 +1223,7 @@ pub struct ToolBus {
     consent: Option<Box<dyn ConsentLedger>>,
     protocol_id: Option<String>,
     calls_this_turn: usize,
+    usage: VecDeque<UsageEvent>,
 }
 
 impl std::fmt::Debug for ToolBus {
@@ -1059,6 +1233,7 @@ impl std::fmt::Debug for ToolBus {
             .field("has_authorizer", &self.authorizer.is_some())
             .field("has_consent", &self.consent.is_some())
             .field("calls_this_turn", &self.calls_this_turn)
+            .field("usage_len", &self.usage.len())
             .finish()
     }
 }
@@ -1075,6 +1250,7 @@ impl ToolBus {
             consent: None,
             protocol_id: None,
             calls_this_turn: 0,
+            usage: VecDeque::new(),
         }
     }
 
@@ -1125,6 +1301,139 @@ impl ToolBus {
     #[must_use]
     pub fn tool_names(&self) -> Vec<String> {
         self.registry.names()
+    }
+
+    /// Append one usage event, oldest-evicting past [`MAX_USAGE_EVENTS`]
+    /// (AI-0246 Slice 1).
+    ///
+    /// The event is normalized before it is stored: the tool, scope,
+    /// protocol, server, task, and reason strings are bounded to
+    /// display-safe printable ASCII (idempotent; valid values pass through
+    /// unchanged) and the status runs through [`ToolStatus::normalized`], so
+    /// a host-threaded row cannot smuggle unbounded or newline-bearing text
+    /// into the ring. The digest travels as-is (a fixed `u64`; raw arguments
+    /// never enter). When the ring is full the oldest event is dropped and
+    /// the new one is kept; there is deliberately no delete or update API —
+    /// the ring is append-only and read-only besides this push.
+    pub fn push_usage(&mut self, mut event: UsageEvent) {
+        event.tool = bound_reason(&event.tool);
+        event.scope = bound_reason(&event.scope);
+        event.protocol_id = bound_reason(&event.protocol_id);
+        event.status = event.status.normalized();
+        event.reason = bound_reason(&event.reason);
+        if let Some(server_id) = event.site.server_id.take() {
+            let bounded = bound_reason(&server_id);
+            event.site.server_id = if bounded.is_empty() {
+                None
+            } else {
+                Some(bounded)
+            };
+        }
+        if let Some(task_id) = event.site.task_id.take() {
+            let bounded = bound_reason(&task_id);
+            event.site.task_id = if bounded.is_empty() {
+                None
+            } else {
+                Some(bounded)
+            };
+        }
+        if self.usage.len() >= MAX_USAGE_EVENTS {
+            self.usage.pop_front();
+        }
+        self.usage.push_back(event);
+    }
+
+    /// Usage events retained in the ring.
+    #[must_use]
+    pub fn usage_len(&self) -> usize {
+        self.usage.len()
+    }
+
+    /// Whether the usage ring holds no event.
+    #[must_use]
+    pub fn is_usage_empty(&self) -> bool {
+        self.usage.is_empty()
+    }
+
+    /// Read-only usage snapshot, oldest-first (AI-0246 Slice 1).
+    ///
+    /// Returns cloned events matching `filter` in insertion order (oldest
+    /// first), capped at `limit` rows. Takes `&self` and returns owned
+    /// clones: callers cannot mutate, delete, or reorder the ring through
+    /// this path, and mutating the returned vector leaves the bus unchanged.
+    /// `limit == 0` returns no rows. Pure; no clock, no I/O.
+    #[must_use]
+    pub fn list_usage(&self, filter: &UsageFilter, limit: usize) -> Vec<UsageEvent> {
+        self.usage
+            .iter()
+            .filter(|event| filter.matches(event))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Record the audit row for one dispatch returning a [`ToolExecution`].
+    ///
+    /// Threads what the execution record drops: the registry
+    /// `required_scope` (empty when the tool is unregistered) and the
+    /// declared `placement` (`None` when unregistered), plus the installed
+    /// protocol id (empty when no consent pair is installed), the caller
+    /// triple, the dispatch `now_ms`, a digest of the raw arguments (never
+    /// the bytes), and the bounded reason derived from the already-normalized
+    /// status. Server/task site labels stay `None` on this path: the bus
+    /// never invents them, and the host threads them only through explicit
+    /// [`ToolBus::push_usage`] rows. Pushes through [`ToolBus::push_usage`],
+    /// so bounds and oldest-eviction apply uniformly.
+    fn observe_dispatch(
+        &mut self,
+        execution_id: crate::session::ExecutionId,
+        call: &ToolCall,
+        base: &AuthBase,
+        now_ms: u64,
+        status: &ToolStatus,
+        disposition: &ResultDisposition,
+    ) {
+        let (scope, placement) = self
+            .registry
+            .lookup(&call.name)
+            .map(|spec| (spec.required_scope.clone(), spec.placement))
+            .unwrap_or_else(|| (String::new(), None));
+        let protocol_id = self.protocol_id.clone().unwrap_or_default();
+        let event = UsageEvent {
+            execution_id,
+            tool: call.name.clone(),
+            scope,
+            protocol_id,
+            caller: *base,
+            occurred_at_ms: now_ms,
+            site: UsageSite {
+                placement,
+                server_id: None,
+                task_id: None,
+            },
+            status: status.clone(),
+            result_disposition: disposition.clone(),
+            reason: Self::status_reason(status),
+            args_digest: UsageEvent::args_digest(&call.arguments),
+        };
+        self.push_usage(event);
+    }
+
+    /// Bounded diagnostic reason for a dispatch status (AI-0246 Slice 1).
+    ///
+    /// Success carries no text (empty); terminal failure, denial, and
+    /// uncertainty statuses contribute their already-bounded reason;
+    /// admission refusals contribute the bounded render of their typed cause.
+    /// The result is bounded again on [`ToolBus::push_usage`], so this helper
+    /// stays total over hostile input.
+    fn status_reason(status: &ToolStatus) -> String {
+        match status {
+            ToolStatus::Success => String::new(),
+            ToolStatus::Failed { reason }
+            | ToolStatus::Denied { reason }
+            | ToolStatus::Unknown { reason } => bound_reason(reason),
+            ToolStatus::Refused { cause } => bound_reason(&cause.to_string()),
+        }
     }
 
     /// Authorize one call against the tier floor and the hook. The `inspect`
@@ -1364,6 +1673,11 @@ impl ToolBus {
     /// [`ResultDisposition::Rejected`] (acceptance) through the returned
     /// [`ToolExecution`] and fails the turn itself with the carried typed
     /// cause.
+    ///
+    /// Every `Ok` return appends one [`UsageEvent`] through
+    /// [`ToolBus::observe_dispatch`] (admission refusals and contacted calls
+    /// alike). The out-of-contract `Err` return carries no terminal
+    /// [`ToolExecution`], so it appends no row; the turn still fails closed.
     pub fn dispatch(
         &mut self,
         executor: &mut dyn ToolExecutor,
@@ -1373,7 +1687,16 @@ impl ToolBus {
         now_ms: u64,
     ) -> Result<ToolExecution, ToolError> {
         if let Err(error) = self.authorize_call(base, call) {
-            return Ok(Self::refused(execution_id, call, error));
+            let execution = Self::refused(execution_id, call, error);
+            self.observe_dispatch(
+                execution_id,
+                call,
+                base,
+                now_ms,
+                &execution.status,
+                &execution.result_disposition,
+            );
+            return Ok(execution);
         }
         // AI-0227 (AIQ-33 S2): authorizer-then-consent, the same relative
         // position as the MCP adapter execute path. A consent denial is an
@@ -1381,16 +1704,34 @@ impl ToolBus {
         // never `Failed`/`Unknown`/`ProtocolRejected`): zero executor
         // contact, zero turn counting, `is_untrusted_surface == false`.
         if let Err(denial) = self.check_consent(call, base, now_ms) {
-            return Ok(Self::refused(execution_id, call, denial));
+            let execution = Self::refused(execution_id, call, denial);
+            self.observe_dispatch(
+                execution_id,
+                call,
+                base,
+                now_ms,
+                &execution.status,
+                &execution.result_disposition,
+            );
+            return Ok(execution);
         }
         if self.calls_this_turn >= MAX_TOOL_CALLS_PER_TURN {
-            return Ok(Self::refused(
+            let execution = Self::refused(
                 execution_id,
                 call,
                 ToolError::CallLimitExceeded {
                     limit: MAX_TOOL_CALLS_PER_TURN,
                 },
-            ));
+            );
+            self.observe_dispatch(
+                execution_id,
+                call,
+                base,
+                now_ms,
+                &execution.status,
+                &execution.result_disposition,
+            );
+            return Ok(execution);
         }
         let context = ExecutionContext {
             execution_id,
@@ -1401,26 +1742,44 @@ impl ToolBus {
         match outcome {
             Ok(success) => {
                 if success.summary.len() > MAX_SUMMARY_BYTES {
-                    return Ok(Self::result_rejected(
+                    let execution = Self::result_rejected(
                         execution_id,
                         call,
                         ToolError::SummaryTooLarge {
                             limit: MAX_SUMMARY_BYTES,
                             actual: success.summary.len(),
                         },
-                    ));
+                    );
+                    self.observe_dispatch(
+                        execution_id,
+                        call,
+                        base,
+                        now_ms,
+                        &execution.status,
+                        &execution.result_disposition,
+                    );
+                    return Ok(execution);
                 }
                 if success.data.len() > MAX_TOOL_RESULT_BYTES {
-                    return Ok(Self::result_rejected(
+                    let execution = Self::result_rejected(
                         execution_id,
                         call,
                         ToolError::ResultTooLarge {
                             limit: MAX_TOOL_RESULT_BYTES,
                             actual: success.data.len(),
                         },
-                    ));
+                    );
+                    self.observe_dispatch(
+                        execution_id,
+                        call,
+                        base,
+                        now_ms,
+                        &execution.status,
+                        &execution.result_disposition,
+                    );
+                    return Ok(execution);
                 }
-                Ok(ToolExecution {
+                let execution = ToolExecution {
                     execution_id,
                     tool: call.name.clone(),
                     status: ToolStatus::Success,
@@ -1428,39 +1787,79 @@ impl ToolBus {
                     summary: success.summary,
                     data: success.data,
                     is_untrusted_surface: true,
-                })
+                };
+                self.observe_dispatch(
+                    execution_id,
+                    call,
+                    base,
+                    now_ms,
+                    &execution.status,
+                    &execution.result_disposition,
+                );
+                Ok(execution)
             }
             Err(ToolError::EffectUnknown { reason, .. }) => {
-                Ok(Self::ack_loss(execution_id, call, &reason))
+                let execution = Self::ack_loss(execution_id, call, &reason);
+                self.observe_dispatch(
+                    execution_id,
+                    call,
+                    base,
+                    now_ms,
+                    &execution.status,
+                    &execution.result_disposition,
+                );
+                Ok(execution)
             }
-            Err(ToolError::Denied { reason, .. }) => Ok(ToolExecution {
-                execution_id,
-                tool: call.name.clone(),
-                // AI-RUN-008: the executor's denial reason is host-supplied;
-                // normalize it before it becomes a status that is displayed,
-                // messaged to the provider, and mapped back into ToolError.
-                status: ToolStatus::Denied {
-                    reason: bound_reason(&reason),
-                },
-                result_disposition: ResultDisposition::Accepted,
-                summary: "host denied execution".to_owned(),
-                data: Vec::new(),
-                is_untrusted_surface: true,
-            }),
-            Err(ToolError::Failed { reason, .. }) => Ok(ToolExecution {
-                execution_id,
-                tool: call.name.clone(),
-                // AI-RUN-008: the executor's failure reason is host-supplied;
-                // normalize it before it becomes a status that is displayed
-                // and messaged to the provider.
-                status: ToolStatus::Failed {
-                    reason: bound_reason(&reason),
-                },
-                result_disposition: ResultDisposition::Accepted,
-                summary: "host reported failure".to_owned(),
-                data: Vec::new(),
-                is_untrusted_surface: true,
-            }),
+            Err(ToolError::Denied { reason, .. }) => {
+                let execution = ToolExecution {
+                    execution_id,
+                    tool: call.name.clone(),
+                    // AI-RUN-008: the executor's denial reason is host-supplied;
+                    // normalize it before it becomes a status that is displayed,
+                    // messaged to the provider, and mapped back into ToolError.
+                    status: ToolStatus::Denied {
+                        reason: bound_reason(&reason),
+                    },
+                    result_disposition: ResultDisposition::Accepted,
+                    summary: "host denied execution".to_owned(),
+                    data: Vec::new(),
+                    is_untrusted_surface: true,
+                };
+                self.observe_dispatch(
+                    execution_id,
+                    call,
+                    base,
+                    now_ms,
+                    &execution.status,
+                    &execution.result_disposition,
+                );
+                Ok(execution)
+            }
+            Err(ToolError::Failed { reason, .. }) => {
+                let execution = ToolExecution {
+                    execution_id,
+                    tool: call.name.clone(),
+                    // AI-RUN-008: the executor's failure reason is host-supplied;
+                    // normalize it before it becomes a status that is displayed
+                    // and messaged to the provider.
+                    status: ToolStatus::Failed {
+                        reason: bound_reason(&reason),
+                    },
+                    result_disposition: ResultDisposition::Accepted,
+                    summary: "host reported failure".to_owned(),
+                    data: Vec::new(),
+                    is_untrusted_surface: true,
+                };
+                self.observe_dispatch(
+                    execution_id,
+                    call,
+                    base,
+                    now_ms,
+                    &execution.status,
+                    &execution.result_disposition,
+                );
+                Ok(execution)
+            }
             // AI-0204: a pre-execution protocol rejection never executed, so
             // it is never `Denied` (policy), never `Unknown` (no reconcile),
             // and never an admission refusal. It records `Failed` status with
@@ -1468,17 +1867,28 @@ impl ToolBus {
             // model-observable exactly like an executed failure while the
             // attribution stays distinct; the dispatch is counted and the
             // surface stays untrusted.
-            Err(ToolError::ProtocolRejected { reason, .. }) => Ok(ToolExecution {
-                execution_id,
-                tool: call.name.clone(),
-                status: ToolStatus::Failed {
-                    reason: bound_reason(&reason),
-                },
-                result_disposition: ResultDisposition::Accepted,
-                summary: "protocol rejected before execution".to_owned(),
-                data: Vec::new(),
-                is_untrusted_surface: true,
-            }),
+            Err(ToolError::ProtocolRejected { reason, .. }) => {
+                let execution = ToolExecution {
+                    execution_id,
+                    tool: call.name.clone(),
+                    status: ToolStatus::Failed {
+                        reason: bound_reason(&reason),
+                    },
+                    result_disposition: ResultDisposition::Accepted,
+                    summary: "protocol rejected before execution".to_owned(),
+                    data: Vec::new(),
+                    is_untrusted_surface: true,
+                };
+                self.observe_dispatch(
+                    execution_id,
+                    call,
+                    base,
+                    now_ms,
+                    &execution.status,
+                    &execution.result_disposition,
+                );
+                Ok(execution)
+            }
             Err(error) => Err(error),
         }
     }
@@ -1490,7 +1900,8 @@ impl ToolBus {
     /// [`ToolError::Denied`] cause with zero executor contact, zero
     /// `calls_this_turn` increment, and `is_untrusted_surface == false`
     /// (admission-only: status stays [`ToolStatus::Refused`], never
-    /// `Failed`/`Unknown`; the carried cause is [`ToolError::Denied`]).
+    /// `Failed`/`Unknown`; the carried cause is [`ToolError::Denied`]), and
+    /// still appends one [`UsageEvent`] so the refusal stays attributable.
     /// Otherwise delegates to [`ToolBus::dispatch`] unchanged. [`ExecutionContext`]
     /// is untouched (no borrowed data): the allow-set travels as this
     /// separate `allowed` parameter only.
@@ -1509,11 +1920,16 @@ impl ToolBus {
         allowed: Option<&[String]>,
     ) -> Result<ToolExecution, ToolError> {
         if Self::narrowing_omits(allowed, &call.name) {
-            return Ok(Self::refused(
+            let execution = Self::refused(execution_id, call, Self::narrowing_denial(call));
+            self.observe_dispatch(
                 execution_id,
                 call,
-                Self::narrowing_denial(call),
-            ));
+                base,
+                now_ms,
+                &execution.status,
+                &execution.result_disposition,
+            );
+            return Ok(execution);
         }
         self.dispatch(executor, call, base, execution_id, now_ms)
     }
