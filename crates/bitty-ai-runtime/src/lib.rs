@@ -161,7 +161,7 @@ pub use stream::{
 };
 pub use tool::{
     AuthBase, AuthContext, AuthDecision, DenyAllAuthorizer, ExecutionContext, FakeToolExecutor,
-    NativePlacement, RecordingExecutor, ResultDisposition, ToolAuthorizer, ToolBus, ToolCall,
-    ToolError, ToolExecution, ToolExecutor, ToolPlacement, ToolRegistry, ToolSpec, ToolStatus,
-    ToolSuccess, validate_tool_name,
+    MAX_USAGE_EVENTS, NativePlacement, RecordingExecutor, ResultDisposition, ToolAuthorizer,
+    ToolBus, ToolCall, ToolError, ToolExecution, ToolExecutor, ToolPlacement, ToolRegistry,
+    ToolSpec, ToolStatus, ToolSuccess, UsageEvent, UsageFilter, UsageSite, validate_tool_name,
 };
