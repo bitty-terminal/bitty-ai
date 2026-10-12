@@ -8,10 +8,11 @@
 //! ```bash
 //! # Ephemeral in-memory session:
 //! cargo run -p bitty-ai-slice --example wheel_stdio_host
-//!
-//! # Persistent SQLite database session:
-//! cargo run -p bitty-ai-slice --example wheel_stdio_host -- --db /tmp/bitty/wheel.db
 //! ```
+//!
+//! v0.1 gate (AI-0238): the persistent `--db` session below refuses with the
+//! Wheel path-open gate error and creates no file; only the in-memory
+//! session runs under the v0.1 profile.
 //!
 //! # Protocol
 //! - Each request on `stdin` is a single line:
@@ -73,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             eprintln!(
-                "[wheel-stdio-host] Opened persistent database at {}",
+                "[wheel-stdio-host] Attempting persistent database at {} (v0.1 gate AI-0238 refuses path opens)",
                 path.display()
             );
             WheelBridge::open(path)?

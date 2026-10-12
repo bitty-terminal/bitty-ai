@@ -24,7 +24,6 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use bitty_ai_session::pending::{
     MAX_HEAD_MARKERS, MAX_OPEN_PENDING_PER_SESSION, PendingError, PendingStore,
@@ -145,81 +144,51 @@ pub struct WheelKernel {
 
 impl WheelKernel {
     /// Open a persistent WheelKernel backed by a SQLite database at `path` with default configs.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, FacadeError> {
-        Self::open_with_config(
-            path,
-            CompilerBudgetConfig::default(),
-            SpilloverConfig::default(),
-        )
+    ///
+    /// v0.1 gate (AI-0238): path-taking file-backed opens refuse with
+    /// [`FacadeError::Store`] carrying the v0.1 gate message before any
+    /// filesystem access and create no file; use [`Self::open_in_memory`].
+    pub fn open(_path: impl AsRef<Path>) -> Result<Self, FacadeError> {
+        Err(FacadeError::Store(
+            crate::content_store::V01_DURABLE_GATE_MESSAGE.to_owned(),
+        ))
     }
 
     /// Open a persistent WheelKernel with caller-supplied budget and spillover configurations.
     ///
-    /// Opens the file exactly once, applies the durable pragma profile, admits
+    /// v0.1 gate (AI-0238): refuses like [`Self::open`]; use
+    /// [`Self::open_in_memory_with_config`]. The single-open sequence below
+    /// documents the post-v0.1 behavior this gate suspends:
+    /// opens the file exactly once, applies the durable pragma profile, admits
     /// content and task schemas, claims the single-writer lock, shares the
     /// handle into the content store and task engine, then validates the
     /// HEAD -> checkpoint -> tree triple (fail closed on partial).
     pub fn open_with_config(
-        path: impl AsRef<Path>,
-        budget_config: CompilerBudgetConfig,
-        spillover_config: SpilloverConfig,
+        _path: impl AsRef<Path>,
+        _budget_config: CompilerBudgetConfig,
+        _spillover_config: SpilloverConfig,
     ) -> Result<Self, FacadeError> {
-        let path = path.as_ref();
-        crate::content_store::check_sqlite_magic(path).map_err(FacadeError::from)?;
-        let conn = Connection::open(path)
-            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
-        // Fail-fast admission: the busy timeout stays zero until the writer
-        // claim succeeds, so a second open while the first lives returns
-        // promptly instead of waiting out the steady-state timeout.
-        conn.busy_timeout(Duration::ZERO)
-            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
-        crate::content_store::admit_or_init(&conn).map_err(FacadeError::from)?;
-        crate::task_dag::admit_task_or_init(&conn).map_err(FacadeError::from)?;
-        crate::content_store::apply_durable_pragmas(&conn).map_err(FacadeError::from)?;
-        conn.busy_timeout(Duration::ZERO)
-            .map_err(|e| FacadeError::Store(crate::content_store::map_busy_for_facade(e)))?;
-        crate::content_store::init_content_schema(&conn).map_err(FacadeError::from)?;
-        {
-            use crate::task_dag::TASK_SCHEMA;
-            conn.execute_batch(TASK_SCHEMA)
-                .map_err(|e| FacadeError::TaskDag(format!("task schema init: {e}")))?;
-        }
-        crate::content_store::verify_profile(&conn).map_err(FacadeError::from)?;
-        crate::content_store::claim_writer_fast(&conn).map_err(FacadeError::from)?;
-        let shared = Arc::new(Mutex::new(conn));
-        let content_store =
-            ContentStore::from_shared(Arc::clone(&shared)).map_err(FacadeError::from)?;
-        let task_engine =
-            TaskEngine::from_shared(Arc::clone(&shared)).map_err(FacadeError::from)?;
-        let (head_checkpoint, active_tree) = Self::recover(&content_store)?;
-
-        let action_engine = ActionEngine::new(spillover_config.clone());
-
-        Ok(Self {
-            content_store,
-            task_engine,
-            active_tree,
-            action_engine,
-            spillover_config,
-            budget_config,
-            active_task_id: None,
-            head_checkpoint,
-            recent_actions: Vec::new(),
-        })
+        Err(FacadeError::Store(
+            crate::content_store::V01_DURABLE_GATE_MESSAGE.to_owned(),
+        ))
     }
 
     /// Open a durable WheelKernel (formal path, same profile as [`Self::open`]).
-    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, FacadeError> {
-        Self::open(path)
+    ///
+    /// v0.1 gate (AI-0238): refuses like [`Self::open`].
+    pub fn open_durable(_path: impl AsRef<Path>) -> Result<Self, FacadeError> {
+        Self::open(_path)
     }
 
     /// Validate the HEAD -> checkpoint -> tree triple after open.
     ///
+    /// v0.1 gate (AI-0238): unreachable while path opens refuse; kept for the
+    /// post-v0.1 restore of the durable path.
+    ///
     /// Returns the admitted HEAD plus the decoded tree, or fails closed with
     /// a typed error when any link is missing or undecodable. Never advances
     /// a partial HEAD: on error the caller receives `Err` and no kernel.
+    #[allow(dead_code)]
     fn recover(
         content_store: &ContentStore,
     ) -> Result<(Option<ContentHash>, ContextTree), FacadeError> {

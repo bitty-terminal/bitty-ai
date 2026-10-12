@@ -347,6 +347,9 @@ fn unambiguous_canonical_hashing_prevents_field_injection() {
     );
 }
 
+/// v0.1 gate (AI-0238): the file-backed content-store open refuses and
+/// creates no file. SQLite-tamper detection across reopen is out of the v0.1
+/// profile; the gate itself is fail-closed with zero filesystem effects.
 #[test]
 fn corrupt_checkpoint_detection_on_sqlite_tamper() {
     let scratch_dir = std::path::PathBuf::from("/tmp/bitty");
@@ -358,62 +361,33 @@ fn corrupt_checkpoint_detection_on_sqlite_tamper() {
             .unwrap()
             .as_nanos()
     ));
+    let _ = std::fs::remove_file(&db_path);
 
-    let cp_id: bitty_ai_slice::content_store::ContentHash;
-    {
-        let mut store = ContentStore::open(&db_path).expect("open store file");
-        let cp = store
-            .commit_checkpoint(CheckpointDraft {
-                parents: Vec::new(),
-                task_id: "AI-0162".to_string(),
-                agent_id: "agent-1".to_string(),
-                rationale: Rationale::new("Original intent", "Original action"),
-                tree_hash: None,
-                summary: "Clean checkpoint".to_string(),
-                timestamp_ms: 5000,
-            })
-            .expect("commit clean cp");
-
-        // Verify clean retrieval succeeds
-        let retrieved = store
-            .get_checkpoint(&cp.id)
-            .expect("get clean cp")
-            .expect("cp exists");
-        assert_eq!(retrieved.id, cp.id);
-        cp_id = cp.id;
-        // AI-0178: single-writer EXCLUSIVE holds the file lock, so the raw
-        // tamper connection can only proceed after this handle drops.
-    }
-
-    {
-        // Directly tamper with SQLite row without updating primary key hash
-        let conn = rusqlite::Connection::open(&db_path).expect("open raw conn");
-        conn.execute(
-            "UPDATE checkpoints SET summary = ?1 WHERE hash = ?2",
-            rusqlite::params!["Tampered summary", cp_id.to_hex()],
-        )
-        .expect("tamper row");
-    }
-
-    {
-        let store = ContentStore::open(&db_path).expect("reopen");
-        // Verify get_checkpoint fails closed with CorruptCheckpoint
-        let err = match store.get_checkpoint(&cp_id) {
-            Ok(_) => panic!("must detect corruption"),
-            Err(e) => e,
-        };
-        match err {
-            ContentStoreError::CorruptCheckpoint { expected, found } => {
-                assert_eq!(expected, cp_id);
-                assert_ne!(found, expected);
-            }
-            other => panic!("expected CorruptCheckpoint, got: {other:?}"),
-        }
-    }
+    let err = match ContentStore::open(&db_path) {
+        Ok(_) => panic!("durable content-store open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, ContentStoreError::DurableGated),
+        "expected DurableGated, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {err}"
+    );
+    assert!(
+        !db_path.exists(),
+        "refused open must not create a file: {}",
+        db_path.display()
+    );
 
     let _ = std::fs::remove_file(&db_path);
 }
 
+/// v0.1 gate (AI-0238): the durable pragma profile no longer applies on open
+/// because the file-backed open refuses. The per-connection pragma behavior
+/// stays covered by the `durable_profile_tests::pragmas_apply_on_the_same_connection`
+/// unit test in `src/content_store.rs`.
 #[test]
 fn durable_pragmas_unified_on_open() {
     let dir = std::env::temp_dir().join(format!("bitty_test_pragmas_{}", std::process::id()));
@@ -421,22 +395,19 @@ fn durable_pragmas_unified_on_open() {
     let db_path = dir.join("pragmas.db");
     let _ = std::fs::remove_file(&db_path);
     {
-        {
-            let _store = ContentStore::open(&db_path).expect("open");
-            // AI-0178: drop the single-writer handle before the raw read so
-            // the probe connection is not fenced by EXCLUSIVE.
-        }
-        let raw = rusqlite::Connection::open(&db_path).expect("raw");
-        let journal: String = raw
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .expect("journal_mode");
-        assert_eq!(journal.to_lowercase(), "wal");
-        // NOTE: `synchronous` and `foreign_keys` are per-connection state,
-        // not file-persisted settings, so they cannot be asserted on this
-        // fresh probe connection (it only shows build defaults). They are
-        // covered on the applying connection itself by the
-        // `durable_profile_tests::pragmas_apply_on_the_same_connection`
-        // unit test in `src/content_store.rs`.
+        let err = match ContentStore::open(&db_path) {
+            Ok(_) => panic!("durable content-store open must refuse under the v0.1 gate"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, ContentStoreError::DurableGated),
+            "expected DurableGated, got: {err:?}"
+        );
+        assert!(
+            !db_path.exists(),
+            "refused open must not create a file: {}",
+            db_path.display()
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

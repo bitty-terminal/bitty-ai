@@ -38,6 +38,13 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      # v0.1 gate (AI-0238): the Wheel durable store path must refuse. Same
+      # guard as `just gate-v01-durable` (spelled as cargo here so CI keeps
+      # zero dependency on `just`); fails if any path-taking file-backed
+      # constructor regains a working durable open.
+      - name: v0.1 durable-path gate
+        run: cargo test --locked -p bitty-ai-slice --test v01_no_durable_path
+
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm

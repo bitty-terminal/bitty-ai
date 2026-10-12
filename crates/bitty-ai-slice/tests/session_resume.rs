@@ -2,9 +2,10 @@
 //!
 //! Hermetic coverage for the kernel `new_session` / `resume_session` /
 //! `fork_branch` / `list_sessions` verbs and their `session.*` / `branch.*`
-//! bridge spellings. File-backed tests use a fresh `temp_dir` scratch
-//! database per test with caller-supplied clocks throughout; no wall clock,
-//! no network, no threads. Scratch directories are removed at test end.
+//! bridge spellings. Crash-across-reopen cases refuse under the v0.1 gate
+//! (AI-0238); all other verbs run on hermetic in-memory kernels with
+//! caller-supplied clocks throughout; no wall clock, no network, no threads.
+//! Scratch directories are removed at test end.
 
 use bitty_ai_slice::content_store::Rationale;
 use bitty_ai_slice::task_dag::{TaskDraft, TaskId};
@@ -46,78 +47,28 @@ fn dispatch_err(bridge: &mut WheelBridge, command: &str, payload: &serde_json::V
     resp.error.expect("error present")
 }
 
+/// v0.1 gate (AI-0238): the file-backed kernel open refuses and creates no
+/// file, so crash-mid-turn resume across reopen is out of the v0.1 profile.
+/// Resume-after-bind on a live handle stays covered by the in-memory tests
+/// below.
 #[test]
 fn crash_mid_turn_resume_reports_head_and_live_generation() {
     let dir = scratch_dir("crash-resume");
     let db_path = dir.join("wheel.db");
-    let head_hex: String;
-    {
-        let mut kernel = WheelKernel::open(&db_path).expect("wheel open");
-        kernel
-            .create_task(test_task("sess-task-1"), 1000)
-            .expect("create task");
-        let task_id = TaskId::new("sess-task-1").expect("valid task id");
-        let started = kernel
-            .start_task(&task_id, "worker-1", 1010)
-            .expect("start task");
-        assert_eq!(started.generation, 1, "assign must bump generation to 1");
-        kernel
-            .set_active_task(Some(task_id))
-            .expect("set active task");
-        kernel
-            .put_slot("notes.txt", b"crash-mid-turn payload", 1020)
-            .expect("put slot");
-        let checkpoint = kernel
-            .commit_checkpoint(
-                Rationale::new("Persist progress", "Save durable state"),
-                Some("heads/main"),
-                1030,
-            )
-            .expect("commit");
-        head_hex = checkpoint.id.to_hex();
-        assert_eq!(checkpoint.task_id, "sess-task-1");
-        kernel
-            .new_session("sess-crash-1", "heads/main", 1040)
-            .expect("bind session");
-        // Drop the kernel without further writes: the crash-mid-turn point.
-        // In-memory state (active task, recent actions, working tree) is lost;
-        // the durable triple (HEAD, checkpoint, tree) plus the session row
-        // must survive.
-    }
-    {
-        let mut kernel = WheelKernel::open(&db_path).expect("wheel reopen");
-        let report = kernel
-            .resume_session("sess-crash-1", 2, 2000)
-            .expect("resume after reopen");
-        assert_eq!(report.checkpoint.to_hex(), head_hex);
-        assert_eq!(
-            report.generation, 1,
-            "report must carry the live task generation, not a default"
-        );
-        assert!(report.pending_unknowns.is_empty());
-        // AI-0199: the durable pending log always exists, so resume reports
-        // it present even when no call is in flight.
-        assert!(!report.pending_log_absent);
-        assert_eq!(report.fence_token, 2);
-        assert_eq!(
-            report.session_id.as_ref().map(|id| id.as_str()),
-            Some("sess-crash-1")
-        );
-        // The resumed working tree continues the lineage: the payload slot
-        // survives the reopen through the sync, not through memory.
-        let slot = kernel
-            .get_slot("notes.txt")
-            .expect("slot read")
-            .expect("slot restored after resume");
-        assert_eq!(slot.as_slice(), b"crash-mid-turn payload");
-        // Bare-branch resume is an unfenced read of the same tip.
-        let by_branch = kernel
-            .resume_session("heads/main", 0, 2010)
-            .expect("branch resume");
-        assert_eq!(by_branch.checkpoint.to_hex(), head_hex);
-        assert_eq!(by_branch.session_id, None);
-        assert_eq!(by_branch.fence_token, 0);
-    }
+    let err = match WheelKernel::open(&db_path) {
+        Ok(_) => panic!("durable kernel open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {text}"
+    );
+    assert!(
+        !db_path.exists(),
+        "refused open must not create a file: {}",
+        db_path.display()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -397,6 +397,8 @@ fn map_store(err: ContentStoreError) -> MergeError {
         | ContentStoreError::InvalidRefName(_)
         | ContentStoreError::OversizedField { .. } => MergeError::Corrupt,
         ContentStoreError::WriterBusy => MergeError::Storage,
+        // v0.1 gate (AI-0238): a gate refusal surfaces as storage failure.
+        ContentStoreError::DurableGated => MergeError::Storage,
         ContentStoreError::Sqlite(err) => map_sqlite(err),
     }
 }

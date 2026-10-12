@@ -239,6 +239,9 @@ fn map_store_err(err: ContentStoreError) -> RefError {
         | ContentStoreError::EmptyField(_)
         | ContentStoreError::OversizedField { .. } => RefError::InvalidName,
         ContentStoreError::WriterBusy => RefError::Storage(WRITER_BUSY_MSG.to_owned()),
+        ContentStoreError::DurableGated => {
+            RefError::Storage(crate::content_store::V01_DURABLE_GATE_MESSAGE.to_owned())
+        }
         ContentStoreError::Sqlite(err) => map_sqlite(err),
         ContentStoreError::Json(err) => RefError::Storage(err.to_string()),
     }

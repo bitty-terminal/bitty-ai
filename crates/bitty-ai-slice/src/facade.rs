@@ -282,6 +282,9 @@ impl AiEngine {
     }
 
     /// Open a transactional content store at the specified path.
+    ///
+    /// v0.1 gate (AI-0238): inherits the store path-open refusal; use
+    /// [`Self::open_in_memory_content_store`].
     pub fn open_content_store(
         path: impl AsRef<Path>,
     ) -> Result<crate::content_store::ContentStore, FacadeError> {
@@ -295,6 +298,9 @@ impl AiEngine {
     }
 
     /// Open a persistent Task DAG SQLite database at the specified path.
+    ///
+    /// v0.1 gate (AI-0238): inherits the engine path-open refusal; use
+    /// [`Self::open_in_memory_task_engine`].
     pub fn open_task_engine(
         path: impl AsRef<Path>,
     ) -> Result<crate::task_dag::TaskEngine, FacadeError> {
@@ -350,6 +356,9 @@ impl AiEngine {
     }
 
     /// Open a persistent WheelKernel orchestrator backed by a SQLite database at `path`.
+    ///
+    /// v0.1 gate (AI-0238): inherits the kernel path-open refusal; use
+    /// [`Self::open_in_memory_wheel_kernel`].
     pub fn open_wheel_kernel(
         path: impl AsRef<Path>,
     ) -> Result<crate::wheel_kernel::WheelKernel, FacadeError> {
@@ -362,6 +371,9 @@ impl AiEngine {
     }
 
     /// Open a persistent WheelBridge boundary backed by a SQLite database at `path`.
+    ///
+    /// v0.1 gate (AI-0238): inherits the bridge path-open refusal; use
+    /// [`Self::open_in_memory_wheel_bridge`].
     pub fn open_wheel_bridge(
         path: impl AsRef<Path>,
     ) -> Result<crate::wheel_bridge::WheelBridge, FacadeError> {

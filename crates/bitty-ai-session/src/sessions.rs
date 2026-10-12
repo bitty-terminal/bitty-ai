@@ -270,6 +270,9 @@ fn map_store_err(err: ContentStoreError) -> SessionError {
         | ContentStoreError::EmptyField(_)
         | ContentStoreError::OversizedField { .. } => SessionError::InvalidId,
         ContentStoreError::WriterBusy => SessionError::Storage(WRITER_BUSY_MSG.to_owned()),
+        ContentStoreError::DurableGated => {
+            SessionError::Storage(crate::content_store::V01_DURABLE_GATE_MESSAGE.to_owned())
+        }
         ContentStoreError::Sqlite(err) => map_sqlite(err),
         ContentStoreError::Json(err) => SessionError::Storage(err.to_string()),
     }

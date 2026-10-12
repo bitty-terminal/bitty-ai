@@ -1,6 +1,7 @@
 //! Integration tests for the refs plane (AI-0180): typed branch verbs plus
-//! automatic reflog. All stores are hermetic in-memory instances except the
-//! file-backed schema migration cases, which need a legacy on-disk layout.
+//! automatic reflog. All stores are hermetic in-memory instances; the legacy
+//! on-disk migration cases refuse under the v0.1 gate (AI-0238) with the
+//! legacy file left byte-identical.
 
 use bitty_ai_slice::content_store::{
     CheckpointDraft, ContentHash, ContentStore, ContentStoreError, Rationale,
@@ -482,6 +483,9 @@ fn legacy_four_table_db(path: &std::path::Path) {
     .expect("legacy schema");
 }
 
+/// v0.1 gate (AI-0238): the legacy on-disk store refuses with `DurableGated`
+/// and the legacy file is left byte-identical. Schema migration across reopen
+/// is out of the v0.1 profile.
 #[test]
 fn legacy_store_without_reflog_migrates() {
     let dir = std::env::temp_dir().join(format!("bitty_test_refs_migrate_{}", std::process::id()));
@@ -489,18 +493,22 @@ fn legacy_store_without_reflog_migrates() {
     let db_path = dir.join("legacy.db");
     let _ = std::fs::remove_file(&db_path);
     legacy_four_table_db(&db_path);
+    let before = std::fs::read(&db_path).expect("snapshot legacy file");
 
-    let mut store = ContentStore::open(&db_path).expect("legacy store migrates");
-    assert!(list_branches(&store).expect("list").is_empty());
-    // The migrated store records history like any other.
-    let tip = commit_linear(&mut store, Vec::new(), "tip", 1000);
-    create_branch(&mut store, "heads/main", &tip, "create", "alice", 1000)
-        .expect("create after migrate");
-    assert_eq!(
-        read_reflog(&store, "heads/main", 10).expect("read").len(),
-        1
+    let err = match ContentStore::open(&db_path) {
+        Ok(_) => panic!("legacy durable open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, ContentStoreError::DurableGated),
+        "expected DurableGated, got: {err:?}"
     );
-    drop(store);
+    assert_eq!(
+        std::fs::read(&db_path).expect("read back"),
+        before,
+        "refused open must not mutate the legacy file"
+    );
+    drop(before);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -527,9 +535,9 @@ fn partial_schema_fails_closed() {
     assert!(
         matches!(
             ContentStore::open(&partial_path),
-            Err(ContentStoreError::Corrupt { .. })
+            Err(ContentStoreError::DurableGated)
         ),
-        "blobs-only store must fail closed"
+        "v0.1 gate (AI-0238): blobs-only store must refuse with DurableGated"
     );
 
     // Core triple plus a malformed reflog: fail closed, never silently kept.
@@ -578,9 +586,9 @@ fn partial_schema_fails_closed() {
     assert!(
         matches!(
             ContentStore::open(&bad_reflog_path),
-            Err(ContentStoreError::Corrupt { .. })
+            Err(ContentStoreError::DurableGated)
         ),
-        "malformed reflog must fail closed"
+        "v0.1 gate (AI-0238): malformed reflog must refuse with DurableGated"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
