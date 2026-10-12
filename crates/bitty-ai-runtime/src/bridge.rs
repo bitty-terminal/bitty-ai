@@ -94,6 +94,23 @@ pub const MAX_CONSENT_GRANTS: usize = 64;
 /// Real scope validation stays host-side.
 pub const MAX_CONSENT_SCOPE_LEN: usize = 128;
 
+/// Default consent grant time-to-live in milliseconds (AI-0255).
+///
+/// One turn-scoped gesture: `120_000` (`120`s). The accepted solicitation
+/// window is `60s..=300s`: below `60s` a default four-round turn
+/// (`DEFAULT_MAX_ROUNDS` plus provider timeouts plus the human gesture)
+/// lapses mid-turn and re-prompts every round (more gestures, not fewer);
+/// above `300s` the least-privilege window outlives the turn it was granted
+/// for and widens replay. `120s` is the midpoint that covers a full turn
+/// with margin while keeping the window short. [`grant_turn_set`] uses this
+/// when the caller passes `ttl_ms: None`; an explicit `Some(ttl)` overrides
+/// per call (no range enforcement, only documentation). The value is a
+/// duration added to caller-supplied `now_ms` with saturating addition;
+/// there is no wall-clock read anywhere on this path. Never persistent:
+/// every grant carries an absolute `expires_at_ms` and lapses without
+/// refresh, and there is no infinite or session-scoped grant shape.
+pub const DEFAULT_CONSENT_TTL_MS: u64 = 120_000;
+
 /// Maximum bytes kept for any reason string emitted across a runtime
 /// boundary (`AI-0059`).
 ///
@@ -660,6 +677,64 @@ impl FakeConsentLedger {
         });
         expired
     }
+}
+
+/// Grant one turn-scoped batch of exact `(tool, scope)` triples (AI-0255).
+///
+/// One user gesture grants `N` pairs as `N` exact ledger triples, never a
+/// wildcard: the loop calls [`FakeConsentLedger::grant`] once per pair with
+/// `expires_at_ms = now_ms.saturating_add(ttl)`, where `ttl` is
+/// `ttl_ms.unwrap_or(DEFAULT_CONSENT_TTL_MS)`. The ledger stores `N` exact
+/// `(protocol, tool, scope)` entries; a grant for `tool_a` never admits
+/// `tool_b` and a grant for `scope.a` never admits `scope.b`. Refreshing an
+/// existing triple updates its expiry without growing the table; a new
+/// triple past [`MAX_CONSENT_GRANTS`] fails closed with
+/// [`BridgeError::LedgerFull`].
+///
+/// No wall-clock read: expiry derives from caller-supplied `now_ms` only,
+/// so `FakeProvider`-driven turns stay reproducible. The TTL boundary is
+/// exclusive (`now_ms < expires_at_ms` allows, `now_ms == expires_at_ms`
+/// denies), matching the host ledger rule pinned in
+/// [`FakeConsentLedger::check`]. Revocation stays immediate through
+/// [`FakeConsentLedger::revoke`]: the next [`check`](ConsentLedger::check)
+/// denies.
+///
+/// The return value is the display list for the solicitation surface: one
+/// `(tool, scope, expires_at_ms)` tuple per granted pair, in caller order,
+/// so the host renders every triple with its tool, scope, and expiry. There
+/// is no hidden batch: a caller that does not render every entry violates
+/// the consent UX contract.
+///
+/// Declined (do not extend this helper): persistent or session-scoped
+/// grants, wildcard or prefix grants, trusted-tool bypass, auto-approve, and
+/// any silent grant that bypasses the per-triple render.
+///
+/// # Errors
+///
+/// - [`BridgeError::InvalidProtocolId`] when `protocol` violates the
+///   `owner.name` shape.
+/// - [`BridgeError::InvalidGrant`] when any `tool` or `scope` is malformed
+///   (empty, NUL, scope outside `[a-z0-9_.-]`, tool outside the `TB-2`
+///   shape, or scope over [`MAX_CONSENT_SCOPE_LEN`]).
+/// - [`BridgeError::LedgerFull`] when a new triple would exceed
+///   [`MAX_CONSENT_GRANTS`]. Earlier pairs in this batch stay granted
+///   (exact triples, no rollback, no wildcard); the caller decides whether
+///   to revoke them or keep the partial batch.
+pub fn grant_turn_set(
+    ledger: &mut FakeConsentLedger,
+    protocol: &str,
+    grants: &[(&str, &str)],
+    now_ms: u64,
+    ttl_ms: Option<u64>,
+) -> Result<Vec<(String, String, u64)>, BridgeError> {
+    let ttl = ttl_ms.unwrap_or(DEFAULT_CONSENT_TTL_MS);
+    let expires_at = now_ms.saturating_add(ttl);
+    let mut rendered = Vec::with_capacity(grants.len());
+    for (tool, scope) in grants {
+        ledger.grant(protocol, tool, scope, expires_at)?;
+        rendered.push(((*tool).to_owned(), (*scope).to_owned(), expires_at));
+    }
+    Ok(rendered)
 }
 
 impl ConsentLedger for FakeConsentLedger {
@@ -1371,5 +1446,305 @@ mod tests {
             None,
         )
         .expect("valid spec");
+    }
+
+    #[test]
+    fn default_consent_ttl_is_within_documented_window() {
+        assert!(
+            (60_000..=300_000).contains(&DEFAULT_CONSENT_TTL_MS),
+            "default must stay in the 60-300s solicitation window"
+        );
+        assert_eq!(DEFAULT_CONSENT_TTL_MS, 120_000);
+    }
+
+    #[test]
+    fn grant_turn_set_stores_exact_triples_not_a_wildcard() {
+        let mut ledger = FakeConsentLedger::new();
+        let rendered = grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("workspace_read", "workspace.read"), ("tool_a", "scope.a")],
+            1_000,
+            Some(5_000),
+        )
+        .expect("batch fits");
+        assert_eq!(ledger.len(), 2);
+        // Display list renders every triple with tool, scope, and expiry.
+        assert_eq!(
+            rendered,
+            vec![
+                (
+                    "workspace_read".to_owned(),
+                    "workspace.read".to_owned(),
+                    6_000
+                ),
+                ("tool_a".to_owned(), "scope.a".to_owned(), 6_000),
+            ]
+        );
+        // Each exact triple allows at its own scope.
+        assert_eq!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                2_000
+            )),
+            ConsentDecision::Allow
+        );
+        assert_eq!(
+            ledger.check(&query("local.assistant", "tool_a", "scope.a", 2_000)),
+            ConsentDecision::Allow
+        );
+        // No wildcard: cross-tool and cross-scope combinations still deny.
+        for (tool, scope) in [
+            ("workspace_read", "scope.a"),
+            ("tool_a", "workspace.read"),
+            ("workspace_write", "workspace.read"),
+            ("workspace_read", "workspace.write"),
+        ] {
+            assert!(
+                matches!(
+                    ledger.check(&query("local.assistant", tool, scope, 2_000)),
+                    ConsentDecision::Deny { .. }
+                ),
+                "must deny {tool}/{scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_turn_set_defaults_ttl_without_wall_clock() {
+        let mut ledger = FakeConsentLedger::new();
+        let rendered = grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("workspace_read", "workspace.read")],
+            10_000,
+            None,
+        )
+        .expect("default ttl");
+        let expected_expiry = 10_000 + DEFAULT_CONSENT_TTL_MS;
+        assert_eq!(
+            rendered,
+            vec![(
+                "workspace_read".to_owned(),
+                "workspace.read".to_owned(),
+                expected_expiry
+            )]
+        );
+        // Deterministic from caller now_ms only: same inputs give same expiry.
+        let mut second = FakeConsentLedger::new();
+        let rerendered = grant_turn_set(
+            &mut second,
+            "local.assistant",
+            &[("workspace_read", "workspace.read")],
+            10_000,
+            None,
+        )
+        .expect("reproducible");
+        assert_eq!(rendered, rerendered);
+        assert_eq!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                expected_expiry - 1
+            )),
+            ConsentDecision::Allow
+        );
+    }
+
+    #[test]
+    fn grant_turn_set_ttl_boundary_is_exclusive() {
+        let mut ledger = FakeConsentLedger::new();
+        grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("workspace_read", "workspace.read")],
+            1_000,
+            Some(1_000),
+        )
+        .expect("batch");
+        // expires_at = 2_000: live just before, denied exactly at expiry.
+        assert_eq!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                1_999
+            )),
+            ConsentDecision::Allow
+        );
+        assert!(matches!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                2_000
+            )),
+            ConsentDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn grant_turn_set_refresh_updates_expiry_without_growth() {
+        let mut ledger = FakeConsentLedger::new();
+        grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("workspace_read", "workspace.read")],
+            1_000,
+            Some(1_000),
+        )
+        .expect("first batch");
+        assert_eq!(ledger.len(), 1);
+        grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("workspace_read", "workspace.read")],
+            1_500,
+            Some(9_000),
+        )
+        .expect("refresh batch");
+        assert_eq!(ledger.len(), 1);
+        // Old expiry would have denied at 2_000; refreshed expiry allows.
+        assert_eq!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                5_000
+            )),
+            ConsentDecision::Allow
+        );
+    }
+
+    #[test]
+    fn grant_turn_set_revoke_is_immediate() {
+        let mut ledger = FakeConsentLedger::new();
+        grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("workspace_read", "workspace.read")],
+            1_000,
+            Some(9_000),
+        )
+        .expect("batch");
+        assert!(ledger.revoke("local.assistant", "workspace_read", "workspace.read"));
+        assert!(matches!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                1_500
+            )),
+            ConsentDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn grant_turn_set_cap_fails_closed() {
+        let mut ledger = FakeConsentLedger::new();
+        for index in 0..MAX_CONSENT_GRANTS {
+            ledger
+                .grant(
+                    "local.assistant",
+                    &format!("tool_{index}"),
+                    &format!("scope.{index}"),
+                    99_000,
+                )
+                .expect("capacity");
+        }
+        let error = grant_turn_set(
+            &mut ledger,
+            "local.assistant",
+            &[("one_more", "scope.extra")],
+            1_000,
+            Some(5_000),
+        )
+        .expect_err("overflow must fail");
+        assert_eq!(
+            error,
+            BridgeError::LedgerFull {
+                limit: MAX_CONSENT_GRANTS
+            }
+        );
+        assert_eq!(ledger.len(), MAX_CONSENT_GRANTS);
+    }
+
+    #[test]
+    fn dispatch_consent_denial_reason_is_byte_identical_across_paths() {
+        // Both the native `ToolBus` dispatch path and the MCP adapter
+        // execute path deny through the ONE shared helper
+        // `ensure_consented_for_dispatch`, so their `Denied` reasons are
+        // byte-identical by construction. This pins the helper wording the
+        // cross-path test in `bitty-ai-mcp` asserts against.
+        use crate::tool::{
+            AuthBase, AuthContext, AuthDecision, ToolAuthorizer, ToolBus, ToolPlacement,
+            ToolRegistry, ToolSpec,
+        };
+
+        struct Allow;
+        impl ToolAuthorizer for Allow {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(
+                ToolSpec::new(
+                    "workspace_read",
+                    "Read a bounded workspace path",
+                    br#"{"type":"object"}"#.to_vec(),
+                    "workspace.read",
+                    true,
+                    ToolPlacement::Mcp,
+                    None,
+                )
+                .expect("valid spec"),
+            )
+            .expect("capacity");
+        let empty = FakeConsentLedger::new();
+        let mut bus = ToolBus::new(registry)
+            .with_authorizer(Allow)
+            .with_consent(FakeConsentLedger::new(), "local.assistant");
+        let mut ids = crate::session::IdIssuer::default();
+        let base = AuthBase {
+            agent_instance_id: ids.agent_instance(),
+            session_id: ids.session(),
+            level: crate::session::AgentLevel::Workspace,
+        };
+        let call = crate::tool::ToolCall {
+            name: "workspace_read".to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        };
+        let mut executor = crate::tool::FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        let execution = bus
+            .dispatch(&mut executor, &call, &base, ids.execution(), 1_000)
+            .expect("admission refusal is a recorded status");
+        let bus_reason = match &execution.status {
+            crate::tool::ToolStatus::Refused {
+                cause: crate::tool::ToolError::Denied { reason, .. },
+            } => reason.clone(),
+            other => panic!("expected Refused{{Denied}}, got {other:?}"),
+        };
+        let helper_reason = match ensure_consented_for_dispatch(
+            &empty,
+            &ConsentQuery {
+                protocol_id: "local.assistant",
+                agent_instance: base.agent_instance_id,
+                tool: "workspace_read",
+                scope: "workspace.read",
+                now_ms: 1_000,
+            },
+        ) {
+            Err(crate::tool::ToolError::Denied { reason, .. }) => reason,
+            other => panic!("helper must deny, got {other:?}"),
+        };
+        assert_eq!(bus_reason, helper_reason);
+        assert!(bus_reason.contains("consent denied"));
     }
 }

@@ -691,6 +691,19 @@ pub struct Agent<P: ModelProvider> {
     /// dispatcher (capability registry plus the [`ToolBus`] tier/hook
     /// policy) would allow.
     prompt: Option<AssembledPrompt>,
+    /// Per-turn narrowing allow-set for the AI-0255 narrow-first gate
+    /// (`None` = no constraint, the default; `Some(list)` admits only the
+    /// listed names, and an explicit empty list narrows everything away).
+    /// Mirrors the `allowed` parameter of
+    /// [`ToolBus::precheck_narrowed`](crate::tool::ToolBus::precheck_narrowed)
+    /// (AI-0216 semantics): the [`Agent::run_turn`] path checks this before
+    /// the prompt gate so narrowed-away calls refuse pre-contact with the
+    /// narrowing cause and never reach consent solicitation. The host sets
+    /// this before the turn, calls
+    /// [`Agent::narrowed_admitted_calls`] to compute the admitted subset for
+    /// the consent display, grants only that subset through
+    /// [`crate::bridge::grant_turn_set`], then runs the turn.
+    allowed_tools: Option<Vec<String>>,
     executions: Vec<ExecutionRecord>,
     tool_history: Vec<ContextRecord>,
     /// Attribution for effects whose outcome stayed `Unknown` when their
@@ -726,6 +739,7 @@ impl<P: ModelProvider> Agent<P> {
             ids: IdIssuer::default(),
             config,
             prompt: None,
+            allowed_tools: None,
             executions: Vec::new(),
             tool_history: Vec::new(),
             pending_unknown: Vec::new(),
@@ -745,6 +759,24 @@ impl<P: ModelProvider> Agent<P> {
     /// exactly as before.
     pub fn set_prompt(&mut self, prompt: AssembledPrompt) {
         self.prompt = Some(prompt);
+    }
+
+    /// Install the per-turn narrowing allow-set for the AI-0255 narrow-first
+    /// gate (`None` = no constraint, the default; `Some(list)` admits only
+    /// the listed names). Replaces any previously installed set. With `None`
+    /// the narrow gate is skipped and dispatch matches the pre-AI-0255
+    /// shape exactly; with `Some` the [`Agent::run_turn`] path refuses
+    /// narrowed-away calls pre-contact before the prompt gate (narrow before
+    /// prompt), with zero executor contact and no consent solicitation for
+    /// the omitted tools.
+    pub fn set_allowed_tools(&mut self, allowed: Option<Vec<String>>) {
+        self.allowed_tools = allowed;
+    }
+
+    /// Installed narrowing allow-set, if any.
+    #[must_use]
+    pub fn allowed_tools(&self) -> Option<&[String]> {
+        self.allowed_tools.as_deref()
     }
 
     /// Request cancellation (idempotent, visible at the next dispatch or
@@ -867,14 +899,106 @@ impl<P: ModelProvider> Agent<P> {
     /// reports [`PromptError::DispatcherDenied`](crate::prompt::PromptError::DispatcherDenied)
     /// for it before any authorizer, budget, or executor contact). The
     /// runtime-policy half — the tier floor and the authorization hook, both
-    /// keyed by `base` — keeps enforcing behind [`ToolBus::precheck`] and
-    /// [`dispatch`](crate::tool::ToolBus::dispatch) as defense in depth;
-    /// this crate changes no [`ToolBus`] signature to re-expose it here.
+    /// keyed by `base` — keeps enforcing behind [`ToolBus::precheck_narrowed`]
+    /// and [`dispatch_narrowed`](crate::tool::ToolBus::dispatch_narrowed) as
+    /// defense in depth; this crate changes no [`ToolBus`] signature to
+    /// re-expose it here.
     /// Evaluated live every round (never cached) alongside
     /// [`Agent::auth_base`], so the grant input cannot go stale across the
     /// round boundary.
     fn dispatcher_grants(&self, tool: &str) -> bool {
         self.tools.tool_names().iter().any(|name| name == tool)
+    }
+
+    /// Whether `tool` is narrowed away by the installed per-turn allow-set
+    /// (AI-0255 narrow-first gate).
+    ///
+    /// Mirrors the narrowing predicate inside
+    /// [`ToolBus::precheck_narrowed`](crate::tool::ToolBus::precheck_narrowed)
+    /// (AI-0216 semantics): `None` constrains nothing, `Some(list)` admits
+    /// only the listed names. Pure predicate, no state. The refusal wording
+    /// matches the bus narrowing denial byte-for-byte so the narrow-first
+    /// gate and the bus gate report the same cause.
+    fn narrowing_omits(&self, tool: &str) -> bool {
+        match &self.allowed_tools {
+            None => false,
+            Some(list) => !list.iter().any(|entry| entry == tool),
+        }
+    }
+
+    /// Typed narrowing refusal for one call (AI-0255).
+    ///
+    /// Same shape as the bus narrowing denial ([`ToolError::Denied`] naming
+    /// the tool, never `UnknownTool`/`Failed`/`EffectUnknown`/
+    /// `ProtocolRejected`, no new variant), normalized because the refused
+    /// name is model-supplied.
+    fn narrowing_denial(tool: &str) -> ToolError {
+        ToolError::Denied {
+            name: tool.to_owned(),
+            reason: format!("tool '{tool}' omitted by per-call narrowing"),
+        }
+        .normalized()
+    }
+
+    /// First narrowing denial for one batch, if any (AI-0255 narrow-first).
+    ///
+    /// Returns `None` when no allow-set is installed or every call survives
+    /// narrowing; otherwise the refused call name plus its pre-contact
+    /// [`ToolError::Denied`] cause. Pure observation: no dispatch, no
+    /// counter change, no session effect. Runs before
+    /// [`Agent::prompt_gate_denial`] in [`Agent::run_turn`] so narrowed-away
+    /// tools refuse with the narrowing cause even when the prompt would
+    /// also deny them.
+    fn narrowing_denial_for_batch(
+        &self,
+        calls: &[crate::tool::ToolCall],
+    ) -> Option<(String, ToolError)> {
+        calls.iter().find_map(|call| {
+            if self.narrowing_omits(&call.name) {
+                let tool = call.name.clone();
+                Some((tool.clone(), Self::narrowing_denial(&tool)))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Narrow-first admitted subset for one batch (AI-0255).
+    ///
+    /// Returns the calls that survive both narrowing gates, preserving
+    /// caller order: per-turn narrowing (`allowed_tools`, mirroring
+    /// [`ToolBus::precheck_narrowed`](crate::tool::ToolBus::precheck_narrowed)
+    /// allow-set semantics) and the prompt gate
+    /// ([`check_dispatch`](crate::prompt::check_dispatch) with the live
+    /// dispatcher grant). Pure observation: no dispatch, no counter change,
+    /// no session effect. Authorization, budget, and consent still enforce
+    /// at [`ToolBus`](crate::tool::ToolBus) precheck and dispatch after
+    /// this; this set only tells the host which `(tool, scope)` triples to
+    /// solicit through [`crate::bridge::grant_turn_set`] and present. The
+    /// host must present only this set: soliciting consent for a
+    /// narrowed-away tool wastes a gesture on a call the turn will refuse
+    /// pre-contact.
+    #[must_use]
+    pub fn narrowed_admitted_calls(
+        &self,
+        calls: &[crate::tool::ToolCall],
+    ) -> Vec<crate::tool::ToolCall> {
+        calls
+            .iter()
+            .filter(|call| {
+                if self.narrowing_omits(&call.name) {
+                    return false;
+                }
+                match &self.prompt {
+                    None => self.dispatcher_grants(&call.name),
+                    Some(prompt) => {
+                        let dispatcher_grants = self.dispatcher_grants(&call.name);
+                        check_dispatch(prompt, &call.name, dispatcher_grants).is_ok()
+                    }
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     /// First prompt-gate denial for one batch, if any (AIQ-33 S1).
@@ -1189,6 +1313,31 @@ impl<P: ModelProvider> Agent<P> {
             // Fresh base per round so a rotation that landed between rounds
             // is already visible here.
             let precheck_base = self.auth_base();
+            // AI-0255 narrow-first: per-turn narrowing before the prompt gate,
+            // pre-contact. When the host installed an allow-set via
+            // [`Agent::set_allowed_tools`], a narrowed-away call refuses here
+            // with the narrowing cause and never reaches the prompt gate,
+            // `ToolBus` precheck, or consent solicitation: the host presents
+            // only [`Agent::narrowed_admitted_calls`] for
+            // [`crate::bridge::grant_turn_set`], so fewer grants are
+            // solicited. The refusal shape matches the bus narrowing denial
+            // (`Refused` plus typed `Denied`, never `Failed`/`Unknown`/
+            // `ProtocolRejected`) and fails the turn with the carried cause;
+            // without an installed set this gate is skipped entirely. With
+            // `None` this preserves the pre-AI-0255 behavior exactly.
+            if let Some((tool, cause)) = self.narrowing_denial_for_batch(&calls) {
+                if self.executions.len() >= MAX_EXECUTIONS_PER_AGENT {
+                    return self.fail(
+                        ToolError::CallLimitExceeded {
+                            limit: MAX_EXECUTIONS_PER_AGENT,
+                        }
+                        .into(),
+                    );
+                }
+                let execution = Self::prompt_refusal(self.ids.execution(), &tool, cause.clone());
+                self.attribute_execution(&execution);
+                return self.fail(cause.into());
+            }
             // AIQ-33 S1: prompt-dispatch composition at the agent boundary,
             // pre-contact. When the host installed an assembled prompt, gate
             // the whole batch on it before `ToolBus` precheck: a prompt
@@ -1198,7 +1347,10 @@ impl<P: ModelProvider> Agent<P> {
             // typed cause, never `Failed`/`Unknown`/`ProtocolRejected`).
             // The refusal is attributed like a dispatch-time admission
             // refusal and fails the turn with the carried cause; without an
-            // installed prompt this gate is skipped entirely.
+            // installed prompt this gate is skipped entirely. Runs after the
+            // AI-0255 narrowing gate above (narrow before prompt) and before
+            // the bus precheck below (prompt before authorize), so each
+            // narrowing layer keeps its own cause.
             if let Some((tool, cause)) = self.prompt_gate_denial(&calls) {
                 if self.executions.len() >= MAX_EXECUTIONS_PER_AGENT {
                     return self.fail(
@@ -1212,10 +1364,12 @@ impl<P: ModelProvider> Agent<P> {
                 self.attribute_execution(&execution);
                 return self.fail(cause.into());
             }
-            if let Err(error) =
-                self.tools
-                    .precheck(&calls, &precheck_base, self.config.max_tool_calls_per_turn)
-            {
+            if let Err(error) = self.tools.precheck_narrowed(
+                &calls,
+                &precheck_base,
+                self.config.max_tool_calls_per_turn,
+                self.allowed_tools.as_deref(),
+            ) {
                 return self.fail(error.into());
             }
             messages.push(Message::assistant(turn.text.clone()));
@@ -1237,10 +1391,19 @@ impl<P: ModelProvider> Agent<P> {
                 // the remaining dispatches to `Inspect`; already-dispatched
                 // effects are kept, never rolled back.
                 let base = self.auth_base();
-                match self
-                    .tools
-                    .dispatch(executor, call, &base, execution_id, now_ms)
-                {
+                // AI-0255: dispatch through the narrowed variant so the
+                // per-turn allow-set enforces at this boundary too (defense
+                // in depth behind the batch narrowing gate above). With
+                // `None` this matches `dispatch` exactly; the consent gate
+                // inside keeps its authorizer-then-consent order unchanged.
+                match self.tools.dispatch_narrowed(
+                    executor,
+                    call,
+                    &base,
+                    execution_id,
+                    now_ms,
+                    self.allowed_tools.as_deref(),
+                ) {
                     Ok(execution) => {
                         // AI-RUN-004: a pre-dispatch admission refusal never
                         // reached the host: it is attributed as `Refused`
@@ -2081,5 +2244,322 @@ mod tests {
         assert_ne!(trusted.content, untrusted.content);
         assert!(!trusted.content.contains("untrusted observation"));
         assert!(untrusted.content.contains(summary));
+    }
+
+    // AI-0255 narrow-first proofs (offline, no network, caller now_ms only).
+
+    fn narrow_bus() -> ToolBus {
+        use crate::tool::{ToolAuthorizer, ToolPlacement, ToolRegistry, ToolSpec};
+        use crate::{AuthContext, AuthDecision};
+
+        #[derive(Debug, Clone, Copy, Default)]
+        struct AllowAll;
+        impl ToolAuthorizer for AllowAll {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        for (tool, scope, read_only) in [
+            ("workspace_read", "workspace.read", true),
+            ("workspace_write", "workspace.write", false),
+        ] {
+            registry
+                .register(
+                    ToolSpec::new(
+                        tool,
+                        "test tool",
+                        br#"{"type":"object"}"#.to_vec(),
+                        scope,
+                        read_only,
+                        ToolPlacement::Mcp,
+                        None,
+                    )
+                    .expect("valid spec"),
+                )
+                .expect("capacity");
+        }
+        let mut ledger = crate::bridge::FakeConsentLedger::new();
+        for (tool, scope) in [
+            ("workspace_read", "workspace.read"),
+            ("workspace_write", "workspace.write"),
+        ] {
+            ledger
+                .grant("local.assistant", tool, scope, u64::MAX)
+                .expect("grant fits");
+        }
+        ToolBus::new(registry)
+            .with_authorizer(AllowAll)
+            .with_consent(ledger, "local.assistant")
+    }
+
+    fn narrow_session() -> AgentSession {
+        let mut issuer = IdIssuer::default();
+        let session = AgentSession::new(issuer.agent_instance(), issuer.run(), issuer.session());
+        session
+            .elevate(crate::session::AgentLevel::Workspace, &AllowElevation)
+            .expect("elevation");
+        session
+    }
+
+    struct AllowElevation;
+    impl crate::session::ElevationGrant for AllowElevation {
+        fn elevation_granted(
+            &self,
+            _current: crate::session::AgentLevel,
+            _requested: crate::session::AgentLevel,
+        ) -> bool {
+            true
+        }
+    }
+
+    fn narrow_tool_call(name: &str) -> crate::tool::ToolCall {
+        crate::tool::ToolCall {
+            name: name.to_owned(),
+            arguments: br#"{}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn narrowed_admitted_calls_presents_only_survivors() {
+        let provider = crate::provider::FakeProvider::new("bitty-fake").expect("valid");
+        let agent = Agent::new(
+            provider,
+            narrow_bus(),
+            narrow_session(),
+            AgentConfig::default(),
+        );
+        // No allow-set and no prompt: dispatcher admits registered names,
+        // unregistered names are omitted.
+        let calls = vec![
+            narrow_tool_call("workspace_read"),
+            narrow_tool_call("ghost_tool"),
+        ];
+        let admitted = agent.narrowed_admitted_calls(&calls);
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace_read"]
+        );
+
+        // With an allow-set admitting only the read tool, the write tool is
+        // omitted even though the dispatcher would grant it.
+        let mut provider = crate::provider::FakeProvider::new("bitty-fake").expect("valid");
+        let _ = &mut provider;
+        let mut agent = Agent::new(
+            crate::provider::FakeProvider::new("bitty-fake").expect("valid"),
+            narrow_bus(),
+            narrow_session(),
+            AgentConfig::default(),
+        );
+        agent.set_allowed_tools(Some(vec!["workspace_read".to_owned()]));
+        let calls = vec![
+            narrow_tool_call("workspace_read"),
+            narrow_tool_call("workspace_write"),
+        ];
+        let admitted = agent.narrowed_admitted_calls(&calls);
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace_read"]
+        );
+        // Explicit empty list narrows everything away.
+        agent.set_allowed_tools(Some(Vec::new()));
+        assert!(agent.narrowed_admitted_calls(&calls).is_empty());
+    }
+
+    #[test]
+    fn narrow_gate_refuses_precontact_before_prompt() {
+        use crate::prompt::{LayerInput, PromptLayer, PromptSnapshot, assemble as assemble_prompt};
+        // Prompt denies the write tool; the allow-set omits the same tool.
+        // Narrow-first orders narrowing before the prompt gate, so the
+        // refusal carries the narrowing cause, not the prompt cause.
+        let snapshot = PromptSnapshot::new(
+            "bitty-core-prompt@1",
+            vec![
+                LayerInput::text_only(PromptLayer::CoreContract, "stable core"),
+                LayerInput::text_only(PromptLayer::User, "stable user"),
+                LayerInput::text_only(PromptLayer::Project, "stable project"),
+                LayerInput::text_only(PromptLayer::SkillsProfile, "stable skills"),
+                LayerInput {
+                    layer: PromptLayer::RuntimeTurn,
+                    text: "stable policy".to_owned(),
+                    allowed_tools: None,
+                    denied_tools: vec!["workspace_write".to_owned()],
+                    budget_ceiling_bytes: None,
+                    allowed_scopes: None,
+                    directives: Vec::new(),
+                },
+            ],
+        )
+        .expect("valid snapshot");
+        let prompt = assemble_prompt(&snapshot).expect("assembles");
+        let mut provider = crate::provider::FakeProvider::new("bitty-fake").expect("valid");
+        provider.push_turn(crate::provider::ProviderTurn {
+            text: "one write".to_owned(),
+            tool_calls: vec![crate::provider::ToolCallRequest {
+                name: "workspace_write".to_owned(),
+                arguments: br#"{"path":"a"}"#.to_vec(),
+            }],
+            latency_ms: 0,
+            usage: crate::provider::ProviderUsage::default(),
+        });
+        let mut agent = Agent::new(
+            provider,
+            narrow_bus(),
+            narrow_session(),
+            AgentConfig::default(),
+        );
+        agent.set_prompt(prompt);
+        agent.set_allowed_tools(Some(vec!["workspace_read".to_owned()]));
+        let mut executor = crate::tool::FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        let mut sink = crate::stream::VecSink::new();
+        let outcome = agent.run_turn(&mut executor, "fake-chat", "hi", &[], &mut sink, 1_000);
+        match outcome {
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::Denied { name, reason }),
+            } => {
+                assert_eq!(name, "workspace_write");
+                assert!(
+                    reason.contains("narrowing"),
+                    "narrow-first must win over prompt denial"
+                );
+            }
+            other => panic!("expected narrowing Denied, got {other:?}"),
+        }
+        assert_eq!(agent.executions().len(), 1);
+        assert!(agent.executions()[0].status.is_admission_refusal());
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn narrowed_away_batch_aborts_whole_with_zero_contact() {
+        // Whole-batch admission: one narrowed-away call fails the batch with
+        // nothing dispatched, even though the other call was admitted.
+        let mut provider = crate::provider::FakeProvider::new("bitty-fake").expect("valid");
+        provider.push_turn(crate::provider::ProviderTurn {
+            text: "two calls".to_owned(),
+            tool_calls: vec![
+                crate::provider::ToolCallRequest {
+                    name: "workspace_read".to_owned(),
+                    arguments: br#"{"path":"a"}"#.to_vec(),
+                },
+                crate::provider::ToolCallRequest {
+                    name: "workspace_write".to_owned(),
+                    arguments: br#"{"path":"b"}"#.to_vec(),
+                },
+            ],
+            latency_ms: 0,
+            usage: crate::provider::ProviderUsage::default(),
+        });
+        let mut agent = Agent::new(
+            provider,
+            narrow_bus(),
+            narrow_session(),
+            AgentConfig::default(),
+        );
+        agent.set_allowed_tools(Some(vec!["workspace_read".to_owned()]));
+        let mut executor = crate::tool::FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        let mut sink = crate::stream::VecSink::new();
+        let outcome = agent.run_turn(&mut executor, "fake-chat", "hi", &[], &mut sink, 1_000);
+        match outcome {
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::Denied { name, .. }),
+            } => assert_eq!(name, "workspace_write"),
+            other => panic!("expected Denied abort, got {other:?}"),
+        }
+        assert!(executor.calls().is_empty());
+        assert_eq!(agent.executions().len(), 1);
+    }
+
+    #[test]
+    fn turn_abort_on_first_dispatch_deny_preserved() {
+        // Dispatch-time denial (consent denies the first call) aborts before
+        // the second call dispatches: no partial second effect.
+        use crate::tool::{ToolAuthorizer, ToolPlacement, ToolRegistry, ToolSpec};
+        use crate::{AuthContext, AuthDecision};
+
+        #[derive(Debug, Clone, Copy, Default)]
+        struct AllowAll;
+        impl ToolAuthorizer for AllowAll {
+            fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
+                AuthDecision::Allow
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        for (tool, scope) in [
+            ("workspace_read", "workspace.read"),
+            ("workspace_write", "workspace.write"),
+        ] {
+            registry
+                .register(
+                    ToolSpec::new(
+                        tool,
+                        "test tool",
+                        br#"{"type":"object"}"#.to_vec(),
+                        scope,
+                        true,
+                        ToolPlacement::Mcp,
+                        None,
+                    )
+                    .expect("valid spec"),
+                )
+                .expect("capacity");
+        }
+        // Consent grants only the second tool: the first call denies at the
+        // dispatch consent gate (after admission passes).
+        let mut ledger = crate::bridge::FakeConsentLedger::new();
+        ledger
+            .grant(
+                "local.assistant",
+                "workspace_write",
+                "workspace.write",
+                u64::MAX,
+            )
+            .expect("grant fits");
+        let bus = ToolBus::new(registry)
+            .with_authorizer(AllowAll)
+            .with_consent(ledger, "local.assistant");
+        let mut provider = crate::provider::FakeProvider::new("bitty-fake").expect("valid");
+        provider.push_turn(crate::provider::ProviderTurn {
+            text: "two calls".to_owned(),
+            tool_calls: vec![
+                crate::provider::ToolCallRequest {
+                    name: "workspace_read".to_owned(),
+                    arguments: br#"{}"#.to_vec(),
+                },
+                crate::provider::ToolCallRequest {
+                    name: "workspace_write".to_owned(),
+                    arguments: br#"{}"#.to_vec(),
+                },
+            ],
+            latency_ms: 0,
+            usage: crate::provider::ProviderUsage::default(),
+        });
+        let mut agent = Agent::new(provider, bus, narrow_session(), AgentConfig::default());
+        let mut executor = crate::tool::FakeToolExecutor::new();
+        executor.push_success("must never run", b"nope".to_vec());
+        executor.push_success("must never run", b"nope".to_vec());
+        let mut sink = crate::stream::VecSink::new();
+        let outcome = agent.run_turn(&mut executor, "fake-chat", "hi", &[], &mut sink, 1_000);
+        match outcome {
+            ExecOutcome::Failed {
+                error: AgentError::Tool(ToolError::Denied { name, reason }),
+            } => {
+                assert_eq!(name, "workspace_read");
+                assert!(reason.contains("consent denied"));
+            }
+            other => panic!("expected dispatch Denied abort, got {other:?}"),
+        }
+        assert!(executor.calls().is_empty());
+        assert_eq!(agent.executions().len(), 1);
     }
 }
