@@ -342,11 +342,21 @@ impl LayerInput {
 
     /// Validate bounds and shapes fail-closed (no partial acceptance).
     ///
+    /// Candidate (AI-0250 Slice 3): trust-tiered zones, enforced at
+    /// construction. Pinned layers (`CoreContract`, `User`, `Project`,
+    /// `SkillsProfile`) accept ONLY host-pinned bytes; `RuntimeTurn` (tail)
+    /// accepts any bytes verbatim. Untrusted markers offered to a pinned
+    /// layer fail closed with [`PromptError::InvalidLayerText`] (reused —
+    /// see `validate_pinned_layer_trust` for why no new variant), never
+    /// silently relocated to the tail. `assemble` inherits the gate via
+    /// `PromptSnapshot::validate`.
+    ///
     /// # Errors
     ///
     /// Returns [`PromptError`] for over-bound or malformed fields.
     pub fn validate(&self) -> Result<(), PromptError> {
         validate_layer_text(self.layer, &self.text)?;
+        validate_pinned_layer_trust(self.layer, &self.text)?;
         if let Some(allowed) = &self.allowed_tools {
             if allowed.len() > MAX_TOOL_ENTRIES_PER_LAYER {
                 return Err(PromptError::TooManyTools {
@@ -860,6 +870,93 @@ pub fn validate_layer_text(layer: PromptLayer, text: &str) -> Result<(), PromptE
         return Err(PromptError::InvalidLayerText {
             layer,
             reason: "text must not contain NUL".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Candidate (AI-0250 Slice 3): untrusted markers that must never appear in
+/// pinned-layer host-pinned bytes.
+///
+/// Same marker set as the slice [`ContextCompiler`](`crate`) Zone 1 gate:
+/// `"[untrusted"` (every Slice-1 length-prefixed fence plus the Slice-2
+/// `[untrusted:...]` provenance prefix the sibling AI-0249 renders),
+/// `"[/untrusted"` (every close), `"[ACTION OUTCOME]"` (outcome header),
+/// `"[OBSERVATION"` / `"=== OBSERVATIONS ==="` (compiler Zone 3 renderings),
+/// `"delta/1"` (compiler tail marker). `"project-snapshot/1"` is handled
+/// separately per layer (see [`validate_pinned_layer_trust`]): it is tail
+/// content everywhere except the verified Project-layer shape.
+fn contains_untrusted_markers(text: &str) -> bool {
+    text.contains("[untrusted")
+        || text.contains("[/untrusted")
+        || text.contains("[ACTION OUTCOME]")
+        || text.contains("[OBSERVATION")
+        || text.contains("=== OBSERVATIONS ===")
+        || text.contains("delta/1")
+}
+
+/// Candidate (AI-0250 Slice 3): verified snapshot-backed Project-layer shape.
+///
+/// The ONLY untrusted-surface content admitted to the stable prefix is the
+/// digest-bound rendering the slice `prompt_snapshot_with_project` builder
+/// produces: it starts with `"project-snapshot/1 "` and carries the
+/// `full-digest <hex>` binding the caller verified. The trust comes from
+/// that builder's provider + digest-prefix checks, not from this prefix
+/// alone — a hand-written text that merely starts with the marker but was
+/// never digest-bound is still caller-mislabelled host input, and generic
+/// fenced bytes remain rejected even alongside the marker (checked on the
+/// remainder). `RuntimeTurn` tail wiring (slice
+/// `prompt_snapshot_with_project_tail`) is the preferred path for new code;
+/// this shape stays admitted here only so existing cache-affinity flows
+/// (AI-0127/0128/0129) keep assembling.
+fn is_verified_project_text(text: &str) -> bool {
+    text.starts_with("project-snapshot/1 ")
+}
+
+/// Candidate (AI-0250 Slice 3): fail-closed pinned-layer trust gate.
+///
+/// - `CoreContract`, `User`, `SkillsProfile`: reject when `text` carries any
+///   untrusted marker, including `"project-snapshot/1"` (snapshot repo
+///   content belongs in the tail, never in these pinned layers).
+/// - `Project`: reject when `text` carries any untrusted marker EXCEPT the
+///   single leading verified shape above; the remainder after that prefix
+///   must itself be marker-free (so fenced bytes smuggled alongside a
+///   marker still refuse).
+/// - `RuntimeTurn`: no trust check — the tail accepts any bytes verbatim
+///   (fenced at render by Slice-1 where applicable).
+///
+/// Reuses [`PromptError::InvalidLayerText`] (not a new variant): a trust
+/// violation IS a layer-text shape violation like CR/NUL, and a new variant
+/// would churn every exhaustive `PromptError` match plus `Display` across
+/// both crates for no additional audit signal — the static reason names the
+/// trust property (`host-pinned bytes only`). Never echoes caller content;
+/// the reason is static text plus the layer identity already carried by the
+/// variant.
+///
+/// # Errors
+///
+/// Returns [`PromptError::InvalidLayerText`] when a pinned layer carries
+/// tail markers.
+pub fn validate_pinned_layer_trust(layer: PromptLayer, text: &str) -> Result<(), PromptError> {
+    let untrusted = match layer {
+        PromptLayer::CoreContract | PromptLayer::User | PromptLayer::SkillsProfile => {
+            contains_untrusted_markers(text) || text.contains("project-snapshot/1")
+        }
+        PromptLayer::Project => {
+            if is_verified_project_text(text) {
+                let remainder = &text["project-snapshot/1 ".len()..];
+                contains_untrusted_markers(remainder) || remainder.contains("project-snapshot/1")
+            } else {
+                contains_untrusted_markers(text) || text.contains("project-snapshot/1")
+            }
+        }
+        PromptLayer::RuntimeTurn => false,
+    };
+    if untrusted {
+        return Err(PromptError::InvalidLayerText {
+            layer,
+            reason: "pinned layer accepts host-pinned bytes only; offer untrusted observations to RuntimeTurn tail"
+                .to_owned(),
         });
     }
     Ok(())
