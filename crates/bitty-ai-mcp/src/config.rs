@@ -31,6 +31,8 @@ pub const MAX_ALLOWLIST_ENTRY_LEN: usize = 64;
 pub const MAX_CWD_LEN: usize = 1024;
 /// Maximum environment variable name length in bytes.
 pub const MAX_ENV_VAR_LEN: usize = 64;
+/// Exact length of a SHA-256 pin in lowercase hex.
+pub const SHA256_PIN_LEN: usize = 64;
 
 /// Bytes that would let a program string become a shell invocation.
 ///
@@ -167,6 +169,20 @@ fn is_server_id(value: &str) -> bool {
         .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
+/// Optional SHA-256 pin shape: exactly 64 lowercase hex digits.
+///
+/// Same bool-helper style as [`is_server_id`]: length plus per-byte class,
+/// no allocation, no value echo. Uppercase, `0x`-prefixed, truncated, or
+/// non-hex inputs are all refused.
+fn is_sha256_pin(value: &str) -> bool {
+    if value.len() != SHA256_PIN_LEN {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 fn validate_program(program: &str) -> Result<(), McpError> {
     if program.is_empty() || program.len() > MAX_COMMAND_LEN {
         return Err(McpError::invalid_config(
@@ -230,6 +246,15 @@ pub struct McpServerConfig {
     pub timeout_ms: u64,
     /// Raw MCP tool names this server may expose (non-empty, ≤32).
     pub tool_allowlist: Vec<String>,
+    /// Optional SHA-256 pin for the `command` binary (64 lowercase hex).
+    ///
+    /// Rank-2 spawn-time pin (AI-0248): when `Some`,
+    /// [`crate::supervise::spawn_server`] streams the command binary through
+    /// a fixed 64 KiB buffer and refuses spawn fail-closed on digest
+    /// mismatch. When `None` (unpinned), spawn behavior is byte-identical to
+    /// before; the Rank-1 capability-set pin (AI-0244) still applies at
+    /// relist time.
+    pub sha256_pin: Option<String>,
 }
 
 impl McpServerConfig {
@@ -250,6 +275,13 @@ impl McpServerConfig {
             return Err(McpError::invalid_config("command is required"));
         }
         validate_program(&self.command)?;
+        if let Some(pin) = &self.sha256_pin {
+            if !is_sha256_pin(pin) {
+                return Err(McpError::invalid_config(
+                    "sha256 pin must be 64 lowercase hex (0-9, a-f)",
+                ));
+            }
+        }
         if self.args.len() > MAX_COMMAND_ARGS {
             return Err(McpError::invalid_config(
                 "server command carries too many arguments",
@@ -335,6 +367,7 @@ mod tests {
             cwd: "/tmp/bitty".to_owned(),
             timeout_ms: 10_000,
             tool_allowlist: vec!["echo".to_owned()],
+            sha256_pin: None,
         }
     }
 
@@ -427,6 +460,48 @@ mod tests {
         config.env_refs = vec![CredentialRef::Env {
             var: "DEMO_TOKEN".to_owned(),
         }];
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sha256_pin_is_optional_and_shape_validated() {
+        // Absent pin keeps current behavior (unpinned).
+        let mut config = valid_config();
+        assert!(config.sha256_pin.is_none());
+        assert!(config.validate().is_ok());
+
+        // Well-formed pin passes (64 lowercase hex).
+        config.sha256_pin =
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned());
+        assert!(config.validate().is_ok());
+
+        // Malformed pins refuse fail-closed with names-only reasons.
+        for bad in [
+            "",
+            "abc",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85500",
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+            " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+            "0xE3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B8",
+        ] {
+            config.sha256_pin = Some(bad.to_owned());
+            let error = config.validate().expect_err("malformed pin must refuse");
+            assert!(
+                matches!(
+                    error.failure,
+                    crate::error::McpFailure::InvalidConfig { .. }
+                ),
+                "wrong failure for {bad:?}: {:?}",
+                error.failure
+            );
+            // Names-only: non-empty rejected pin bytes never echo.
+            if !bad.trim().is_empty() {
+                assert!(!error.to_string().contains(bad.trim()));
+            }
+        }
+        config.sha256_pin = None;
         assert!(config.validate().is_ok());
     }
 }
