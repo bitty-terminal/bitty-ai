@@ -902,6 +902,23 @@ pub fn collect_garbage(
     Ok(report)
 }
 
+/// Read-only ref export preview (AI-0243, consent/redaction/0600/preview bundle).
+///
+/// Thin read-only wrapper over [`ContentStore::list_refs`]: returns the live
+/// `(name, target)` pairs in the store's ascending-name order, byte-identical
+/// to a direct `list_refs` read under the same store state. Mirrors the
+/// [`gc_preview`] discipline (read-only, no writes, store errors mapped to
+/// [`MergeError`] with static text) for the export path: callers diff or
+/// snapshot refs through this preview without advancing HEAD, touching
+/// branches, or writing reflog rows.
+///
+/// Time/Space: O(R) reads for R refs; space O(R) pairs.
+///
+/// Clocks: none. Threads: none. Network: none. New deps: none.
+pub fn export_preview(store: &ContentStore) -> Result<Vec<(String, ContentHash)>, MergeError> {
+    store.list_refs().map_err(map_store)
+}
+
 // ── Candidate falsifiability helpers (AI-0236, beyond-v0.1) ────────────────
 //
 // Candidate wording only: everything below is a reviewable-test harness for
