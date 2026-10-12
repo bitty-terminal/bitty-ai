@@ -15,6 +15,7 @@
 
 pub mod content_hash;
 pub mod content_store;
+pub mod fs_perms;
 pub mod pending;
 pub mod session_refs;
 pub mod sessions;
