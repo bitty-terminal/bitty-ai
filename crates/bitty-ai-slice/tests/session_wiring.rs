@@ -7,6 +7,7 @@
 //! filesystem, no network.
 
 use bitty_ai_runtime::{ArtifactStore, CacheKey, CacheScope, ContextPriority, assemble_prompt};
+use bitty_ai_slice::snapshot_ingest::InputCaptureOptIn;
 use bitty_ai_slice::{
     RefreshAuthorization, RefreshLedger, SnapshotIngestRequest, ingest_snapshot,
     prompt_snapshot_with_project, snapshot_digest_hex,
@@ -59,6 +60,7 @@ fn full_session_lifecycle_composes() {
             collected_at_ms: 100,
             priority: ContextPriority::High,
             refresh: token_v1,
+            input_capture: InputCaptureOptIn::default(),
         },
         &mut store,
     )
@@ -83,6 +85,7 @@ fn full_session_lifecycle_composes() {
             collected_at_ms: 200,
             priority: ContextPriority::High,
             refresh: token_v2,
+            input_capture: InputCaptureOptIn::default(),
         },
         &mut store,
     )
@@ -121,6 +124,7 @@ fn full_session_lifecycle_composes() {
             collected_at_ms: 300,
             priority: ContextPriority::High,
             refresh: token_v3,
+            input_capture: InputCaptureOptIn::default(),
         },
         &mut store,
     )

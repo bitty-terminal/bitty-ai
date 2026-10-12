@@ -653,3 +653,332 @@ fn w_v10_terminal_change_ai_contract_matrix() {
         }
     }
 }
+
+// ── W-V6 ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn w_v6_provider_continuation_from_canonical_dag_alone() {
+    // Candidate wording only (beyond-v0.1, falsifiable, reviewable): provider
+    // continuity holds from the canonical DAG bytes alone. Two FakeProviders
+    // carry different ids; A commits the canonical DAG + checkpoint, A is
+    // dropped entirely (script queue, last-sampling echo, call counter), and
+    // B rehydrates from `canonical_bytes` alone before continuing with a
+    // byte-equal turn. Offline and in-memory only: injected `*_ms` clocks, no
+    // sockets, no live tests, no real-model calls. No continuation contract
+    // is adopted (only `canonical_bytes` / `from_canonical_bytes` /
+    // `complete`), and no W-V2 economics are pinned (`sampling: None`).
+    use bitty_ai_runtime::{
+        FakeProvider, ModelProvider, ProviderTurn, ProviderUsage, TurnRequest, provider::Message,
+    };
+
+    const NOW_MS: u64 = 1_000;
+    const CHILD_MS: u64 = 1_001;
+    const BUDGET_BYTES: usize = 32 * 1024;
+    const TIMEOUT_MS: u64 = 5_000;
+    const CONTINUATION_TEXT: &str = "continuation answer bytes from canonical dag";
+
+    fn turn_request() -> TurnRequest {
+        TurnRequest {
+            model: "fake-chat".to_owned(),
+            messages: vec![Message::user("continue from the canonical dag")],
+            context_refs: Vec::new(),
+            tools: Vec::new(),
+            budget_bytes: BUDGET_BYTES,
+            timeout_ms: TIMEOUT_MS,
+            now_ms: NOW_MS,
+            sampling: None,
+        }
+    }
+
+    fn scripted_continuation() -> ProviderTurn {
+        ProviderTurn {
+            text: CONTINUATION_TEXT.to_owned(),
+            tool_calls: Vec::new(),
+            latency_ms: 0,
+            usage: ProviderUsage::default(),
+        }
+    }
+
+    // Provider A commits the canonical DAG + checkpoint (a two-node checkpoint
+    // chain so the DAG link itself is pinned, not just a lone row).
+    let mut store = ContentStore::open_in_memory().expect("store");
+    let seed: &[u8] = b"seed context bytes";
+    let seed_hash = store.put_blob(seed, NOW_MS).expect("seed blob");
+    let mut root_tree = ContextTree::new();
+    root_tree.insert(
+        TreeEntry::new("doc/seed", seed_hash, EntryKind::Blob, seed.len()).expect("seed slot"),
+    );
+    let root = commit_tree(&mut store, Vec::new(), &root_tree, "w-v6 root", NOW_MS);
+
+    let answer_bytes = CONTINUATION_TEXT.as_bytes();
+    let answer_hash = store.put_blob(answer_bytes, CHILD_MS).expect("answer blob");
+    let mut child_tree = root_tree.clone();
+    child_tree.insert(
+        TreeEntry::new(
+            "turn/answer",
+            answer_hash,
+            EntryKind::Blob,
+            answer_bytes.len(),
+        )
+        .expect("answer slot"),
+    );
+    let canonical_bytes = child_tree.canonical_bytes();
+    let child = commit_tree(
+        &mut store,
+        vec![root.id],
+        &child_tree,
+        "w-v6 child",
+        CHILD_MS,
+    );
+    assert_eq!(child.parents, vec![root.id], "checkpoint DAG link pinned");
+    assert!(
+        store
+            .get_checkpoint(&child.id)
+            .expect("read back")
+            .is_some(),
+        "child checkpoint committed"
+    );
+
+    let mut provider_a = FakeProvider::new("provider-a").expect("valid id");
+    provider_a.push_turn(scripted_continuation());
+    assert_eq!(provider_a.scripted_turns_remaining(), 1);
+    assert_eq!(provider_a.complete_calls(), 0);
+    assert!(provider_a.last_sampling().is_none());
+    let turn_a = provider_a
+        .complete(&turn_request())
+        .expect("provider A turn");
+    assert_eq!(turn_a.text.as_bytes(), answer_bytes);
+    assert_eq!(provider_a.scripted_turns_remaining(), 0);
+    assert_eq!(provider_a.complete_calls(), 1);
+    assert!(provider_a.last_sampling().is_none());
+    let a_id = provider_a.provider_id().to_owned();
+    // Drop A entirely: the script queue, the last-sampling echo, and the call
+    // counter go with it. Only `canonical_bytes` (plus the expected literal)
+    // survive for B.
+    drop(provider_a);
+
+    // Provider B rehydrates from `canonical_bytes` alone: no store handle, no
+    // provider-A state, no continuation contract.
+    let rehydrated =
+        ContextTree::from_canonical_bytes(&canonical_bytes).expect("rehydrate from bytes alone");
+    assert_eq!(
+        rehydrated.canonical_bytes(),
+        canonical_bytes,
+        "rehydrated DAG byte-matches the committed canonical bytes"
+    );
+
+    let mut provider_b = FakeProvider::new("provider-b").expect("valid id");
+    assert_ne!(
+        a_id,
+        provider_b.provider_id(),
+        "providers carry different ids"
+    );
+    assert_eq!(provider_b.complete_calls(), 0);
+    assert!(provider_b.last_sampling().is_none());
+    provider_b.push_turn(scripted_continuation());
+    let turn_b = provider_b
+        .complete(&turn_request())
+        .expect("provider B turn");
+    assert_eq!(
+        turn_b.text.as_bytes(),
+        turn_a.text.as_bytes(),
+        "continuation turn is byte-equal across the provider switch"
+    );
+    assert_eq!(
+        turn_b, turn_a,
+        "full scripted turn matches across providers"
+    );
+    assert_eq!(provider_b.complete_calls(), 1);
+}
+// ── W-V7 ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn w_v7_two_agents_follow_up_from_refs_and_commit() {
+    // Candidate wording only (beyond-v0.1, falsifiable, reviewable): two-agent
+    // sharing holds from refs + commit alone. Agent-1 commits the shared tree
+    // + checkpoint on heads/main with Rationale (reusing the `commit_tree`
+    // helper and `test_rationale` read-only); agent-2 starts from a fresh
+    // handle holding only the canonical bytes, reads the tip via `get_branch`
+    // / `get_checkpoint`, and completes the follow-up via `merge_commit`. A
+    // private slot absent from every shared tree proves no private-set leak.
+    // Offline and in-memory only: caller-supplied `*_ms` clocks, no threads,
+    // no IPC, no cross-process handles, no live provider calls. No
+    // commit-shape change (only `commit_tree` + `merge_commit` with the
+    // existing Rationale shape) and no merge-protocol change (the existing
+    // 3-way slot merge over the existing refs).
+    use bitty_ai_slice::merge::{MergeInput, TaskGenerationLookup, merge_commit};
+    use bitty_ai_slice::session_refs::get_branch;
+
+    struct NoFence;
+    impl TaskGenerationLookup for NoFence {
+        fn task_generation(
+            &self,
+            _task_id: &str,
+        ) -> Result<u64, bitty_ai_slice::merge::MergeError> {
+            unreachable!("fence unchecked when expected_task_generation is None");
+        }
+    }
+
+    const AGENT1_MS: u64 = 1000;
+    const REFS_MS: u64 = 1001;
+    const SIDE_MS: u64 = 2000;
+    const MERGE_MS: u64 = 3000;
+    const PRIVATE_SLOT: &str = "private/agent1-notes";
+
+    // Agent-1: shared tree + checkpoint published on heads/main with Rationale.
+    let mut store = ContentStore::open_in_memory().expect("store");
+    let shared_payload: &[u8] = b"shared context bytes";
+    let shared_hash = store
+        .put_blob(shared_payload, AGENT1_MS)
+        .expect("shared blob");
+    let mut agent1_tree = ContextTree::new();
+    agent1_tree.insert(
+        TreeEntry::new(
+            "doc/shared",
+            shared_hash,
+            EntryKind::Blob,
+            shared_payload.len(),
+        )
+        .expect("shared slot"),
+    );
+    assert!(
+        agent1_tree.get(PRIVATE_SLOT).is_none(),
+        "private slot absent from the agent-1 shared tree"
+    );
+    let agent1 = commit_tree(
+        &mut store,
+        Vec::new(),
+        &agent1_tree,
+        "w-v7 agent-1",
+        AGENT1_MS,
+    );
+    assert_eq!(
+        agent1.rationale,
+        test_rationale(),
+        "agent-1 checkpoint carries the shared Rationale (read-only reuse)"
+    );
+    store
+        .update_refs_atomic(&[("HEAD", &agent1.id), ("heads/main", &agent1.id)], REFS_MS)
+        .expect("refs");
+
+    // Canonical-bytes handoff only: no tree object crosses the boundary.
+    let handoff = agent1_tree.canonical_bytes();
+
+    // Agent-2: fresh handle from bytes alone, plus refs/commit reads.
+    let agent2_view =
+        ContextTree::from_canonical_bytes(&handoff).expect("rehydrate from bytes alone");
+    assert_eq!(
+        agent2_view.canonical_bytes(),
+        handoff,
+        "fresh handle rehydrates byte-equal from the handoff alone"
+    );
+    let tip = get_branch(&store, "heads/main")
+        .expect("branch read")
+        .expect("heads/main tip");
+    assert_eq!(tip, agent1.id, "agent-2 resolves the agent-1 tip via refs");
+    let row = store
+        .get_checkpoint(&tip)
+        .expect("checkpoint read")
+        .expect("checkpoint row");
+    assert_eq!(row.id, agent1.id, "refs tip dereferences to the commit");
+    assert_eq!(
+        row.rationale,
+        test_rationale(),
+        "Rationale survives the refs+commit round-trip (read-only)"
+    );
+    assert!(
+        agent2_view.get(PRIVATE_SLOT).is_none(),
+        "private slot absent after the handoff: no private-set leak"
+    );
+
+    // Agent-2 follow-up: side commit child of the shared tip, then a merge.
+    let followup_payload: &[u8] = b"agent-2 follow-up bytes";
+    let followup_hash = store
+        .put_blob(followup_payload, SIDE_MS)
+        .expect("followup blob");
+    let mut side_tree = agent2_view.clone();
+    side_tree.insert(
+        TreeEntry::new(
+            "doc/followup",
+            followup_hash,
+            EntryKind::Blob,
+            followup_payload.len(),
+        )
+        .expect("followup slot"),
+    );
+    let side = commit_tree(
+        &mut store,
+        vec![agent1.id],
+        &side_tree,
+        "w-v7 side",
+        SIDE_MS,
+    );
+
+    let merged = merge_commit(
+        &mut store,
+        &NoFence,
+        MergeInput {
+            ours: agent1.id,
+            theirs: side.id,
+            target_branch: "heads/main".to_string(),
+            task_id: "AI-0236".to_string(),
+            agent_id: "ai-0236-impl".to_string(),
+            rationale: test_rationale(),
+            summary: "w-v7 follow-up merge".to_string(),
+            expected_task_generation: None,
+            actor: "w-v7-test".to_string(),
+            reason: "w-v7 follow-up".to_string(),
+            at_ms: MERGE_MS,
+        },
+    )
+    .expect("follow-up merge");
+    assert_eq!(
+        merged.parents,
+        vec![agent1.id, side.id],
+        "follow-up carries both tips as parents"
+    );
+    assert_eq!(
+        merged.rationale,
+        test_rationale(),
+        "follow-up carries the shared Rationale (read-only reuse)"
+    );
+    assert_eq!(
+        get_branch(&store, "heads/main")
+            .expect("branch after")
+            .expect("merged tip"),
+        merged.id,
+        "follow-up advances heads/main"
+    );
+
+    // Durable-only verification: checkpoint + blob reads, no private input.
+    let merged_row = store
+        .get_checkpoint(&merged.id)
+        .expect("merged read")
+        .expect("merged row");
+    let merged_tree_hash = merged_row.tree_hash.expect("merged tree link");
+    let merged_bytes = store
+        .get_blob(&merged_tree_hash)
+        .expect("merged blob")
+        .expect("merged bytes");
+    let merged_tree = ContextTree::from_canonical_bytes(&merged_bytes).expect("merged decodes");
+    assert!(
+        merged_tree.get("doc/shared").is_some(),
+        "shared slot survives the follow-up"
+    );
+    assert!(
+        merged_tree.get("doc/followup").is_some(),
+        "follow-up slot lands in the merged tree"
+    );
+    assert_eq!(
+        store
+            .get_blob(&shared_hash)
+            .expect("shared read")
+            .as_deref(),
+        Some(shared_payload),
+        "shared bytes stay dereferenceable after the follow-up"
+    );
+    assert!(
+        merged_tree.get(PRIVATE_SLOT).is_none(),
+        "private slot absent from the merged tree: no leak through the follow-up"
+    );
+}

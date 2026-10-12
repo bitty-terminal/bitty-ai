@@ -40,6 +40,7 @@ use bitty_ai_runtime::{
     ArtifactStore, ContextError, ContextPriority, ContextRecord, ContextRequest, RecordBody,
     StableId, assemble,
 };
+use bitty_ai_slice::snapshot_ingest::InputCaptureOptIn;
 use bitty_ai_slice::{
     RefreshAuthorization, SNAPSHOT_PROVIDER, SnapshotIngestRequest, ingest_snapshot,
     snapshot_digest_hex,
@@ -70,6 +71,7 @@ fn ingest_request<'a>(
         collected_at_ms,
         priority: ContextPriority::High,
         refresh: RefreshAuthorization::authorize(generation),
+        input_capture: InputCaptureOptIn::default(),
     }
 }
 
