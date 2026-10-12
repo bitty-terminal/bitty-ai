@@ -61,6 +61,7 @@ use bitty_ai_runtime::tool::{
 
 use crate::call::{McpCallError, call_tool};
 use crate::error::{McpError, McpFailure, McpStage, bound_error_text};
+use crate::handshake::{InitializeResult, initialize_request, parse_initialize_result};
 use crate::tools::{
     ImportedTool, ToolListDiff, ToolListSnapshot, diff_tool_snapshots,
     is_tools_list_changed_notification, list_tools,
@@ -87,6 +88,13 @@ pub struct McpAdapterParams {
 /// the request-id counter, and the policy hooks; the host owns the
 /// [`ToolSpec`](bitty_ai_runtime::tool::ToolSpec) registry built from the
 /// same [`ImportedTool`] set.
+///
+/// AI-0244 capability-set / protocol-state pin: when `protocol_pin` is `Some`,
+/// every [`McpToolAdapter::relist`] success re-validates `initialize` and
+/// compares the fresh [`InitializeResult`] to the pin. A mismatch keeps the
+/// old snapshot stale and denies via the deny-stale gate. The pin catches
+/// capability downgrade/upgrade plus version drift, NOT a server-binary swap
+/// (no binary digest, no hash, std-only, no TOFU, no auto-update).
 pub struct McpToolAdapter {
     server_id: String,
     tools: Vec<ImportedTool>,
@@ -97,6 +105,7 @@ pub struct McpToolAdapter {
     next_id: u64,
     list_version: u64,
     list_stale: bool,
+    protocol_pin: Option<InitializeResult>,
 }
 
 impl McpToolAdapter {
@@ -160,7 +169,90 @@ impl McpToolAdapter {
             next_id: 2,
             list_version: 0,
             list_stale: false,
+            protocol_pin: None,
         })
+    }
+
+    /// Build an adapter with a stored capability-set / protocol-state pin.
+    ///
+    /// Same validation as [`McpToolAdapter::new`], plus stores `pinned` for
+    /// [`McpToolAdapter::verify_pin`] and the [`McpToolAdapter::relist`]
+    /// pin check. The pin is the [`InitializeResult`] from the construction
+    /// handshake (negotiated `protocolVersion` plus the `tools`-capability
+    /// shape). Unpinned adapters from [`McpToolAdapter::new`] skip the pin
+    /// check and keep the pre-AI-0244 wire behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpFailure::InvalidConfig`] for a malformed principal, a
+    /// zero/over-ceiling timeout, or an empty tool set.
+    pub fn new_with_pin(
+        server_id: &str,
+        tools: Vec<ImportedTool>,
+        transport: Box<dyn McpTransport>,
+        authorizer: Box<dyn ToolAuthorizer>,
+        consent: Box<dyn ConsentLedger>,
+        params: McpAdapterParams,
+        pinned: InitializeResult,
+    ) -> Result<Self, McpError> {
+        let mut adapter = Self::new(server_id, tools, transport, authorizer, consent, params)?;
+        adapter.protocol_pin = Some(pinned);
+        Ok(adapter)
+    }
+
+    /// Stored capability-set / protocol-state pin, when present.
+    #[must_use]
+    pub fn pinned(&self) -> Option<&InitializeResult> {
+        self.protocol_pin.as_ref()
+    }
+
+    /// Store (or replace) the capability-set / protocol-state pin.
+    ///
+    /// Synchronous, no transport contact. The host calls this once with the
+    /// construction-handshake [`InitializeResult`]; later
+    /// [`McpToolAdapter::verify_pin`] and [`McpToolAdapter::relist`]
+    /// compare against it.
+    pub fn set_pinned(&mut self, pinned: InitializeResult) {
+        self.protocol_pin = Some(pinned);
+    }
+
+    /// Compare `fresh` against the stored pin (AI-0244).
+    ///
+    /// Pure policy plus stale bookkeeping, no transport contact, no
+    /// auto-update, no new UX. When no pin is stored, returns `Ok(())`
+    /// without touching stale. When a pin is stored and `fresh` matches it
+    /// (same `protocolVersion` and same [`crate::handshake::ToolsCapabilityShape`]),
+    /// returns `Ok(())` with stale unchanged. On mismatch, ensures stale via
+    /// [`McpToolAdapter::mark_stale`] when not already stale (keeps stale
+    /// otherwise, snapshot untouched) and returns
+    /// [`McpFailure::CapabilityDrift`] (non-retryable). The next
+    /// [`ToolExecutor::execute`] then denies with [`ToolError::Denied`]
+    /// (`tool list stale; re-list required`) and zero transport contact.
+    /// Catches capability downgrade/upgrade plus version drift, NOT a
+    /// server-binary swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpFailure::CapabilityDrift`] on pin mismatch.
+    pub fn verify_pin(&mut self, fresh: &InitializeResult) -> Result<(), McpError> {
+        let Some(pinned) = self.protocol_pin.clone() else {
+            return Ok(());
+        };
+        if pinned.matches_pin(fresh) {
+            return Ok(());
+        }
+        if !self.list_stale {
+            self.mark_stale();
+        }
+        Err(McpError::new(
+            McpStage::Bridge,
+            McpFailure::CapabilityDrift {
+                detail: bound_error_text(
+                    "protocol pin mismatch",
+                    crate::error::MAX_ERROR_TEXT_BYTES,
+                ),
+            },
+        ))
     }
 
     /// Imported tools backing this adapter.
@@ -236,7 +328,7 @@ impl McpToolAdapter {
         }
     }
 
-    /// Explicit host-driven re-list (AI-0211, AI-0212).
+    /// Explicit host-driven re-list (AI-0211, AI-0212, AI-0244 pin).
     ///
     /// Re-runs `tools/list` with `allowlist` over the owned transport using
     /// the shared `next_id` counter discipline, diffs digests against the
@@ -264,10 +356,24 @@ impl McpToolAdapter {
     /// during this call are routable; nothing reconciles against server
     /// state beyond them).
     ///
+    /// AI-0244 pin (pinned adapters only): after a successful `tools/list`
+    /// and before swapping, re-runs `initialize` read-only (no
+    /// `notifications/initialized`, no server state change) and compares the
+    /// fresh [`InitializeResult`] to the stored pin via
+    /// [`McpToolAdapter::verify_pin`]. A mismatch discards the fresh tools
+    /// (old snapshot kept), keeps stale, and returns
+    /// [`McpFailure::CapabilityDrift`] (non-retryable); the next `execute`
+    /// denies via the deny-stale gate with zero contact. Unpinned adapters
+    /// (from [`McpToolAdapter::new`]) skip the pin round-trip and keep the
+    /// pre-AI-0244 wire behavior. The pin catches capability
+    /// downgrade/upgrade plus version drift, NOT a server-binary swap.
+    ///
     /// # Errors
     ///
     /// Returns pagination, bound, collision, unknown-tool, timeout, or
-    /// transport errors from [`list_tools`].
+    /// transport errors from [`list_tools`], plus [`McpFailure::CapabilityDrift`]
+    /// (or the mapped `initialize` handshake failure) on pin mismatch for
+    /// pinned adapters.
     pub fn relist(&mut self, allowlist: &[String]) -> Result<ToolListDiff, McpError> {
         self.next_id = self.next_id.max(2);
         let before = ToolListSnapshot::from_imported(&self.tools);
@@ -292,6 +398,26 @@ impl McpToolAdapter {
                 return Err(error);
             }
         };
+        if self.protocol_pin.is_some() {
+            let fresh_pin = match self.revalidate_protocol_pin(&mut surfaced) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    for line in &surfaced {
+                        self.observe_notification(line);
+                    }
+                    if !self.list_stale {
+                        self.mark_stale();
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(pin_error) = self.verify_pin(&fresh_pin) {
+                for line in &surfaced {
+                    self.observe_notification(line);
+                }
+                return Err(pin_error);
+            }
+        }
         self.next_id = self.next_id.max(2);
         let after = ToolListSnapshot::from_imported(&fresh);
         let diff = diff_tool_snapshots(&before, &after);
@@ -302,6 +428,50 @@ impl McpToolAdapter {
             self.observe_notification(line);
         }
         Ok(diff)
+    }
+
+    /// Re-run `initialize` read-only and return the fresh pin (AI-0244).
+    ///
+    /// Uses the shared `next_id` counter discipline and the adapter timeout.
+    /// Appends any surfaced notification frames observed while waiting onto
+    /// `surfaced` for the caller to route. Sends no
+    /// `notifications/initialized` (validation only, no server state change).
+    /// Handshake-stage failures are remapped to [`McpStage::Bridge`] with the
+    /// same [`McpFailure`] so a pin-step version/capability refusal is
+    /// attributable to the relist gate.
+    fn revalidate_protocol_pin(
+        &mut self,
+        surfaced: &mut Vec<String>,
+    ) -> Result<InitializeResult, McpError> {
+        use crate::handshake::wait_for_response;
+        use std::time::{Duration, Instant};
+
+        let timeout = self.params.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
+        let pin_id = self.next_id.max(2);
+        self.next_id = pin_id.wrapping_add(1).max(2);
+        let cwd = self.params.cwd.clone();
+        self.transport
+            .as_mut()
+            .send_line(&initialize_request(pin_id, &cwd))?;
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+        let mut pin_surfaced = Vec::new();
+        let answer = match wait_for_response(
+            self.transport.as_mut(),
+            pin_id,
+            &cwd,
+            deadline,
+            timeout,
+            &mut pin_surfaced,
+        ) {
+            Ok(answer) => answer,
+            Err(error) => {
+                surfaced.extend(pin_surfaced);
+                return Err(McpError::new(McpStage::Bridge, error.failure));
+            }
+        };
+        surfaced.extend(pin_surfaced);
+        parse_initialize_result(&answer)
+            .map_err(|error| McpError::new(McpStage::Bridge, error.failure))
     }
 
     /// Credential discipline pin: secrets resolve into the closed child
@@ -1436,5 +1606,162 @@ mod tests {
             other => panic!("adapter must deny, got {other:?}"),
         }
         assert!(sent.borrow().is_empty());
+    }
+
+    // ── AI-0244: capability-set / protocol-state pin ──
+
+    fn pin_with_shape(tools: &str) -> crate::handshake::InitializeResult {
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"{}\",\"capabilities\":{{\"tools\":{tools}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}",
+            crate::PROTOCOL_VERSION
+        );
+        crate::handshake::parse_initialize_result(&line).expect("pin parses")
+    }
+
+    fn pin_answer(id: u64, tools: &str) -> String {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"{}\",\"capabilities\":{{\"tools\":{tools}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}",
+            crate::PROTOCOL_VERSION
+        )
+    }
+
+    fn make_pinned_adapter(
+        transport: FakeTransport,
+        pinned: crate::handshake::InitializeResult,
+    ) -> McpToolAdapter {
+        McpToolAdapter::new_with_pin(
+            "demo",
+            vec![imported_echo()],
+            Box::new(transport),
+            Box::new(Allow),
+            Box::new(consented()),
+            McpAdapterParams {
+                protocol_id: "local.assistant".to_owned(),
+                base: base(AgentLevel::Workspace),
+                cwd: "/tmp/bitty".to_owned(),
+                timeout_ms: 1_000,
+            },
+            pinned,
+        )
+        .expect("pinned adapter")
+    }
+
+    #[test]
+    fn unpinned_adapter_skips_pin_check() {
+        let (transport, _sent) = FakeTransport::fresh(Vec::new());
+        let adapter = make_adapter(transport, Allow, consented(), AgentLevel::Workspace);
+        assert!(adapter.pinned().is_none());
+    }
+
+    #[test]
+    fn verify_pin_matches_leaves_stale_untouched() {
+        let pin = pin_with_shape("{\"listChanged\":true}");
+        let (transport, _sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_pinned_adapter(transport, pin.clone());
+        assert_eq!(adapter.pinned(), Some(&pin));
+        assert!(!adapter.is_stale());
+        adapter.verify_pin(&pin).expect("match");
+        assert!(!adapter.is_stale());
+        assert_eq!(adapter.list_version(), 0);
+    }
+
+    #[test]
+    fn verify_pin_mismatch_keeps_stale_and_is_non_retryable() {
+        let pin = pin_with_shape("{\"listChanged\":true}");
+        let drifted = pin_with_shape("{}");
+        assert!(!pin.matches_pin(&drifted));
+        let (transport, sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_pinned_adapter(transport, pin);
+        let before = adapter.snapshot();
+        let error = adapter.verify_pin(&drifted).expect_err("mismatch");
+        assert!(matches!(error.failure, McpFailure::CapabilityDrift { .. }));
+        assert!(!error.retryable);
+        assert_eq!(error.stage, McpStage::Bridge);
+        assert!(adapter.is_stale());
+        assert_eq!(adapter.snapshot(), before);
+        let denied = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("stale must deny");
+        assert!(matches!(denied, ToolError::Denied { .. }));
+        assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn pinned_relist_match_swaps_and_clears_stale() {
+        let pin = pin_with_shape("{\"listChanged\":true}");
+        let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+        let pin_frame = pin_answer(3, "{\"listChanged\":true}");
+        let (transport, sent) = FakeTransport::fresh(vec![list_frame.to_owned(), pin_frame]);
+        let mut adapter = make_pinned_adapter(transport, pin);
+        adapter.mark_stale();
+        assert_eq!(adapter.list_version(), 1);
+        let diff = adapter
+            .relist(&["echo".to_owned()])
+            .expect("matching pin relists");
+        assert!(diff.is_empty());
+        assert!(!adapter.is_stale());
+        assert_eq!(adapter.list_version(), 2);
+        assert_eq!(adapter.next_id(), 4);
+        assert_eq!(sent.borrow().len(), 2);
+        assert!(sent.borrow()[0].contains("\"id\":2"));
+        assert!(sent.borrow()[1].contains("\"method\":\"initialize\""));
+        assert!(sent.borrow()[1].contains("\"id\":3"));
+    }
+
+    #[test]
+    fn pinned_relist_mismatch_keeps_stale_snapshot_and_denies() {
+        let pin = pin_with_shape("{\"listChanged\":true}");
+        let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+        // Downgrade: fresh answers `{}` while the pin holds `listChanged`.
+        let pin_frame = pin_answer(3, "{}");
+        let (transport, sent) = FakeTransport::fresh(vec![list_frame.to_owned(), pin_frame]);
+        let mut adapter = make_pinned_adapter(transport, pin);
+        let before = adapter.snapshot();
+        adapter.mark_stale();
+        let version = adapter.list_version();
+        assert_eq!(version, 1);
+        let error = adapter
+            .relist(&["echo".to_owned()])
+            .expect_err("downgrade must fail");
+        assert!(matches!(error.failure, McpFailure::CapabilityDrift { .. }));
+        assert!(!error.retryable);
+        assert!(adapter.is_stale());
+        assert_eq!(adapter.list_version(), version);
+        assert_eq!(adapter.snapshot(), before);
+        let denied = adapter
+            .execute("mcp_demo_echo", b"{}", 1_000)
+            .expect_err("still stale");
+        match &denied {
+            ToolError::Denied { reason, .. } => {
+                assert!(reason.contains("tool list stale; re-list required"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(sent.borrow().len(), 2);
+    }
+
+    #[test]
+    fn observe_notification_then_pinned_relist_mismatch_stays_stale() {
+        let pin = pin_with_shape("{}");
+        let (transport, _sent) = FakeTransport::fresh(Vec::new());
+        let mut adapter = make_pinned_adapter(transport, pin);
+        assert!(adapter.observe_notification(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
+        ));
+        assert!(adapter.is_stale());
+        // Swap in a transport carrying a good list plus an upgraded pin.
+        let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+        let pin_frame = pin_answer(3, "{\"listChanged\":true}");
+        let (fresh_transport, _sent) = FakeTransport::fresh(vec![list_frame.to_owned(), pin_frame]);
+        adapter.transport = Box::new(fresh_transport);
+        let before = adapter.snapshot();
+        let version = adapter.list_version();
+        let error = adapter
+            .relist(&["echo".to_owned()])
+            .expect_err("upgrade must fail");
+        assert!(matches!(error.failure, McpFailure::CapabilityDrift { .. }));
+        assert!(adapter.is_stale());
+        assert_eq!(adapter.list_version(), version);
+        assert_eq!(adapter.snapshot(), before);
     }
 }
