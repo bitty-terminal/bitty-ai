@@ -1304,6 +1304,9 @@ fn map_store_err(err: ContentStoreError) -> PendingError {
         | ContentStoreError::EmptyField(_)
         | ContentStoreError::OversizedField { .. } => PendingError::InvalidId,
         ContentStoreError::WriterBusy => PendingError::Storage(WRITER_BUSY_MSG.to_owned()),
+        ContentStoreError::DurableGated => {
+            PendingError::Storage(crate::content_store::V01_DURABLE_GATE_MESSAGE.to_owned())
+        }
         ContentStoreError::Sqlite(err) => map_sqlite(err),
         ContentStoreError::Json(err) => PendingError::Storage(err.to_string()),
     }

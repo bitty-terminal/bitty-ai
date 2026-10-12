@@ -263,92 +263,37 @@ fn duplicate_delivery_dedup_expiry_conflict() {
     );
 }
 
+/// v0.1 gate (AI-0238): the file-backed kernel open refuses and creates no
+/// file, so crash-between-effect-and-ack replay across reopen is out of the
+/// v0.1 profile. Unknown-preserved-through-resume on a live handle stays
+/// covered by the in-memory executor test in `session_resume_pending.rs`.
 #[test]
 fn crash_between_effect_and_ack_unknown_preserved_through_replay() {
     let dir = scratch_dir("crash-replay");
     let db_path = dir.join("wheel.db");
-    {
-        let mut kernel = WheelKernel::open(&db_path).expect("wheel open");
-        kernel
-            .create_task(test_task("fault-task-1"), BEGUN_MS)
-            .expect("create task");
-        let task_id = TaskId::new("fault-task-1").expect("valid task id");
-        kernel
-            .start_task(&task_id, "worker-1", BEGUN_MS + 10)
-            .expect("start task");
-        kernel
-            .set_active_task(Some(task_id))
-            .expect("set active task");
-        kernel
-            .put_slot("notes.txt", b"fault-matrix payload", BEGUN_MS + 20)
-            .expect("put slot");
-        kernel
-            .commit_checkpoint(
-                Rationale::new("Persist progress", "Save durable state"),
-                Some("heads/main"),
-                BEGUN_MS + 30,
-            )
-            .expect("commit");
-        kernel
-            .new_session("sess-fault-1", "heads/main", BEGUN_MS + 40)
-            .expect("bind session");
-        // Crash window: the host began the call and crashed before the ack,
-        // so the open row is the only durable trace.
-        let session = WheelSessionId::parse("sess-fault-1").expect("valid session");
-        PendingStore::begin(
-            kernel.content_store(),
-            PendingBegin {
-                call_id: "beef01",
-                session_id: &session,
-                task_id: Some("fault-task-1"),
-                tool: "workspace_write",
-                args: br#"{"path":"notes.txt"}"#,
-                generation: 1,
-                epoch: 1,
-                now_ms: BEGUN_MS + 50,
-            },
-        )
-        .expect("host begin");
-        // Drop without resolving: the crash-mid-turn point.
-    }
-    {
-        let mut kernel = WheelKernel::open(&db_path).expect("wheel reopen");
-        let report = kernel
-            .resume_session("sess-fault-1", 2, BEGUN_MS + 1_000)
-            .expect("resume after reopen");
-        assert_eq!(
-            report.pending_unknowns,
-            vec!["beef01".to_owned()],
-            "replay must name the surviving Unknown"
-        );
-        assert!(
-            !report.pending_log_absent,
-            "resume must report the log present"
-        );
-        assert_eq!(report.fence_token, 2, "resume must admit the fresh fence");
-        // Replay preserves Unknown: the row stays open after resume (never
-        // auto-resolved, never re-executed).
-        let session = WheelSessionId::parse("sess-fault-1").expect("valid session");
-        let open = PendingStore::list_open(kernel.content_store(), &session).expect("list open");
-        assert_eq!(open.len(), 1, "resume must leave the Unknown open");
-        assert_eq!(
-            open[0].call_id, "beef01",
-            "surviving Unknown id must match the crash row"
-        );
-        // The bare-branch path unions the same Unknown without resolving it.
-        let by_branch = kernel
-            .resume_session("heads/main", 0, BEGUN_MS + 1_010)
-            .expect("branch resume");
-        assert_eq!(
-            by_branch.pending_unknowns,
-            vec!["beef01".to_owned()],
-            "branch replay must union the same Unknown"
-        );
-        let open = PendingStore::list_open(kernel.content_store(), &session).expect("list open");
-        assert_eq!(open.len(), 1, "branch replay must not resolve the Unknown");
-    }
-    // Ack-loss taxonomy: Unknown stays Unknown through the bus (never
-    // Failed); admission refusals stay Denied/Refused pre-contact.
+    let err = match WheelKernel::open(&db_path) {
+        Ok(_) => panic!("durable kernel open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {text}"
+    );
+    assert!(
+        !db_path.exists(),
+        "refused open must not create a file: {}",
+        db_path.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ack-loss taxonomy (split from the crash-replay test under the v0.1 gate
+/// AI-0238; this half is pure in-memory bus logic): Unknown stays Unknown
+/// through the bus (never Failed); admission refusals stay Denied/Refused
+/// pre-contact.
+#[test]
+fn ack_loss_taxonomy_unknown_never_failed() {
     let mut bus = read_tool_bus();
     let mut executor = FakeToolExecutor::new();
     executor.push_error(ToolError::EffectUnknown {
@@ -383,7 +328,6 @@ fn crash_between_effect_and_ack_unknown_preserved_through_replay() {
         !is_reconcile_terminal(&execution.status),
         "Unknown must never read terminal"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -585,9 +529,9 @@ fn stale_generation_takeover_refused() {
     );
     // Wheel resume fencing: a stale claim epoch refuses with zero writes and
     // the same claim stays admissible for retry; the fresh claim advances.
-    let dir = scratch_dir("stale-takeover");
-    let db_path = dir.join("wheel.db");
-    let mut kernel = WheelKernel::open(&db_path).expect("wheel open");
+    // v0.1 gate (AI-0238): single-handle fencing needs no reopen, so it runs
+    // on the in-memory kernel with all other asserts unchanged.
+    let mut kernel = WheelKernel::open_in_memory().expect("wheel open");
     kernel
         .create_task(test_task("fault-task-2"), BEGUN_MS)
         .expect("create task");
@@ -616,7 +560,6 @@ fn stale_generation_takeover_refused() {
     kernel
         .resume_session("sess-fault-2", 3, BEGUN_MS + 60)
         .expect("fresh claim epoch must admit");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -400,16 +400,35 @@ fn topological_sort_and_priority_queue() -> Result<(), TaskEngineError> {
     Ok(())
 }
 
+/// v0.1 gate (AI-0238): the facade task-engine path open refuses and creates
+/// no file. Disk persistence across reopen is out of the v0.1 profile; the
+/// in-memory engine path below keeps covering task create/assign/get.
 #[test]
-fn facade_and_sqlite_persistence() -> Result<(), Box<dyn std::error::Error>> {
+fn facade_task_engine_durable_path_gated_v01() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = std::env::temp_dir().join(format!("bitty-test-task-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir)?;
     let db_path = temp_dir.join("tasks.db");
 
-    // Open via AiEngine facade
+    // Path open refuses with the v0.1 gate error and creates no file.
+    let err = match AiEngine::open_task_engine(&db_path) {
+        Ok(_) => panic!("durable task-engine open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {text}"
+    );
+    assert!(
+        !db_path.exists(),
+        "refused open must not create a file: {}",
+        db_path.display()
+    );
+
+    // The in-memory engine still covers the same create/assign/get shape.
     {
-        let mut engine = AiEngine::open_task_engine(&db_path)?;
+        let mut engine = AiEngine::open_in_memory_task_engine()?;
         let t_id = TaskId::new("persist-task")?;
         engine.create_task(
             TaskDraft {
@@ -423,12 +442,6 @@ fn facade_and_sqlite_persistence() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let generation = engine.assign_task(&t_id, "persistent-agent", 1010)?;
         assert_eq!(generation, 1);
-    }
-
-    // Reopen and verify persisted state
-    {
-        let engine = AiEngine::open_task_engine(&db_path)?;
-        let t_id = TaskId::new("persist-task")?;
         let task = engine.get_task(&t_id)?;
         assert_eq!(task.title, "Persisted Task");
         assert_eq!(task.priority, 42);

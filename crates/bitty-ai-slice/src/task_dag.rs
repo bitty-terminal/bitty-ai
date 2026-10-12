@@ -101,6 +101,10 @@ pub enum TaskEngineError {
     Corrupt { detail: String },
     /// Another live writer holds this database file's single-writer lock.
     WriterBusy,
+    /// v0.1 gate (AI-0238): path-taking file-backed opens refuse with this
+    /// before any filesystem access, so no file is created or mutated. Use
+    /// [`TaskEngine::open_in_memory`].
+    DurableGated,
 }
 
 impl fmt::Display for TaskEngineError {
@@ -154,6 +158,7 @@ impl fmt::Display for TaskEngineError {
             Self::InvalidHash(err) => write!(f, "invalid checkpoint hash: {err}"),
             Self::Corrupt { detail } => write!(f, "task engine corrupt or incompatible: {detail}"),
             Self::WriterBusy => write!(f, "another writer holds the single-writer lock"),
+            Self::DurableGated => write!(f, "{}", crate::content_store::V01_DURABLE_GATE_MESSAGE),
         }
     }
 }
@@ -504,6 +509,11 @@ CREATE INDEX IF NOT EXISTS idx_task_deps_prerequisite
     ON task_dependencies(prerequisite_id);
 "#;
 
+/// Admit the task schema on a shared connection (Wheel single-open path).
+///
+/// v0.1 gate (AI-0238): unreachable while path opens refuse; kept for the
+/// post-v0.1 restore of the durable path.
+#[allow(dead_code)]
 pub(crate) fn admit_task_or_init(conn: &rusqlite::Connection) -> Result<(), TaskEngineError> {
     let mut stmt = conn
         .prepare(
@@ -620,6 +630,10 @@ fn task_map_busy(err: rusqlite::Error) -> TaskEngineError {
 
 /// Bounded SQLite header probe for standalone task opens: only the first 16
 /// bytes are ever read, so the check costs O(1) memory on any file size.
+///
+/// v0.1 gate (AI-0238): unreachable while path opens refuse; kept for the
+/// post-v0.1 restore of the durable path.
+#[allow(dead_code)]
 fn check_task_magic(path: &Path) -> Result<(), TaskEngineError> {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -673,12 +687,16 @@ fn apply_task_pragmas(conn: &Connection) -> Result<(), TaskEngineError> {
 
 /// Claim the single-writer lock on a standalone open.
 ///
+/// v0.1 gate (AI-0238): unreachable while path opens refuse; kept for the
+/// post-v0.1 restore of the durable path.
+///
 /// `CREATE TABLE IF NOT EXISTS` is read-only when the schema already exists,
 /// so the EXCLUSIVE locking mode alone takes no lock until the first real
 /// write. This zero-timeout `BEGIN EXCLUSIVE` probe takes the lock at open:
 /// a second open while the first lives fails fast with
 /// [`TaskEngineError::WriterBusy`]. Steady state restores the nonzero profile
 /// timeout only after the claim succeeds.
+#[allow(dead_code)]
 fn claim_task_writer(conn: &Connection) -> Result<(), TaskEngineError> {
     conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;")
         .map_err(task_map_busy)?;
@@ -698,7 +716,11 @@ impl TaskEngine {
 
     /// Open or create a persistent Task DAG SQLite database at the specified path.
     ///
-    /// Applies the durable pragma profile shared with
+    /// v0.1 gate (AI-0238): path-taking file-backed opens refuse with
+    /// [`TaskEngineError::DurableGated`] before any filesystem access and
+    /// create no file; use [`TaskEngine::open_in_memory`]. The durable
+    /// profile below documents the post-v0.1 behavior this gate suspends:
+    /// applies the durable pragma profile shared with
     /// `crate::content_store` (WAL, FULL, FK ON, nonzero busy timeout,
     /// EXCLUSIVE single-writer). The file header is magic-checked, the task
     /// schema is admitted (foreign or partial shapes fail closed), and the
@@ -706,26 +728,16 @@ impl TaskEngine {
     /// the first lives fails with [`TaskEngineError::WriterBusy`]. The busy
     /// timeout stays zero through admission and init and restores the nonzero
     /// profile timeout only after the writer claim succeeds.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
-        let path = path.as_ref();
-        check_task_magic(path)?;
-        let conn = Connection::open(path).map_err(task_map_busy)?;
-        conn.busy_timeout(Duration::ZERO).map_err(task_map_busy)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(task_map_busy)?;
-        admit_task_or_init(&conn)?;
-        apply_task_pragmas(&conn)?;
-        conn.busy_timeout(Duration::ZERO).map_err(task_map_busy)?;
-        conn.execute_batch(TASK_SCHEMA).map_err(task_map_busy)?;
-        claim_task_writer(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+    pub fn open(_path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
+        Err(TaskEngineError::DurableGated)
     }
 
     /// Open a durable task engine (formal path, same profile as `Self::open`).
-    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
-        Self::open(path)
+    ///
+    /// v0.1 gate (AI-0238): refuses with [`TaskEngineError::DurableGated`]
+    /// like [`Self::open`].
+    pub fn open_durable(_path: impl AsRef<Path>) -> Result<Self, TaskEngineError> {
+        Self::open(_path)
     }
 
     /// Open an in-memory Task DAG SQLite database for ephemeral sessions and testing.
@@ -1863,6 +1875,8 @@ fn map_task(err: TaskEngineError) -> MergeError {
         | TaskEngineError::DuplicateTask(_)
         | TaskEngineError::DependencyNotFound { .. } => MergeError::Corrupt,
         TaskEngineError::WriterBusy => MergeError::Storage,
+        // v0.1 gate (AI-0238): a gate refusal surfaces as storage failure.
+        TaskEngineError::DurableGated => MergeError::Storage,
         TaskEngineError::Sqlite(err) => map_sqlite(err),
     }
 }

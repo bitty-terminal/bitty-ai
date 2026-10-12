@@ -1,8 +1,9 @@
-//! Durable journal slice tests (AI-0178, formal path).
+//! Durable journal slice tests (AI-0178, formal path; v0.1 gate AI-0238).
 //!
-//! Covers reopen-across-exit, torn-write recovery, zero-summarizer replay,
-//! deletion propagation, expiry absence, single-writer fencing, and
-//! corrupt/foreign fail-closed behavior. `recent_actions` and `active_task_id`
+//! The Wheel halves below refuse under the v0.1 gate (path opens fail closed
+//! with the gate error and create no file); the `CompactionStore` halves are
+//! a separate prototype surface outside the gate and keep their file-backed
+//! reopen coverage byte-identical. `recent_actions` and `active_task_id`
 //! are explicitly non-persisted session state (see non-persistence test).
 
 use bitty_ai_runtime::compression::{
@@ -11,8 +12,6 @@ use bitty_ai_runtime::compression::{
 };
 use bitty_ai_runtime::context::{ContextPriority, ContextRecord, RecordBody, StableId};
 use bitty_ai_slice::compaction_store::{CompactionStore, DurabilityError};
-use bitty_ai_slice::content_store::Rationale;
-use bitty_ai_slice::task_dag::{TaskDraft, TaskId};
 use bitty_ai_slice::wheel_kernel::WheelKernel;
 
 fn scratch_dir(name: &str) -> std::path::PathBuf {
@@ -53,27 +52,41 @@ fn compress_two(now_ms: u64) -> (CompressedView, usize) {
     (view, calls)
 }
 
+/// v0.1 gate (AI-0238): the Wheel path opens refuse, so wheel reopen
+/// preservation is out of the v0.1 profile. The compaction reopen half below
+/// is a separate prototype surface and keeps its asserts byte-identical.
 #[test]
 fn reopen_preserves_head_spans_tombstones_tags_previous_summary_strikes() {
     let dir = scratch_dir("reopen-preserves");
     let wheel_path = dir.join("wheel.db");
     let comp_path = dir.join("compaction.db");
 
-    let head_hex: String;
-    {
-        let mut kernel = WheelKernel::open(&wheel_path).expect("wheel open");
-        kernel
-            .put_slot("data.txt", b"durable payload", 1010)
-            .expect("put slot");
-        let cp = kernel
-            .commit_checkpoint(
-                Rationale::new("Persist", "Save durable state"),
-                Some("heads/main"),
-                1020,
-            )
-            .expect("commit");
-        head_hex = cp.id.to_hex();
+    // Wheel side: both spellings refuse with the gate error, no file.
+    for api in ["open", "open_durable"] {
+        let err = if api == "open" {
+            match WheelKernel::open(&wheel_path) {
+                Ok(_) => panic!("durable wheel open must refuse under the v0.1 gate"),
+                Err(err) => err,
+            }
+        } else {
+            match WheelKernel::open_durable(&wheel_path) {
+                Ok(_) => panic!("durable wheel open must refuse under the v0.1 gate"),
+                Err(err) => err,
+            }
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("gated out of v0.1"),
+            "{api} refusal must carry the v0.1 gate message, got: {text}"
+        );
+    }
+    assert!(
+        !wheel_path.exists(),
+        "refused wheel opens must not create a file: {}",
+        wheel_path.display()
+    );
 
+    {
         let mut tags = RetentionTags::new();
         tags.set("r1", RetentionClass::Ephemeral);
         let records = vec![record("r1", 100), record("r2", 120), record("r3", 140)];
@@ -93,17 +106,6 @@ fn reopen_preserves_head_spans_tombstones_tags_previous_summary_strikes() {
     }
 
     {
-        let kernel = WheelKernel::open(&wheel_path).expect("wheel reopen");
-        let head = kernel.head_checkpoint().expect("HEAD survives");
-        assert_eq!(head.to_hex(), head_hex);
-        let history = kernel.log(5).expect("log");
-        assert_eq!(history.len(), 1);
-        let slot = kernel
-            .get_slot("data.txt")
-            .expect("slot read")
-            .expect("slot restored");
-        assert_eq!(slot.as_slice(), b"durable payload");
-
         let store = CompactionStore::open(&comp_path).expect("compaction reopen");
         let reloaded = store.load_view().expect("load view");
         assert_eq!(reloaded.spans.len(), 1);
@@ -125,94 +127,28 @@ fn reopen_preserves_head_spans_tombstones_tags_previous_summary_strikes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v0.1 gate (AI-0238): the Wheel path open refuses before any filesystem
+/// access, so torn-write recovery across reopen is out of the v0.1 profile.
+/// The refusal itself is fail-closed with zero filesystem effects.
 #[test]
 fn torn_write_never_half_advances_head() {
     let dir = scratch_dir("torn-write");
     let wheel_path = dir.join("wheel.db");
 
-    let cp1_hex: String;
-    {
-        let mut kernel = WheelKernel::open(&wheel_path).expect("open");
-        kernel.put_slot("a.txt", b"v1", 1000).expect("slot");
-        let cp1 = kernel
-            .commit_checkpoint(Rationale::new("First", "Baseline"), None, 1010)
-            .expect("cp1");
-        cp1_hex = cp1.id.to_hex();
-    }
-
-    // Simulate a crash between checkpoint-row insert and HEAD update: insert a
-    // valid blob + checkpoint row via raw SQL without touching HEAD.
-    let orphan_hex: String;
-    {
-        let raw = rusqlite::Connection::open(&wheel_path).expect("raw open");
-        let tree_bytes = b"{\"orphan\":true}";
-        let tree_hash = bitty_ai_slice::content_store::ContentHash::compute(tree_bytes);
-        raw.execute(
-            "INSERT OR IGNORE INTO blobs (hash, size, data, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                tree_hash.to_hex(),
-                tree_bytes.len() as i64,
-                tree_bytes,
-                1020i64
-            ],
-        )
-        .expect("raw blob");
-        // Minimal checkpoint row with parent cp1, no HEAD advance.
-        let rationale = serde_json::to_string(&Rationale::new("Orphan", "Crashed")).expect("json");
-        let parents = serde_json::to_string(&vec![cp1_hex.clone()]).expect("parents json");
-        // Compute a deterministic fake hash id for the orphan row.
-        let orphan_id = bitty_ai_slice::content_store::ContentHash::compute(b"orphan-checkpoint");
-        orphan_hex = orphan_id.to_hex();
-        raw.execute(
-            "INSERT OR IGNORE INTO checkpoints (hash, parents_json, task_id, agent_id, rationale_json, tree_hash, summary, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                orphan_hex,
-                parents,
-                "task-unassigned",
-                "wheel-kernel",
-                rationale,
-                tree_hash.to_hex(),
-                "cognitive checkpoint",
-                1020i64
-            ],
-        )
-        .expect("raw checkpoint");
-    }
-
-    {
-        let kernel = WheelKernel::open(&wheel_path).expect("reopen after torn write");
-        let head = kernel.head_checkpoint().expect("HEAD present");
-        assert_eq!(
-            head.to_hex(),
-            cp1_hex,
-            "reopen must yield the pre-crash HEAD, never the orphan"
-        );
-        assert_ne!(head.to_hex(), orphan_hex);
-    }
-
-    // Corrupt triple: HEAD points at a missing checkpoint row -> typed failure,
-    // never a half-advanced kernel.
-    {
-        let raw = rusqlite::Connection::open(&wheel_path).expect("raw open 2");
-        let missing = bitty_ai_slice::content_store::ContentHash::compute(b"missing-target");
-        raw.execute(
-            "INSERT OR REPLACE INTO refs (name, target_hash, updated_at_ms) VALUES ('HEAD', ?1, ?2)",
-            rusqlite::params![missing.to_hex(), 1030i64],
-        )
-        .expect("point HEAD at missing");
-    }
-    {
-        let err = match WheelKernel::open(&wheel_path) {
-            Ok(_) => panic!("partial triple must fail closed"),
-            Err(e) => e,
-        };
-        let text = format!("{err}");
-        assert!(
-            text.contains("recovery") || text.contains("HEAD"),
-            "typed absence error, got: {text}"
-        );
-    }
+    let err = match WheelKernel::open(&wheel_path) {
+        Ok(_) => panic!("durable wheel open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {text}"
+    );
+    assert!(
+        !wheel_path.exists(),
+        "refused open must not create a file: {}",
+        wheel_path.display()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -398,6 +334,9 @@ fn expired_source_deadline_is_typed_absence_never_resurrected() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v0.1 gate (AI-0238): the Wheel path opens refuse, so the wheel half of
+/// writer fencing is out of the v0.1 profile. The compaction half below is a
+/// separate prototype surface and keeps its asserts byte-identical.
 #[test]
 fn second_open_durable_while_first_lives_is_writer_busy() {
     let dir = scratch_dir("writer-busy");
@@ -414,15 +353,29 @@ fn second_open_durable_while_first_lives_is_writer_busy() {
         "expected WriterBusy, got {err:?}"
     );
 
-    let _first_wheel = WheelKernel::open(&wheel_path).expect("first wheel open");
-    let err = match WheelKernel::open_durable(&wheel_path) {
-        Ok(_) => panic!("second wheel must fail"),
-        Err(e) => e,
-    };
-    let text = format!("{err}");
+    // Wheel side: both spellings refuse with the gate error, no file.
+    for api in ["open", "open_durable"] {
+        let err = if api == "open" {
+            match WheelKernel::open(&wheel_path) {
+                Ok(_) => panic!("durable wheel open must refuse under the v0.1 gate"),
+                Err(err) => err,
+            }
+        } else {
+            match WheelKernel::open_durable(&wheel_path) {
+                Ok(_) => panic!("durable wheel open must refuse under the v0.1 gate"),
+                Err(err) => err,
+            }
+        };
+        let text = format!("{err}");
+        assert!(
+            text.contains("gated out of v0.1"),
+            "{api} refusal must carry the v0.1 gate message, got: {text}"
+        );
+    }
     assert!(
-        text.contains("busy") || text.contains("Busy") || text.contains("writer"),
-        "expected writer-busy refusal, got: {text}"
+        !wheel_path.exists(),
+        "refused wheel opens must not create a file: {}",
+        wheel_path.display()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -451,8 +404,8 @@ fn corrupt_and_foreign_db_fail_closed_bytes_unchanged() {
     };
     let text = format!("{err}");
     assert!(
-        text.contains("corrupt") || text.contains("SQLite") || text.contains("not a"),
-        "got: {text}"
+        text.contains("gated out of v0.1"),
+        "v0.1 gate (AI-0238): wheel path open must refuse gated, got: {text}"
     );
     assert_eq!(std::fs::read(&garbage_path).expect("read back 2"), garbage);
 
@@ -495,49 +448,30 @@ fn corrupt_and_foreign_db_fail_closed_bytes_unchanged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// v0.1 gate (AI-0238): the Wheel path open refuses, so session-state
+/// non-persistence across reopen is out of the v0.1 profile. The same
+/// session-only property on a live handle stays covered by
+/// `test_kernel_session_state_is_non_persisted_documented` in
+/// `tests/wheel_kernel.rs`.
 #[test]
 fn session_state_is_explicitly_non_persisted() {
     // recent_actions and active_task_id reset on every open by design; only
     // HEAD, the DAG, blobs/refs, and tasks survive a reopen.
     let dir = scratch_dir("session-non-persisted");
     let wheel_path = dir.join("wheel.db");
-    {
-        let mut kernel = WheelKernel::open(&wheel_path).expect("open");
-        let task_id = TaskId::new("task-01").expect("id");
-        kernel
-            .create_task(
-                TaskDraft {
-                    id: task_id.clone(),
-                    title: "T".to_owned(),
-                    description: "D".to_owned(),
-                    priority: 1,
-                    dependencies: vec![],
-                },
-                1000,
-            )
-            .expect("task");
-        kernel.set_active_task(Some(task_id)).expect("active");
-        kernel
-            .record_action_outcome("act-1", true, Some(0), 5, "ok", "", 1010)
-            .expect("action");
-        assert_eq!(kernel.recent_actions().len(), 1);
-        assert!(kernel.active_task().is_some());
-    }
-    {
-        let kernel = WheelKernel::open(&wheel_path).expect("reopen");
-        assert!(
-            kernel.recent_actions().is_empty(),
-            "recent_actions are session state and must not persist"
-        );
-        assert!(
-            kernel.active_task().is_none(),
-            "active_task_id is session state and must not persist"
-        );
-        assert_eq!(
-            kernel.list_tasks().expect("tasks").len(),
-            1,
-            "tasks persist"
-        );
-    }
+    let err = match WheelKernel::open(&wheel_path) {
+        Ok(_) => panic!("durable wheel open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    let text = format!("{err}");
+    assert!(
+        text.contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {text}"
+    );
+    assert!(
+        !wheel_path.exists(),
+        "refused open must not create a file: {}",
+        wheel_path.display()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

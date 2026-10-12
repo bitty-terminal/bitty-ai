@@ -20,6 +20,15 @@ test:
 typecheck:
     cargo check --workspace --all-targets --locked
 
+# v0.1 gate (AI-0238): the Wheel durable store path must refuse. Runs the
+# single behavior guard asserting every path-taking file-backed constructor
+# (ContentStore, TaskEngine, WheelKernel, plus the delegating WheelBridge and
+# AiEngine wrappers) fails closed with the gate error, creates no file, and
+# leaves the in-memory constructors working. Part of `check` and CI so the
+# artifact cannot silently regain a durable path.
+gate-v01-durable:
+    cargo test --locked -p bitty-ai-slice --test v01_no_durable_path
+
 actionlint:
     actionlint -color
 
@@ -70,7 +79,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test actionlint markdownlint
+check: fmt-check clippy test gate-v01-durable actionlint markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the

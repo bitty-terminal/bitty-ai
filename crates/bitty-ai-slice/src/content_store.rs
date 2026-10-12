@@ -6,7 +6,7 @@ pub use bitty_ai_session::content_store::{
     Checkpoint, CheckpointDraft, ContentHash, ContentHashError, ContentStore, ContentStoreError,
     DURABLE_BUSY_TIMEOUT_MS, DURABLE_PROFILE, MAX_AGENT_ID_BYTES, MAX_BLOB_BYTES,
     MAX_CHECKPOINT_PARENTS, MAX_RATIONALE_FIELD_BYTES, MAX_RATIONALE_TOTAL_BYTES,
-    MAX_REF_NAME_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_ID_BYTES, Rationale, admit_or_init,
-    apply_durable_pragmas, check_sqlite_magic, claim_writer_fast, init_content_schema,
-    map_busy_for_facade, verify_profile,
+    MAX_REF_NAME_BYTES, MAX_SUMMARY_BYTES, MAX_TASK_ID_BYTES, Rationale, V01_DURABLE_GATE_MESSAGE,
+    admit_or_init, apply_durable_pragmas, check_sqlite_magic, claim_writer_fast,
+    init_content_schema, map_busy_for_facade, verify_profile,
 };

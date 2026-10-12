@@ -274,6 +274,9 @@ fn test_kernel_three_zone_context_compilation() {
     assert!(compiled.total_bytes > 0);
 }
 
+/// v0.1 gate (AI-0238): the file-backed kernel open refuses and creates no
+/// file. Persistence across reopen is out of the v0.1 profile; task/slot/
+/// checkpoint behavior stays covered on the in-memory kernel below.
 #[test]
 fn test_kernel_persistence_across_reopen() {
     let temp_dir =
@@ -282,52 +285,20 @@ fn test_kernel_persistence_across_reopen() {
     let db_path = temp_dir.join("wheel.db");
     let _ = std::fs::remove_file(&db_path);
 
-    // Session 1: Create state
-    {
-        let mut kernel = WheelKernel::open(&db_path).expect("open persistent kernel");
-        let task_id = TaskId::new("task-persisted").unwrap();
-        kernel
-            .create_task(
-                TaskDraft {
-                    id: task_id.clone(),
-                    title: "Durable Task".to_string(),
-                    description: "Must survive reopen".to_string(),
-                    priority: 5,
-                    dependencies: vec![],
-                },
-                1000,
-            )
-            .unwrap();
-
-        kernel
-            .put_slot("data.txt", b"durable payload", 1010)
-            .unwrap();
-        let r = Rationale::new("Persist", "Save durable state");
-        let cp = kernel
-            .commit_checkpoint(r, Some("heads/main"), 1020)
-            .unwrap();
-        assert_eq!(kernel.head_checkpoint(), Some(&cp.id));
-    }
-
-    // Session 2: Re-open from same file
-    {
-        let kernel = WheelKernel::open(&db_path).expect("reopen kernel");
-        let task_id = TaskId::new("task-persisted").unwrap();
-        let task = kernel.get_task(&task_id).unwrap().expect("task persisted");
-        assert_eq!(task.title, "Durable Task");
-
-        assert!(kernel.head_checkpoint().is_some());
-        let history = kernel.log(5).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].rationale.why, "Persist");
-
-        // Merkle context tree slot restored from HEAD checkpoint blob
-        let slot = kernel
-            .get_slot("data.txt")
-            .unwrap()
-            .expect("slot restored on reopen");
-        assert_eq!(slot.as_slice(), b"durable payload");
-    }
+    let err = match WheelKernel::open(&db_path) {
+        Ok(_) => panic!("durable kernel open must refuse under the v0.1 gate"),
+        Err(err) => err,
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("gated out of v0.1"),
+        "refusal must carry the v0.1 gate message, got: {text}"
+    );
+    assert!(
+        !db_path.exists(),
+        "refused open must not create a file: {}",
+        db_path.display()
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

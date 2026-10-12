@@ -113,6 +113,12 @@ pub const DURABLE_BUSY_TIMEOUT_MS: u64 = 5000;
 /// Durable profile marker stored in `durable_meta.profile`.
 pub const DURABLE_PROFILE: &str = "durable-v1";
 
+/// v0.1 gate message (AI-0238): every path-taking file-backed constructor
+/// refuses with this message before any filesystem access and creates no
+/// file. Ephemeral workflows use [`ContentStore::open_in_memory`].
+pub const V01_DURABLE_GATE_MESSAGE: &str =
+    "durable store path gated out of v0.1 (AI-0238; use open_in_memory)";
+
 /// Errors arising from content store, rationale, or checkpoint operations.
 #[derive(Debug)]
 pub enum ContentStoreError {
@@ -153,6 +159,10 @@ pub enum ContentStoreError {
     Corrupt { detail: String },
     /// Another live writer holds this database file's single-writer lock.
     WriterBusy,
+    /// v0.1 gate (AI-0238): path-taking file-backed opens refuse with this
+    /// before any filesystem access, so no file is created or mutated. Use
+    /// [`ContentStore::open_in_memory`].
+    DurableGated,
 }
 
 impl fmt::Display for ContentStoreError {
@@ -194,6 +204,7 @@ impl fmt::Display for ContentStoreError {
                 write!(f, "content store corrupt or incompatible: {detail}")
             }
             Self::WriterBusy => write!(f, "another writer holds the single-writer lock"),
+            Self::DurableGated => write!(f, "{V01_DURABLE_GATE_MESSAGE}"),
         }
     }
 }
@@ -775,38 +786,28 @@ impl ContentStore {
 
     /// Open a content store at the given SQLite database path.
     ///
-    /// Applies the durable pragma profile, admits the store (new files are
+    /// v0.1 gate (AI-0238): path-taking file-backed opens refuse with
+    /// [`ContentStoreError::DurableGated`] before any filesystem access and
+    /// create no file; use [`ContentStore::open_in_memory`]. The durable
+    /// profile below documents the post-v0.1 behavior this gate suspends:
+    /// applies the durable pragma profile, admits the store (new files are
     /// initialized; complete stores are verified; partial, occupied, or
     /// foreign stores fail with [`ContentStoreError::Corrupt`] unchanged),
     /// and claims the single-writer lock. The busy timeout stays zero through
     /// admission and schema init so a second open while the first lives fails
     /// fast with [`ContentStoreError::WriterBusy`]; steady state restores the
     /// nonzero profile timeout only after the writer claim succeeds.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
-        let path = path.as_ref();
-        check_sqlite_magic(path)?;
-        let conn = Connection::open(path).map_err(map_busy)?;
-        conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
-        // Non-mutating gate: foreign_keys is per-connection state.
-        conn.execute_batch("PRAGMA foreign_keys = ON;")
-            .map_err(map_busy)?;
-        admit_or_init(&conn)?;
-        apply_durable_pragmas(&conn)?;
-        conn.busy_timeout(Duration::ZERO).map_err(map_busy)?;
-        init_content_schema(&conn)?;
-        verify_profile(&conn)?;
-        claim_writer_fast(&conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-        })
+    pub fn open(_path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
+        Err(ContentStoreError::DurableGated)
     }
 
     /// Open a durable content store (formal path, same profile as [`Self::open`]).
     ///
-    /// Kept as a named alias so call sites spell the formal-path intent;
-    /// behavior matches [`Self::open`] exactly.
-    pub fn open_durable(path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
-        Self::open(path)
+    /// Kept as a named alias so call sites spell the formal-path intent.
+    /// v0.1 gate (AI-0238): refuses with [`ContentStoreError::DurableGated`]
+    /// like [`Self::open`]; behavior matches [`Self::open`] exactly.
+    pub fn open_durable(_path: impl AsRef<Path>) -> Result<Self, ContentStoreError> {
+        Self::open(_path)
     }
 
     /// Open an in-memory content store (useful for testing and ephemeral workflows).

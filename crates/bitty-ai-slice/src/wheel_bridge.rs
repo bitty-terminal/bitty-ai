@@ -71,6 +71,9 @@ impl WheelBridge {
     }
 
     /// Open a persistent bridge at the specified SQLite path.
+    ///
+    /// v0.1 gate (AI-0238): inherits the [`WheelKernel`] path-open refusal;
+    /// use [`Self::open_in_memory`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, FacadeError> {
         let kernel = WheelKernel::open(path)?;
         Ok(Self::new(kernel))
