@@ -6,7 +6,10 @@
 //! tool allowlist mirrors [`crate::config`] (non-empty, at most 32 entries of
 //! `1..=64` bytes over `[a-zA-Z0-9_.-]`). Custom headers are optional,
 //! bounded, `https`-only (never sent over cleartext), and never echo values
-//! into errors or `Debug` (URL query strings are redacted there too).
+//! into errors or `Debug` (URL query strings are redacted there too). SPKI
+//! pins are optional, shape-validated (at most [`MAX_SPKI_PINS`] entries of 64
+//! lowercase hex), count-only in `Debug`, and enforced pre-request by the
+//! transport through [`crate::peer_key::PeerKeyProvider`].
 //!
 //! The network [`bitty_network_api::NetworkCapability`] grant travels with
 //! the config but is enforced per request by
@@ -30,6 +33,8 @@ pub const MAX_REMOTE_HEADER_NAME_LEN: usize = 128;
 pub const MAX_REMOTE_HEADER_VALUE_LEN: usize = 4096;
 /// Maximum host length in bytes (DNS ceiling).
 pub const MAX_REMOTE_HOST_LEN: usize = 253;
+/// Maximum SPKI pins per remote server (rotation overlap plus backup bound).
+pub const MAX_SPKI_PINS: usize = 8;
 
 fn is_server_id(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_SERVER_ID_LEN {
@@ -80,6 +85,19 @@ fn is_header_value(value: &str) -> bool {
             || byte == b'\n'
             || (byte.is_ascii_control() && byte != b'\t')
     })
+}
+
+/// Optional SPKI pin shape: exactly 64 lowercase hex digits.
+///
+/// Same bool-helper style as the stdio pin (duplicated, not shared: neither
+/// module owns the other, and the bound is pinned by tests here).
+fn is_spki_pin(value: &str) -> bool {
+    if value.len() != crate::config::SHA256_PIN_LEN {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Authority slice of `url` (after `://`, before `/`, `?`, `#`, or `\`).
@@ -143,6 +161,17 @@ pub struct RemoteServerConfig {
     /// Network capability allowlist enforced pre-contact per request
     /// (offline-first deny-all default; zero service calls on deny).
     pub capability: bitty_network_api::NetworkCapability,
+    /// Optional SPKI SHA-256 pins (each exactly 64 lowercase hex digits, at
+    /// most [`MAX_SPKI_PINS`] entries).
+    ///
+    /// HTTP consumer seam (AI-0254): when non-empty, the transport consults
+    /// its attached [`crate::peer_key::PeerKeyProvider`] for the endpoint's
+    /// SPKI SHA-256 BEFORE any request bytes on every request path (POST,
+    /// poll GET, shutdown DELETE); mismatch or absent key refuses fail-closed
+    /// with `TransportClosed` (names-only, zero service contact). When empty
+    /// (unpinned), the provider is never consulted and behavior is
+    /// byte-identical to before.
+    pub spki_pins: Vec<String>,
 }
 
 impl RemoteServerConfig {
@@ -238,6 +267,18 @@ impl RemoteServerConfig {
                 ));
             }
         }
+        if self.spki_pins.len() > MAX_SPKI_PINS {
+            return Err(McpError::invalid_config(
+                "remote carries too many spki pins",
+            ));
+        }
+        for pin in &self.spki_pins {
+            if !is_spki_pin(pin) {
+                return Err(McpError::invalid_config(
+                    "spki pin must be 64 lowercase hex (0-9, a-f)",
+                ));
+            }
+        }
         // Custom headers (often `Authorization` secrets) must not ride
         // cleartext: the capability grant checks host/port/method only, so an
         // allowlisted `http://` endpoint would otherwise send credentials
@@ -264,7 +305,8 @@ impl RemoteServerConfig {
     }
 }
 
-// Manual Debug keeps header values out of logs while still showing shapes.
+// Manual Debug keeps header values and SPKI pin bytes out of logs while
+// still showing shapes (pin count only, never pin bytes).
 impl std::fmt::Debug for RemoteServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Rebuild without a derived impl so values can never leak through a
@@ -289,6 +331,7 @@ impl std::fmt::Debug for RemoteServerConfig {
             .field("tool_allowlist", &self.tool_allowlist)
             .field("header_count", &self.headers.len())
             .field("headers", &redacted_headers)
+            .field("spki_pin_count", &self.spki_pins.len())
             .field("capability", &self.capability)
             .finish()
     }
@@ -307,6 +350,7 @@ mod tests {
             headers: Vec::new(),
             capability: bitty_network_api::NetworkCapability::offline()
                 .with_domain("mcp.example.com"),
+            spki_pins: Vec::new(),
         }
     }
 
@@ -431,5 +475,67 @@ mod tests {
             "path lost"
         );
         assert!(rendered.contains("?[redacted]"), "query marker missing");
+    }
+
+    #[test]
+    fn spki_pins_are_optional_and_shape_validated() {
+        // Absent pins keep current behavior (unpinned).
+        let mut config = valid_config();
+        assert!(config.spki_pins.is_empty());
+        assert!(config.validate().is_ok());
+
+        // Well-formed pins pass (64 lowercase hex each, rotation list).
+        config.spki_pins = vec![
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+        ];
+        assert!(config.validate().is_ok());
+
+        // Malformed pins refuse fail-closed with names-only reasons.
+        for bad in [
+            "",
+            "abc",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85500",
+            "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+            " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85",
+            "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8",
+        ] {
+            config.spki_pins = vec![bad.to_owned()];
+            let error = config.validate().expect_err("malformed pin must refuse");
+            assert!(
+                matches!(
+                    error.failure,
+                    crate::error::McpFailure::InvalidConfig { .. }
+                ),
+                "wrong failure for {bad:?}: {:?}",
+                error.failure
+            );
+            // Names-only: non-empty rejected pin bytes never echo.
+            if !bad.trim().is_empty() {
+                assert!(!error.to_string().contains(bad.trim()));
+            }
+        }
+        // Over-bound pin count fails without echoing any pin.
+        config.spki_pins = vec![
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_owned();
+            MAX_SPKI_PINS + 1
+        ];
+        let error = config.validate().expect_err("over-bound pins must refuse");
+        assert!(!error.to_string().contains("e3b0c442"));
+        config.spki_pins = Vec::new();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn debug_reports_pin_count_never_pin_bytes() {
+        let mut config = valid_config();
+        let pin = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned();
+        config.spki_pins = vec![pin.clone()];
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains(&pin), "pin bytes leaked: {rendered}");
+        assert!(rendered.contains("spki_pin_count"));
     }
 }
