@@ -653,3 +653,140 @@ fn w_v10_terminal_change_ai_contract_matrix() {
         }
     }
 }
+
+// ── W-V6 ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn w_v6_provider_continuation_from_canonical_dag_alone() {
+    // Candidate wording only (beyond-v0.1, falsifiable, reviewable): provider
+    // continuity holds from the canonical DAG bytes alone. Two FakeProviders
+    // carry different ids; A commits the canonical DAG + checkpoint, A is
+    // dropped entirely (script queue, last-sampling echo, call counter), and
+    // B rehydrates from `canonical_bytes` alone before continuing with a
+    // byte-equal turn. Offline and in-memory only: injected `*_ms` clocks, no
+    // sockets, no live tests, no real-model calls. No continuation contract
+    // is adopted (only `canonical_bytes` / `from_canonical_bytes` /
+    // `complete`), and no W-V2 economics are pinned (`sampling: None`).
+    use bitty_ai_runtime::{
+        FakeProvider, ModelProvider, ProviderTurn, ProviderUsage, TurnRequest, provider::Message,
+    };
+
+    const NOW_MS: u64 = 1_000;
+    const CHILD_MS: u64 = 1_001;
+    const BUDGET_BYTES: usize = 32 * 1024;
+    const TIMEOUT_MS: u64 = 5_000;
+    const CONTINUATION_TEXT: &str = "continuation answer bytes from canonical dag";
+
+    fn turn_request() -> TurnRequest {
+        TurnRequest {
+            model: "fake-chat".to_owned(),
+            messages: vec![Message::user("continue from the canonical dag")],
+            context_refs: Vec::new(),
+            tools: Vec::new(),
+            budget_bytes: BUDGET_BYTES,
+            timeout_ms: TIMEOUT_MS,
+            now_ms: NOW_MS,
+            sampling: None,
+        }
+    }
+
+    fn scripted_continuation() -> ProviderTurn {
+        ProviderTurn {
+            text: CONTINUATION_TEXT.to_owned(),
+            tool_calls: Vec::new(),
+            latency_ms: 0,
+            usage: ProviderUsage::default(),
+        }
+    }
+
+    // Provider A commits the canonical DAG + checkpoint (a two-node checkpoint
+    // chain so the DAG link itself is pinned, not just a lone row).
+    let mut store = ContentStore::open_in_memory().expect("store");
+    let seed: &[u8] = b"seed context bytes";
+    let seed_hash = store.put_blob(seed, NOW_MS).expect("seed blob");
+    let mut root_tree = ContextTree::new();
+    root_tree.insert(
+        TreeEntry::new("doc/seed", seed_hash, EntryKind::Blob, seed.len()).expect("seed slot"),
+    );
+    let root = commit_tree(&mut store, Vec::new(), &root_tree, "w-v6 root", NOW_MS);
+
+    let answer_bytes = CONTINUATION_TEXT.as_bytes();
+    let answer_hash = store.put_blob(answer_bytes, CHILD_MS).expect("answer blob");
+    let mut child_tree = root_tree.clone();
+    child_tree.insert(
+        TreeEntry::new(
+            "turn/answer",
+            answer_hash,
+            EntryKind::Blob,
+            answer_bytes.len(),
+        )
+        .expect("answer slot"),
+    );
+    let canonical_bytes = child_tree.canonical_bytes();
+    let child = commit_tree(
+        &mut store,
+        vec![root.id],
+        &child_tree,
+        "w-v6 child",
+        CHILD_MS,
+    );
+    assert_eq!(child.parents, vec![root.id], "checkpoint DAG link pinned");
+    assert!(
+        store
+            .get_checkpoint(&child.id)
+            .expect("read back")
+            .is_some(),
+        "child checkpoint committed"
+    );
+
+    let mut provider_a = FakeProvider::new("provider-a").expect("valid id");
+    provider_a.push_turn(scripted_continuation());
+    assert_eq!(provider_a.scripted_turns_remaining(), 1);
+    assert_eq!(provider_a.complete_calls(), 0);
+    assert!(provider_a.last_sampling().is_none());
+    let turn_a = provider_a
+        .complete(&turn_request())
+        .expect("provider A turn");
+    assert_eq!(turn_a.text.as_bytes(), answer_bytes);
+    assert_eq!(provider_a.scripted_turns_remaining(), 0);
+    assert_eq!(provider_a.complete_calls(), 1);
+    assert!(provider_a.last_sampling().is_none());
+    let a_id = provider_a.provider_id().to_owned();
+    // Drop A entirely: the script queue, the last-sampling echo, and the call
+    // counter go with it. Only `canonical_bytes` (plus the expected literal)
+    // survive for B.
+    drop(provider_a);
+
+    // Provider B rehydrates from `canonical_bytes` alone: no store handle, no
+    // provider-A state, no continuation contract.
+    let rehydrated =
+        ContextTree::from_canonical_bytes(&canonical_bytes).expect("rehydrate from bytes alone");
+    assert_eq!(
+        rehydrated.canonical_bytes(),
+        canonical_bytes,
+        "rehydrated DAG byte-matches the committed canonical bytes"
+    );
+
+    let mut provider_b = FakeProvider::new("provider-b").expect("valid id");
+    assert_ne!(
+        a_id,
+        provider_b.provider_id(),
+        "providers carry different ids"
+    );
+    assert_eq!(provider_b.complete_calls(), 0);
+    assert!(provider_b.last_sampling().is_none());
+    provider_b.push_turn(scripted_continuation());
+    let turn_b = provider_b
+        .complete(&turn_request())
+        .expect("provider B turn");
+    assert_eq!(
+        turn_b.text.as_bytes(),
+        turn_a.text.as_bytes(),
+        "continuation turn is byte-equal across the provider switch"
+    );
+    assert_eq!(
+        turn_b, turn_a,
+        "full scripted turn matches across providers"
+    );
+    assert_eq!(provider_b.complete_calls(), 1);
+}
