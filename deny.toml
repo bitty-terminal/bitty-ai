@@ -58,4 +58,7 @@ allow-git = [
   # allowlists), not bitty-ai's choice. Named URL only, never a blanket git
   # allow, so any further new git source still fails loudly.
   "https://github.com/kyren/gc-arena",
+  # AI-0257: `bitty-agent-api` dev-dep for the vocabulary conformance
+  # ledger (exact rev pin a8e4112, test-only). Named URL only, same rule.
+  "https://github.com/bitty-terminal/bitty-agent",
 ]
