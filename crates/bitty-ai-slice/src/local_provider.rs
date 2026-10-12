@@ -2909,6 +2909,65 @@ mod tests {
         assert!(!turn.text.is_empty());
     }
 
+    /// S6 loopback smoke (manual only, AI-0237): requires a self-started
+    /// `llama-server` on loopback only, e.g.
+    /// `llama-server --host 127.0.0.1 --port 8089 --model <chat-gguf>
+    /// --alias minicpm5-1b-smoke`. Corroboration only, never acceptance.
+    /// Never runs in CI. Must not target 11434/8080 (other tasks/ports).
+    #[test]
+    #[ignore]
+    fn s6_loopback_smoke_ai_0237() {
+        let endpoint =
+            LocalEndpoint::new("127.0.0.1", 8089, "minicpm5-1b-smoke").expect("endpoint");
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("minicpm5-1b-smoke", "say ok"))
+            .expect("loopback turn");
+        assert!(!turn.text.is_empty());
+    }
+
+    /// S6 keep_alive shapes against llama-server (manual only, AI-0237):
+    /// default-omit plus explicit duration and both sentinels must all
+    /// succeed because the OpenAI-compat server ignores the extra field.
+    /// Corroboration only, never acceptance. Never runs in CI.
+    #[test]
+    #[ignore]
+    fn s6_loopback_keep_alive_shapes_ai_0237() {
+        for keep_alive in ["10m", "-1", "0"] {
+            let endpoint = LocalEndpoint::new("127.0.0.1", 8089, "minicpm5-1b-smoke")
+                .expect("endpoint")
+                .with_keep_alive(keep_alive)
+                .expect("keep_alive");
+            let mut provider = LocalProvider::new(endpoint);
+            let turn = provider
+                .complete(&turn_request("minicpm5-1b-smoke", "say ok"))
+                .expect("loopback turn");
+            assert!(
+                !turn.text.is_empty(),
+                "keep_alive {keep_alive:?} must keep the loopback turn non-empty"
+            );
+        }
+    }
+
+    /// S6 Bearer edge against a keyless loopback server (manual only,
+    /// AI-0237): the server was started without `--api-key`, so an extra
+    /// `Authorization: Bearer` header must be tolerated (HTTP 200, no 401).
+    /// Uses the existing test-only placeholder key, never a real secret.
+    /// Corroboration only, never acceptance. Never runs in CI.
+    #[test]
+    #[ignore]
+    fn s6_loopback_bearer_tolerated_ai_0237() {
+        let endpoint = LocalEndpoint::new("127.0.0.1", 8089, "minicpm5-1b-smoke")
+            .expect("endpoint")
+            .with_api_key("test-live-key-0043")
+            .expect("key");
+        let mut provider = LocalProvider::new(endpoint);
+        let turn = provider
+            .complete(&turn_request("minicpm5-1b-smoke", "say ok"))
+            .expect("loopback turn");
+        assert!(!turn.text.is_empty());
+    }
+
     // ── AI-CTX-004: declared sampling reaches the backend ───────────────────
 
     /// A sampling contract with every field undeclared.
