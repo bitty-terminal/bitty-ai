@@ -1,6 +1,7 @@
 //! Integration tests for the unified `AiEngine` facade (AI-0161).
 
 use bitty_ai_runtime::prompt::{LayerInput, PromptLayer, PromptSnapshot};
+use bitty_ai_slice::snapshot_ingest::InputCaptureOptIn;
 use bitty_ai_slice::{
     AiEngine, RefreshAuthorization, SNAPSHOT_CANONICALIZATION_VERSION, SNAPSHOT_SCHEMA_VERSION,
     SnapshotIngestRequest,
@@ -94,6 +95,7 @@ fn snapshot_engine_verifies_and_ingests() {
         collected_at_ms: 1_000,
         priority: bitty_ai_runtime::context::ContextPriority::High,
         refresh: RefreshAuthorization::authorize(1),
+        input_capture: InputCaptureOptIn::default(),
     };
 
     let record = engine.ingest(&req).expect("ingest success");

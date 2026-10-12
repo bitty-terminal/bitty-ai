@@ -7,6 +7,7 @@
 //! subprocess, no filesystem, no network.
 
 use bitty_ai_runtime::{ArtifactStore, CacheKey, CacheScope, ContextPriority, assemble_prompt};
+use bitty_ai_slice::snapshot_ingest::InputCaptureOptIn;
 use bitty_ai_slice::{
     RefreshAuthorization, SnapshotIngestRequest, ingest_snapshot, prompt_snapshot_with_project,
     snapshot_digest_hex,
@@ -31,6 +32,7 @@ fn ingest(revision: &str, generation: u64) -> (bitty_ai_runtime::ContextRecord, 
         collected_at_ms: 100,
         priority: ContextPriority::High,
         refresh: RefreshAuthorization::authorize(generation),
+        input_capture: InputCaptureOptIn::default(),
     };
     let record = ingest_snapshot(&request, &mut store).expect("ingests");
     (record, digest)
