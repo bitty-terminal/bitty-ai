@@ -943,6 +943,132 @@ fn relist_stale_marks_only_signals_within_surfaced_cap() {
     assert_eq!(adapter.list_version(), 1);
 }
 
+// ── AI-0244: capability-set / protocol-state pin ─────────────────────────────
+// Store `InitializeResult` (negotiated `protocolVersion` + tools-capability
+// shape) in the adapter at construction/handshake; compare on every relist
+// success and on the `observe_notification`-triggered refresh; mismatch keeps
+// stale and denies via the deny-stale gate (zero-contact `Denied`, no new
+// UX). Catches capability downgrade/upgrade + version drift, NOT a
+// server-binary swap (std-only, no crypto, no TOFU, no auto-update).
+
+fn pin_frame(id: u64, tools: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"{PROTOCOL_VERSION}\",\"capabilities\":{{\"tools\":{tools}}},\"serverInfo\":{{\"name\":\"fake\",\"version\":\"0.0.1\"}}}}}}"
+    )
+}
+
+fn pinned_test_adapter(
+    transport: FakeTransport,
+    pinned: bitty_ai_mcp::handshake::InitializeResult,
+) -> McpToolAdapter {
+    McpToolAdapter::new_with_pin(
+        "demo",
+        vec![echo_import()],
+        Box::new(transport),
+        Box::new(allow_authorizer()),
+        Box::new(consented_ledger(&[("mcp_demo_echo", "mcp.demo")])),
+        McpAdapterParams {
+            protocol_id: "local.assistant".to_owned(),
+            base: workspace_base(bitty_ai_runtime::session::AgentLevel::Workspace),
+            cwd: "/tmp/bitty".to_owned(),
+            timeout_ms: 1_000,
+        },
+        pinned,
+    )
+    .expect("pinned adapter builds")
+}
+
+#[test]
+fn pinning_stores_negotiated_state_at_construction() {
+    let pin = parse_initialize_result(&pin_frame(1, "{\"listChanged\":true}")).expect("pin parses");
+    assert!(pin.tools_supported);
+    let (transport, _sent) = FakeTransport::fresh(Vec::new());
+    let adapter = pinned_test_adapter(transport, pin.clone());
+    assert_eq!(adapter.pinned(), Some(&pin));
+    assert!(!adapter.is_stale());
+}
+
+#[test]
+fn pinning_compare_match_allows_relist_and_mismatch_keeps_stale() {
+    let pin = parse_initialize_result(&pin_frame(1, "{\"listChanged\":true}")).expect("pin");
+    // Match: list (id 2) + pin re-check (id 3, same shape) → success.
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+    let (transport, sent) = FakeTransport::fresh(vec![
+        list_frame.to_owned(),
+        pin_frame(3, "{\"listChanged\":true}"),
+    ]);
+    let mut adapter = pinned_test_adapter(transport, pin.clone());
+    adapter.mark_stale();
+    let diff = adapter.relist(&["echo".to_owned()]).expect("match relists");
+    assert!(diff.is_empty());
+    assert!(!adapter.is_stale());
+    assert_eq!(sent.borrow().len(), 2);
+
+    // Mismatch (downgrade to `{}`): list (id 2) + pin (id 3) → drift,
+    // snapshot kept, stale preserved, next execute denies zero-contact.
+    let (transport, sent) = FakeTransport::fresh(vec![list_frame.to_owned(), pin_frame(3, "{}")]);
+    let mut adapter = pinned_test_adapter(transport, pin);
+    let before = adapter.snapshot();
+    adapter.mark_stale();
+    let version = adapter.list_version();
+    let error = adapter
+        .relist(&["echo".to_owned()])
+        .expect_err("downgrade must drift");
+    assert_eq!(
+        error.failure,
+        McpFailure::CapabilityDrift {
+            detail: "protocol pin mismatch".to_owned(),
+        }
+    );
+    assert!(!error.retryable);
+    assert!(adapter.is_stale());
+    assert_eq!(adapter.list_version(), version);
+    assert_eq!(adapter.snapshot(), before);
+    let denied = adapter
+        .execute("mcp_demo_echo", b"{}", 1_000)
+        .expect_err("still stale");
+    assert!(matches!(
+        denied,
+        bitty_ai_runtime::tool::ToolError::Denied { .. }
+    ));
+    assert_eq!(sent.borrow().len(), 2);
+}
+
+#[test]
+fn pinning_observe_notification_refresh_mismatch_keeps_stale() {
+    let pin = parse_initialize_result(&pin_frame(1, "{}")).expect("pin");
+    let (transport, _sent) = FakeTransport::fresh(Vec::new());
+    let mut adapter = pinned_test_adapter(transport, pin);
+    assert!(adapter.observe_notification(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}"
+    ));
+    assert!(adapter.is_stale());
+    let version = adapter.list_version();
+    let before = adapter.snapshot();
+    // Refresh with an upgraded shape must stay stale (no swap, no clear).
+    // Note: the adapter owns its transport; the test replaces it by
+    // rebuilding a pinned adapter over fresh inbound while preserving the
+    // stale mark via `mark_stale` (same version bump discipline as the host
+    // path that reuses one adapter across observe → relist).
+    let list_frame = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}";
+    let (transport, _sent) = FakeTransport::fresh(vec![
+        list_frame.to_owned(),
+        pin_frame(3, "{\"listChanged\":true}"),
+    ]);
+    let stored = adapter.pinned().expect("pin stored").clone();
+    let mut adapter = pinned_test_adapter(transport, stored);
+    adapter.mark_stale();
+    assert_eq!(adapter.list_version(), 1);
+    let error = adapter
+        .relist(&["echo".to_owned()])
+        .expect_err("upgrade must drift");
+    assert!(matches!(error.failure, McpFailure::CapabilityDrift { .. }));
+    assert!(adapter.is_stale());
+    // The pre-refresh snapshot is untouched (empty diff would have swapped).
+    assert_eq!(adapter.snapshot(), before);
+    assert_eq!(adapter.list_version(), version);
+}
+
 // ── Unix live-spawn tests (bounded fixtures) ──────────────────────────────────
 
 #[cfg(unix)]

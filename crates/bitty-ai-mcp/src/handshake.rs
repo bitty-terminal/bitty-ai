@@ -72,7 +72,32 @@ pub const UNKNOWN_METHOD_MESSAGE: &str = "Method not found";
 /// generous — real servers send ~0-2 notifications per wait.
 pub const MAX_SURFACED_FRAMES: usize = 16;
 
+/// Shape of the negotiated `tools` capability (AI-0244 pin).
+///
+/// Distinguishes `"tools": true` from `"tools": { ... }` and records the
+/// `listChanged` flag when present. A server that upgrades (`{}` to
+/// `{"listChanged":true}`) or downgrades (`{"listChanged":true}` to `{}` or
+/// to `true`) changes this shape: the pin catches it even though every shape
+/// is handshake-valid on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolsCapabilityShape {
+    /// `"tools": true`.
+    BoolTrue,
+    /// `"tools": { ... }`, with the `listChanged` flag when present.
+    Object {
+        /// Value of `listChanged` inside the tools object, if any.
+        list_changed: Option<bool>,
+    },
+}
+
 /// Parsed `initialize` result: the facts the client requires before use.
+///
+/// AI-0244 capability-set / protocol-state pin: the adapter stores this whole
+/// value at construction/handshake and compares it on every `relist` success
+/// (plus the `observe_notification`-triggered refresh path). A mismatch keeps
+/// the old snapshot stale and denies via the existing deny-stale gate. The
+/// pin catches capability downgrade/upgrade plus version drift, NOT a
+/// server-binary swap (no binary digest, no hash, std-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitializeResult {
     /// Server protocol version (always the pin; anything else is refused).
@@ -80,6 +105,24 @@ pub struct InitializeResult {
     /// Whether the server offers the `tools` capability (always true here;
     /// absence is refused before this returns).
     pub tools_supported: bool,
+    /// Negotiated `tools`-capability shape (bool vs object, `listChanged`).
+    pub tools_shape: ToolsCapabilityShape,
+}
+
+impl InitializeResult {
+    /// Whether `other` matches this pin (protocol version plus tools shape).
+    ///
+    /// Pure, no I/O. True only when the version and the full
+    /// [`ToolsCapabilityShape`] agree. Version drift and any
+    /// capability-shape move (downgrade or upgrade) report false; a
+    /// server-binary swap with identical protocol state still reports true
+    /// (binary identity is out of scope, std-only pin).
+    #[must_use]
+    pub fn matches_pin(&self, other: &Self) -> bool {
+        self.protocol_version == other.protocol_version
+            && self.tools_supported == other.tools_supported
+            && self.tools_shape == other.tools_shape
+    }
 }
 
 /// Build the `initialize` request frame for `id`.
@@ -152,17 +195,22 @@ pub fn parse_initialize_result(line: &str) -> Result<InitializeResult, McpError>
     }
     let capabilities = find_object_field(result, "capabilities")
         .ok_or_else(|| McpError::new(McpStage::Handshake, McpFailure::NoToolCapability))?;
-    let tools_supported = find_object_field(capabilities, "tools").is_some()
-        || find_bool_field(capabilities, "tools") == Some(true);
-    if !tools_supported {
+    let tools_shape = if find_bool_field(capabilities, "tools") == Some(true) {
+        ToolsCapabilityShape::BoolTrue
+    } else if let Some(tools) = find_object_field(capabilities, "tools") {
+        ToolsCapabilityShape::Object {
+            list_changed: find_bool_field(tools, "listChanged"),
+        }
+    } else {
         return Err(McpError::new(
             McpStage::Handshake,
             McpFailure::NoToolCapability,
         ));
-    }
+    };
     Ok(InitializeResult {
         protocol_version: version,
-        tools_supported,
+        tools_supported: true,
+        tools_shape,
     })
 }
 
@@ -606,5 +654,61 @@ mod tests {
         assert_eq!(transport.sent.len(), 3);
         assert!(transport.sent[1].contains("\"id\":9"));
         assert!(transport.sent[1].contains("\"result\":{}"));
+    }
+
+    #[test]
+    fn pin_captures_tools_shape_for_store_compare() {
+        // AI-0244: the pin records the negotiated shape so a later compare
+        // can tell downgrade/upgrade apart from an identical re-handshake.
+        let bare = parse_initialize_result(&ok_result("{}")).expect("bare object");
+        assert_eq!(
+            bare.tools_shape,
+            ToolsCapabilityShape::Object { list_changed: None }
+        );
+        let listed = parse_initialize_result(&ok_result("{\"listChanged\":true}"))
+            .expect("listChanged true");
+        assert_eq!(
+            listed.tools_shape,
+            ToolsCapabilityShape::Object {
+                list_changed: Some(true)
+            }
+        );
+        let unlisted = parse_initialize_result(&ok_result("{\"listChanged\":false}"))
+            .expect("listChanged false");
+        assert_eq!(
+            unlisted.tools_shape,
+            ToolsCapabilityShape::Object {
+                list_changed: Some(false)
+            }
+        );
+        let boolean = parse_initialize_result(&ok_result("true")).expect("bool true");
+        assert_eq!(boolean.tools_shape, ToolsCapabilityShape::BoolTrue);
+        // Same bytes pin identically.
+        let again = parse_initialize_result(&ok_result("{\"listChanged\":true}")).expect("again");
+        assert!(listed.matches_pin(&again));
+        assert!(again.matches_pin(&listed));
+    }
+
+    #[test]
+    fn pin_mismatch_catches_downgrade_upgrade_and_version_drift() {
+        // AI-0244: downgrade (`listChanged:true` to `{}`), upgrade (`{}` to
+        // `true`), and version drift all mismatch. Identical protocol state
+        // still matches (binary swap with identical state is out of scope by
+        // design: std-only pin, no binary digest).
+        let listed = parse_initialize_result(&ok_result("{\"listChanged\":true}")).expect("listed");
+        let bare = parse_initialize_result(&ok_result("{}")).expect("bare");
+        assert!(!listed.matches_pin(&bare));
+        assert!(!bare.matches_pin(&listed));
+
+        let boolean = parse_initialize_result(&ok_result("true")).expect("bool");
+        assert!(!bare.matches_pin(&boolean));
+        assert!(!listed.matches_pin(&boolean));
+
+        let drifted = InitializeResult {
+            protocol_version: "1999-01-01".to_owned(),
+            tools_supported: true,
+            tools_shape: listed.tools_shape.clone(),
+        };
+        assert!(!listed.matches_pin(&drifted));
     }
 }

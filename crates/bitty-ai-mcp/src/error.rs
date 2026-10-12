@@ -138,6 +138,18 @@ pub enum McpFailure {
     },
     /// Server offers no tool capability.
     NoToolCapability,
+    /// Pinned protocol state drifted (AI-0244 capability-set pin).
+    ///
+    /// The stored [`crate::handshake::InitializeResult`] (negotiated
+    /// `protocolVersion` plus the `tools`-capability shape) no longer matches
+    /// a fresh `initialize` answer: a capability downgrade/upgrade (for
+    /// example `{"listChanged":true}` to `{}` or `{}` to `true`) or a version
+    /// drift. Fail-closed, non-retryable. This catches protocol-state drift
+    /// only, NOT a server-binary swap (no binary digest, no hash, std-only).
+    CapabilityDrift {
+        /// Bounded detail (protocol facts only, never payloads).
+        detail: String,
+    },
     /// A frame exceeds [`crate::frame::MAX_FRAME_BYTES`].
     FrameTooLarge {
         /// Bound in bytes.
@@ -271,6 +283,7 @@ impl Display for McpFailure {
                 )
             }
             Self::NoToolCapability => write!(f, "server offers no tool capability"),
+            Self::CapabilityDrift { detail } => write!(f, "capability drift: {detail}"),
             Self::FrameTooLarge { limit, actual } => {
                 write!(f, "frame of {actual} bytes exceeds {limit} byte limit")
             }
@@ -389,6 +402,12 @@ mod tests {
             ),
             McpError::new(McpStage::Handshake, McpFailure::NoToolCapability),
             McpError::new(
+                McpStage::Bridge,
+                McpFailure::CapabilityDrift {
+                    detail: bound_error_text("protocol pin mismatch", MAX_ERROR_TEXT_BYTES),
+                },
+            ),
+            McpError::new(
                 McpStage::Config,
                 McpFailure::InvalidConfig {
                     reason: bound_error_text("command is required", MAX_ERROR_TEXT_BYTES),
@@ -430,6 +449,9 @@ mod tests {
         }
         let fatal = [
             McpFailure::NoToolCapability,
+            McpFailure::CapabilityDrift {
+                detail: "protocol pin mismatch".to_owned(),
+            },
             McpFailure::AllowlistDeny {
                 name: "t".to_owned(),
             },
