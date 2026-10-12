@@ -1479,4 +1479,225 @@ mod unix {
         server.shutdown();
         let _ = std::fs::remove_file(&path);
     }
+
+    // ── AI-0248 fix round: verified-path reuse (Fix A) + bounded hash (Fix B)
+
+    // Fix A: bare `true` with a non-executable decoy earlier in `PATH`. The
+    // pin is the decoy digest: pre-fix code verified the decoy then
+    // re-resolved the bare name after `env_clear` (default search path) and
+    // launched system `true` (wrong binary, `Ok`); fixed code spawns EXACTLY
+    // the verified decoy path, which fails closed at `exec` (`SpawnFailed`)
+    // and never launches the system binary.
+    //
+    // `unsafe_code` allow: test-only `PATH` swap via `unsafe { set_var }`
+    // (edition 2024). The new `PATH` is `early_dir` plus the original `PATH`,
+    // so `python3`/system lookups still resolve; the window is one spawn;
+    // `RestorePath` restores even on panic. No other test mutates `PATH`.
+    #[test]
+    #[allow(unsafe_code)]
+    fn digest_pin_bare_name_uses_verified_path_never_resolves_again() {
+        struct RestorePath {
+            original: Option<std::ffi::OsString>,
+        }
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.original {
+                        Some(orig) => std::env::set_var("PATH", orig),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        let pid = std::process::id();
+        let early_dir = std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{pid}-early"));
+        std::fs::create_dir_all(&early_dir).expect("mkdir early");
+        let decoy = early_dir.join("true");
+        std::fs::write(&decoy, "decoy-not-executable\n").expect("write decoy");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod decoy");
+        }
+        // Pin the decoy digest (the file `resolve_program_path` finds first
+        // in the parent `PATH`).
+        let decoy_pin = sha256_hex_of(&decoy);
+        assert_eq!(decoy_pin.len(), 64);
+
+        let original = std::env::var_os("PATH");
+        {
+            let mut parts = vec![early_dir.clone().into_os_string()];
+            if let Some(ref orig) = original {
+                parts.extend(std::env::split_paths(orig).map(|p| p.into_os_string()));
+            }
+            let joined = std::env::join_paths(parts).expect("join PATH");
+            unsafe {
+                std::env::set_var("PATH", &joined);
+            }
+        }
+        let _restore = RestorePath { original };
+
+        let config = pin_config("pindecoy", "true", Some(decoy_pin));
+        config.validate().expect("pinned bare validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("pinned bare name must not launch a re-resolved binary");
+            }
+            Err(error) => error,
+        };
+        // The verified decoy is non-executable: spawn fails closed at `exec`
+        // (never `IdentityMismatch` — the digest matched — and never `Ok`
+        // launching system `true`).
+        assert!(
+            matches!(error.failure, bitty_ai_mcp::McpFailure::SpawnFailed { .. }),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        let text = error.to_string();
+        assert!(text.contains("true"), "{text}");
+        assert!(
+            !text.contains(&early_dir.to_string_lossy().into_owned()),
+            "path leaked: {text}"
+        );
+
+        let _ = std::fs::remove_file(&decoy);
+        let _ = std::fs::remove_dir(&early_dir);
+    }
+
+    // Fix B (FIFO): a pre-existing FIFO refuses fail-closed without hanging.
+    // The pre-open + opened-handle `is_file` gates refuse before any blocking
+    // read; the test asserts a tight deadline to prove no hang.
+    #[test]
+    fn digest_pin_fifo_refuses_fail_closed_without_hanging() {
+        use std::time::{Duration, Instant};
+        let pid = std::process::id();
+        let fifo = std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{pid}-fifo"));
+        let _ = std::fs::remove_file(&fifo);
+        let fifo_str = fifo.to_string_lossy().into_owned();
+        let status = std::process::Command::new("python3")
+            .args([
+                "-c".to_owned(),
+                "import os,sys; os.mkfifo(sys.argv[1])".to_owned(),
+                fifo_str.clone(),
+            ])
+            .status()
+            .expect("mkfifo via python3");
+        assert!(status.success(), "mkfifo failed");
+        // Well-formed pin (empty digest): the refusal comes from the
+        // non-regular gate, not shape validation.
+        let config = pin_config(
+            "pinfifo",
+            &fifo_str,
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()),
+        );
+        config.validate().expect("fifo config validates");
+        let started = Instant::now();
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("FIFO must refuse");
+            }
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "fifo check hung: {elapsed:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("pinfifo"), "{text}");
+        assert!(!text.contains(&fifo_str), "path leaked: {text}");
+        let _ = std::fs::remove_file(&fifo);
+    }
+
+    // Fix B (over-cap): a sparse file one byte past
+    // `MAX_PINNED_BINARY_BYTES` refuses fail-closed. The sparse fixture is
+    // instant with no large I/O (metadata length drives the fast refusal);
+    // over-cap never truncates-and-accepts since a partial hash cannot verify
+    // identity.
+    #[test]
+    fn digest_pin_oversized_refuses_fail_closed_over_cap() {
+        use bitty_ai_mcp::supervise::MAX_PINNED_BINARY_BYTES;
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bitty-ai-mcp-pin-{pid}-overcap"));
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::File::create(&path).expect("create overcap");
+        file.set_len(MAX_PINNED_BINARY_BYTES as u64 + 1)
+            .expect("sparse overcap");
+        drop(file);
+        let size = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(size, MAX_PINNED_BINARY_BYTES as u64 + 1);
+        let config = pin_config(
+            "pinovercap",
+            &path.to_string_lossy(),
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()),
+        );
+        config.validate().expect("overcap config validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("over-cap must refuse");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable);
+        let text = error.to_string();
+        assert!(text.contains("pinovercap"), "{text}");
+        assert!(
+            !text.contains(&path.to_string_lossy().into_owned()),
+            "path leaked: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Fix B (char device): `/dev/null` would hash to the empty digest if
+    // read, so pinning the empty digest proves the non-regular gate (not the
+    // digest compare) refuses. Never `/dev/zero` in tests (unbounded).
+    #[test]
+    fn digest_pin_char_device_refuses_fail_closed() {
+        let config = pin_config(
+            "pinnull",
+            "/dev/null",
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()),
+        );
+        config.validate().expect("null config validates");
+        let error = match spawn_server(&config, &no_env) {
+            Ok(mut server) => {
+                server.shutdown();
+                panic!("char device must refuse");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.failure,
+                bitty_ai_mcp::McpFailure::IdentityMismatch { .. }
+            ),
+            "wrong failure: {:?}",
+            error.failure
+        );
+        assert!(!error.retryable);
+        let text = error.to_string();
+        assert!(text.contains("pinnull"), "{text}");
+        assert!(!text.contains("/dev/null"), "path leaked: {text}");
+    }
 }

@@ -44,6 +44,18 @@ pub const MAX_HOST_SERVERS: usize = 32;
 /// loop, so memory stays bounded no matter how large the binary is: the whole
 /// file is never loaded.
 pub const BINARY_DIGEST_BUF_LEN: usize = 64 * 1024;
+/// Maximum pinned server-binary size hashed pre-spawn (8 MiB).
+///
+/// Value choice: 8 MiB is 128x the [`BINARY_DIGEST_BUF_LEN`] streaming buffer
+/// and 32x the [`MAX_FRAME_BYTES`] frame cap (power-of-two KiB multiples, the
+/// repo bound idiom). It covers typical MCP server helpers (shell/python
+/// shims and small compiled servers; e.g. `bash` ~1.2 MiB) while bounding
+/// pre-spawn hash work to milliseconds. Larger binaries refuse fail-closed
+/// with [`McpFailure::IdentityMismatch`] — never truncate-and-accept, since a
+/// partial hash cannot verify identity — so operators pin a small launcher
+/// shim instead of a multi-tens-of-MiB runtime. The existing multi-chunk
+/// streaming test (~72 KiB) stays well under this cap.
+pub const MAX_PINNED_BINARY_BYTES: usize = 8 * 1024 * 1024;
 
 /// Pipe event delivered by the stdout-drain worker.
 enum PipeEvent {
@@ -779,30 +791,112 @@ fn resolve_program_path(program: &str) -> std::path::PathBuf {
 
 /// Stream the file at `path` through a fixed 64 KiB buffer into the pin
 /// hasher. Memory stays bounded: the whole file is never loaded.
+///
+/// Fail-closed bounds: the pre-open metadata and the opened-handle metadata
+/// must both report a regular file, and the total hashed bytes must stay
+/// within [`MAX_PINNED_BINARY_BYTES`]. Non-regular files (FIFOs, sockets,
+/// char/block devices) and over-cap binaries refuse with an I/O error that
+/// callers map to [`McpFailure::IdentityMismatch`]; over-cap never
+/// truncates-and-accepts since a partial hash cannot verify identity. The
+/// pre-open check avoids a blocking `open` on a pre-existing FIFO; the Unix
+/// `O_NONBLOCK` open covers a swap between check and open; the streaming
+/// total covers growth between metadata and EOF. Residual TOCTOU (swap
+/// between hash and `exec`) is documented at [`verify_binary_pin`].
 fn hash_command_binary(path: &std::path::Path) -> Result<[u8; 32], std::io::Error> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
+    // Pre-open gate: refuse non-regular or over-cap without touching `open`,
+    // so a pre-existing FIFO never blocks here.
+    let pre = std::fs::metadata(path)?;
+    if !pre.is_file() {
+        return Err(std::io::Error::other("pinned binary is not a regular file"));
+    }
+    if pre.len() > MAX_PINNED_BINARY_BYTES as u64 {
+        return Err(std::io::Error::other("pinned binary exceeds size bound"));
+    }
+    let mut file = open_pinned_binary_nonblocking(path)?;
+    // Opened-handle gate: catch a swap between the pre-check and `open`.
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("pinned binary is not a regular file"));
+    }
+    if meta.len() > MAX_PINNED_BINARY_BYTES as u64 {
+        return Err(std::io::Error::other("pinned binary exceeds size bound"));
+    }
     let mut hasher = PinSha256::new();
     let mut buf = [0u8; BINARY_DIGEST_BUF_LEN];
+    let mut total: u64 = 0;
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("pinned binary exceeds size bound"))?;
+        if total > MAX_PINNED_BINARY_BYTES as u64 {
+            return Err(std::io::Error::other("pinned binary exceeds size bound"));
         }
         hasher.update(&buf[..read]);
     }
     Ok(hasher.finalize())
 }
 
+/// Open the pinned binary without blocking on FIFOs where supported.
+///
+/// Unix opens with `O_NONBLOCK` so a FIFO swapped in between the pre-open
+/// metadata gate and `open` still cannot hang the caller: the subsequent
+/// `is_file` gate refuses it. Flag values are OS-specific (`Linux`/`Android`
+/// `0o4000`, other Unix `0x0004`); non-Unix falls back to a plain open (no
+/// FIFO semantics there). Std-only, MSRV 1.85 safe, no `unsafe`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_pinned_binary_nonblocking(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o4000)
+        .open(path)
+}
+
+/// Open the pinned binary without blocking on FIFOs where supported.
+///
+/// Unix opens with `O_NONBLOCK` so a FIFO swapped in between the pre-open
+/// metadata gate and `open` still cannot hang the caller: the subsequent
+/// `is_file` gate refuses it. Flag values are OS-specific (`Linux`/`Android`
+/// `0o4000`, other Unix `0x0004`); non-Unix falls back to a plain open (no
+/// FIFO semantics there). Std-only, MSRV 1.85 safe, no `unsafe`.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn open_pinned_binary_nonblocking(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0004)
+        .open(path)
+}
+
+/// Open the pinned binary without blocking on FIFOs where supported.
+///
+/// Unix opens with `O_NONBLOCK` so a FIFO swapped in between the pre-open
+/// metadata gate and `open` still cannot hang the caller: the subsequent
+/// `is_file` gate refuses it. Flag values are OS-specific (`Linux`/`Android`
+/// `0o4000`, other Unix `0x0004`); non-Unix falls back to a plain open (no
+/// FIFO semantics there). Std-only, MSRV 1.85 safe, no `unsafe`.
+#[cfg(not(unix))]
+fn open_pinned_binary_nonblocking(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::File::open(path)
+}
+
 /// Verify the command binary against the pre-configured pin, when present.
 ///
 /// Streams the binary through [`BINARY_DIGEST_BUF_LEN`] BEFORE `Command::new`;
 /// mismatch or unreadable binary refuses with [`McpFailure::IdentityMismatch`]
-/// carrying the server id only. Absent pin returns `Ok(())` without touching
-/// the filesystem.
-fn verify_binary_pin(config: &McpServerConfig) -> Result<(), McpError> {
+/// carrying the server id only. Absent pin returns `Ok(None)` without touching
+/// the filesystem. On success returns the verified path: callers must spawn
+/// EXACTLY this path (never re-resolve the bare name), eliminating the
+/// double-lookup confusion where a non-executable decoy earlier in `PATH`
+/// could satisfy the pin while a different binary launches after `env_clear`.
+fn verify_binary_pin(config: &McpServerConfig) -> Result<Option<std::path::PathBuf>, McpError> {
     let Some(expected_hex) = config.sha256_pin.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     let identity_mismatch = || {
         McpError::new(
@@ -822,7 +916,7 @@ fn verify_binary_pin(config: &McpServerConfig) -> Result<(), McpError> {
     if !pin_digest_eq(&actual, &expected) {
         return Err(identity_mismatch());
     }
-    Ok(())
+    Ok(Some(path))
 }
 
 /// Spawn one supervised server child.
@@ -835,7 +929,9 @@ fn verify_binary_pin(config: &McpServerConfig) -> Result<(), McpError> {
 /// (`env_clear` plus resolved pairs only), pinned `cwd`, piped `stdin`,
 /// OS-null `stderr`, and piped `stdout` drained by the single worker thread.
 /// An absent pin skips verification without touching the filesystem
-/// (byte-identical behavior).
+/// (byte-identical behavior: the bare `command` passes straight to
+/// `Command::new` as before). A present pin spawns EXACTLY the verified path
+/// (no second `PATH` lookup after `env_clear`).
 ///
 /// # Errors
 ///
@@ -845,9 +941,12 @@ pub fn spawn_server(
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<SupervisedServer, McpError> {
     config.validate()?;
-    verify_binary_pin(config)?;
+    let verified_path = verify_binary_pin(config)?;
     let pairs = resolve_env_refs(&config.env_refs, env_lookup)?;
-    let mut command = Command::new(&config.command);
+    let program = verified_path
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new(&config.command));
+    let mut command = Command::new(program);
     command
         .args(&config.args)
         .env_clear()
