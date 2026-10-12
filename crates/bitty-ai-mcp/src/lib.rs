@@ -40,6 +40,7 @@ pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod http_transport;
+pub mod peer_key;
 pub mod remote;
 pub mod supervise;
 pub mod tools;
@@ -56,9 +57,10 @@ pub use http_transport::{
     HTTP_ACCEPT, HTTP_CONTENT_TYPE, HttpLineTransport, MAX_SESSION_ID_LEN,
     MAX_SSE_FRAMES_PER_RESPONSE, SESSION_HEADER, TRANSPORT_ERROR_CODE,
 };
+pub use peer_key::{FakePeerKeys, PeerKeyProvider};
 pub use remote::{
     MAX_REMOTE_HEADER_NAME_LEN, MAX_REMOTE_HEADER_VALUE_LEN, MAX_REMOTE_HEADERS,
-    MAX_REMOTE_HOST_LEN, MAX_REMOTE_URL_LEN, RemoteServerConfig,
+    MAX_REMOTE_HOST_LEN, MAX_REMOTE_URL_LEN, MAX_SPKI_PINS, RemoteServerConfig,
 };
 pub use supervise::{McpHost, SupervisedServer};
 pub use tools::{

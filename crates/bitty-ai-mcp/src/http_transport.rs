@@ -33,6 +33,11 @@
 //!
 //! - Capability deny pre-contact: [`McpFailure::TransportClosed`] with zero
 //!   service calls.
+//! - SPKI pin mismatch or absent peer key pre-request (pinned endpoints
+//!   only, via the attached [`crate::peer_key::PeerKeyProvider`]):
+//!   [`McpFailure::TransportClosed`] with zero service calls (names-only:
+//!   no pin or key bytes enter the diagnostic). Unpinned endpoints never
+//!   consult the provider.
 //! - [`NetworkError::Timeout`]: [`McpFailure::Timeout`] (handshake/list
 //!   surface it; `tools/call` folds it to `Unknown` through the existing
 //!   wrapper: reconcile before retry, never blind retry).
@@ -68,6 +73,7 @@ use bitty_network_api::{HttpMethod, NetworkError, NetworkService, Request, Respo
 use crate::McpTransport;
 use crate::error::{McpError, McpFailure, McpStage, bound_error_text};
 use crate::frame::MAX_FRAME_BYTES;
+use crate::peer_key::PeerKeyProvider;
 use crate::remote::RemoteServerConfig;
 
 /// `Accept` advertised on every POST (single JSON or SSE per reply).
@@ -274,7 +280,8 @@ fn valid_session_id(value: &str) -> bool {
 
 /// [`McpTransport`] over Streamable HTTP/SSE, backed by a sync service.
 ///
-/// Owns the [`RemoteServerConfig`], the service, a line queue, the optional
+/// Owns the [`RemoteServerConfig`], the service, an optional peer-key source
+/// for SPKI pin enforcement, a line queue, the optional
 /// session id, a closed flag, a sticky poll-disabled flag, and a bounded
 /// retain buffer for poll SSE overflow. Synchronous only (`&mut self`, no
 /// threads, no async). Whole-operation deadlines come from the config: each
@@ -283,6 +290,7 @@ fn valid_session_id(value: &str) -> bool {
 pub struct HttpLineTransport<S> {
     config: RemoteServerConfig,
     service: S,
+    peer_keys: Option<Box<dyn PeerKeyProvider>>,
     queue: VecDeque<String>,
     session_id: Option<String>,
     closed: bool,
@@ -293,6 +301,11 @@ pub struct HttpLineTransport<S> {
 impl<S> HttpLineTransport<S> {
     /// Build a transport over `service` after validating `config` fail-closed.
     ///
+    /// Starts with no peer-key source: unpinned configs behave byte-identical
+    /// to before, while pinned configs refuse every request fail-closed until
+    /// [`HttpLineTransport::with_peer_keys`] attaches one. Use that builder
+    /// for pinned endpoints.
+    ///
     /// # Errors
     ///
     /// Returns [`McpFailure::InvalidConfig`] when the config shape is refused.
@@ -301,12 +314,23 @@ impl<S> HttpLineTransport<S> {
         Ok(Self {
             config,
             service,
+            peer_keys: None,
             queue: VecDeque::new(),
             session_id: None,
             closed: false,
             poll_disabled: false,
             pending_poll: VecDeque::new(),
         })
+    }
+
+    /// Attach the peer-key source consulted pre-request when SPKI pins are
+    /// configured (see [`crate::peer_key`]).
+    ///
+    /// Unpinned configs never consult the provider, attached or not.
+    #[must_use]
+    pub fn with_peer_keys(mut self, provider: impl PeerKeyProvider + 'static) -> Self {
+        self.peer_keys = Some(Box::new(provider));
+        self
     }
 
     /// Remote configuration backing this transport.
@@ -357,6 +381,33 @@ impl<S> HttpLineTransport<S> {
         self.queue.len()
     }
 
+    /// Enforce the configured SPKI pins against the attached peer-key source.
+    ///
+    /// Unpinned (no pins) returns `Ok` without consulting anything
+    /// (byte-identical behavior, provider or not). Pinned requires an
+    /// attached provider, an observed key for the endpoint URL, and a match
+    /// against any pin; anything else refuses as
+    /// [`McpFailure::TransportClosed`] with zero service contact (names-only:
+    /// no pin or key bytes enter the error). Every request path consults this
+    /// BEFORE any request bytes.
+    fn check_spki_pin(&self) -> Result<(), McpError> {
+        if self.config.spki_pins.is_empty() {
+            return Ok(());
+        }
+        let observed = self
+            .peer_keys
+            .as_ref()
+            .and_then(|provider| provider.peer_spki_sha256(&self.config.url));
+        let Some(observed) = observed else {
+            return Err(transport_closed());
+        };
+        if crate::peer_key::spki_pin_matches(&self.config.spki_pins, &observed) {
+            Ok(())
+        } else {
+            Err(transport_closed())
+        }
+    }
+
     /// Best-effort session close: DELETEs the session, then marks closed.
     ///
     /// Failures (including `405 Method Not Allowed` for servers without
@@ -392,6 +443,11 @@ impl<S> HttpLineTransport<S> {
         }
         request.headers.push((SESSION_HEADER.to_owned(), session));
         if self.config.capability.check_request(&request).is_err() {
+            return;
+        }
+        // SPKI pins second: skip the DELETE on mismatch/absent key (the
+        // transport still marks closed; zero service contact on refuse).
+        if self.check_spki_pin().is_err() {
             return;
         }
         let _ = self.service.request(&request);
@@ -580,7 +636,9 @@ impl<S> HttpLineTransport<S> {
     ///
     /// Capability, secret, and error-mapping conventions mirror `send_line`:
     /// capability deny is [`McpFailure::TransportClosed`] with zero service
-    /// calls (no disable); timeouts, budgets, TLS map names-only (`"http
+    /// calls (no disable); SPKI pin mismatch or absent peer key (pinned
+    /// endpoints only) is likewise [`McpFailure::TransportClosed`] with zero
+    /// service calls and no disable; timeouts, budgets, TLS map names-only (`"http
     /// get"` for I/O context, never payloads, URLs, or header values);
     /// non-`405` statuses, bad content types, and malformed bodies fail as
     /// [`McpFailure::HandshakeRejected`] (poll carries no outgoing `id`);
@@ -608,6 +666,9 @@ impl<S> HttpLineTransport<S> {
         if self.config.capability.check_request(&request).is_err() {
             return Err(transport_closed());
         }
+        // SPKI pins second: zero service calls on mismatch/absent key (no
+        // disable, mirroring capability deny).
+        self.check_spki_pin()?;
         // Dispatch payloads retained from an over-cap previous poll before
         // any new I/O, preserving the per-call work bound. Notifications
         // dispatch with zero service calls; retained server requests still
@@ -727,6 +788,8 @@ impl<S: NetworkService> McpTransport for HttpLineTransport<S> {
         if self.config.capability.check_request(&request).is_err() {
             return Err(transport_closed());
         }
+        // SPKI pins second: zero service calls on mismatch/absent key.
+        self.check_spki_pin()?;
         let timeout_ms = self.config.effective_timeout_ms();
         match self.service.request(&request) {
             Err(error) => Err(map_network_error(error, timeout_ms)),
@@ -834,6 +897,7 @@ mod tests {
             headers: Vec::new(),
             capability: bitty_network_api::NetworkCapability::offline()
                 .with_domain("mcp.example.com"),
+            spki_pins: Vec::new(),
         }
     }
 

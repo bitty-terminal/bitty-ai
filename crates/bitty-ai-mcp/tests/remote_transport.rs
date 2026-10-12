@@ -6,7 +6,9 @@
 //! loopback `TcpListener` fixture pins the wire shape (POST, `Accept`,
 //! `Content-Type`, `Mcp-Session-Id`) through a minimal std-only HTTP client
 //! used only in that test. Allowlist misses stay zero-contact; secrets never
-//! enter errors or `Debug`.
+//! enter errors or `Debug`. AI-0254 SPKI pins consult a fake peer-key source
+//! pre-request (match allows, mismatch/absent refuses zero-contact as
+//! `TransportClosed`); unpinned endpoints never consult.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -90,6 +92,7 @@ fn remote_config(url: &str) -> RemoteServerConfig {
         tool_allowlist: vec!["echo".to_owned()],
         headers: Vec::new(),
         capability: bitty_network_api::NetworkCapability::offline().with_domain("mcp.example.com"),
+        spki_pins: Vec::new(),
     }
 }
 
@@ -101,6 +104,7 @@ fn loopback_config(url: &str, host: &str) -> RemoteServerConfig {
         tool_allowlist: vec!["echo".to_owned()],
         headers: Vec::new(),
         capability: bitty_network_api::NetworkCapability::offline().with_domain(host),
+        spki_pins: Vec::new(),
     }
 }
 
@@ -2101,4 +2105,246 @@ fn secrets_never_enter_errors_or_debug() {
             "request debug leaked: {request_debug}"
         );
     }
+}
+
+// ── AI-0254: HTTP SPKI consumer seam ─────────────────────────────────────────
+// Pinned endpoints consult the attached `PeerKeyProvider` BEFORE any request
+// bytes on every request path (POST, poll GET, shutdown DELETE); mismatch or
+// absent key refuses as `TransportClosed` with zero service contact
+// (names-only: no pin or key bytes enter diagnostics). Unpinned endpoints
+// never consult. Fully offline via `FakePeerKeys`: `bitty-network-api`
+// exposes no server peer-key accessor (only client-identity config), so the
+// fake is the only source until that cross-repo trigger lands.
+
+const SPKI_GOOD_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const SPKI_OTHER_HEX: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+fn pinned_config(url: &str, pins: &[&str]) -> RemoteServerConfig {
+    let mut config = remote_config(url);
+    config.spki_pins = pins.iter().map(|pin| (*pin).to_owned()).collect();
+    config
+}
+
+fn peer_keys_for(url: &str, hex: &str) -> bitty_ai_mcp::FakePeerKeys {
+    let mut keys = bitty_ai_mcp::FakePeerKeys::new();
+    assert!(keys.insert_hex(url, hex), "test pin must be well-formed");
+    keys
+}
+
+/// Test-only hex decode (the crate helper stays `pub(crate)`; the fake's
+/// `insert_hex` is the only public constructor).
+fn decode_hex_32(hex: &str) -> [u8; 32] {
+    assert_eq!(hex.len(), 64, "test helper takes full pins only");
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        out[i] = (digit(chunk[0]).expect("hex") << 4) | digit(chunk[1]).expect("hex");
+    }
+    out
+}
+
+/// Swappable test source: one mutable key slot behind a shared lock (sync
+/// transport, no threads spawned by the test itself). The slot is shared via
+/// `Arc` so the test can rotate the observed key after the provider moves
+/// into the transport.
+struct SwappableKeys {
+    key: std::sync::Arc<Mutex<Option<[u8; 32]>>>,
+}
+
+impl bitty_ai_mcp::PeerKeyProvider for SwappableKeys {
+    fn peer_spki_sha256(&self, _endpoint_url: &str) -> Option<[u8; 32]> {
+        self.key.lock().map(|guard| *guard).unwrap_or_default()
+    }
+}
+
+#[test]
+fn spki_match_allows_request() {
+    let url = "https://mcp.example.com/rpc";
+    let service = FakeService::new();
+    service.queue_response(json_ok(200, &call_answer(1, "hi")));
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(peer_keys_for(url, SPKI_GOOD_HEX));
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect("pin match allows");
+    let line = transport.recv_line(10).expect("recv").expect("queued");
+    assert!(line.contains("\"id\":1"));
+    assert_eq!(transport.service().recorded_count(), 1);
+}
+
+#[test]
+fn spki_mismatch_refuses_zero_contact() {
+    let url = "https://mcp.example.com/rpc";
+    let service = FakeService::new();
+    service.queue_response(json_ok(200, &call_answer(1, "hi")));
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(peer_keys_for(url, SPKI_OTHER_HEX));
+    let error = transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect_err("pin mismatch must refuse");
+    assert_eq!(error.failure, McpFailure::TransportClosed);
+    assert_eq!(transport.service().recorded_count(), 0);
+    // Names-only: neither the pin nor the observed key bytes enter the error.
+    let text = error.to_string();
+    assert!(!text.contains(SPKI_GOOD_HEX), "pin leaked: {text}");
+    assert!(!text.contains(SPKI_OTHER_HEX), "key leaked: {text}");
+    assert!(!format!("{error:?}").contains(SPKI_GOOD_HEX));
+}
+
+#[test]
+fn spki_absent_key_refuses_zero_contact() {
+    let url = "https://mcp.example.com/rpc";
+    // Provider attached but silent for this endpoint.
+    let service = FakeService::new();
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(bitty_ai_mcp::FakePeerKeys::new());
+    let error = transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect_err("absent key must refuse");
+    assert_eq!(error.failure, McpFailure::TransportClosed);
+    assert_eq!(transport.service().recorded_count(), 0);
+    assert!(!error.to_string().contains(SPKI_GOOD_HEX));
+
+    // Pinned with NO provider attached refuses the same way.
+    let service = FakeService::new();
+    let mut transport =
+        HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service).expect("transport");
+    let error = transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect_err("missing source must refuse");
+    assert_eq!(error.failure, McpFailure::TransportClosed);
+    assert_eq!(transport.service().recorded_count(), 0);
+}
+
+#[test]
+fn spki_malformed_pin_refused_at_config() {
+    let url = "https://mcp.example.com/rpc";
+    let mut config = pinned_config(url, &[SPKI_GOOD_HEX]);
+    assert!(config.validate().is_ok());
+    for bad in [
+        "abc",
+        "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85g",
+    ] {
+        config.spki_pins = vec![bad.to_owned()];
+        let error = config.validate().expect_err("malformed pin must refuse");
+        assert!(matches!(error.failure, McpFailure::InvalidConfig { .. }));
+        assert!(!error.to_string().contains(bad.trim()));
+    }
+    // The transport constructor inherits the refusal (no pinned-malformed
+    // transport can exist).
+    config.spki_pins = vec!["abc".to_owned()];
+    assert!(HttpLineTransport::new(config, FakeService::new()).is_err());
+}
+
+#[test]
+fn spki_unpinned_never_consults_provider() {
+    let url = "https://mcp.example.com/rpc";
+    // Unpinned with a hostile (mismatching) provider attached: the provider
+    // is ignored and current behavior is byte-identical (one POST, answer
+    // queued).
+    let service = FakeService::new();
+    service.queue_response(json_ok(200, &call_answer(1, "hi")));
+    let mut transport = HttpLineTransport::new(remote_config(url), service)
+        .expect("transport")
+        .with_peer_keys(peer_keys_for(url, SPKI_OTHER_HEX));
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect("unpinned ignores provider");
+    let line = transport.recv_line(10).expect("recv").expect("queued");
+    assert!(line.contains("\"id\":1"));
+    assert_eq!(transport.service().recorded_count(), 1);
+}
+
+#[test]
+fn spki_poll_match_allows_mismatch_refuses_without_disable() {
+    let url = "https://mcp.example.com/rpc";
+    let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\"}\n\n";
+    let poll_ok = || Response {
+        status: 200,
+        headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+        body: body.as_bytes().to_vec(),
+    };
+
+    // Match: the poll GET performs I/O and queues.
+    let service = FakeService::new();
+    service.queue_response(poll_ok());
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(peer_keys_for(url, SPKI_GOOD_HEX));
+    let queued = transport.poll_server_messages("/tmp/bitty").expect("poll");
+    assert_eq!(queued, 1);
+    assert_eq!(transport.service().recorded_count(), 1);
+    assert!(!transport.is_poll_disabled());
+
+    // Mismatch: `TransportClosed` with zero service calls and no sticky
+    // disable (mirroring capability deny).
+    let service = FakeService::new();
+    service.queue_response(poll_ok());
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(peer_keys_for(url, SPKI_OTHER_HEX));
+    let error = transport
+        .poll_server_messages("/tmp/bitty")
+        .expect_err("poll mismatch must refuse");
+    assert_eq!(error.failure, McpFailure::TransportClosed);
+    assert_eq!(transport.service().recorded_count(), 0);
+    assert!(!transport.is_poll_disabled());
+    assert!(!error.to_string().contains(SPKI_GOOD_HEX));
+}
+
+#[test]
+fn spki_shutdown_match_deletes_mismatch_skips_delete() {
+    let url = "https://mcp.example.com/rpc";
+    // Match: session captured, then shutdown DELETEs (two requests).
+    let service = FakeService::new();
+    service.queue_response(json_ok_session(200, &initialize_answer(1), "sess-spki"));
+    service.queue_response(Response {
+        status: 200,
+        headers: Vec::new(),
+        body: Vec::new(),
+    });
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(peer_keys_for(url, SPKI_GOOD_HEX));
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect("post");
+    assert_eq!(transport.session_id(), Some("sess-spki"));
+    transport.shutdown();
+    assert!(transport.is_closed());
+    let recorded = transport.service().recorded();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[1].method, bitty_network_api::HttpMethod::Delete);
+
+    // Mismatch after session capture: shutdown still marks closed but sends
+    // zero DELETE bytes.
+    let service = FakeService::new();
+    service.queue_response(json_ok_session(200, &initialize_answer(1), "sess-spki"));
+    let slot = std::sync::Arc::new(Mutex::new(Some(decode_hex_32(SPKI_GOOD_HEX))));
+    let mut transport = HttpLineTransport::new(pinned_config(url, &[SPKI_GOOD_HEX]), service)
+        .expect("transport")
+        .with_peer_keys(SwappableKeys {
+            key: std::sync::Arc::clone(&slot),
+        });
+    transport
+        .send_line("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}")
+        .expect("post");
+    assert_eq!(transport.session_id(), Some("sess-spki"));
+    // Rotate the observed key: the shutdown DELETE must not go out.
+    *slot.lock().expect("slot") = Some(decode_hex_32(SPKI_OTHER_HEX));
+    transport.shutdown();
+    assert!(transport.is_closed());
+    assert_eq!(
+        transport.service().recorded_count(),
+        1,
+        "mismatch shutdown must skip the DELETE"
+    );
 }
