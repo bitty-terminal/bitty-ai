@@ -43,6 +43,30 @@ pub enum CompilerError {
         /// Maximum allowed limit in bytes.
         max: usize,
     },
+    /// Candidate (AI-0250 Slice 3): untrusted bytes offered to Zone 1.
+    ///
+    /// Trust-tiered zones, enforced at construction: Zone 1 (system prompt,
+    /// project rules, tool schemas) accepts ONLY host-pinned bytes. All
+    /// `is_untrusted_surface` records, `uncollapsed_observations`, and
+    /// `ActionOutcome` text compile to Zone 3 / RuntimeTurn tail. A Zone 1
+    /// field carrying Slice-1 fences (`[untrusted ...]`, `[/untrusted`,
+    /// `[ACTION OUTCOME]`, `[OBSERVATION ...]`, `=== OBSERVATIONS ===`),
+    /// the Slice-2 provenance prefix (`[untrusted:` — covered by the
+    /// `[untrusted` prefix), or compiler/snapshot tail markers (`delta/1`,
+    /// `project-snapshot/1`) fails closed here instead of silently moving
+    /// bytes to the tail. The host must offer such bytes to Zone 3
+    /// (`uncollapsed_observations` / `turn_prompt`) instead.
+    ///
+    /// New variant (not a reuse of `Zone1BudgetExceeded`): budget vs trust
+    /// are distinct failure modes — conflating them would hide the security
+    /// property in logs and break existing `Zone1BudgetExceeded` match arms
+    /// that assert on `size`/`max`. The payload names only the offending
+    /// field (`system_prompt` / `project_rules` / `tool_schemas`, static
+    /// text); caller content is never echoed.
+    UntrustedInZone1 {
+        /// Which Zone 1 field carried untrusted markers (static, never content).
+        field: &'static str,
+    },
     /// Total context size exceeds maximum budget even after all pruning and compression tiers.
     TotalBudgetExceeded {
         /// Actual total bytes.
@@ -74,6 +98,12 @@ impl fmt::Display for CompilerError {
                 write!(
                     f,
                     "zone 1 (stable prefix) exceeds budget: {size} bytes > {max} bytes"
+                )
+            }
+            Self::UntrustedInZone1 { field } => {
+                write!(
+                    f,
+                    "zone 1 (stable prefix) rejects untrusted bytes in {field}: host-pinned bytes only"
                 )
             }
             Self::TotalBudgetExceeded { size, max } => {
@@ -604,6 +634,52 @@ fn zone3_fence_overhead(zone3_len: usize) -> usize {
     zone3_fence_open(zone3_len).len() + ZONE3_FENCE_CLOSE.len()
 }
 
+/// Candidate (AI-0250 Slice 3): untrusted markers that must never appear in
+/// Zone 1 host-pinned bytes.
+///
+/// Each entry names bytes that belong in the Zone 3 / RuntimeTurn tail:
+/// - `"[untrusted"` covers every Slice-1 length-prefixed fence (`[untrusted
+///   observations len=...]`, `[untrusted stdout len=...]`, `[untrusted
+///   stderr len=...]`) plus the Slice-2 provenance prefix (`[untrusted:...]`)
+///   the sibling AI-0249 renders — one prefix, forward-compatible, no content
+///   scan beyond the marker.
+/// - `"[/untrusted"` covers every closing fence.
+/// - `"[ACTION OUTCOME]"` is the `ActionOutcome::format_for_context` header;
+///   outcome text is an observation, never Zone 1 policy.
+/// - `"[OBSERVATION"` and `"=== OBSERVATIONS ==="` are this compiler's own
+///   Zone 3 renderings; feeding them back into Zone 1 would double-fence
+///   stable bytes.
+/// - `"project-snapshot/1"` and `"delta/1"` are tail markers: snapshot repo
+///   content and compiler deltas are verified tail bytes (digest/generation
+///   pinned in `snapshot_ingest`), never invariant prefix policy.
+///
+/// Host authorship note: a host that legitimately wants to *discuss* the
+/// mechanism in Zone 1 must paraphrase without these marker bytes; offering
+/// them to Zone 1 fails closed and the caller re-offers to Zone 3. No
+/// scanning, no escaping, no silent rewrites — presence alone refuses.
+fn contains_untrusted_markers(text: &str) -> bool {
+    text.contains("[untrusted")
+        || text.contains("[/untrusted")
+        || text.contains("[ACTION OUTCOME]")
+        || text.contains("[OBSERVATION")
+        || text.contains("=== OBSERVATIONS ===")
+        || text.contains("project-snapshot/1")
+        || text.contains("delta/1")
+}
+
+/// Candidate (AI-0250 Slice 3): fail-closed Zone 1 trust gate.
+///
+/// Returns [`CompilerError::UntrustedInZone1`] naming only the field (static
+/// text, never caller content) when `text` carries tail markers. Called at
+/// the top of `compile` for each Zone 1 field, before any budget accounting,
+/// so a trust violation never masks as (or hides behind) a budget outcome.
+fn validate_zone1_text(field: &'static str, text: &str) -> Result<(), CompilerError> {
+    if contains_untrusted_markers(text) {
+        return Err(CompilerError::UntrustedInZone1 { field });
+    }
+    Ok(())
+}
+
 /// Three-zone context compiler optimizing for prefix-cache hit rate and high-density state.
 #[derive(Debug, Clone, Default)]
 pub struct ContextCompiler {
@@ -643,7 +719,23 @@ impl ContextCompiler {
     /// - Tier 1: Prune unpinned scratchpad slots (`scratch/*`, `temp/*`).
     /// - Tier 2: Summarize older historical rationales into 1-line digests.
     /// - Tier 3: Hard truncate dynamic observations while preserving Zone 1 and the active task.
+    ///
+    /// Candidate (AI-0250 Slice 3): trust-tiered zones, enforced at
+    /// construction. Zone 1 accepts ONLY host-pinned bytes: each Zone 1
+    /// field is gated by [`validate_zone1_text`] before assembly, so
+    /// `is_untrusted_surface` records, `uncollapsed_observations`, and
+    /// `ActionOutcome` text offered to Zone 1 fail closed with
+    /// [`CompilerError::UntrustedInZone1`] instead of silently moving to
+    /// the tail. Zone 2 (typed active-task/checkpoint/slot state) and Zone 3
+    /// (observations + turn prompt) are unchanged: Zone 3 accepts any bytes
+    /// verbatim inside the Slice-1 untrusted fence.
     pub fn compile(&self, budget: &CompilerBudgetConfig) -> Result<CompiledContext, CompilerError> {
+        // Candidate (AI-0250 Slice 3): trust gate before budget accounting —
+        // a trust violation must never mask as (or hide behind) a budget
+        // outcome, and no partial zones are returned on refusal.
+        validate_zone1_text("system_prompt", &self.system_prompt)?;
+        validate_zone1_text("project_rules", &self.project_rules)?;
+        validate_zone1_text("tool_schemas", &self.tool_schemas)?;
         // --- Assemble Zone 1: Stable Prefix ---
         let mut z1 = String::new();
         if !self.system_prompt.trim().is_empty() {

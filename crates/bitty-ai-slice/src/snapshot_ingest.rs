@@ -914,11 +914,21 @@ impl std::error::Error for ProjectLayerError {}
 /// mismatch: a hand-written or foreign record, or a digest that does not
 /// belong to the record, can never silently occupy the PROJECT layer.
 ///
+/// Candidate (AI-0250 Slice 3): this Project-layer placement is the legacy
+/// cache-affinity path (AI-0127/0128/0129) — the digest-bound snapshot text
+/// is the ONLY untrusted-surface content the prompt trust gate admits to the
+/// stable prefix, and only in this verified shape. New code that must keep
+/// untrusted bytes OUT of the stable prefix should use
+/// [`prompt_snapshot_with_project_tail`], which wires the same verified text
+/// to the `RuntimeTurn` tail and leaves `Project` for host-pinned intent.
+/// See that builder for the migration.
+///
 /// # Errors
 ///
 /// Returns [`ProjectLayerError`] for non-project records, digest mismatch,
 /// or the runtime [`PromptError`](bitty_ai_runtime::PromptError) when any
-/// layer text violates prompt bounds.
+/// layer text violates prompt bounds (including the Slice-3 pinned-layer
+/// trust gate).
 pub fn prompt_snapshot_with_project(
     record: &ContextRecord,
     full_digest: &str,
@@ -959,6 +969,88 @@ pub fn prompt_snapshot_with_project(
             LayerInput::text_only(PromptLayer::Project, project_text),
             LayerInput::text_only(PromptLayer::SkillsProfile, skills_profile),
             LayerInput::text_only(PromptLayer::RuntimeTurn, runtime_turn),
+        ],
+    )
+    .map_err(|err| ProjectLayerError::InvalidLayer {
+        message: format!("{err}"),
+    })
+}
+
+/// Candidate (AI-0250 Slice 3): PROJECT→tail wiring — build a validated
+/// [`PromptSnapshot`](bitty_ai_runtime::PromptSnapshot) with the verified
+/// snapshot text in the `RuntimeTurn` tail instead of the stable-prefix
+/// `Project` layer.
+///
+/// Trust-tiered zones, enforced at construction: snapshot repo content is
+/// `is_untrusted_surface` bytes (verified, never interpreted), so the
+/// Slice-3 preferred placement keeps it OUT of the stable prefix. The
+/// caller supplies the same digest-bound `record` + `full_digest` as
+/// [`prompt_snapshot_with_project`] (same provider + digest-prefix binding,
+/// same fail-closed refusals), plus host-pinned `project_pinned` intent for
+/// the stable `Project` layer (typically empty; any tail markers there still
+/// fail via the prompt trust gate) and the surrounding fixed layers. The
+/// tail renders as the marker-prefixed PROJECT text followed by the turn
+/// instruction (`project_text` alone when `runtime_turn` is empty, otherwise
+/// joined with one `\n`); the stable `Project` layer carries ONLY
+/// `project_pinned`.
+///
+/// Pinning note: existing cache-affinity flows (AI-0127/0128/0129) keep
+/// using [`prompt_snapshot_with_project`] (Project-layer placement) and keep
+/// passing; new context flows MUST use this tail builder so a snapshot
+/// refresh moves only tail bytes and the stable prefix (`CoreContract`,
+/// `User`, `Project`, `SkillsProfile` canonical head) stays byte-stable.
+/// Never silently moves bytes: callers choose the builder explicitly, and a
+/// digest mismatch or non-project record fails closed before any snapshot
+/// is constructed.
+///
+/// # Errors
+///
+/// Returns [`ProjectLayerError`] for non-project records, digest mismatch,
+/// or the runtime [`PromptError`](bitty_ai_runtime::PromptError) when any
+/// layer text violates prompt bounds (including the Slice-3 pinned-layer
+/// trust gate on `project_pinned` and the fixed layers).
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_snapshot_with_project_tail(
+    record: &ContextRecord,
+    full_digest: &str,
+    core_contract: &str,
+    user: &str,
+    project_pinned: &str,
+    skills_profile: &str,
+    runtime_turn: &str,
+    core_version: &str,
+) -> Result<bitty_ai_runtime::PromptSnapshot, ProjectLayerError> {
+    use bitty_ai_runtime::{LayerInput, PromptLayer, PromptSnapshot};
+    if record.provider != SNAPSHOT_PROVIDER {
+        return Err(ProjectLayerError::NotProjectRecord {
+            provider: record.provider.clone(),
+        });
+    }
+    let expected_tail = format!(
+        "digest {}",
+        full_digest.get(..SNAPSHOT_DIGEST_PREFIX_LEN).unwrap_or("")
+    );
+    if !record.summary.ends_with(&expected_tail) {
+        return Err(ProjectLayerError::DigestMismatch);
+    }
+    let project_text = project_layer_text(&record.summary, full_digest);
+    debug_assert!(
+        project_text.starts_with(SNAPSHOT_LAYER_MARKER),
+        "renderer must prefix the marker"
+    );
+    let tail_text = if runtime_turn.trim().is_empty() {
+        project_text
+    } else {
+        format!("{project_text}\n{}", runtime_turn.trim())
+    };
+    PromptSnapshot::new(
+        core_version,
+        vec![
+            LayerInput::text_only(PromptLayer::CoreContract, core_contract),
+            LayerInput::text_only(PromptLayer::User, user),
+            LayerInput::text_only(PromptLayer::Project, project_pinned),
+            LayerInput::text_only(PromptLayer::SkillsProfile, skills_profile),
+            LayerInput::text_only(PromptLayer::RuntimeTurn, tail_text),
         ],
     )
     .map_err(|err| ProjectLayerError::InvalidLayer {
