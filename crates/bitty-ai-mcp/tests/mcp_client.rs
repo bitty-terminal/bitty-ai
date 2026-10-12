@@ -1445,14 +1445,25 @@ mod unix {
         // Absent pin skips verification without touching the filesystem:
         // the same binary spawns exactly as before (Rank-1 capability pin
         // still applies at relist time, untouched here).
-        let path = pin_temp_path("absent");
-        write_executable(&path, "#!/bin/sh\nsleep 30\n");
-        let config = pin_config("pinabsent", &path.to_string_lossy(), None);
+        //
+        // AI-0251: the fixture is the stable system `/bin/sleep`, never a
+        // just-written /tmp script. Write-then-spawn of a fresh script races
+        // under parallel-suite fork pressure: `posix_spawnp` transiently
+        // fails with ETXTBSY (errno 26, surfaced as `SpawnFailed`) on the
+        // immediate write-close-to-exec path, while the gapped siblings
+        // (`match`/`oversized`, which hash between write and spawn) stay
+        // clean. Traced runs show a single writer and a fresh inode, so a
+        // more-unique path cannot fix it. `/bin/sleep` exercises the
+        // identical unpinned path (no verify, `command` straight to
+        // `Command::new`; same precedent as `hanging_helper_*` below) with
+        // no file race. No retry, no weakened assert.
+        let mut config = pin_config("pinabsent", "/bin/sleep", None);
+        config.args = vec!["30".to_owned()];
         config.validate().expect("unpinned validates");
         let mut server = spawn_server(&config, &no_env).expect("absent pin spawns");
         assert!(server.is_alive());
         server.shutdown();
-        let _ = std::fs::remove_file(&path);
+        assert!(!server.is_alive());
     }
 
     #[test]
