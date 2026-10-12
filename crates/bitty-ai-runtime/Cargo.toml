@@ -15,3 +15,8 @@ workspace = true
 
 [dependencies]
 # No dependencies: std only. No network providers, no TLS, no async runtime.
+
+[dev-dependencies]
+# AI-0257 report-only vocabulary conformance: bitty-agent-api at the exact
+# 7-char green-main rev pin per workspace policy. Test-only; never a prod dep.
+bitty-agent-api = { git = "https://github.com/bitty-terminal/bitty-agent", rev = "a8e4112" }
