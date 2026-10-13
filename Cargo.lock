@@ -115,11 +115,13 @@ dependencies = [
 name = "bitty-ai-slice"
 version = "0.0.1"
 dependencies = [
+ "bitty-ai-mcp",
  "bitty-ai-runtime",
  "bitty-ai-session",
  "bitty-ipc",
  "bitty-network",
  "bitty-network-api",
+ "bitty-network-tls",
  "bitty-package",
  "bitty-plugin-host",
  "hex",
@@ -153,8 +155,8 @@ dependencies = [
 
 [[package]]
 name = "bitty-network"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=f3c313244667e5dca910b4f7cd8e9d9447dce9a7#f3c313244667e5dca910b4f7cd8e9d9447dce9a7"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
 dependencies = [
  "bitty-network-api",
  "bitty-network-core",
@@ -166,13 +168,13 @@ dependencies = [
 
 [[package]]
 name = "bitty-network-api"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=f3c313244667e5dca910b4f7cd8e9d9447dce9a7#f3c313244667e5dca910b4f7cd8e9d9447dce9a7"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
 
 [[package]]
 name = "bitty-network-core"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=f3c313244667e5dca910b4f7cd8e9d9447dce9a7#f3c313244667e5dca910b4f7cd8e9d9447dce9a7"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
 dependencies = [
  "bitty-network-api",
  "idna",
@@ -180,13 +182,13 @@ dependencies = [
 
 [[package]]
 name = "bitty-network-dns"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=f3c313244667e5dca910b4f7cd8e9d9447dce9a7#f3c313244667e5dca910b4f7cd8e9d9447dce9a7"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
 
 [[package]]
 name = "bitty-network-tls"
-version = "0.1.0"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=f3c313244667e5dca910b4f7cd8e9d9447dce9a7#f3c313244667e5dca910b4f7cd8e9d9447dce9a7"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
 dependencies = [
  "bitty-network-api",
  "idna",
@@ -1013,9 +1015,9 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "potential_utf"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
+checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "serde_core",
  "writeable",
@@ -1290,9 +1292,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-platform-verifier"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0"
+checksum = "1167586491e2b18b8bfbb293e8180ec17c201c4f076d7cb3070ca964e7598f98"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
@@ -1311,9 +1313,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-platform-verifier-android"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
+checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
@@ -1973,9 +1975,9 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yoke"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe8c5fda708d9ca3df187cae8bfb9ceda00dd96231bed36e445a1a48e66f9ca"
+checksum = "709fe23a0424b6a435d82152b1bd3fdfb0833487d5fa90d05d42762a9891fef5"
 dependencies = [
  "stable_deref_trait",
  "yoke-derive",
@@ -1984,14 +1986,14 @@ dependencies = [
 
 [[package]]
 name = "yoke-derive"
-version = "0.8.2"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
+checksum = "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
- "synstructure 0.13.2",
+ "syn 3.0.6",
+ "synstructure 0.14.0",
 ]
 
 [[package]]
@@ -2043,9 +2045,9 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zerotrie"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f9152d31db0792fa83f70fb2f83148effb5c1f5b8c7686c3459e361d9bc20bf"
+checksum = "4ea269c3bd32f0a32c321907a2ae912ba6f4649bb0fc764a15627e99a7095a3f"
 dependencies = [
  "displaydoc",
  "yoke",
@@ -2054,9 +2056,9 @@ dependencies = [
 
 [[package]]
 name = "zerovec"
-version = "0.11.6"
+version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90f911cbc359ab6af17377d242225f4d75119aec87ea711a880987b18cd7b239"
+checksum = "bb0464e17806c1d976d5cba29399c7f08e516e279e2ba493f63123b5fca67dd8"
 dependencies = [
  "serde",
  "yoke",

@@ -72,6 +72,7 @@ pub mod network_adapter;
 pub mod pending_host;
 pub mod session_refs;
 pub mod snapshot_ingest;
+pub mod spki_provider;
 pub mod task_dag;
 pub mod wheel_bridge;
 pub mod wheel_kernel;
@@ -128,6 +129,7 @@ pub use snapshot_ingest::{
     SnapshotIngestRequest, ingest_compiled_turn, ingest_snapshot, project_layer_text,
     prompt_snapshot_with_project, snapshot_digest_hex,
 };
+pub use spki_provider::NetworkSpkiProvider;
 pub use task_dag::{
     TaskDraft, TaskEngine, TaskEngineError, TaskId, TaskNode, TaskStatus, TaskView,
 };
