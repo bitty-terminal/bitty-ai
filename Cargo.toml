@@ -10,6 +10,9 @@ members = [
   "crates/bitty-ai-session",
   # Hand-rolled sync stdio MCP client (AI-0179). Std plus path dep only.
   "crates/bitty-ai-mcp",
+  # Host-boundary shell skeleton, Phase 1 per CTX-0147 (AI-0261). Names only,
+  # no behavior; same quality posture as sibling crates from day one.
+  "crates/bitty-ai-host",
   # Future crates:
   # - crates/bitty-ai-model-provider
   # - crates/bitty-ai-context-provider
