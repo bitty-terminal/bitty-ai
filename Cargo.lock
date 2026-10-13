@@ -86,6 +86,10 @@ version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-agent?rev=a8e4112#a8e4112116a7e6c74382ab8294a98096f74d2a14"
 
 [[package]]
+name = "bitty-ai-host"
+version = "0.0.1"
+
+[[package]]
 name = "bitty-ai-mcp"
 version = "0.0.1"
 dependencies = [

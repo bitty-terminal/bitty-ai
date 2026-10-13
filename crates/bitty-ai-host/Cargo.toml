@@ -1,0 +1,18 @@
+[package]
+name = "bitty-ai-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Host-boundary shell skeleton, Phase 1 per CTX-0147 (no behavior)"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No dependencies: std only. Any future network, TLS, or IPC dependency needs
+# its own scoped task plus supply-chain review before adoption (CTX-0147).
