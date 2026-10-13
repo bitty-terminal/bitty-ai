@@ -53,10 +53,9 @@
 //!   the in-crate hasher, with the same supply-chain review.
 //! - A trust-policy decision: which roots the provider verifies against and
 //!   who configures them (this experiment uses native-only trust).
-//! - The offline-first capability discipline: this experiment self-grants the
-//!   observed host per call; a shipped provider must instead take its grant
-//!   from the caller's capability (the [`NetworkSpkiProvider::with_capability`]
-//!   restrictive mode previews that shape).
+//! - The offline-first capability discipline: the default provider carries
+//!   no grant (every lookup is `None` with zero socket contact); a grant
+//!   arrives only through [`NetworkSpkiProvider::with_capability`].
 //!
 //! [`bitty_ai_mcp::HttpLineTransport`]: https://github.com/bitty-terminal/bitty-ai
 
@@ -77,10 +76,9 @@ const MAX_HOST_LEN: usize = 253;
 
 /// Real [`PeerKeyProvider`] over the `bitty-network-tls` peer accessor.
 ///
-/// Parses host/port from the endpoint URL, fetches the leaf SPKI DER with an
-/// offline-deny-default capability opened for that host plus a native-only
-/// [`TlsProvider`], and SHA-256 hashes the DER consumer-side. Any failure —
-/// malformed URL, non-HTTPS scheme, capability denial, DNS/TCP/TLS failure,
+/// Parses host/port from the endpoint URL, fetches the leaf SPKI DER with the
+/// configured base capability plus a native-only [`TlsProvider`], and SHA-256
+/// hashes the DER consumer-side. Any failure — missing grant, malformed URL,
 /// or unparsable certificate — reports `None` (unavailable key), never a
 /// panic and never key bytes in an error.
 #[derive(Debug)]
@@ -88,9 +86,9 @@ pub struct NetworkSpkiProvider {
     /// Native-only trust provider (no custom roots, no client identity).
     tls: TlsProvider,
     /// Optional restrictive base grant enforced before any socket work. When
-    /// `None` (experiment default) the fetch self-grants the observed host
-    /// per call; when `Some`, the host/port must first pass this grant or the
-    /// lookup returns `None` with zero socket contact.
+    /// `None` (default) every lookup returns `None` with zero socket contact
+    /// (fail-closed: no self-grant); when `Some`, the host/port must first
+    /// pass this grant or the lookup returns `None` with zero socket contact.
     base_capability: Option<NetworkCapability>,
     /// Whole-fetch bound (DNS, TCP, handshake together); `None` applies the
     /// accessor default (`bitty_network_tls::DEFAULT_PEER_TIMEOUT`).
@@ -98,8 +96,10 @@ pub struct NetworkSpkiProvider {
 }
 
 impl NetworkSpkiProvider {
-    /// Provider with native-only trust, per-host self-grant, and the accessor
-    /// default timeout. Performs no I/O at construction.
+    /// Provider with native-only trust, no grant, and the accessor
+    /// default timeout. Performs no I/O at construction. Every lookup
+    /// returns `None` until a grant arrives via [`with_capability`]
+    /// (fail-closed default: no self-grant, zero socket contact).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -133,13 +133,9 @@ impl NetworkSpkiProvider {
     /// transport failure, or unparsable certificate. Never panics, never
     /// echoes key material.
     pub fn fetch_for_host(&self, host: &str, port: u16) -> Option<[u8; 32]> {
-        let capability = match &self.base_capability {
-            Some(base) => {
-                base.check_host_port(host, port).ok()?;
-                base.clone()
-            }
-            None => NetworkCapability::offline().with_domain(host),
-        };
+        let base = self.base_capability.as_ref()?;
+        base.check_host_port(host, port).ok()?;
+        let capability = base.clone();
         let der = peer_leaf_spki_der(host, port, &capability, &self.tls, self.timeout).ok()?;
         Some(spki_sha256_of_der(&der))
     }
@@ -254,6 +250,19 @@ mod tests {
     /// socket contact (the Nothing-To-Observe shape the offline tests pin).
     fn denied_provider() -> NetworkSpkiProvider {
         NetworkSpkiProvider::new().with_capability(NetworkCapability::offline())
+    }
+
+    /// Fail-closed default: a provider with no grant fetches nothing (no
+    /// self-grant, zero socket contact) — CodeRabbit Minor on PR #433.
+    #[test]
+    fn default_provider_without_grant_fetches_nothing() {
+        let bare = NetworkSpkiProvider::new();
+        assert_eq!(bare.fetch_for_host("example.com", 443), None);
+        assert_eq!(bare.peer_spki_sha256("https://example.com/rpc"), None);
+        assert_eq!(
+            NetworkSpkiProvider::default().fetch_for_host("example.com", 443),
+            None
+        );
     }
 
     #[test]
@@ -416,7 +425,10 @@ mod tests {
 
         const URL: &str = "https://example.com/rpc";
         let bound = Duration::from_secs(10);
-        let probe = NetworkSpkiProvider::new().with_timeout(bound);
+        let grant = NetworkCapability::offline().with_domain("example.com");
+        let probe = NetworkSpkiProvider::new()
+            .with_capability(grant)
+            .with_timeout(bound);
         let first = probe
             .peer_spki_sha256(URL)
             .expect("live handshake must observe a key");
@@ -443,7 +455,11 @@ mod tests {
         };
         let mut transport = HttpLineTransport::new(config, service)
             .expect("pinned config validates")
-            .with_peer_keys(NetworkSpkiProvider::new().with_timeout(bound));
+            .with_peer_keys(
+                NetworkSpkiProvider::new()
+                    .with_capability(NetworkCapability::offline().with_domain("example.com"))
+                    .with_timeout(bound),
+            );
         transport
             .send_line(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
             .expect("pinned live key must pass the pin check");
