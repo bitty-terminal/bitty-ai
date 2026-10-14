@@ -28,6 +28,9 @@
 //!   -> capability-subset match (empty requirement set refused: never by name alone)
 //!   -> context-window minimum filter (unknown `0` satisfies no minimum)
 //!   -> cost-ceiling filter (effective weights must fit; `0` counts as baseline `1`)
+//!   -> caller-scope intersection (Phase 2 S3 per CTX-0149: empty echo is
+//!      unfiltered; otherwise the candidate must grant every requested scope;
+//!      unknown scopes fail closed with `NoCandidate`)
 //!   -> ordered fallback chain (alias order with an alias, else provider/model
 //!      lexicographic; non-alias entries are never appended to an alias chain)
 //!   -> per-candidate execution stays runtime-side via its `ModelProvider`
@@ -40,9 +43,13 @@
 //!
 //! - No provider trait, no `list_models`/`complete` wiring, no execution.
 //!   Selection returns snapshots; execution stays on the runtime side.
-//! - No MP-4 caller-scope filter and no closed-vocabulary enforcement: the
-//!   capability mapping prose on [`SelectRequest`] is routing vocabulary
-//!   only, never a rejection rule.
+//!   Provider-side `list_models`/`complete` scope filtering stays owned by
+//!   AI-0290 and is never re-mirrored here.
+//! - MP-4 caller-scope filter (Phase 2 S3 per CTX-0149) is selection-side
+//!   only via [`CallerScope`], [`ScopePolicy`], and [`select_filtered`]
+//!   below; there is still no closed-vocabulary enforcement: the capability
+//!   mapping prose on [`SelectRequest`] is routing vocabulary only, never a
+//!   rejection rule.
 //! - Context-window and cost metadata are data for routing and budget
 //!   decisions, not enforcement by themselves. Cost weights are relative
 //!   routing units, never currency.
@@ -70,7 +77,11 @@
 //! [`provider_registry`](crate::provider_registry) module and only
 //! re-exported here, so both paths name the same items with no logic
 //! duplication. What this module owns is the selection-side S2 envelope
-//! layer below plus the gate-order contract above.
+//! layer below, the selection-side S3 caller-scope filter
+//! ([`CallerScope`], [`ScopePolicy`], [`select_filtered`] plus the
+//! `MAX_CALLER_SCOPE_LEN`, `MAX_CALLER_SCOPES`, `MAX_SCOPED_MODELS`, and
+//! `MAX_SCOPES_PER_MODEL` bounds) per CTX-0149, plus the gate-order contract
+//! above.
 //!
 pub use crate::provider_registry::{
     FallbackDirective, MAX_ALIAS_CANDIDATES, MAX_ALIASES, MAX_MODEL_NAME_LEN, MAX_PROVIDER_ID_LEN,
@@ -375,6 +386,396 @@ impl EstimateCostEnvelopeResponse {
                 self.output_weight,
             )
     }
+}
+
+// ── Phase 2 S3 caller-scope filter (no transport, AI-0291) ──
+//
+// Selection-side caller-scope filter per the CTX-0149 candidate in
+// `providers/provider-plugin-boundary.md` (MP-4 section): scope vocabulary
+// plus intersection-only narrowing with deny-by-default, enforced host-side
+// at dispatch before selection and provider I/O. The request envelope
+// carries a scope echo for audit while the host — never the adapter —
+// applies the filter; the echo is observation data, not authority.
+//
+// What is reused, not re-mirrored: [`ModelCapability`], [`SelectRequest`],
+// [`SelectedModel`], [`SelectionError`], [`ProviderError`],
+// [`FallbackDirective`], [`ModelRef`], [`ProviderRegistry`],
+// [`SelectEnvelopeRequest`], [`estimate_cost`], [`fallback_directive`], the
+// S1 `matches` gate (capability-subset plus window minimum where unknown
+// `0` satisfies nothing plus cost ceiling where effective `0` counts as
+// baseline `1`), and the S1 `MAX_*` discipline. What is new here:
+// [`CallerScope`], [`ScopePolicy`], [`select_filtered`], and the
+// `MAX_CALLER_SCOPE_LEN`, `MAX_CALLER_SCOPES`, `MAX_SCOPED_MODELS`, and
+// `MAX_SCOPES_PER_MODEL` bounds below. What stays out: provider-side
+// `list_models`/`complete` envelopes (AI-0290 owns those and they appear
+// here by name only), transport of any kind, any `version` field, threads,
+// clock reads, filesystem or network access, credentials or secrets, and any
+// `Cargo.toml` change (`std`-only).
+//
+// Scope vocabulary (candidate-exact where the candidate pins it, minimal
+// concrete choice where the candidate leaves it open): caller identity
+// reuses the established caller triple shape (protocol, instance, session)
+// without a new authentication primitive; authentication, consent, and
+// budget gates stay with the existing IPC and `ai.provider` controls. A
+// scope string is bounded ([`MAX_CALLER_SCOPE_LEN`] bytes), printable-ASCII
+// (the closed charset below is a printable subset), slash-separated
+// (`segment(/segment)*` with no empty segment, hence no leading/trailing
+// `/` and no `//`), closed-charset (each segment
+// `[a-z0-9][a-z0-9_.-]*`); an empty, overlong, or out-of-grammar value is
+// invalid. Registry-field placement was open: grants live selection-side in
+// [`ScopePolicy`] so the S1 registry stays untouched for AI-0290.
+//
+// Filter semantics (intersection-only narrowing with deny-by-default): the
+// unfiltered registry snapshot stays preserved as-is (an empty scope echo
+// applies no filtering); a filtered view is a subset of that snapshot for
+// the same request and never wider. A candidate passes the scope gate iff
+// its granted scopes contain every requested scope (`requested ⊆ granted`),
+// so adding a requested scope never widens visibility. A model with no
+// grant entry is denied whenever filtering (deny-by-default) and allowed
+// only when unfiltered. An unknown scope (granted by no candidate) fails
+// closed with [`SelectionError::NoCandidate`] carrying names only
+// (requirement summary plus requested scope names), never credential values
+// or raw vendor text.
+//
+// Gate and mapping summary (re-stated, not re-implemented): [`select_filtered`]
+// traverses alias resolution (unknown alias fails; stale candidates skipped
+// in declared order; the alias is exclusive and a full alias miss fails
+// closed) -> capability-subset match (empty requirement set refused) ->
+// context-window minimum (unknown `0` satisfies no minimum) -> cost ceiling
+// (effective `0` counts as baseline `1`, so `Some(0)` admits nothing) ->
+// scope intersection (`requested ⊆ granted`; empty echo is unfiltered) ->
+// ordered chain (alias-declared order with an alias, else provider/model
+// lexicographic; non-alias entries are never appended to an alias chain);
+// the fallback mapping is unchanged ([`fallback_directive`], with
+// [`ProviderError::Unknown`] mapping to [`FallbackDirective::Stop`]).
+// ---------------------------------------------------------------------------
+
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
+/// Maximum caller-scope string length in bytes (S3, MP-4 candidate).
+///
+/// Mirrors the S1 bound discipline ([`MAX_PROVIDER_ID_LEN`] is also 64):
+/// a bounded, printable-ASCII, slash-separated name with a stated ceiling;
+/// an empty, overlong, or out-of-grammar value stays invalid.
+pub const MAX_CALLER_SCOPE_LEN: usize = 64;
+/// Maximum caller scopes per filtered selection (S3).
+///
+/// Mirrors [`MAX_ALIAS_CANDIDATES`]: an over-limit echo fails closed with
+/// [`SelectionError::TooManyCandidates`] (fixed `scope-echo` marker, counts
+/// only) so selection bounds CPU and refusal detail.
+pub const MAX_CALLER_SCOPES: usize = 8;
+/// Maximum scope-granted models in a [`ScopePolicy`] (S3).
+///
+/// Mirrors [`MAX_REGISTERED_MODELS`]: a full policy refuses with
+/// [`SelectionError::RegistryFull`]. Every refusal leaves the policy
+/// unchanged.
+pub const MAX_SCOPED_MODELS: usize = 64;
+/// Maximum granted scopes per model in a [`ScopePolicy`] (S3).
+///
+/// Mirrors [`MAX_ALIAS_CANDIDATES`]: an over-limit grant fails closed with
+/// [`SelectionError::TooManyCandidates`] carrying the `provider/model` key
+/// plus limit and actual counts (names only).
+pub const MAX_SCOPES_PER_MODEL: usize = 8;
+
+/// One validated caller scope (S3, MP-4 candidate).
+///
+/// A bounded, printable-ASCII, slash-separated name with a closed charset:
+/// `segment(/segment)*` where each segment is `[a-z0-9][a-z0-9_.-]*` (no
+/// empty segment, hence no leading/trailing `/` and no `//`), at most
+/// [`MAX_CALLER_SCOPE_LEN`] bytes. Construction validates; the echo is
+/// observation data for audit, not authority (the host applies the filter
+/// in [`select_filtered`] before selection and provider I/O).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerScope {
+    /// Validated scope string (never empty, overlong, or out-of-grammar).
+    scope: String,
+}
+
+impl CallerScope {
+    /// Validate a scope string.
+    ///
+    /// Fail-closed: an empty, overlong, or out-of-grammar value is refused
+    /// with [`SelectionError::InvalidName`] (carries the rejected name only,
+    /// never secrets).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelectionError::InvalidName`] when the shape is violated.
+    pub fn new(scope: impl Into<String>) -> Result<Self, SelectionError> {
+        let scope = scope.into();
+        let valid = !scope.is_empty()
+            && scope.len() <= MAX_CALLER_SCOPE_LEN
+            && scope.split('/').all(|segment| {
+                let mut bytes = segment.bytes();
+                match bytes.next() {
+                    Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit() => {}
+                    _ => return false,
+                }
+                bytes.all(|b| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b == b'_'
+                        || b == b'-'
+                        || b == b'.'
+                })
+            });
+        if valid {
+            Ok(Self { scope })
+        } else {
+            Err(SelectionError::InvalidName { name: scope })
+        }
+    }
+
+    /// Validated scope string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.scope
+    }
+
+    /// Consume into the validated scope string.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.scope
+    }
+}
+
+impl Display for CallerScope {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "{}", self.scope)
+    }
+}
+
+/// One scope-granted model entry (S3): the `(provider, model)` key plus its
+/// granted caller scopes. Private: construction and inspection go through
+/// [`ScopePolicy`] so the fail-closed discipline (duplicate/conflict before
+/// capacity, no state change on any refusal) holds by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedModel {
+    /// Owning provider id (`MP-2` shape, validated at grant time).
+    provider_id: String,
+    /// Registry-known model name (validated at grant time).
+    model: String,
+    /// Granted caller scopes (at most [`MAX_SCOPES_PER_MODEL`]; empty means
+    /// visible only when unfiltered, denied whenever filtering).
+    scopes: Vec<CallerScope>,
+}
+
+/// Selection-side caller-scope grants (S3, MP-4 candidate).
+///
+/// A sidecar table mapping each `(provider, model)` key to the caller scopes
+/// that may see it. The S1 [`ProviderRegistry`] stays untouched (AI-0290
+/// owns the provider side); this policy holds only the scope placements
+/// whose exact registry-field placement the candidate left open. Entries
+/// keep grant order internally; selection output order is always derived
+/// (alias order, then provider/model lexicographic), never grant order.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ScopePolicy {
+    /// Granted models in grant order.
+    grants: Vec<ScopedModel>,
+}
+
+impl ScopePolicy {
+    /// Construct an empty policy (no grants: every filtered selection misses
+    /// until grants arrive; unfiltered selections still pass through).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Grant caller scopes to one `(provider, model)` key.
+    ///
+    /// Fail-closed, mirroring the registry discipline: an exact re-grant is
+    /// refused with [`SelectionError::DuplicateModel`]; the same key with
+    /// different scopes is refused with [`SelectionError::ConflictingModel`]
+    /// (no shadowing, no merge: the kept entry is untouched); malformed keys
+    /// are refused with their typed error via [`ModelRef::new`]; an
+    /// over-limit scope list with [`SelectionError::TooManyCandidates`]
+    /// (alias carries the `provider/model` key plus limit and actual);
+    /// a full policy with [`SelectionError::RegistryFull`]. Every refusal
+    /// leaves the policy unchanged. Duplicate/conflict checks run before the
+    /// capacity check, so a duplicate reports as a duplicate even when the
+    /// policy is full. An empty scope list is allowed: it is visible only
+    /// when unfiltered and denied whenever filtering (deny-by-default).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelectionError`] as described above.
+    pub fn grant(
+        &mut self,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+        scopes: Vec<CallerScope>,
+    ) -> Result<(), SelectionError> {
+        let key = ModelRef::new(provider_id, model)?;
+        if let Some(kept) = self
+            .grants
+            .iter()
+            .find(|kept| kept.provider_id == key.provider_id && kept.model == key.model)
+        {
+            if kept.scopes == scopes {
+                return Err(SelectionError::DuplicateModel {
+                    provider: key.provider_id,
+                    model: key.model,
+                });
+            }
+            return Err(SelectionError::ConflictingModel {
+                provider: key.provider_id,
+                model: key.model,
+            });
+        }
+        if scopes.len() > MAX_SCOPES_PER_MODEL {
+            return Err(SelectionError::TooManyCandidates {
+                alias: format!("{}/{}", key.provider_id, key.model),
+                limit: MAX_SCOPES_PER_MODEL,
+                actual: scopes.len(),
+            });
+        }
+        if self.grants.len() >= MAX_SCOPED_MODELS {
+            return Err(SelectionError::RegistryFull {
+                limit: MAX_SCOPED_MODELS,
+            });
+        }
+        self.grants.push(ScopedModel {
+            provider_id: key.provider_id,
+            model: key.model,
+            scopes,
+        });
+        Ok(())
+    }
+
+    /// Granted model count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.grants.len()
+    }
+
+    /// Whether the policy holds no grant.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.grants.is_empty()
+    }
+
+    /// Granted scopes for one `(provider, model)` key, if any.
+    #[must_use]
+    pub fn scopes_for(&self, provider_id: &str, model: &str) -> Option<&[CallerScope]> {
+        self.grants
+            .iter()
+            .find(|kept| kept.provider_id == provider_id && kept.model == model)
+            .map(|kept| kept.scopes.as_slice())
+    }
+
+    /// Whether one `(provider, model)` key is visible under `scope_echo`.
+    ///
+    /// An empty echo is unfiltered (always visible: the snapshot stays
+    /// preserved as-is). Otherwise the key must have a grant entry whose
+    /// scopes contain every requested scope (`requested ⊆ granted`); a key
+    /// with no entry, or missing any requested scope, is denied
+    /// (deny-by-default; unknown scopes fail closed downstream as
+    /// [`SelectionError::NoCandidate`]). Pure, deterministic, no I/O.
+    #[must_use]
+    pub fn is_visible(&self, provider_id: &str, model: &str, scope_echo: &[CallerScope]) -> bool {
+        if scope_echo.is_empty() {
+            return true;
+        }
+        match self.scopes_for(provider_id, model) {
+            Some(granted) => scope_echo.iter().all(|want| granted.contains(want)),
+            None => false,
+        }
+    }
+}
+
+/// Select the ordered fallback chain for `request` under `scope_echo`.
+///
+/// Gate order: empty requirement refused ([`SelectionError::EmptyRequirement`];
+/// never by name or alias alone) -> over-limit scope echo refused
+/// ([`SelectionError::TooManyCandidates`] with the fixed `scope-echo`
+/// marker) -> alias resolution (unknown alias fails with
+/// [`SelectionError::UnknownAlias`]; stale candidates skipped in declared
+/// order; the alias is exclusive and a full alias miss fails closed) ->
+/// capability-subset match plus context-window minimum (unknown `0`
+/// satisfies no minimum) plus cost ceiling (effective `0` counts as baseline
+/// `1`, via [`SelectRequest::matches`]) -> scope intersection
+/// (`requested ⊆ granted` per [`ScopePolicy::is_visible`]; empty echo is
+/// unfiltered) -> ordered chain (alias-declared order with an alias, else
+/// provider/model lexicographic; non-alias entries are never appended to an
+/// alias chain). The primary is element `0`; every element independently
+/// satisfies the request plus the scope echo, so advancing on a typed
+/// transient error never weakens the requirement set. A full miss at any
+/// gate after alias resolution fails closed with
+/// [`SelectionError::NoCandidate`] whose detail carries the requirement
+/// summary plus the requested scope names only (never secrets or vendor
+/// text). The fallback mapping is unchanged: classify per-candidate
+/// failures separately with [`fallback_directive`] (`Advance` on
+/// transport/rate-limit/unavailable/timeout, `Stop` otherwise including
+/// [`ProviderError::Unknown`).
+///
+/// All behavior is deterministic from the registry contents plus the
+/// request, echo, and policy: no wall clock, no threads, no filesystem, no
+/// secrets. Selection returns detached snapshots; execution stays
+/// runtime-side.
+///
+/// # Errors
+///
+/// Returns [`SelectionError::EmptyRequirement`] when no capability is
+/// required, [`SelectionError::TooManyCandidates`] when the echo exceeds
+/// [`MAX_CALLER_SCOPES`], [`SelectionError::UnknownAlias`] for an
+/// unregistered alias, or [`SelectionError::NoCandidate`] when nothing
+/// satisfies the request plus the scope echo (including a fully missed or
+/// fully scope-denied alias).
+pub fn select_filtered(
+    registry: &ProviderRegistry,
+    request: &SelectEnvelopeRequest,
+    scope_echo: &[CallerScope],
+    policy: &ScopePolicy,
+) -> Result<Vec<SelectedModel>, SelectionError> {
+    if request.required.is_empty() {
+        return Err(SelectionError::EmptyRequirement);
+    }
+    if scope_echo.len() > MAX_CALLER_SCOPES {
+        return Err(SelectionError::TooManyCandidates {
+            alias: "scope-echo".to_owned(),
+            limit: MAX_CALLER_SCOPES,
+            actual: scope_echo.len(),
+        });
+    }
+    let base = request.to_select_request();
+    let mut chain: Vec<SelectedModel> = Vec::new();
+    if let Some(alias) = &request.alias {
+        let candidates = registry.resolve_alias(alias)?;
+        for candidate in candidates {
+            match registry.lookup(&candidate.provider_id, &candidate.model) {
+                Some(entry)
+                    if base.matches(entry)
+                        && policy.is_visible(&entry.provider_id, &entry.name, scope_echo) =>
+                {
+                    chain.push(SelectedModel::from_entry(entry));
+                }
+                Some(_) | None => {}
+            }
+        }
+    } else {
+        for entry in registry.entries() {
+            if base.matches(entry) && policy.is_visible(&entry.provider_id, &entry.name, scope_echo)
+            {
+                chain.push(SelectedModel::from_entry(entry));
+            }
+        }
+    }
+    if chain.is_empty() {
+        return Err(SelectionError::NoCandidate {
+            detail: scope_detail(request, scope_echo),
+        });
+    }
+    Ok(chain)
+}
+
+/// Human-readable requirement-plus-scope summary for
+/// [`SelectionError::NoCandidate`]: the S1 [`SelectRequest::describe`] text
+/// plus the requested scope names only (`scopes=[a,b]`; `scopes=[]` when
+/// unfiltered). Never carries secrets or vendor text.
+fn scope_detail(request: &SelectEnvelopeRequest, scope_echo: &[CallerScope]) -> String {
+    let names: Vec<&str> = scope_echo.iter().map(CallerScope::as_str).collect();
+    format!("{} scopes=[{}]", request.describe(), names.join(","))
 }
 
 #[cfg(test)]
@@ -1537,6 +1938,522 @@ mod tests {
         assert_eq!(
             via_selection[0].estimate_cost(10, 5),
             crate::provider_registry::estimate_cost(10, 5, 1, 2)
+        );
+    }
+
+    fn scope(name: &str) -> CallerScope {
+        CallerScope::new(name).expect("valid scope")
+    }
+
+    fn scoped_registry() -> ProviderRegistry {
+        let mut registry = registry_two();
+        registry
+            .register(text_model("bitty-c", "fast"))
+            .expect("capacity");
+        registry
+    }
+
+    fn scoped_policy() -> ScopePolicy {
+        // bitty-a/vision sees team-a only; bitty-b/chat sees team-a and
+        // team-b; bitty-c/fast sees team-b only. A two-scope echo therefore
+        // admits only chat (requested ⊆ granted), so adding a scope never
+        // widens.
+        let mut policy = ScopePolicy::new();
+        policy
+            .grant("bitty-a", "vision", vec![scope("team-a")])
+            .expect("capacity");
+        policy
+            .grant("bitty-b", "chat", vec![scope("team-a"), scope("team-b")])
+            .expect("capacity");
+        policy
+            .grant("bitty-c", "fast", vec![scope("team-b")])
+            .expect("capacity");
+        policy
+    }
+
+    #[test]
+    fn scope_string_grammar() {
+        assert_eq!(MAX_CALLER_SCOPE_LEN, 64);
+        assert_eq!(MAX_CALLER_SCOPES, 8);
+        assert_eq!(MAX_SCOPED_MODELS, 64);
+        assert_eq!(MAX_SCOPES_PER_MODEL, 8);
+        for valid in [
+            "team-a",
+            "a",
+            "a1",
+            "team-a/proj-x",
+            "proto/inst/session",
+            "x.y-z_w",
+        ] {
+            let parsed = CallerScope::new(valid).expect("valid scope");
+            assert_eq!(parsed.as_str(), valid);
+            assert_eq!(parsed.clone().into_string(), valid);
+            assert_eq!(parsed.to_string(), valid);
+        }
+        for invalid in [
+            "",
+            "Team-a",
+            "team a",
+            "/team-a",
+            "team-a/",
+            "team-a//proj",
+            "-team",
+            ".team",
+            "_team",
+            "team-😀",
+            "TEAM",
+        ] {
+            assert!(
+                matches!(
+                    CallerScope::new(invalid),
+                    Err(SelectionError::InvalidName { .. })
+                ),
+                "must refuse: {invalid:?}"
+            );
+        }
+        let overlong = "a".repeat(MAX_CALLER_SCOPE_LEN + 1);
+        assert!(matches!(
+            CallerScope::new(overlong),
+            Err(SelectionError::InvalidName { .. })
+        ));
+        let ceiling = "a".repeat(MAX_CALLER_SCOPE_LEN);
+        assert!(CallerScope::new(ceiling).is_ok());
+    }
+
+    #[test]
+    fn scope_policy_grant_discipline() {
+        let mut policy = ScopePolicy::new();
+        assert!(policy.is_empty());
+        assert_eq!(policy.len(), 0);
+        policy
+            .grant("bitty-a", "vision", vec![scope("team-a")])
+            .expect("capacity");
+        assert_eq!(policy.len(), 1);
+        assert_eq!(
+            policy.scopes_for("bitty-a", "vision"),
+            Some(vec![scope("team-a")].as_slice())
+        );
+        assert!(policy.scopes_for("bitty-a", "other").is_none());
+        // Empty grant is allowed: visible only when unfiltered, denied
+        // whenever filtering (deny-by-default).
+        policy
+            .grant("bitty-b", "chat", Vec::new())
+            .expect("capacity");
+        assert!(policy.is_visible("bitty-b", "chat", &[]));
+        assert!(!policy.is_visible("bitty-b", "chat", &[scope("team-a")]));
+        // Ungranted keys are denied when filtering, allowed when unfiltered.
+        assert!(policy.is_visible("bitty-c", "fast", &[]));
+        assert!(!policy.is_visible("bitty-c", "fast", &[scope("team-a")]));
+        // Exact re-grant is a duplicate; same key with different scopes is a
+        // conflict (no shadowing, kept untouched).
+        let retry = policy.grant("bitty-a", "vision", vec![scope("team-a")]);
+        assert_eq!(
+            retry.expect_err("duplicate must fail"),
+            SelectionError::DuplicateModel {
+                provider: "bitty-a".to_owned(),
+                model: "vision".to_owned(),
+            }
+        );
+        let shadow = policy.grant("bitty-a", "vision", vec![scope("team-b")]);
+        assert_eq!(
+            shadow.expect_err("conflict must fail"),
+            SelectionError::ConflictingModel {
+                provider: "bitty-a".to_owned(),
+                model: "vision".to_owned(),
+            }
+        );
+        assert_eq!(
+            policy.scopes_for("bitty-a", "vision"),
+            Some(vec![scope("team-a")].as_slice())
+        );
+        // Malformed keys are refused with their typed error.
+        assert!(matches!(
+            policy.grant("BITTY", "chat", vec![scope("team-a")]),
+            Err(SelectionError::InvalidProviderId { .. })
+        ));
+        assert!(matches!(
+            policy.grant("bitty-a", "Chat", vec![scope("team-a")]),
+            Err(SelectionError::InvalidName { .. })
+        ));
+        assert_eq!(policy.len(), 2);
+        // Over-limit scope lists fail closed with names plus counts.
+        let burst: Vec<CallerScope> = (0..MAX_SCOPES_PER_MODEL + 1)
+            .map(|index| scope(format!("team-{index}").as_str()))
+            .collect();
+        let error = policy
+            .grant("bitty-c", "fast", burst)
+            .expect_err("burst must fail");
+        match error {
+            SelectionError::TooManyCandidates {
+                alias,
+                limit,
+                actual,
+            } => {
+                assert_eq!(alias, "bitty-c/fast");
+                assert_eq!(limit, MAX_SCOPES_PER_MODEL);
+                assert_eq!(actual, MAX_SCOPES_PER_MODEL + 1);
+            }
+            other => panic!("burst must report bound: {other:?}"),
+        }
+        assert_eq!(policy.len(), 2);
+    }
+
+    #[test]
+    fn scope_filter_exclusive_alias_plus_scope() {
+        let mut registry = scoped_registry();
+        registry
+            .register_alias(
+                "chat",
+                vec![
+                    ModelRef::new("bitty-c", "fast").expect("valid ref"),
+                    ModelRef::new("bitty-b", "chat").expect("valid ref"),
+                ],
+            )
+            .expect("capacity");
+        let policy = scoped_policy();
+        // Echo team-b: both alias candidates grant it, in declared order.
+        // The matching non-alias entry (bitty-a/vision) is never appended.
+        let request =
+            SelectEnvelopeRequest::new(vec![Cap::Text], Some("chat".to_owned()), None, None);
+        let chain = select_filtered(&registry, &request, &[scope("team-b")], &policy)
+            .expect("alias resolves under team-b");
+        let order: Vec<(&str, &str)> = chain
+            .iter()
+            .map(|item| (item.provider_id.as_str(), item.name.as_str()))
+            .collect();
+        assert_eq!(order, vec![("bitty-c", "fast"), ("bitty-b", "chat")]);
+        assert_eq!(chain[0].name, "fast");
+        // Echo team-a: fast grants team-b only, so it is denied; the chain
+        // stays alias-only with chat alone (no fall-through to vision).
+        let chain = select_filtered(&registry, &request, &[scope("team-a")], &policy)
+            .expect("alias narrows to chat under team-a");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider_id, "bitty-b");
+        assert_eq!(chain[0].name, "chat");
+        // Unknown scope (well-formed, granted by nothing) fails closed with
+        // names only, never a fall-through to vision.
+        match select_filtered(&registry, &request, &[scope("team-c")], &policy) {
+            Err(SelectionError::NoCandidate { detail }) => {
+                assert!(detail.contains("alias=chat"), "unexpected detail: {detail}");
+                assert!(detail.contains("team-c"), "unexpected detail: {detail}");
+            }
+            other => panic!("scope-denied alias must fail closed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_filter_stale_chain_yields_no_candidate() {
+        let mut registry = scoped_registry();
+        registry
+            .register_alias(
+                "chat",
+                vec![
+                    ModelRef::new("bitty-gone", "ghost").expect("valid ref"),
+                    ModelRef::new("bitty-b", "chat").expect("valid ref"),
+                ],
+            )
+            .expect("capacity");
+        let policy = scoped_policy();
+        // Stale skipped in declared order, live candidate still needs its
+        // scope: team-b is granted, so chat survives (alias-only).
+        let request =
+            SelectEnvelopeRequest::new(vec![Cap::Text], Some("chat".to_owned()), None, None);
+        let chain = select_filtered(&registry, &request, &[scope("team-b")], &policy)
+            .expect("stale skipped under team-b");
+        // bitty-b/chat grants team-a and team-b, so team-b passes.
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name, "chat");
+        // Same chain under an unknown scope: the stale entry is skipped and
+        // the live entry is scope-denied, so the full miss is NoCandidate
+        // (never a fall-through to the matching non-alias vision entry).
+        match select_filtered(&registry, &request, &[scope("team-c")], &policy) {
+            Err(SelectionError::NoCandidate { detail }) => {
+                assert!(detail.contains("alias=chat"), "unexpected detail: {detail}");
+                assert!(detail.contains("team-c"), "unexpected detail: {detail}");
+            }
+            other => panic!("stale plus scope-denied must fail closed: {other:?}"),
+        }
+        // Fully stale alias under any echo is still NoCandidate.
+        let mut stale_only = scoped_registry();
+        stale_only
+            .register_alias(
+                "chat",
+                vec![ModelRef::new("bitty-gone", "ghost").expect("valid ref")],
+            )
+            .expect("capacity");
+        match select_filtered(&stale_only, &request, &[scope("team-a")], &policy) {
+            Err(SelectionError::NoCandidate { detail }) => {
+                assert!(detail.contains("alias=chat"), "unexpected detail: {detail}");
+            }
+            other => panic!("fully stale alias must fail closed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_filter_narrows_only() {
+        let registry = scoped_registry();
+        let policy = scoped_policy();
+        let request = SelectEnvelopeRequest::capabilities(vec![Cap::Text]);
+        let open = select_filtered(&registry, &request, &[], &policy).expect("unfiltered");
+        assert_eq!(open.len(), 3);
+        let team_a =
+            select_filtered(&registry, &request, &[scope("team-a")], &policy).expect("team-a");
+        let team_b =
+            select_filtered(&registry, &request, &[scope("team-b")], &policy).expect("team-b");
+        // Each filtered view is a subset of the unfiltered snapshot (never
+        // wider), in the same provider/model lexicographic order.
+        let open_names: Vec<&str> = open.iter().map(|item| item.name.as_str()).collect();
+        for item in team_a.iter().chain(team_b.iter()) {
+            assert!(open_names.contains(&item.name.as_str()));
+        }
+        assert_eq!(open_names, vec!["vision", "chat", "fast"]);
+        let team_a_names: Vec<&str> = team_a.iter().map(|item| item.name.as_str()).collect();
+        let team_b_names: Vec<&str> = team_b.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(team_a_names, vec!["vision", "chat"]);
+        assert_eq!(team_b_names, vec!["chat", "fast"]);
+        // Adding a requested scope never widens: team-a plus team-b admits
+        // only chat (requested ⊆ granted).
+        let both = select_filtered(
+            &registry,
+            &request,
+            &[scope("team-a"), scope("team-b")],
+            &policy,
+        )
+        .expect("both scopes");
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].name, "chat");
+        let both_names: Vec<&str> = both.iter().map(|item| item.name.as_str()).collect();
+        for name in &both_names {
+            assert!(team_a_names.contains(name) && team_b_names.contains(name));
+        }
+        // Unknown scope admits nothing.
+        assert!(matches!(
+            select_filtered(&registry, &request, &[scope("team-c")], &policy),
+            Err(SelectionError::NoCandidate { .. })
+        ));
+        // Over-limit echoes fail closed with counts only (never widen).
+        let burst: Vec<CallerScope> = (0..MAX_CALLER_SCOPES + 1)
+            .map(|index| scope(format!("team-{index}").as_str()))
+            .collect();
+        match select_filtered(&registry, &request, &burst, &policy) {
+            Err(SelectionError::TooManyCandidates {
+                alias,
+                limit,
+                actual,
+            }) => {
+                assert_eq!(alias, "scope-echo");
+                assert_eq!(limit, MAX_CALLER_SCOPES);
+                assert_eq!(actual, MAX_CALLER_SCOPES + 1);
+            }
+            other => panic!("over-limit echo must fail closed: {other:?}"),
+        }
+        // Empty requirement is still refused before any scope work.
+        let empty = SelectEnvelopeRequest::capabilities(Vec::new());
+        assert_eq!(
+            select_filtered(&registry, &empty, &[scope("team-a")], &policy)
+                .expect_err("empty requirement must fail"),
+            SelectionError::EmptyRequirement
+        );
+        // Unknown alias still fails closed (scope does not rescue it).
+        let unknown =
+            SelectEnvelopeRequest::new(vec![Cap::Text], Some("nope".to_owned()), None, None);
+        assert_eq!(
+            select_filtered(&registry, &unknown, &[scope("team-a")], &policy)
+                .expect_err("unknown alias must fail"),
+            SelectionError::UnknownAlias {
+                alias: "nope".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn scope_filter_effective_zero_is_one_preserved() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(registration(
+                "bitty-fake",
+                "mystery",
+                vec![Cap::Text],
+                0,
+                0,
+                0,
+            ))
+            .expect("capacity");
+        registry
+            .register(registration(
+                "bitty-fake",
+                "roomy",
+                vec![Cap::Text],
+                32_768,
+                1,
+                1,
+            ))
+            .expect("capacity");
+        registry
+            .register(registration(
+                "bitty-fake",
+                "pricey",
+                vec![Cap::Text],
+                32_768,
+                1,
+                9,
+            ))
+            .expect("capacity");
+        let mut policy = ScopePolicy::new();
+        for name in ["mystery", "roomy", "pricey"] {
+            policy
+                .grant("bitty-fake", name, vec![scope("team-a")])
+                .expect("capacity");
+        }
+        let echo = [scope("team-a")];
+        // Window minimum refuses the unknown (`0`) window through the
+        // filtered path too.
+        let windowed = SelectEnvelopeRequest::new(vec![Cap::Text], None, Some(4_096), None);
+        let chain = select_filtered(&registry, &windowed, &echo, &policy).expect("windowed");
+        assert_eq!(chain.len(), 2);
+        assert!(chain.iter().all(|item| item.name != "mystery"));
+        // Cost ceiling uses effective weights through the filtered path:
+        // uncalibrated (`0`) counts as baseline `1`.
+        let mut uncalibrated = ProviderRegistry::new();
+        uncalibrated
+            .register(registration(
+                "bitty-fake",
+                "uncalibrated",
+                vec![Cap::Text],
+                4_096,
+                0,
+                0,
+            ))
+            .expect("capacity");
+        uncalibrated
+            .register(registration(
+                "bitty-fake",
+                "calibrated",
+                vec![Cap::Text],
+                4_096,
+                2,
+                2,
+            ))
+            .expect("capacity");
+        let mut weights = ScopePolicy::new();
+        for name in ["uncalibrated", "calibrated"] {
+            weights
+                .grant("bitty-fake", name, vec![scope("team-a")])
+                .expect("capacity");
+        }
+        let ceiling = SelectEnvelopeRequest::new(vec![Cap::Text], None, None, Some(1));
+        let chain = select_filtered(&uncalibrated, &ceiling, &echo, &weights)
+            .expect("uncalibrated fits baseline");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].name, "uncalibrated");
+        // A zero ceiling admits nothing through the filtered path either:
+        // baseline `1` is the floor, `0` is never free.
+        let zero = SelectEnvelopeRequest::new(vec![Cap::Text], None, None, Some(0));
+        assert!(matches!(
+            select_filtered(&uncalibrated, &zero, &echo, &weights),
+            Err(SelectionError::NoCandidate { .. })
+        ));
+        // Filtered cost agrees with the unfiltered S1 rule exactly.
+        let open = SelectEnvelopeRequest::new(vec![Cap::Text], None, None, Some(1));
+        let filtered = select_filtered(&uncalibrated, &open, &echo, &weights).expect("filtered");
+        let unfiltered = uncalibrated
+            .select(&open.to_select_request())
+            .expect("unfiltered");
+        assert_eq!(filtered, unfiltered);
+    }
+
+    #[test]
+    fn scope_filter_fallback_mapping_is_total_incl_unknown_stop() {
+        // The S3 filter adds no fallback path: the mapping stays the S1
+        // total (`Advance` on transport/rate-limit/unavailable/timeout,
+        // `Stop` otherwise including `Unknown`).
+        let advance = [
+            ProviderError::Transport {
+                provider: "p".to_owned(),
+                reason: "reset".to_owned(),
+            },
+            ProviderError::RateLimited {
+                provider: "p".to_owned(),
+                retry_after_ms: Some(1_000),
+            },
+            ProviderError::RateLimited {
+                provider: "p".to_owned(),
+                retry_after_ms: None,
+            },
+            ProviderError::ModelUnavailable {
+                provider: "p".to_owned(),
+                model: "m".to_owned(),
+            },
+            ProviderError::Timeout {
+                timeout_ms: 5_000,
+                latency_ms: 6_000,
+            },
+        ];
+        for error in &advance {
+            assert_eq!(
+                fallback_directive(error),
+                FallbackDirective::Advance,
+                "must advance: {error}"
+            );
+            assert_eq!(
+                super::fallback_directive(error),
+                crate::provider_registry::fallback_directive(error)
+            );
+        }
+        let stop = [
+            ProviderError::UnknownModel {
+                name: "m".to_owned(),
+            },
+            ProviderError::BudgetExceeded {
+                limit: 1,
+                actual: 2,
+            },
+            ProviderError::TimeoutTooLarge {
+                max: 30_000,
+                actual: 60_000,
+            },
+            ProviderError::InvalidProviderId {
+                id: "BAD".to_owned(),
+            },
+            ProviderError::InvalidSampling,
+            ProviderError::UnsupportedSampling { field: "top_k" },
+            ProviderError::Auth {
+                provider: "p".to_owned(),
+                reason: "revoked".to_owned(),
+            },
+            ProviderError::CapabilityMismatch {
+                provider: "p".to_owned(),
+                model: "m".to_owned(),
+                missing: vec![Cap::ImageInput],
+            },
+            ProviderError::Unknown {
+                provider: "p".to_owned(),
+                reason: "ack lost".to_owned(),
+            },
+        ];
+        for error in &stop {
+            assert_eq!(
+                fallback_directive(error),
+                FallbackDirective::Stop,
+                "must stop: {error}"
+            );
+        }
+        // Unknown explicitly stops through the selection path too: the effect
+        // may have happened, so blind advance could double-apply; reconcile
+        // first. A filtered chain still advances only via the same typed
+        // directive, never past Unknown.
+        let registry = scoped_registry();
+        let policy = scoped_policy();
+        let request = SelectEnvelopeRequest::capabilities(vec![Cap::Text]);
+        let chain = select_filtered(&registry, &request, &[scope("team-a")], &policy)
+            .expect("team-a chain");
+        assert!(!chain.is_empty());
+        assert_eq!(
+            fallback_directive(&ProviderError::Unknown {
+                provider: "p".to_owned(),
+                reason: "ack lost".to_owned(),
+            }),
+            FallbackDirective::Stop
         );
     }
 }
