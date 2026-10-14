@@ -402,12 +402,215 @@ impl ContributionEnvelope {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 S3: deny-all activation stub (AI-0294, CTX-0152 candidate).
+// ---------------------------------------------------------------------------
+
+// Deny-all stub for the activation-policy candidate section of
+// `architecture/host-boundary-trait-design.md` (candidate only, no acceptance
+// claim, no identifier minted). `std`-only, offline, no behavior beyond
+// refusal: no registry, no resolution, no discovery/loading, no
+// version-predicate parsing or evaluation, no auto-activate, no state, no
+// threads, no clock, no network, no filesystem, no `Cargo.toml` change.
+// Reuses the S1 mirror ([`ExtensionPoint`]) and introduces no re-mirrored
+// vocabulary and no new byte bounds.
+//
+// Gate summary (re-stated as a gating contract, not executed): a candidate
+// point activation would run strictly after the R2 gates, in the candidate
+// order recorded in [`ACTIVATION_ORDER_DOC`] — grant parse, then
+// authorization, then tool registration, then consent evaluation — with each
+// step a precondition for the next. A point declaration (one of the eight
+// [`ExtensionPoint`] variants, a [`Manifest`], or a [`ContributionEnvelope`])
+// never substitutes for a grant, an authorization, a registration, or a
+// consent evaluation: the declaration names the capability shape while grant,
+// authorization, registration, and consent each remain a separate check owned
+// elsewhere. This stub performs none of those steps; it records the order as
+// the contract and denies every activation — known points even when
+// explicitly enabled (fail-closed) and unknown point names (typed refusal).
+
+/// Candidate activation order as a gating contract (documented, not executed).
+///
+/// ```text
+/// grant parse -> authorization -> tool registration -> consent evaluation
+/// ```
+///
+/// Each step is a precondition for the next, and the sequence starts only
+/// after the R2 gates have passed. No step runs here: there is no grant
+/// parsing, no authorization, no tool registration, and no consent
+/// evaluation in this module.
+pub const ACTIVATION_ORDER_DOC: &str =
+    "grant parse -> authorization -> tool registration -> consent evaluation";
+
+/// Shared deny-all activation reason (byte-identical for every point).
+///
+/// Constant by construction so any two [`ActivationError::Denied`] refusals
+/// compare byte-equal on the `reason` field regardless of the requested
+/// point or enable list.
+pub const DENY_ALL_ACTIVATION_REASON: &str = "default-deny: no activation grant";
+
+/// Typed activation refusal.
+///
+/// `Denied` is a known [`ExtensionPoint`] refused fail-closed (even when the
+/// caller lists it as explicitly enabled); `UnknownPoint` is a point name
+/// outside the closed eight-point vocabulary, refused without synthesizing
+/// a point. Neither variant grants anything and neither performs any
+/// registry or resolution step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActivationError {
+    /// Known point refused fail-closed (no auto-activate, no enable grants).
+    Denied {
+        /// Refused point.
+        point: ExtensionPoint,
+        /// Shared refusal reason ([`DENY_ALL_ACTIVATION_REASON`]).
+        reason: String,
+    },
+    /// Point name outside the closed vocabulary (never synthesized).
+    UnknownPoint {
+        /// Rejected point name (stored verbatim).
+        name: String,
+    },
+}
+
+impl std::fmt::Display for ActivationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Denied { point, reason } => write!(
+                f,
+                "extension point '{}' activation denied: {reason}",
+                activation_point_name(*point)
+            ),
+            Self::UnknownPoint { name } => {
+                write!(f, "unknown extension point: {name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ActivationError {}
+
+/// Vocabulary name for one [`ExtensionPoint`].
+///
+/// Pure projection; no I/O, no parsing, no authorization. Match is
+/// exhaustive with no wildcard so adding a ninth point breaks at compile
+/// time.
+#[must_use]
+pub fn activation_point_name(point: ExtensionPoint) -> &'static str {
+    match point {
+        ExtensionPoint::Model => "model",
+        ExtensionPoint::Tool => "tool",
+        ExtensionPoint::Context => "context",
+        ExtensionPoint::Memory => "memory",
+        ExtensionPoint::Compactor => "compactor",
+        ExtensionPoint::Agent => "agent",
+        ExtensionPoint::Command => "command",
+        ExtensionPoint::Ui => "ui",
+    }
+}
+
+/// Parse the closed eight-point activation vocabulary.
+///
+/// # Errors
+///
+/// Returns [`ActivationError::UnknownPoint`] carrying the rejected (verbatim)
+/// string for anything outside the closed vocabulary. Never synthesizes a
+/// point.
+pub fn parse_activation_point(name: &str) -> Result<ExtensionPoint, ActivationError> {
+    match name {
+        "model" => Ok(ExtensionPoint::Model),
+        "tool" => Ok(ExtensionPoint::Tool),
+        "context" => Ok(ExtensionPoint::Context),
+        "memory" => Ok(ExtensionPoint::Memory),
+        "compactor" => Ok(ExtensionPoint::Compactor),
+        "agent" => Ok(ExtensionPoint::Agent),
+        "command" => Ok(ExtensionPoint::Command),
+        "ui" => Ok(ExtensionPoint::Ui),
+        _ => Err(ActivationError::UnknownPoint {
+            name: name.to_owned(),
+        }),
+    }
+}
+
+/// Typed activation refusal for one known point.
+///
+/// [`ActivationError::Denied`] naming the point with the shared
+/// [`DENY_ALL_ACTIVATION_REASON`], so the same point denied with or without
+/// an explicit enable compares byte-equal.
+#[must_use]
+pub fn activation_denial(point: ExtensionPoint) -> ActivationError {
+    ActivationError::Denied {
+        point,
+        reason: DENY_ALL_ACTIVATION_REASON.to_owned(),
+    }
+}
+
+/// Deny-all activation stub (no auto-activate, no state).
+///
+/// Holds no enabled set and performs no activation step: construction grants
+/// nothing, and every check denies — known points even when the caller lists
+/// them as explicitly enabled (the enable list is accepted for signature
+/// compatibility and then ignored, fail-closed), unknown point names via
+/// [`ActivationError::UnknownPoint`]. Zero-sized by construction: no grant
+/// table, no registry, no resolution cache, no expiry queue, no state of any
+/// kind.
+#[derive(Debug, Default)]
+pub struct ActivationStub;
+
+impl ActivationStub {
+    /// Empty deny-all stub. Pure constructor; no activation runs here and no
+    /// enable list is stored.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Check one point activation: always denies.
+    ///
+    /// The `_explicitly_enabled` slice exists so callers pass the per-point
+    /// enable list the candidate policy names; it is ignored fail-closed —
+    /// a listed point still denies. No registry lookup, no resolution, no
+    /// I/O.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ActivationError::Denied`] for `point`.
+    pub fn check(
+        &self,
+        point: ExtensionPoint,
+        _explicitly_enabled: &[ExtensionPoint],
+    ) -> Result<(), ActivationError> {
+        Err(activation_denial(point))
+    }
+
+    /// Check one named point activation: known names deny, unknown names
+    /// refuse typed.
+    ///
+    /// The `_explicitly_enabled` slice is ignored fail-closed like
+    /// [`ActivationStub::check`]: a listed known name still denies. No
+    /// registry lookup, no resolution, no I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ActivationError::UnknownPoint`] for a name outside the
+    /// closed vocabulary, and [`ActivationError::Denied`] for a known point
+    /// (even when listed in `_explicitly_enabled`).
+    pub fn check_named(
+        &self,
+        name: &str,
+        _explicitly_enabled: &[&str],
+    ) -> Result<(), ActivationError> {
+        let point = parse_activation_point(name)?;
+        Err(activation_denial(point))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDescriptor, CommandDescriptor, CompactorDescriptor, ContextDescriptor,
-        ContributionEnvelope, DeclarationEnvelope, ExtensionPoint, Manifest, MemoryDescriptor,
-        ModelDescriptor, ToolDescriptor, UiDescriptor,
+        ACTIVATION_ORDER_DOC, ActivationError, ActivationStub, AgentDescriptor, CommandDescriptor,
+        CompactorDescriptor, ContextDescriptor, ContributionEnvelope, DENY_ALL_ACTIVATION_REASON,
+        DeclarationEnvelope, ExtensionPoint, Manifest, MemoryDescriptor, ModelDescriptor,
+        ToolDescriptor, UiDescriptor, activation_denial, activation_point_name,
+        parse_activation_point,
     };
 
     /// Exhaustive match with no wildcard: adding a ninth point breaks this
@@ -688,5 +891,187 @@ mod tests {
         assert_eq!(pair[0].point(), ExtensionPoint::Tool);
         assert_eq!(pair[1].point(), ExtensionPoint::Model);
         assert_ne!(pair[0], pair[1]);
+    }
+
+    fn all_points() -> [ExtensionPoint; 8] {
+        [
+            ExtensionPoint::Model,
+            ExtensionPoint::Tool,
+            ExtensionPoint::Context,
+            ExtensionPoint::Memory,
+            ExtensionPoint::Compactor,
+            ExtensionPoint::Agent,
+            ExtensionPoint::Command,
+            ExtensionPoint::Ui,
+        ]
+    }
+
+    #[test]
+    fn s3_activation_denies_every_known_point_even_when_explicitly_enabled() {
+        let stub = ActivationStub::new();
+        let all = all_points();
+        // No auto-activate: an empty enable list denies every known point.
+        for point in all {
+            let err = stub.check(point, &[]).unwrap_err();
+            assert_eq!(err, activation_denial(point));
+            assert!(matches!(err, ActivationError::Denied { .. }));
+            match &err {
+                ActivationError::Denied {
+                    point: refused,
+                    reason,
+                } => {
+                    assert_eq!(*refused, point);
+                    assert_eq!(reason, DENY_ALL_ACTIVATION_REASON);
+                }
+                ActivationError::UnknownPoint { .. } => {
+                    panic!("known point must deny, not refuse unknown")
+                }
+            }
+        }
+        // Explicit enable per point still denies: the enable list is
+        // accepted and then ignored fail-closed.
+        for point in all {
+            let err = stub.check(point, &all).unwrap_err();
+            assert_eq!(err, activation_denial(point));
+            assert!(matches!(err, ActivationError::Denied { .. }));
+        }
+        // A manifest declaration listing points grants nothing: passing the
+        // declared points as the enable list still denies each one, and the
+        // stub performs no registry or resolution step.
+        let manifest = Manifest {
+            name: "example-extension".to_owned(),
+            version: "0.1.0".to_owned(),
+            host: "bitty-ai >=0.1.0".to_owned(),
+            points: vec![ExtensionPoint::Tool, ExtensionPoint::Command],
+        };
+        for point in &manifest.points {
+            let err = stub.check(*point, &manifest.points).unwrap_err();
+            assert!(matches!(err, ActivationError::Denied { .. }));
+        }
+    }
+
+    #[test]
+    fn s3_activation_named_check_denies_known_even_when_listed() {
+        let stub = ActivationStub::new();
+        let names = [
+            "model",
+            "tool",
+            "context",
+            "memory",
+            "compactor",
+            "agent",
+            "command",
+            "ui",
+        ];
+        for name in names {
+            // Listed explicitly, yet still denied: no enable grants.
+            let err = stub.check_named(name, &names).unwrap_err();
+            let point = parse_activation_point(name).expect("closed name parses");
+            assert_eq!(err, activation_denial(point));
+            assert!(matches!(err, ActivationError::Denied { .. }));
+            // Unlisted denies identically: the enable list changes nothing.
+            let unlisted = stub.check_named(name, &[]).unwrap_err();
+            assert_eq!(err, unlisted);
+        }
+    }
+
+    #[test]
+    fn s3_activation_unknown_point_is_typed_refusal() {
+        let stub = ActivationStub::new();
+        let unknowns = ["admin", "", "TOOL", "model ", "tool/model", "compactor2"];
+        for name in unknowns {
+            let err = stub.check_named(name, &[]).unwrap_err();
+            assert_eq!(
+                err,
+                ActivationError::UnknownPoint {
+                    name: name.to_owned(),
+                }
+            );
+            assert!(matches!(err, ActivationError::UnknownPoint { .. }));
+            assert!(!matches!(err, ActivationError::Denied { .. }));
+            // Unknown stays unknown even when the enable list names it: the
+            // stub never synthesizes a point.
+            let listed = stub.check_named(name, &[name]).unwrap_err();
+            assert_eq!(err, listed);
+            // Direct parse agrees and keeps the rejected name verbatim.
+            let parsed = parse_activation_point(name).unwrap_err();
+            assert_eq!(parsed, err);
+            assert!(format!("{err}").contains("unknown extension point"));
+            assert!(format!("{err}").contains(name));
+        }
+    }
+
+    #[test]
+    fn s3_activation_vocabulary_is_closed_and_round_trips() {
+        // Closed eight-point vocabulary shared with the S1 mirror: every
+        // point projects to its name and every name parses back.
+        let all = all_points();
+        let mut names = Vec::new();
+        for point in all {
+            let name = activation_point_name(point);
+            assert_eq!(parse_activation_point(name), Ok(point));
+            names.push(name);
+        }
+        assert_eq!(
+            names,
+            [
+                "model",
+                "tool",
+                "context",
+                "memory",
+                "compactor",
+                "agent",
+                "command",
+                "ui"
+            ]
+        );
+        // Denial keeps the point identity: same point denies byte-equal,
+        // different points differ only in the point field.
+        let stub = ActivationStub::new();
+        let first = stub.check(ExtensionPoint::Tool, &[]).unwrap_err();
+        let again = stub.check(ExtensionPoint::Tool, &[]).unwrap_err();
+        assert_eq!(first, again);
+        let other = stub.check(ExtensionPoint::Model, &[]).unwrap_err();
+        assert_ne!(first, other);
+        assert!(format!("{first}").contains("'tool'"));
+        assert!(format!("{first}").contains(DENY_ALL_ACTIVATION_REASON));
+    }
+
+    #[test]
+    fn s3_activation_stub_has_no_state() {
+        // Zero-sized by construction: no grant table, no registry, no
+        // resolution cache, no expiry queue.
+        assert_eq!(std::mem::size_of::<ActivationStub>(), 0);
+        let first = ActivationStub::new();
+        let second = ActivationStub;
+        for point in all_points() {
+            // Deterministic: separate instances deny identically (no hidden
+            // state, no clock, enable list ignored).
+            assert_eq!(first.check(point, &[]), second.check(point, &[]));
+            assert_eq!(first.check(point, &[]), first.check(point, &[]));
+        }
+        let probe = "tool";
+        assert_eq!(
+            first.check_named(probe, &[]),
+            second.check_named(probe, &[])
+        );
+    }
+
+    #[test]
+    fn s3_activation_order_doc_states_gating_contract() {
+        // Sequence document present: the four candidate stages appear once
+        // and in candidate order (grant parse first, consent last).
+        let doc = ACTIVATION_ORDER_DOC;
+        let grant = doc.find("grant parse").expect("grant parse stage");
+        let authorization = doc.find("authorization").expect("authorization stage");
+        let registration = doc.find("tool registration").expect("registration stage");
+        let consent = doc.find("consent evaluation").expect("consent stage");
+        assert!(grant < authorization);
+        assert!(authorization < registration);
+        assert!(registration < consent);
+        assert_eq!(
+            doc,
+            "grant parse -> authorization -> tool registration -> consent evaluation"
+        );
     }
 }
