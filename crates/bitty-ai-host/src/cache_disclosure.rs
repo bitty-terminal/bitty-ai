@@ -1509,6 +1509,151 @@ impl CacheHintResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 S3 admission deny-all stub (AI-0295).
+// ---------------------------------------------------------------------------
+//
+// Deny-all stub for the CTX-0153 candidate admission-rules section of
+// `context/prefix-cache-context-design.md` (candidate only, no acceptance
+// claim, no identifier minted, AIQ-13 stays open). `std`-only, offline, no
+// behavior beyond refusal: no store, no lookup, no routing, no selection,
+// no I/O, no threads, no clock, no network, no filesystem, no `Cargo.toml`
+// change. Reuses the S1 mirror ([`CacheKey`], [`CacheScope`],
+// [`InputFingerprint`]) and the S2 envelopes above ([`CacheHintRequest`],
+// [`CacheHintResponse`]); introduces no re-mirrored vocabulary and no new
+// byte bounds. There is deliberately no `version` field:
+// versioning/negotiation stays out of scope. Construction performs no I/O
+// and bestows no capability; the stub is terminal-side metadata describing
+// the deny-all outcome, never a channel carrying cached bytes.
+//
+// Candidate rule (re-stated, not re-implemented): a hint would be honored
+// only on exact key, scope, and fingerprint equality (key covers
+// provider-scoped identity, scope covers the reuse boundary, fingerprint
+// covers the stable-prefix content); a miss or a foreign key would
+// recompute from authorized sources and would never widen authority to make
+// reuse succeed (identical bytes under a different provider, model, scope,
+// or fingerprint compare unequal by the S1 scope rule); equality alone
+// would not authorize reuse — a separate candidate admission handle would
+// still be required, so there would be no auto-reuse on equality; any path
+// not meeting all of the above would deny reuse. The stub implements the
+// deny-all default: every hint denies — including an exact-equality hint a
+// live policy would honor — so there is no auto-reuse on equality. A miss
+// or a foreign key denies the same way with the same reason; the caller
+// recomputes from authorized sources and never widens authority to make
+// reuse succeed.
+//
+// Gate relationship (re-stated, not re-implemented): this stub is necessary
+// but not sufficient for closing AIQ-13. Closing AIQ-13 still requires
+// measured prefix reuse plus reviewer acceptance under the register entry,
+// and this module records no such measurement or acceptance. AIQ-13 stays
+// open, and this stub closes nothing, claims no caching benefit, no
+// hit-rate result, and no routing behavior.
+//
+// Hints carry keys only, never value bytes: [`CacheHintResponse`] has no
+// `value` field by construction (only the echoed [`CacheKey`] plus the
+// `hit` presence bit), and [`AdmissionDecision::Deny`] carries only the
+// echoed request key plus the shared reason — so neither the hint nor the
+// denial can smuggle cached content across the seam. Key equality — and a
+// `hit` answer, and [`InputFingerprint::allows_reuse`] — never imply reuse:
+// admission stays deny-all here, and no admission handle is modeled (there
+// is deliberately no allow path on [`AdmissionDecision`]).
+
+/// Shared deny-all admission reason (byte-identical for every hint).
+///
+/// Constant by construction so any two [`AdmissionStub`] denials compare
+/// byte-equal on the `reason` field regardless of the hinted key, scope,
+/// fingerprint, or `hit` bit. The suffix documents the miss/foreign
+/// direction: recompute from authorized sources, never widen authority to
+/// make reuse succeed.
+pub const DENY_ALL_ADMISSION_REASON: &str =
+    "default-deny: no cache admission; recompute from authorized sources";
+
+/// Deny-all cache admission stub (no store, no state).
+///
+/// Denies every hint — including an exact key/scope/fingerprint match with
+/// a `hit` presence answer that a live policy would honor — with the shared
+/// [`DENY_ALL_ADMISSION_REASON`]. Zero-sized by construction: no cache
+/// table, no grant handle, no expiry queue, no capacity, no state of any
+/// kind.
+#[derive(Debug, Default)]
+pub struct AdmissionStub;
+
+impl AdmissionStub {
+    /// Empty deny-all stub. Pure constructor; no lookup runs here.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Deny one hinted lookup.
+    ///
+    /// Takes the S2 hint envelopes but performs no lookup, no comparison
+    /// branch, and no I/O: the `hit` bit, the echo match, the scope match,
+    /// and the fingerprint match are all ignored and the answer is always
+    /// [`AdmissionDecision::Deny`] echoing `request.key` with the shared
+    /// [`DENY_ALL_ADMISSION_REASON`]. An exact-equality hint therefore
+    /// denies exactly like a miss or a foreign key: no auto-reuse on
+    /// equality, and a miss/foreign denial recomputes from authorized
+    /// sources without widening authority. Pure, deterministic, offline.
+    #[must_use]
+    pub fn decide(
+        &self,
+        request: &CacheHintRequest,
+        response: &CacheHintResponse,
+    ) -> AdmissionDecision {
+        let _ = response;
+        AdmissionDecision::Deny {
+            key: request.key.clone(),
+            reason: DENY_ALL_ADMISSION_REASON.to_owned(),
+        }
+    }
+}
+
+/// Cache admission outcome: deny only, by construction.
+///
+/// There is deliberately no allow path: equality, presence, and fingerprint
+/// agreement never authorize reuse here, and the separate candidate
+/// admission handle stays unmodeled until a scoped policy task designs it.
+/// The denied key echo keeps the S1 scope rule (route fields participate in
+/// equality), so the same bytes under a different route still deny as a
+/// foreign key, never as an alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    /// Reuse denied for the echoed request key with the shared reason.
+    Deny {
+        /// Echo of the request key reuse was denied for (keys only, never
+        /// value bytes).
+        key: CacheKey,
+        /// Always [`DENY_ALL_ADMISSION_REASON`], byte-identical for every
+        /// hint.
+        reason: String,
+    },
+}
+
+impl AdmissionDecision {
+    /// `true` by construction: the only outcome is [`AdmissionDecision::Deny`].
+    #[must_use]
+    pub fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny { .. })
+    }
+
+    /// Echoed request key reuse was denied for.
+    #[must_use]
+    pub fn key(&self) -> &CacheKey {
+        match self {
+            Self::Deny { key, .. } => key,
+        }
+    }
+
+    /// Shared deny-all reason ([`DENY_ALL_ADMISSION_REASON`]).
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Deny { reason, .. } => reason,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2416,6 +2561,217 @@ mod hint_envelope_tests {
             CacheHintResponse {
                 key: hint_key(),
                 hit: false,
+            }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3 offline tests: deny-all incl exact-equality, no auto-reuse,
+// miss/foreign recompute direction, no value bytes. Deterministic, no
+// network, no filesystem, no clock, no threads.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admission_stub_tests {
+    use super::*;
+
+    /// Canonical bytes with the `prompt::render_canonical` layout, test-side
+    /// assembly duplicated from `tests` on purpose: the admission stub pins
+    /// the layout independently of the shared helper.
+    fn admission_canonical_bytes(stable_user: &str, turn: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"prompt/1\n");
+        out.extend_from_slice(b"core-version:bitty-core-prompt@1\n");
+        for (name, text) in [
+            ("core-contract", "stable core"),
+            ("user", stable_user),
+            ("project", "stable project"),
+            ("skills-profile", "stable skills"),
+            ("runtime-turn", turn),
+        ] {
+            out.extend_from_slice(b"[layer:");
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b" len=");
+            out.extend_from_slice(text.len().to_string().as_bytes());
+            out.extend_from_slice(b"]\n");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\n");
+        }
+        out.extend_from_slice(b"[effective]\n");
+        out.extend_from_slice(b"end\n");
+        out
+    }
+
+    fn admission_key() -> CacheKey {
+        CacheKey::new(
+            "bitty-fake",
+            "fake-chat",
+            CacheScope::Session,
+            &admission_canonical_bytes("stable user", "turn one"),
+        )
+        .expect("valid test key inputs")
+    }
+
+    fn admission_fingerprint() -> InputFingerprint {
+        InputFingerprint::new(b"complete input").expect("non-empty fingerprints")
+    }
+
+    fn admission_request() -> CacheHintRequest {
+        CacheHintRequest {
+            key: admission_key(),
+            scope: CacheScope::Session,
+            fingerprint: admission_fingerprint(),
+        }
+    }
+
+    #[test]
+    fn denies_exact_equality_hit_with_no_auto_reuse() {
+        let stub = AdmissionStub::new();
+        let request = admission_request();
+        // Exact-equality preconditions a live policy would honor: scope
+        // matches, echo matches, fingerprint exact-matches, presence is hit.
+        assert!(request.validate().is_ok());
+        let hit = CacheHintResponse::hit_for(admission_key());
+        assert!(hit.hit);
+        assert!(hit.check_echo(&request).is_ok());
+        assert!(request.fingerprint.allows_reuse(&admission_fingerprint()));
+        assert_eq!(request.key, hit.key);
+        // The deny-all stub still denies: equality never authorizes reuse,
+        // and there is no auto-reuse on equality.
+        let decision = stub.decide(&request, &hit);
+        assert!(decision.is_deny());
+        assert_eq!(decision.key(), &request.key);
+        assert_eq!(decision.reason(), DENY_ALL_ADMISSION_REASON);
+        assert!(
+            matches!(decision, AdmissionDecision::Deny { .. }),
+            "exact-equality hint must deny"
+        );
+        // Deterministic: repeated decisions agree.
+        assert_eq!(decision, stub.decide(&request, &hit));
+    }
+
+    #[test]
+    fn denies_miss_and_foreign_with_recompute_direction_never_widen() {
+        let stub = AdmissionStub::new();
+        let request = admission_request();
+        let exact_hit = CacheHintResponse::hit_for(admission_key());
+        let exact_decision = stub.decide(&request, &exact_hit);
+        // Miss over the same key denies the same way: the caller recomputes
+        // from authorized sources instead of reading cache.
+        let miss = CacheHintResponse::miss_for(admission_key());
+        assert!(!miss.hit);
+        let miss_decision = stub.decide(&request, &miss);
+        assert!(miss_decision.is_deny());
+        assert_eq!(miss_decision.key(), &request.key);
+        assert_eq!(miss_decision.reason(), exact_decision.reason());
+        // Foreign key (identical bytes under a different provider) denies
+        // the requested key the same way: same bytes under a different
+        // route stay unequal by the S1 scope rule, and the denial never
+        // widens authority to admit the foreign entry.
+        let foreign_key = CacheKey::new(
+            "bitty-other",
+            "fake-chat",
+            CacheScope::Session,
+            &admission_canonical_bytes("stable user", "turn one"),
+        )
+        .expect("valid test key inputs");
+        assert_ne!(foreign_key, request.key);
+        let foreign_hit = CacheHintResponse::hit_for(foreign_key);
+        assert_eq!(
+            foreign_hit.check_echo(&request),
+            Err(CacheHintError::KeyMismatch)
+        );
+        let foreign_decision = stub.decide(&request, &foreign_hit);
+        assert!(foreign_decision.is_deny());
+        assert_eq!(foreign_decision.key(), &request.key);
+        assert_eq!(foreign_decision.reason(), exact_decision.reason());
+        // Recompute direction is documented on the shared reason, never a
+        // widened grant.
+        for decision in [&exact_decision, &miss_decision, &foreign_decision] {
+            assert!(decision.reason().contains("recompute"));
+            assert!(decision.reason().contains("default-deny"));
+        }
+        assert_eq!(DENY_ALL_ADMISSION_REASON, exact_decision.reason());
+    }
+
+    #[test]
+    fn reason_byte_identical_across_hints() {
+        let stub = AdmissionStub::new();
+        let request = admission_request();
+        let probes = [
+            CacheHintResponse::hit_for(admission_key()),
+            CacheHintResponse::miss_for(admission_key()),
+            CacheHintResponse::hit_for(
+                CacheKey::new(
+                    "bitty-other",
+                    "fake-chat",
+                    CacheScope::Session,
+                    &admission_canonical_bytes("stable user", "turn one"),
+                )
+                .expect("valid test key inputs"),
+            ),
+        ];
+        let mut reasons = Vec::new();
+        for probe in &probes {
+            match stub.decide(&request, probe) {
+                AdmissionDecision::Deny { reason, .. } => {
+                    assert_eq!(reason, DENY_ALL_ADMISSION_REASON);
+                    reasons.push(reason);
+                }
+            }
+        }
+        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons[0].as_bytes(), reasons[1].as_bytes());
+        assert_eq!(reasons[0].as_bytes(), reasons[2].as_bytes());
+    }
+
+    #[test]
+    fn has_no_state_no_storage_deterministic() {
+        // Zero-sized by construction: no table, no handle, no state.
+        assert_eq!(std::mem::size_of::<AdmissionStub>(), 0);
+        let first = AdmissionStub::new();
+        let second = AdmissionStub;
+        let request = admission_request();
+        let hit = CacheHintResponse::hit_for(admission_key());
+        // Deterministic: separate instances deny identically (no hidden
+        // state, no clock, no threads).
+        assert_eq!(first.decide(&request, &hit), second.decide(&request, &hit));
+        assert_eq!(first.decide(&request, &hit), first.decide(&request, &hit));
+        assert_eq!(
+            AdmissionStub::new().decide(&request, &hit),
+            first.decide(&request, &hit)
+        );
+    }
+
+    #[test]
+    fn carries_keys_only_no_value_bytes() {
+        let stub = AdmissionStub::new();
+        let request = admission_request();
+        let hit = CacheHintResponse::hit_for(admission_key());
+        let decision = stub.decide(&request, &hit);
+        // Exhaustive destructure: adding a `value` (or any) field to the
+        // decision later breaks this compile, so keys-only denial is pinned
+        // by construction, not by convention.
+        let AdmissionDecision::Deny { key, reason } = decision.clone();
+        assert_eq!(key, admission_key());
+        assert_eq!(key, request.key);
+        assert_eq!(reason, DENY_ALL_ADMISSION_REASON);
+        assert_eq!(decision.key(), &admission_key());
+        assert_eq!(decision.reason(), DENY_ALL_ADMISSION_REASON);
+        // The hint envelopes still carry keys only (S2 shape reused here,
+        // not re-mirrored): echo plus presence bit, no value bytes.
+        let CacheHintResponse {
+            key: hint_key,
+            hit: is_hit,
+        } = hit;
+        assert_eq!(hint_key, admission_key());
+        assert!(is_hit);
+        assert_eq!(
+            decision,
+            AdmissionDecision::Deny {
+                key: admission_key(),
+                reason: DENY_ALL_ADMISSION_REASON.to_owned(),
             }
         );
     }
