@@ -1373,6 +1373,207 @@ impl InputCaptureOptIn {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2 S2 scoped-IPC envelope: context read request/response (types-only).
+// ---------------------------------------------------------------------------
+//
+// Status: Phase 2 S2 per AI-0281. Scoped-IPC envelope shapes only — no
+// transport. This section appends `ContextReadRequest` / `ContextReadResponse`
+// (+ `ContextReadAbsence` / `ContextReadError`) to the S1 mirror above and
+// reuses the S1 types without re-mirroring them: `StableId`,
+// `ContextRequest` (budget + generation fence), `DetailLevel`,
+// `AssembledRecord` (with `span_header` labels), `AssembledContext`
+// (refs/omitted/pruned/externalized/truncated), `ArtifactRef`,
+// `ArtifactAbsence`, and `ContextMirrorError`.
+//
+// Shared S2 convention: types-only, `std`-only, no socket/transport/dep
+// change, NO version field, no behavior beyond pure bound checks and pure
+// absence mapping, no thread/clock/net/fs. There is deliberately no `version`
+// field on either envelope: versioning/negotiation stays out of scope.
+// Construction performs no I/O and bestows no capability; the envelopes are
+// terminal-side metadata describing a read, never a channel carrying it.
+//
+// Trust labels travel as data with no enforcement here. The
+// `is_untrusted_surface` flag on each `AssembledRecord` is carried verbatim
+// and `span_header` labels it (`[trusted:..]` vs `[untrusted:..]`); the
+// PROJECT-untrusted (`provider "project"`, snapshot-backed, untrusted
+// surface) vs DELTA-trusted (`provider "diagnostics"`, host-collected,
+// trusted) distinction is marked by the source at ingest and is NOT
+// re-decided here. Generation fencing is data only: the request carries the
+// fence in `request.current_generation` and the response echoes it in
+// `current_generation`; matching is checked by the caller, never enforced
+// here. Absence entries are explicit per-reference `ArtifactAbsence` values
+// with no silent recovery: every non-`Available` absence maps to a typed
+// `ContextMirrorError` (see `ContextReadAbsence::to_error`).
+
+/// Scoped-IPC envelope validation failures (pure bound checks only).
+///
+/// Reasons carry bounds and counts, never record content or payload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextReadError {
+    /// No scope was requested; a read must name at least one `StableId`.
+    EmptyScopes,
+    /// Too many scopes requested.
+    TooManyScopes {
+        /// Bound (`MAX_CONTEXT_RECORDS`).
+        limit: usize,
+        /// Observed scope count.
+        actual: usize,
+    },
+    /// Too many records carried in a response.
+    TooManyRecords {
+        /// Bound (`MAX_CONTEXT_RECORDS`).
+        limit: usize,
+        /// Observed record count.
+        actual: usize,
+    },
+    /// Too many absence entries carried in a response.
+    TooManyAbsences {
+        /// Bound (`MAX_ARTIFACTS`).
+        limit: usize,
+        /// Observed absence count.
+        actual: usize,
+    },
+}
+
+impl Display for ContextReadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::EmptyScopes => write!(f, "context read requires at least one scope"),
+            Self::TooManyScopes { limit, actual } => {
+                write!(f, "context read scopes {actual} exceed {limit} scope limit")
+            }
+            Self::TooManyRecords { limit, actual } => write!(
+                f,
+                "context read records {actual} exceed {limit} record limit"
+            ),
+            Self::TooManyAbsences { limit, actual } => write!(
+                f,
+                "context read absences {actual} exceed {limit} absence limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContextReadError {}
+
+/// Scoped context read request envelope (no transport).
+///
+/// - `scopes`: the `StableId` set to read; non-empty, at most
+///   `MAX_CONTEXT_RECORDS` entries (bound checked by `validate`).
+/// - `request`: the S1 budget + generation-fence shape (`max_tokens` /
+///   `max_bytes` resolve via `effective_budget_bytes`; `current_generation`
+///   is the fence).
+/// - `detail`: the S1 reserved detail vocabulary, carried verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextReadRequest {
+    /// Stable Id scopes requested.
+    pub scopes: Vec<StableId>,
+    /// Budget ceilings plus the generation fence.
+    pub request: ContextRequest,
+    /// Requested detail depth (reserved vocabulary, carried as data).
+    pub detail: DetailLevel,
+}
+
+impl ContextReadRequest {
+    /// Fail-closed scope bound check: non-empty, at most
+    /// `MAX_CONTEXT_RECORDS`. Pure, deterministic, offline.
+    pub fn validate(&self) -> Result<(), ContextReadError> {
+        if self.scopes.is_empty() {
+            return Err(ContextReadError::EmptyScopes);
+        }
+        if self.scopes.len() > MAX_CONTEXT_RECORDS {
+            return Err(ContextReadError::TooManyScopes {
+                limit: MAX_CONTEXT_RECORDS,
+                actual: self.scopes.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve the effective byte budget via the inner S1 request.
+    #[must_use]
+    pub fn effective_budget_bytes(&self) -> usize {
+        self.request.effective_budget_bytes()
+    }
+}
+
+/// One explicit artifact absence entry for a read response.
+///
+/// The reference string travels with its `ArtifactAbsence` classification;
+/// payload bytes never travel here. `Missing` and `NeverRecorded` both map
+/// to `ArtifactUnavailable` (same fail-closed variant, distinct reasons kept
+/// in `absence` for attribution); `Deleted` maps to `ArtifactDeleted`;
+/// `Expired` maps to `ArtifactExpired`; `Available` is the only `Ok` case.
+/// No silent recovery: every non-`Available` absence is a typed error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextReadAbsence {
+    /// Reference the absence classifies.
+    pub reference: ArtifactRef,
+    /// Explicit absence classification (data, not re-decided here).
+    pub absence: ArtifactAbsence,
+}
+
+impl ContextReadAbsence {
+    /// Pure mapping from the carried absence to the matching S1 error.
+    ///
+    /// Deterministic, offline, no I/O: clones only the reference string.
+    pub fn to_error(&self) -> Result<(), ContextMirrorError> {
+        let reference = self.reference.as_str().to_owned();
+        match self.absence {
+            ArtifactAbsence::Available => Ok(()),
+            ArtifactAbsence::NeverRecorded | ArtifactAbsence::Missing => {
+                Err(ContextMirrorError::ArtifactUnavailable { reference })
+            }
+            ArtifactAbsence::Deleted => Err(ContextMirrorError::ArtifactDeleted { reference }),
+            ArtifactAbsence::Expired => Err(ContextMirrorError::ArtifactExpired { reference }),
+        }
+    }
+}
+
+/// Scoped context read response envelope (no transport).
+///
+/// - `current_generation`: fence echo of the request's
+///   `request.current_generation` (data only; matching is checked by the
+///   caller).
+/// - `assembled`: the S1 assembled shape reused verbatim — records (with
+///   `span_header` trust labels), `context_refs`, `omitted_ids`,
+///   `pruned_ids`, `externalized`, `truncated_bytes`,
+///   `truncated_tokens_estimate`, `truncated_providers`, `budget_bytes`.
+/// - `absences`: explicit per-reference absence mapping; empty when every
+///   referenced artifact resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextReadResponse {
+    /// Generation fence echoed from the request.
+    pub current_generation: u64,
+    /// Assembled records plus truncation markers (S1 shape, reused).
+    pub assembled: AssembledContext,
+    /// Explicit absence entries (no silent recovery).
+    pub absences: Vec<ContextReadAbsence>,
+}
+
+impl ContextReadResponse {
+    /// Fail-closed envelope bound check: at most `MAX_CONTEXT_RECORDS`
+    /// records and at most `MAX_ARTIFACTS` absence entries. Pure,
+    /// deterministic, offline. Trust labels, fence matching, and absence
+    /// correctness are NOT re-decided here.
+    pub fn validate(&self) -> Result<(), ContextReadError> {
+        if self.assembled.records.len() > MAX_CONTEXT_RECORDS {
+            return Err(ContextReadError::TooManyRecords {
+                limit: MAX_CONTEXT_RECORDS,
+                actual: self.assembled.records.len(),
+            });
+        }
+        if self.absences.len() > MAX_ARTIFACTS {
+            return Err(ContextReadError::TooManyAbsences {
+                limit: MAX_ARTIFACTS,
+                actual: self.absences.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Offline tests: shape / budget / trust-label / fence-length / admit-deny.
 // Deterministic, no network, no filesystem, no clock.
 // ---------------------------------------------------------------------------
@@ -1769,5 +1970,244 @@ mod tests {
             Err(ContextMirrorError::ArtifactTooLarge { .. })
         ));
         assert_eq!(store.next_id(), before);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2 offline tests: request bounds, absence mapping, labels, fence, markers.
+// Deterministic, no network, no filesystem, no clock.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod read_envelope_tests {
+    use super::*;
+
+    fn read_request(scopes: Vec<StableId>, generation: u64) -> ContextReadRequest {
+        ContextReadRequest {
+            scopes,
+            request: ContextRequest {
+                max_tokens: None,
+                max_bytes: None,
+                current_generation: generation,
+            },
+            detail: DetailLevel::Standard,
+        }
+    }
+
+    fn assembled_fixture() -> AssembledContext {
+        AssembledContext {
+            records: vec![AssembledRecord {
+                id: "rec-1".to_owned(),
+                provider: "project".to_owned(),
+                summary: "summary".to_owned(),
+                content: AssembledContent::Inline(vec![9]),
+                is_untrusted_surface: true,
+            }],
+            context_refs: vec!["rec-1".to_owned()],
+            omitted_ids: vec!["rec-9".to_owned()],
+            pruned_ids: vec!["rec-7".to_owned()],
+            externalized: 1,
+            truncated_bytes: 12,
+            truncated_tokens_estimate: 3,
+            truncated_providers: vec!["terminal".to_owned()],
+            budget_bytes: 32 * 1024,
+        }
+    }
+
+    #[test]
+    fn request_bounds_are_fail_closed() {
+        let empty = read_request(Vec::new(), 7);
+        assert_eq!(empty.validate(), Err(ContextReadError::EmptyScopes));
+        let one = read_request(vec![StableId::new("window-1").expect("valid")], 7);
+        assert!(one.validate().is_ok());
+        assert_eq!(one.effective_budget_bytes(), 32 * 1024);
+        assert_eq!(one.request.current_generation, 7);
+        // Over-cap scopes refuse with the bound carried, not silent truncation.
+        let many: Vec<StableId> = (0..MAX_CONTEXT_RECORDS + 1)
+            .map(|i| StableId::new(format!("scope-{i}")).expect("valid"))
+            .collect();
+        let over = read_request(many, 7);
+        assert_eq!(
+            over.validate(),
+            Err(ContextReadError::TooManyScopes {
+                limit: MAX_CONTEXT_RECORDS,
+                actual: MAX_CONTEXT_RECORDS + 1,
+            })
+        );
+        // Detail level travels as data.
+        let mut full = read_request(vec![StableId::new("a").expect("valid")], 1);
+        full.detail = DetailLevel::Full;
+        assert_eq!(full.detail, DetailLevel::Full);
+        assert!(full.validate().is_ok());
+    }
+
+    #[test]
+    fn absence_mapping_is_four_way_with_no_silent_recovery() {
+        let deleted = ContextReadAbsence {
+            reference: ArtifactRef("artifact://1".to_owned()),
+            absence: ArtifactAbsence::Deleted,
+        };
+        assert!(matches!(
+            deleted.to_error(),
+            Err(ContextMirrorError::ArtifactDeleted { .. })
+        ));
+        let expired = ContextReadAbsence {
+            reference: ArtifactRef("artifact://1".to_owned()),
+            absence: ArtifactAbsence::Expired,
+        };
+        assert!(matches!(
+            expired.to_error(),
+            Err(ContextMirrorError::ArtifactExpired { .. })
+        ));
+        for absence in [ArtifactAbsence::NeverRecorded, ArtifactAbsence::Missing] {
+            let entry = ContextReadAbsence {
+                reference: ArtifactRef("artifact://1".to_owned()),
+                absence,
+            };
+            assert!(matches!(
+                entry.to_error(),
+                Err(ContextMirrorError::ArtifactUnavailable { .. })
+            ));
+        }
+        // Available is the only Ok case; reasons stay distinct for attribution.
+        let available = ContextReadAbsence {
+            reference: ArtifactRef("artifact://1".to_owned()),
+            absence: ArtifactAbsence::Available,
+        };
+        assert!(available.to_error().is_ok());
+        assert_ne!(ArtifactAbsence::Missing, ArtifactAbsence::NeverRecorded);
+        // Cross-check against the S1 store taxonomy (same mapping).
+        let mut store = ArtifactStore::new();
+        let live = store.store(vec![1], 7).expect("store");
+        assert_eq!(store.absence_reason(&live, 7), ArtifactAbsence::Available);
+        assert_eq!(store.absence_reason(&live, 8), ArtifactAbsence::Expired);
+    }
+
+    #[test]
+    fn trust_labels_propagate_as_data_without_redecision() {
+        // PROJECT-untrusted vs DELTA-trusted is marked by source: the envelope
+        // carries the flag verbatim and never re-derives it from content.
+        let untrusted = AssembledRecord {
+            id: "snap-1".to_owned(),
+            provider: SNAPSHOT_PROVIDER.to_owned(),
+            summary: "summary".to_owned(),
+            content: AssembledContent::Inline(vec![1]),
+            is_untrusted_surface: true,
+        };
+        let trusted = AssembledRecord {
+            id: "delta-0".to_owned(),
+            provider: COMPILED_DELTA_PROVIDER.to_owned(),
+            summary: "summary".to_owned(),
+            content: AssembledContent::Inline(vec![2]),
+            is_untrusted_surface: false,
+        };
+        assert_eq!(untrusted.span_header(), "[untrusted:project:snap-1]");
+        assert_eq!(trusted.span_header(), "[trusted:diagnostics:delta-0]");
+        let response = ContextReadResponse {
+            current_generation: 7,
+            assembled: AssembledContext {
+                records: vec![untrusted.clone(), trusted.clone()],
+                context_refs: vec!["snap-1".to_owned(), "delta-0".to_owned()],
+                omitted_ids: Vec::new(),
+                pruned_ids: Vec::new(),
+                externalized: 0,
+                truncated_bytes: 0,
+                truncated_tokens_estimate: 0,
+                truncated_providers: Vec::new(),
+                budget_bytes: 32 * 1024,
+            },
+            absences: Vec::new(),
+        };
+        assert!(response.validate().is_ok());
+        assert_eq!(response.assembled.records[0], untrusted);
+        assert_eq!(response.assembled.records[1], trusted);
+        assert_eq!(
+            response.assembled.records[0].span_header(),
+            "[untrusted:project:snap-1]"
+        );
+        assert_eq!(
+            response.assembled.records[1].span_header(),
+            "[trusted:diagnostics:delta-0]"
+        );
+    }
+
+    #[test]
+    fn fence_echo_carries_generation_without_enforcement() {
+        let request = read_request(vec![StableId::new("window-1").expect("valid")], 41);
+        let response = ContextReadResponse {
+            current_generation: request.request.current_generation,
+            assembled: assembled_fixture(),
+            absences: Vec::new(),
+        };
+        assert_eq!(response.current_generation, 41);
+        assert_eq!(
+            response.current_generation,
+            request.request.current_generation
+        );
+        // A mismatched fence is still well-formed data here; matching is the
+        // caller's check, never envelope enforcement.
+        let mismatched = ContextReadResponse {
+            current_generation: 42,
+            assembled: assembled_fixture(),
+            absences: Vec::new(),
+        };
+        assert!(mismatched.validate().is_ok());
+        assert_ne!(
+            mismatched.current_generation,
+            request.request.current_generation
+        );
+    }
+
+    #[test]
+    fn truncation_markers_travel_explicitly() {
+        let response = ContextReadResponse {
+            current_generation: 7,
+            assembled: assembled_fixture(),
+            absences: Vec::new(),
+        };
+        assert!(response.validate().is_ok());
+        assert_eq!(response.assembled.context_refs, vec!["rec-1".to_owned()]);
+        assert_eq!(response.assembled.omitted_ids, vec!["rec-9".to_owned()]);
+        assert_eq!(response.assembled.pruned_ids, vec!["rec-7".to_owned()]);
+        assert_eq!(response.assembled.externalized, 1);
+        assert_eq!(response.assembled.truncated_bytes, 12);
+        assert_eq!(response.assembled.truncated_tokens_estimate, 3);
+        assert_eq!(
+            response.assembled.truncated_providers,
+            vec!["terminal".to_owned()]
+        );
+        assert_eq!(response.assembled.budget_bytes, 32 * 1024);
+        // Over-cap records/absences refuse with bounds carried.
+        let mut over_records = response.clone();
+        over_records.assembled.records = (0..MAX_CONTEXT_RECORDS + 1)
+            .map(|i| AssembledRecord {
+                id: format!("rec-{i}"),
+                provider: "project".to_owned(),
+                summary: String::new(),
+                content: AssembledContent::Inline(Vec::new()),
+                is_untrusted_surface: false,
+            })
+            .collect();
+        assert_eq!(
+            over_records.validate(),
+            Err(ContextReadError::TooManyRecords {
+                limit: MAX_CONTEXT_RECORDS,
+                actual: MAX_CONTEXT_RECORDS + 1,
+            })
+        );
+        let mut over_absences = response.clone();
+        over_absences.absences = (0..MAX_ARTIFACTS + 1)
+            .map(|i| ContextReadAbsence {
+                reference: ArtifactRef(format!("artifact://{i}")),
+                absence: ArtifactAbsence::NeverRecorded,
+            })
+            .collect();
+        assert_eq!(
+            over_absences.validate(),
+            Err(ContextReadError::TooManyAbsences {
+                limit: MAX_ARTIFACTS,
+                actual: MAX_ARTIFACTS + 1,
+            })
+        );
     }
 }
