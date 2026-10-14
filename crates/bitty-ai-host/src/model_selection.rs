@@ -1068,6 +1068,303 @@ pub fn fallback_directive(error: &ProviderError) -> FallbackDirective {
     }
 }
 
+// ── Phase 2 S2 scoped-IPC envelope types (no transport, AI-0279) ──
+//
+// Scoped-IPC request/response shapes for the model-selection seam so a
+// future host-side caller can cross the boundary without touching the
+// registry directly. Types-only, `std`-only, no behavior: no socket, no
+// transport, no thread, no clock, no network, no filesystem, no dependency
+// change (`Cargo.toml` stays `std`-only), no new byte bounds (the S1
+// [`MAX_MODEL_NAME_LEN`], [`MAX_REGISTERED_MODELS`], [`MAX_ALIASES`],
+// [`MAX_ALIAS_CANDIDATES`], and `MAX_PROVIDER_ID_LEN` values apply
+// unchanged), no version field on any envelope, and no selection execution.
+// Every envelope reuses the S1 mirror above ([`ModelCapability`],
+// [`SelectRequest`], [`SelectedModel`], [`SelectionError`],
+// [`ProviderError`], [`FallbackDirective`], [`estimate_cost`],
+// [`fallback_directive`]) and introduces no re-mirrored vocabulary.
+//
+// Provider-side `list_models`/`complete` envelopes stay owned by AI-0278:
+// they are named here only to mark the boundary and are not mirrored in
+// this module.
+//
+// Gate and mapping summary (re-stated, not re-implemented): an envelope
+// request narrows only (capability subset, alias-exclusive, window minimum
+// where unknown `0` satisfies nothing, cost ceiling where effective `0`
+// counts as baseline `1`); an envelope response carries either the detached
+// [`SelectedModel`] chain (primary is element `0`) or the typed
+// [`SelectionError`], with a full alias miss preserved as
+// [`SelectionError::NoCandidate`] (never a fall-through); the fallback
+// envelope maps [`ProviderError::Transport`], [`ProviderError::RateLimited`],
+// [`ProviderError::ModelUnavailable`], and [`ProviderError::Timeout`] to
+// [`FallbackDirective::Advance`] and every other variant — including
+// [`ProviderError::Unknown`] (reconcile before retry, never blind advance)
+// — to [`FallbackDirective::Stop`]; the cost envelope echoes its four
+// [`estimate_cost`] inputs with `effective(0) = 1` in relative routing units
+// (never currency, saturating on overflow).
+
+/// Scoped-IPC selection request envelope: narrowing-only filters over the
+/// S1 [`SelectRequest`] shape.
+///
+/// Every field is a filter; adding a filter never widens the result.
+/// `required` must be non-empty (selection never matches by name or alias
+/// alone); `alias` is exclusive when set (only declared candidates are
+/// eligible, each still passing every other gate in declared order, stale
+/// candidates skipped, full miss is [`SelectionError::NoCandidate`]);
+/// `min_context_window_tokens` refuses unknown (`0`) windows;
+/// `max_cost_weight` compares effective weights (`0` counts as baseline
+/// `1`, so `Some(0)` admits nothing). No version field, no transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectEnvelopeRequest {
+    /// Required capabilities: every candidate must advertise all of them.
+    pub required: Vec<ModelCapability>,
+    /// Optional exclusive semantic alias.
+    pub alias: Option<String>,
+    /// Optional minimum context window in tokens.
+    pub min_context_window_tokens: Option<u32>,
+    /// Optional cost ceiling over effective weights.
+    pub max_cost_weight: Option<u32>,
+}
+
+impl SelectEnvelopeRequest {
+    /// Build an envelope request from its four narrowing fields. No
+    /// validation runs here: shape checks stay at registration/selection
+    /// time via the S1 vocabulary.
+    #[must_use]
+    pub fn new(
+        required: Vec<ModelCapability>,
+        alias: Option<String>,
+        min_context_window_tokens: Option<u32>,
+        max_cost_weight: Option<u32>,
+    ) -> Self {
+        Self {
+            required,
+            alias,
+            min_context_window_tokens,
+            max_cost_weight,
+        }
+    }
+
+    /// Build a capability-only envelope request.
+    #[must_use]
+    pub fn capabilities(required: Vec<ModelCapability>) -> Self {
+        Self {
+            required,
+            alias: None,
+            min_context_window_tokens: None,
+            max_cost_weight: None,
+        }
+    }
+
+    /// View this envelope as the S1 [`SelectRequest`] it narrows with.
+    /// Pure data mapping; selection itself stays on [`ProviderRegistry`].
+    #[must_use]
+    pub fn to_select_request(&self) -> SelectRequest {
+        SelectRequest {
+            required: self.required.clone(),
+            alias: self.alias.clone(),
+            min_context_window_tokens: self.min_context_window_tokens,
+            max_cost_weight: self.max_cost_weight,
+        }
+    }
+
+    /// Wrap an S1 [`SelectRequest`] as an envelope. Pure data mapping.
+    #[must_use]
+    pub fn from_select_request(request: &SelectRequest) -> Self {
+        Self {
+            required: request.required.clone(),
+            alias: request.alias.clone(),
+            min_context_window_tokens: request.min_context_window_tokens,
+            max_cost_weight: request.max_cost_weight,
+        }
+    }
+
+    /// Human-readable requirement summary, mirroring
+    /// [`SelectRequest::describe`] for the [`SelectionError::NoCandidate`]
+    /// detail.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.to_select_request().describe()
+    }
+}
+
+/// Scoped-IPC selection response envelope: either the detached
+/// [`SelectedModel`] chain or the typed [`SelectionError`].
+///
+/// `Selected` carries the full ordered fallback chain (primary is element
+/// `0`; every element independently satisfies the request; snapshots are
+/// detached so later registry changes do not leak in). `Failed` carries the
+/// selection refusal, with a full alias miss preserved as
+/// [`SelectionError::NoCandidate`] (never a fall-through to non-alias
+/// entries). No version field, no transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectEnvelopeResponse {
+    /// Ordered detached snapshot chain.
+    Selected {
+        /// Every candidate that satisfies the envelope request.
+        chain: Vec<SelectedModel>,
+    },
+    /// Typed selection refusal.
+    Failed {
+        /// Why nothing satisfies the envelope request.
+        error: SelectionError,
+    },
+}
+
+impl SelectEnvelopeResponse {
+    /// Wrap a [`ProviderRegistry::select`](ProviderRegistry::select) outcome
+    /// as an envelope. Pure data mapping.
+    #[must_use]
+    pub fn from_result(result: Result<Vec<SelectedModel>, SelectionError>) -> Self {
+        match result {
+            Ok(chain) => Self::Selected { chain },
+            Err(error) => Self::Failed { error },
+        }
+    }
+
+    /// Unwrap an envelope back to the selection outcome. Pure data mapping.
+    pub fn into_result(self) -> Result<Vec<SelectedModel>, SelectionError> {
+        match self {
+            Self::Selected { chain } => Ok(chain),
+            Self::Failed { error } => Err(error),
+        }
+    }
+
+    /// Whether this envelope carries a selected chain.
+    #[must_use]
+    pub fn is_selected(&self) -> bool {
+        matches!(self, Self::Selected { .. })
+    }
+}
+
+/// Scoped-IPC fallback request envelope: echoes the [`ProviderError`] to
+/// classify. No version field, no transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackDirectiveEnvelopeRequest {
+    /// Provider failure to classify.
+    pub error: ProviderError,
+}
+
+impl FallbackDirectiveEnvelopeRequest {
+    /// Build a fallback request echoing `error`. No classification runs here.
+    #[must_use]
+    pub fn new(error: ProviderError) -> Self {
+        Self { error }
+    }
+
+    /// Classify the echoed error via the S1 [`fallback_directive`] mapping
+    /// (`Advance` on transport/rate-limit/unavailable/timeout, `Stop`
+    /// otherwise including [`ProviderError::Unknown`]). Pure, total, no I/O.
+    #[must_use]
+    pub fn resolve(&self) -> FallbackDirectiveEnvelopeResponse {
+        FallbackDirectiveEnvelopeResponse {
+            directive: fallback_directive(&self.error),
+        }
+    }
+}
+
+/// Scoped-IPC fallback response envelope: the [`FallbackDirective`] for the
+/// echoed error. No version field, no transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackDirectiveEnvelopeResponse {
+    /// Advance to the next chain element or stop and reconcile.
+    pub directive: FallbackDirective,
+}
+
+impl FallbackDirectiveEnvelopeResponse {
+    /// Build a fallback response carrying `directive`.
+    #[must_use]
+    pub fn new(directive: FallbackDirective) -> Self {
+        Self { directive }
+    }
+}
+
+/// Scoped-IPC cost-estimation request envelope: echoes the four
+/// [`estimate_cost`] inputs. No version field, no transport.
+///
+/// `input_weight`/`output_weight` are relative routing units (never
+/// currency); `0` means uncalibrated and counts as the baseline weight `1`
+/// (`effective(0) = 1`), so an unset weight is never free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstimateCostEnvelopeRequest {
+    /// Observed input tokens.
+    pub input_tokens: u64,
+    /// Observed output tokens.
+    pub output_tokens: u64,
+    /// Relative input cost weight (`0` = uncalibrated, counts as `1`).
+    pub input_weight: u32,
+    /// Relative output cost weight (`0` = uncalibrated, counts as `1`).
+    pub output_weight: u32,
+}
+
+impl EstimateCostEnvelopeRequest {
+    /// Build a cost request echoing its four [`estimate_cost`] inputs.
+    #[must_use]
+    pub fn new(
+        input_tokens: u64,
+        output_tokens: u64,
+        input_weight: u32,
+        output_weight: u32,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            input_weight,
+            output_weight,
+        }
+    }
+
+    /// Estimate routing cost for the echoed inputs via the S1
+    /// [`estimate_cost`] rule (relative units, saturating, `effective(0) =
+    /// 1`). Pure, no I/O, no clock. The response echoes the inputs.
+    #[must_use]
+    pub fn estimate(&self) -> EstimateCostEnvelopeResponse {
+        EstimateCostEnvelopeResponse {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            input_weight: self.input_weight,
+            output_weight: self.output_weight,
+            cost: estimate_cost(
+                self.input_tokens,
+                self.output_tokens,
+                self.input_weight,
+                self.output_weight,
+            ),
+        }
+    }
+}
+
+/// Scoped-IPC cost-estimation response envelope: echoes the request inputs
+/// plus the estimated cost in relative routing units (never currency).
+/// No version field, no transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstimateCostEnvelopeResponse {
+    /// Echoed input tokens.
+    pub input_tokens: u64,
+    /// Echoed output tokens.
+    pub output_tokens: u64,
+    /// Echoed input weight.
+    pub input_weight: u32,
+    /// Echoed output weight.
+    pub output_weight: u32,
+    /// Estimated cost (`effective(0) = 1`, saturating).
+    pub cost: u64,
+}
+
+impl EstimateCostEnvelopeResponse {
+    /// Whether the echoed cost matches a fresh [`estimate_cost`] evaluation
+    /// over the echoed inputs. Pure.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.cost
+            == estimate_cost(
+                self.input_tokens,
+                self.output_tokens,
+                self.input_weight,
+                self.output_weight,
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ModelCapability as Cap;
@@ -1805,5 +2102,342 @@ mod tests {
         };
         let selected = SelectedModel::from_entry(&entry);
         assert_eq!(selected.estimate_cost(3, 7), 3 * 2 + 7 * 4);
+    }
+
+    #[test]
+    fn envelope_select_is_alias_exclusive() {
+        let mut registry = registry_two();
+        registry
+            .register(text_model("bitty-c", "fast"))
+            .expect("capacity");
+        registry
+            .register_alias(
+                "chat",
+                vec![
+                    ModelRef::new("bitty-c", "fast").expect("valid ref"),
+                    ModelRef::new("bitty-b", "chat").expect("valid ref"),
+                ],
+            )
+            .expect("capacity");
+        let envelope =
+            SelectEnvelopeRequest::new(vec![Cap::Text], Some("chat".to_owned()), None, None);
+        let chain = registry
+            .select(&envelope.to_select_request())
+            .expect("alias resolves");
+        let response = SelectEnvelopeResponse::from_result(Ok(chain.clone()));
+        assert!(response.is_selected());
+        match response {
+            SelectEnvelopeResponse::Selected { chain: kept } => {
+                let order: Vec<(&str, &str)> = kept
+                    .iter()
+                    .map(|item| (item.provider_id.as_str(), item.name.as_str()))
+                    .collect();
+                // Alias-exclusive: only declared candidates in declared order;
+                // the matching non-alias entry ("bitty-a", "vision") is never
+                // appended.
+                assert_eq!(order, vec![("bitty-c", "fast"), ("bitty-b", "chat")]);
+                // Primary is element 0 and snapshots are detached.
+                assert_eq!(kept[0].name, "fast");
+                assert_eq!(kept, chain);
+            }
+            SelectEnvelopeResponse::Failed { error } => {
+                panic!("alias-exclusive select must succeed: {error:?}");
+            }
+        }
+        // Round-trip preserves the narrowing fields and the describe text.
+        let rebuilt = SelectEnvelopeRequest::from_select_request(&envelope.to_select_request());
+        assert_eq!(rebuilt, envelope);
+        assert!(envelope.describe().contains("alias=chat"));
+    }
+
+    #[test]
+    fn envelope_stale_chain_yields_no_candidate() {
+        let mut registry = registry_two();
+        registry
+            .register_alias(
+                "chat",
+                vec![
+                    ModelRef::new("bitty-gone", "ghost").expect("valid ref"),
+                    ModelRef::new("bitty-b", "chat").expect("valid ref"),
+                ],
+            )
+            .expect("capacity");
+        // One stale candidate degrades to the next in declared order, staying
+        // alias-only.
+        let envelope =
+            SelectEnvelopeRequest::new(vec![Cap::Text], Some("chat".to_owned()), None, None);
+        let response =
+            SelectEnvelopeResponse::from_result(registry.select(&envelope.to_select_request()));
+        match response.clone().into_result() {
+            Ok(chain) => {
+                assert_eq!(chain.len(), 1);
+                assert_eq!(chain[0].name, "chat");
+            }
+            Err(error) => panic!("stale skips to live candidate: {error:?}"),
+        }
+        assert!(response.is_selected());
+        // Every alias candidate stale while non-alias entries satisfy the
+        // caps: full miss is NoCandidate, never a fall-through.
+        let mut stale_only = registry_two();
+        stale_only
+            .register_alias(
+                "chat",
+                vec![ModelRef::new("bitty-gone", "ghost").expect("valid ref")],
+            )
+            .expect("capacity");
+        let stale_envelope = SelectEnvelopeRequest::capabilities(vec![Cap::Text]);
+        let stale_envelope = SelectEnvelopeRequest::new(
+            stale_envelope.required,
+            Some("chat".to_owned()),
+            None,
+            None,
+        );
+        let response = SelectEnvelopeResponse::from_result(
+            stale_only.select(&stale_envelope.to_select_request()),
+        );
+        assert!(!response.is_selected());
+        match response.into_result() {
+            Err(SelectionError::NoCandidate { detail }) => {
+                assert!(detail.contains("alias=chat"), "unexpected detail: {detail}");
+            }
+            other => panic!("fully stale alias must fail closed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn envelope_window_and_cost_gates_narrow_only() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(registration(
+                "bitty-fake",
+                "mystery",
+                vec![Cap::Text],
+                0,
+                0,
+                0,
+            ))
+            .expect("capacity");
+        registry
+            .register(registration(
+                "bitty-fake",
+                "roomy",
+                vec![Cap::Text],
+                32_768,
+                1,
+                1,
+            ))
+            .expect("capacity");
+        registry
+            .register(registration(
+                "bitty-fake",
+                "pricey",
+                vec![Cap::Text],
+                32_768,
+                1,
+                9,
+            ))
+            .expect("capacity");
+        // No narrowing: all three are routing-eligible.
+        let open = SelectEnvelopeRequest::capabilities(vec![Cap::Text]);
+        let open_chain = registry
+            .select(&open.to_select_request())
+            .expect("all match");
+        assert_eq!(open_chain.len(), 3);
+        // Window minimum filters the unknown (`0`) window.
+        let windowed = SelectEnvelopeRequest::new(vec![Cap::Text], None, Some(4_096), None);
+        assert!(windowed.describe().contains("min_window=4096"));
+        let windowed_chain = registry
+            .select(&windowed.to_select_request())
+            .expect("windowed matches");
+        assert_eq!(windowed_chain.len(), 2);
+        assert!(windowed_chain.iter().all(|item| item.name != "mystery"));
+        // Cost ceiling filters both weights with effective(0) = 1.
+        let priced = SelectEnvelopeRequest::new(vec![Cap::Text], None, Some(4_096), Some(2));
+        assert!(priced.describe().contains("max_cost=2"));
+        let priced_chain = registry
+            .select(&priced.to_select_request())
+            .expect("priced matches");
+        assert_eq!(priced_chain.len(), 1);
+        assert_eq!(priced_chain[0].name, "roomy");
+        // Narrowing never widens: each filtered chain is a subset.
+        let open_names: Vec<&str> = open_chain.iter().map(|item| item.name.as_str()).collect();
+        for item in &windowed_chain {
+            assert!(open_names.contains(&item.name.as_str()));
+        }
+        // A zero ceiling admits nothing: baseline `1` is the floor.
+        let zero = SelectEnvelopeRequest::new(vec![Cap::Text], None, None, Some(0));
+        assert!(matches!(
+            registry.select(&zero.to_select_request()),
+            Err(SelectionError::NoCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn envelope_estimate_cost_echo_effective_zero_is_one() {
+        // Inputs echo plus effective(0) = 1 in relative units (never currency).
+        let request = EstimateCostEnvelopeRequest::new(10, 5, 0, 0);
+        let response = request.estimate();
+        assert_eq!(response.input_tokens, 10);
+        assert_eq!(response.output_tokens, 5);
+        assert_eq!(response.input_weight, 0);
+        assert_eq!(response.output_weight, 0);
+        assert_eq!(response.cost, 15);
+        assert!(response.is_consistent());
+        // Zero weights equal baseline-one weights; partial-zero echoes too.
+        assert_eq!(
+            response.cost,
+            EstimateCostEnvelopeRequest::new(10, 5, 1, 1)
+                .estimate()
+                .cost
+        );
+        let mixed = EstimateCostEnvelopeRequest::new(10, 5, 0, 3).estimate();
+        assert_eq!(mixed.cost, 25);
+        assert_eq!(
+            mixed.cost,
+            EstimateCostEnvelopeRequest::new(10, 5, 1, 3)
+                .estimate()
+                .cost
+        );
+        assert!(mixed.is_consistent());
+        // Exact small-value accounting and saturation echo the S1 rule.
+        assert_eq!(
+            EstimateCostEnvelopeRequest::new(10, 5, 2, 3)
+                .estimate()
+                .cost,
+            35
+        );
+        assert_eq!(
+            EstimateCostEnvelopeRequest::new(0, 0, 2, 3).estimate().cost,
+            0
+        );
+        assert_eq!(
+            EstimateCostEnvelopeRequest::new(u64::MAX, 1, 2, u32::MAX)
+                .estimate()
+                .cost,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn envelope_fallback_mapping_is_total_incl_unknown_stop() {
+        let advance = [
+            ProviderError::Transport {
+                provider: "p".to_owned(),
+                reason: "reset".to_owned(),
+            },
+            ProviderError::RateLimited {
+                provider: "p".to_owned(),
+                retry_after_ms: Some(1_000),
+            },
+            ProviderError::RateLimited {
+                provider: "p".to_owned(),
+                retry_after_ms: None,
+            },
+            ProviderError::ModelUnavailable {
+                provider: "p".to_owned(),
+                model: "m".to_owned(),
+            },
+            ProviderError::Timeout {
+                timeout_ms: 5_000,
+                latency_ms: 6_000,
+            },
+        ];
+        for error in &advance {
+            let envelope = FallbackDirectiveEnvelopeRequest::new(error.clone());
+            let resolved = envelope.resolve();
+            assert_eq!(resolved.directive, FallbackDirective::Advance);
+            assert_eq!(
+                resolved,
+                FallbackDirectiveEnvelopeResponse::new(FallbackDirective::Advance)
+            );
+            assert_eq!(resolved.directive, fallback_directive(error));
+        }
+        let stop = [
+            ProviderError::UnknownModel {
+                name: "m".to_owned(),
+            },
+            ProviderError::BudgetExceeded {
+                limit: 1,
+                actual: 2,
+            },
+            ProviderError::TimeoutTooLarge {
+                max: 30_000,
+                actual: 60_000,
+            },
+            ProviderError::InvalidProviderId {
+                id: "BAD".to_owned(),
+            },
+            ProviderError::InvalidSampling,
+            ProviderError::UnsupportedSampling { field: "top_k" },
+            ProviderError::Auth {
+                provider: "p".to_owned(),
+                reason: "revoked".to_owned(),
+            },
+            ProviderError::CapabilityMismatch {
+                provider: "p".to_owned(),
+                model: "m".to_owned(),
+                missing: vec![Cap::ImageInput],
+            },
+            ProviderError::Unknown {
+                provider: "p".to_owned(),
+                reason: "ack lost".to_owned(),
+            },
+        ];
+        for error in &stop {
+            let envelope = FallbackDirectiveEnvelopeRequest::new(error.clone());
+            let resolved = envelope.resolve();
+            assert_eq!(
+                resolved.directive,
+                FallbackDirective::Stop,
+                "must stop: {error}"
+            );
+            assert_eq!(resolved.directive, fallback_directive(error));
+        }
+        // Unknown explicitly stops: the effect may have happened, so blind
+        // advance could double-apply; reconcile first.
+        let unknown = FallbackDirectiveEnvelopeRequest::new(ProviderError::Unknown {
+            provider: "p".to_owned(),
+            reason: "ack lost".to_owned(),
+        });
+        assert_eq!(unknown.resolve().directive, FallbackDirective::Stop);
+    }
+
+    #[test]
+    fn envelope_bounds_match_s1_and_carry_no_version() {
+        // Byte bounds are the S1 values, unchanged for the envelope layer.
+        assert_eq!(MAX_MODEL_NAME_LEN, 128);
+        assert_eq!(MAX_REGISTERED_MODELS, 64);
+        assert_eq!(MAX_ALIASES, 32);
+        assert_eq!(MAX_ALIAS_CANDIDATES, 8);
+        // Envelopes carry no version field by construction: exact-field
+        // construction round-trips without loss.
+        let request = SelectEnvelopeRequest::new(
+            vec![Cap::Text],
+            Some("chat".to_owned()),
+            Some(4_096),
+            Some(2),
+        );
+        assert_eq!(
+            SelectEnvelopeRequest::from_select_request(&request.to_select_request()),
+            request
+        );
+        let chain = vec![SelectedModel {
+            provider_id: "bitty-fake".to_owned(),
+            name: "m".to_owned(),
+            capabilities: vec![Cap::Text],
+            context_window_tokens: 4_096,
+            input_cost_weight: 1,
+            output_cost_weight: 2,
+        }];
+        let selected = SelectEnvelopeResponse::from_result(Ok(chain.clone()));
+        assert_eq!(selected.clone().into_result().expect("selected"), chain);
+        let failed = SelectEnvelopeResponse::from_result(Err(SelectionError::NoCandidate {
+            detail: "1 capabilities alias=chat".to_owned(),
+        }));
+        assert!(!failed.is_selected());
+        assert!(matches!(
+            failed.into_result(),
+            Err(SelectionError::NoCandidate { .. })
+        ));
     }
 }
