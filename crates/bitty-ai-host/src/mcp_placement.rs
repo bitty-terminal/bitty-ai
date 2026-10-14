@@ -992,7 +992,8 @@ pub fn diff_tool_snapshots(old: &ToolListSnapshot, new: &ToolListSnapshot) -> To
 // [`McpError`] envelope form via [`placement_to_mcp_error`] (total over the
 // four declaration-refusal variants, fatal-only, names-only bounded detail).
 //
-// No placement decision or routing is modeled here (S3 trigger unmet):
+// No placement decision or routing is modeled here (the S3 deny-all stub in
+// [`PlacementStub`] denies without routing; see the S3 section below):
 // envelopes carry pins and snapshots only — never an admit/deny verdict,
 // never a dispatch route, never a registry mutation. Rank-2 binary identity
 // stays out of scope: the envelope carries no path bytes and no hash bytes
@@ -1166,6 +1167,91 @@ pub fn placement_to_mcp_error(error: &PlacementError) -> McpError {
         McpStage::ListTools,
         McpFailure::HandshakeRejected { detail },
     )
+}
+
+// ── Phase 2 S3 placement deny-all stub (no routing, AI-0296) ──
+//
+// Deny-all placement-policy stub evaluated host-side at dispatch, per the
+// CTX-0154 candidate (`providers/provider-plugin-boundary.md`, MCP placement
+// policy section): every placement denies with a typed refusal until its
+// backend is reviewed and listed. No routing, no model selection, no I/O.
+//
+// Denial covers every placement input: [`ToolPlacement::Mcp`] and
+// [`ToolPlacement::Native`] alike, declared or not (`None` placement,
+// contradictory `Mcp`-with-detail, `Native`-without-detail, and valid
+// declarations the S1 [`validate_placement`] rule would admit all deny here
+// with the same typed refusal). There is no admit path, no fallback to the
+// other placement path, and no partial state: the single `Err` below is the
+// only outcome.
+//
+// Transport kind never doubles as placement: the provider transport kinds
+// (`HttpApi`, `LocalEndpoint`, `CliHarness`, `ManagedAccount`, `Router`) name
+// adapter classes and grant no capability by themselves; tool placement is
+// only the `mcp` / `native` declaration above plus, for `native`, the
+// reviewed backend name and the recorded reason. Provider adapters stay
+// behind the same backend, never a second authorization path.
+//
+// AIQ-36 (native versus MCP tool transport and bridge placement) stays open:
+// this stub closes nothing, grants nothing, reviews no backend, and lists no
+// backend. Acceptance belongs to reviewers through the canonical admission
+// rule, not to this task.
+//
+// Reuse only: this section reuses the S1/S2 types above ([`ToolPlacement`],
+// [`NativePlacement`], [`McpError`], [`McpStage`], [`McpFailure`],
+// [`bound_error_text`], [`MAX_ERROR_TEXT_BYTES`]) and introduces no
+// re-mirrored vocabulary, no new byte bounds, no version field, and no
+// envelope. `std`-only, no threads, no clock, no network, no filesystem, no
+// SPKI fetch, no spawn, no credential or secret material. `Cargo.toml` stays
+// `std`-only.
+
+/// Deny-all placement-policy stub: every placement denies until its backend
+/// is reviewed and listed.
+///
+/// Unit struct, no state: construction performs no I/O and grants nothing.
+/// Evaluation is a pure `&str`/`&[u8]`-in/value-out refusal — never a route,
+/// never a model selection, never a dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlacementStub;
+
+impl PlacementStub {
+    /// Build the stub. No state, no I/O, grants nothing.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Deny every placement with the typed refusal.
+    ///
+    /// Both inputs are observed only as denied: `placement` covers `mcp`,
+    /// `native`, and undeclared (`None`); `native` covers absent, valid, and
+    /// contradictory detail. Contents are never inspected for routing, never
+    /// select a model, and never move provider or tool I/O — every
+    /// combination returns the same [`McpStage::Bridge`] +
+    /// [`McpFailure::HandshakeRejected`] refusal. Pure, deterministic,
+    /// offline.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Err`: the placement is denied until its backend is
+    /// reviewed and listed.
+    pub fn check(
+        &self,
+        placement: Option<ToolPlacement>,
+        native: Option<&NativePlacement>,
+    ) -> Result<(), McpError> {
+        // Observed only as denied: no branch on placement or detail, so no
+        // routing, selection, or fallback observable can leak through.
+        let _ = (placement, native);
+        Err(McpError::new(
+            McpStage::Bridge,
+            McpFailure::HandshakeRejected {
+                detail: bound_error_text(
+                    "placement denied: backend not reviewed and listed",
+                    MAX_ERROR_TEXT_BYTES,
+                ),
+            },
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1855,5 +1941,159 @@ mod placement_envelope_tests {
         assert_eq!(MAX_ERROR_NAME_BYTES, 128);
         assert_eq!(MAX_TOOL_PAGES, 5);
         assert_eq!(PROTOCOL_VERSION, "2025-11-25");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3 offline tests: deny-all placements, declared-still-denies, typed
+// refusal, no routing observables. Deterministic, no network, no filesystem,
+// no clock.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod placement_stub_tests {
+    use super::*;
+
+    fn native_detail() -> NativePlacement {
+        NativePlacement {
+            reason: "host-native".to_owned(),
+            backend: "backend".to_owned(),
+        }
+    }
+
+    fn denied_error(
+        placement: Option<ToolPlacement>,
+        native: Option<&NativePlacement>,
+    ) -> McpError {
+        PlacementStub::new()
+            .check(placement, native)
+            .expect_err("deny-all stub never admits")
+    }
+
+    #[test]
+    fn deny_all_placements_mcp_native_and_undeclared() {
+        let stub = PlacementStub::new();
+        // Undeclared denies.
+        assert!(stub.check(None, None).is_err());
+        // MCP without detail denies.
+        assert!(stub.check(Some(ToolPlacement::Mcp), None).is_err());
+        // Native with valid detail denies.
+        let detail = native_detail();
+        assert!(
+            stub.check(Some(ToolPlacement::Native), Some(&detail))
+                .is_err()
+        );
+        // Contradictory and incomplete declarations deny with no fallback to
+        // the other path.
+        assert!(stub.check(Some(ToolPlacement::Mcp), Some(&detail)).is_err());
+        assert!(stub.check(Some(ToolPlacement::Native), None).is_err());
+        assert!(
+            stub.check(
+                Some(ToolPlacement::Native),
+                Some(&NativePlacement {
+                    reason: String::new(),
+                    backend: "b".to_owned(),
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn declared_still_denies() {
+        // S1 admits this MCP declaration, the stub still denies it.
+        let mcp_spec = ToolSpec::new(
+            "mcp_tool",
+            "test",
+            Vec::new(),
+            "mcp.demo",
+            true,
+            ToolPlacement::Mcp,
+            None,
+        )
+        .expect("S1 admits valid MCP declaration");
+        assert!(
+            PlacementStub::new()
+                .check(mcp_spec.placement, mcp_spec.native.as_ref())
+                .is_err()
+        );
+        // S1 admits this native declaration, the stub still denies it.
+        let native_spec = ToolSpec::new(
+            "native_tool",
+            "test",
+            Vec::new(),
+            "test.scope",
+            false,
+            ToolPlacement::Native,
+            Some(native_detail()),
+        )
+        .expect("S1 admits valid native declaration");
+        assert!(
+            PlacementStub::new()
+                .check(native_spec.placement, native_spec.native.as_ref())
+                .is_err()
+        );
+        // Imported MCP tools carry Mcp placement by construction and still
+        // deny.
+        let imported = import_tool(
+            "demo",
+            &RawMcpTool {
+                name: "echo".to_owned(),
+                description: "test".to_owned(),
+                schema_json: br#"{"type":"object"}"#.to_vec(),
+            },
+        )
+        .expect("valid import");
+        assert_eq!(imported.spec.placement, Some(ToolPlacement::Mcp));
+        assert!(
+            PlacementStub::new()
+                .check(imported.spec.placement, imported.spec.native.as_ref())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn typed_refusal_is_bridge_handshake_rejected_fatal() {
+        let error = denied_error(Some(ToolPlacement::Mcp), None);
+        assert_eq!(error.stage, McpStage::Bridge);
+        assert!(
+            matches!(error.failure, McpFailure::HandshakeRejected { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(!error.retryable, "placement denial is fatal-only");
+        let text = error.to_string();
+        assert!(text.starts_with("mcp bridge: handshake rejected: "));
+        assert!(text.contains("placement denied: backend not reviewed and listed"));
+        // Names-only bounded diagnostic: printable ASCII, within bound, no
+        // payload bytes.
+        assert!(text.bytes().all(|b| (0x20..=0x7E).contains(&b)));
+        assert!(text.len() <= "mcp bridge: handshake rejected: ".len() + MAX_ERROR_TEXT_BYTES);
+        assert!(!text.contains('{'));
+        assert!(!text.contains('}'));
+    }
+
+    #[test]
+    fn no_routing_observables() {
+        // Every placement input maps to the identical typed refusal: no
+        // branch, no route, no model selection, no fallback observable.
+        let detail = native_detail();
+        let cases = [
+            denied_error(None, None),
+            denied_error(Some(ToolPlacement::Mcp), None),
+            denied_error(Some(ToolPlacement::Native), Some(&detail)),
+            denied_error(Some(ToolPlacement::Mcp), Some(&detail)),
+            denied_error(Some(ToolPlacement::Native), None),
+        ];
+        for error in &cases[1..] {
+            assert_eq!(*error, cases[0]);
+        }
+        // Deterministic across calls and instances; the stub carries no
+        // state that could select or route.
+        assert_eq!(PlacementStub::new(), PlacementStub);
+        assert_eq!(std::mem::size_of::<PlacementStub>(), 0);
+        assert_eq!(
+            denied_error(Some(ToolPlacement::Native), Some(&detail)),
+            denied_error(Some(ToolPlacement::Native), Some(&detail))
+        );
     }
 }
