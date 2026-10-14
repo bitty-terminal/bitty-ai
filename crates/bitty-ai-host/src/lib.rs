@@ -7,8 +7,8 @@
 //! threads, no filesystem or network access, no dependencies beyond `std`.
 //!
 //! Deny-all posture holds by construction: the shell carries no ambient
-//! authority because there is nothing to call — every seam module below is
-//! documentation only, with zero items — and `#![deny(unsafe_code)]`
+//! authority because each seam module below carries only types plus pure
+//! checks — no behavior, no transport — and `#![deny(unsafe_code)]`
 //! (honored via the workspace lints) forbids unsafe blocks crate-wide.
 //!
 //! Explicitly open (no choice made here or in any module below):
@@ -19,16 +19,16 @@
 //! - `LocalEndpoint` route question (stays with the Phase 2 backlog).
 //! - Per-seam behavior (stays with separately scoped Phase 2 tasks).
 //!
-//! Shape note: the seam modules are intentionally doc-only with no items and
-//! no tests — except `context_providers`, which carries the Phase 2 S1
-//! pure-type/zone mirror, and `extension_registry`, which carries the Phase 2
-//! S1 pure-type mirror (both std-only, still no I/O, IPC, threads, or ambient
-//! authority, each with offline unit tests). A test elsewhere would either assert
-//! a vacuous truth or require introducing an item (constant or function) to
-//! assert on, and any such item would itself be behavior-adjacent surface
-//! contradicting the no-types, no-functions, no-behavior rule above. The
-//! deny-all default is structural (empty shell apart from the mirror,
-//! std-only, deny unsafe), not asserted.
+//! Shape note: each of the seven seam modules below carries its Phase 2 S1
+//! pure-type mirror plus its Phase 2 S2 scoped-IPC envelope types — types
+//! plus pure `&str`/`&[u8]`-in/value-out checks only, `std`-only, with no
+//! behavior and no transport (no registry execution, no dispatch, no provider
+//! or context wiring, no socket, no encoding, no version field, no threads,
+//! no clock, no filesystem or network access, no ambient authority), each
+//! with offline unit tests. Each module's own header documents its S-scope
+//! (what is mirrored, what stays out, and which S2 task owns its envelopes).
+//! The deny-all default stays structural (mirrors plus envelopes only,
+//! `std`-only, deny unsafe), not asserted.
 //!
 //! Canonical design text lives in `bitty-ai-docs`
 //! (`architecture/host-boundary-trait-design.md`, Phase 1 scope section);
