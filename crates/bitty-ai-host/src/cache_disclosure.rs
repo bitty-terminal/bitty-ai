@@ -1362,6 +1362,153 @@ pub fn ensure_0600(path: &Path) -> std::io::Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 S2 scoped-IPC envelope: cache-hint request/response (types-only).
+// ---------------------------------------------------------------------------
+//
+// Status: Phase 2 S2 per AI-0283. Scoped-IPC envelope shapes only — no
+// transport. This section appends `CacheHintRequest` / `CacheHintResponse`
+// (+ `CacheHintError`) to the S1 mirror above and reuses the S1 types
+// without re-mirroring them: [`CacheKey`] (5 fields, scope rule as code),
+// [`CacheScope`], and [`InputFingerprint`] (exact-only reuse shape).
+//
+// Shared S2 convention: types-only, `std`-only, no socket/transport/dep
+// change, NO version field, no behavior beyond pure shape checks and pure
+// echo mapping, no thread/clock/net/fs. There is deliberately no `version`
+// field on either envelope: versioning/negotiation stays out of scope.
+// Construction performs no I/O and bestows no capability; the envelopes are
+// terminal-side metadata describing a cache hint, never a channel carrying
+// cached bytes.
+//
+// Hints carry keys only, never value bytes: [`CacheHintResponse`] has no
+// `value` field by construction (only the echoed [`CacheKey`] plus the
+// `hit` presence bit), so a hint cannot smuggle cached content across the
+// seam. Key equality — and a `hit` answer — never imply reuse: admission
+// stays deny-all until a scoped policy task designs it (S-3 trigger unmet),
+// and no admission decision is modeled here (there is deliberately no
+// allow/deny field on either envelope). No cross-provider reuse: the echoed
+// key keeps the S1 scope rule (route fields participate in equality), so the
+// same bytes under a different route still compare unequal here.
+
+/// Scoped-IPC envelope shape failures (pure checks only).
+///
+/// Variants carry scopes only — never fingerprints, digests, or value bytes
+/// (there are no value bytes at this seam).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheHintError {
+    /// The request scope does not equal the echoed key's scope. Carries the
+    /// key's scope as `expected` and the carried scope as `actual`.
+    ScopeMismatch {
+        /// Scope carried by the echoed key.
+        expected: CacheScope,
+        /// Scope carried by the request.
+        actual: CacheScope,
+    },
+    /// A response key does not echo the request key it answers. The caller
+    /// already holds both keys, so no payload travels here.
+    KeyMismatch,
+}
+
+impl Display for CacheHintError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::ScopeMismatch { expected, actual } => write!(
+                f,
+                "cache hint scope {actual} does not match key scope {expected}"
+            ),
+            Self::KeyMismatch => {
+                write!(f, "cache hint response key does not echo the request key")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CacheHintError {}
+
+/// Scoped cache-hint request envelope (no transport).
+///
+/// - `key`: the S1 cache key under test, echoed verbatim (route + content
+///   fields all participate in equality, so cross-route aliasing stays
+///   impossible by construction).
+/// - `scope`: the routing scope the hint is asked under; must equal
+///   `key.scope` (checked by [`CacheHintRequest::validate`]).
+/// - `fingerprint`: the S1 complete-input fingerprint carried with the key
+///   (exact-only shape reused verbatim; matching stays with the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheHintRequest {
+    /// Echoed cache key under test.
+    pub key: CacheKey,
+    /// Routing scope the hint is asked under.
+    pub scope: CacheScope,
+    /// Complete-input fingerprint carried with the key.
+    pub fingerprint: InputFingerprint,
+}
+
+impl CacheHintRequest {
+    /// Fail-closed shape check: the carried scope must equal the echoed
+    /// key's scope. Pure, deterministic, offline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheHintError::ScopeMismatch`] when the scopes differ.
+    pub fn validate(&self) -> Result<(), CacheHintError> {
+        if self.scope != self.key.scope {
+            return Err(CacheHintError::ScopeMismatch {
+                expected: self.key.scope,
+                actual: self.scope,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Scoped cache-hint response envelope (no transport).
+///
+/// - `key`: echo of the request key this presence answer is about.
+/// - `hit`: presence answer only (`true` = key present, `false` = absent).
+///   Presence is not admission: a `hit` never authorizes reuse on its own.
+///
+/// There is deliberately no `value` field: hints carry keys only, so cached
+/// content cannot cross this seam by construction. There is deliberately no
+/// admission field either: the deny-all posture holds until S-3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheHintResponse {
+    /// Echo of the request key this presence answer is about.
+    pub key: CacheKey,
+    /// Presence answer: `true` for hit, `false` for miss.
+    pub hit: bool,
+}
+
+impl CacheHintResponse {
+    /// Presence answer "hit" for `key`. Pure data construction: performs no
+    /// lookup and bestows no capability.
+    #[must_use]
+    pub fn hit_for(key: CacheKey) -> Self {
+        Self { key, hit: true }
+    }
+
+    /// Presence answer "miss" for `key`. Pure data construction: performs no
+    /// lookup and bestows no capability.
+    #[must_use]
+    pub fn miss_for(key: CacheKey) -> Self {
+        Self { key, hit: false }
+    }
+
+    /// Pure echo check: the response key must equal the request key it
+    /// answers. Matching stays a caller-side check over data; nothing is
+    /// admitted here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheHintError::KeyMismatch`] when the keys differ.
+    pub fn check_echo(&self, request: &CacheHintRequest) -> Result<(), CacheHintError> {
+        if self.key != request.key {
+            return Err(CacheHintError::KeyMismatch);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2117,5 +2264,159 @@ mod tests {
         let err = ensure_0600(&path).expect_err("off-Unix helper must fail closed");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         assert!(!path.exists(), "stub must create no file");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2 offline tests: key echo, hit/miss mapping, error axes, no value bytes.
+// Deterministic, no network, no filesystem, no clock.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hint_envelope_tests {
+    use super::*;
+
+    /// Canonical bytes with the `prompt::render_canonical` layout, test-side
+    /// assembly duplicated from `tests` on purpose: the hint envelope pins
+    /// the layout independently of the shared helper.
+    fn hint_canonical_bytes(stable_user: &str, turn: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"prompt/1\n");
+        out.extend_from_slice(b"core-version:bitty-core-prompt@1\n");
+        for (name, text) in [
+            ("core-contract", "stable core"),
+            ("user", stable_user),
+            ("project", "stable project"),
+            ("skills-profile", "stable skills"),
+            ("runtime-turn", turn),
+        ] {
+            out.extend_from_slice(b"[layer:");
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b" len=");
+            out.extend_from_slice(text.len().to_string().as_bytes());
+            out.extend_from_slice(b"]\n");
+            out.extend_from_slice(text.as_bytes());
+            out.extend_from_slice(b"\n");
+        }
+        out.extend_from_slice(b"[effective]\n");
+        out.extend_from_slice(b"end\n");
+        out
+    }
+
+    fn hint_key() -> CacheKey {
+        CacheKey::new(
+            "bitty-fake",
+            "fake-chat",
+            CacheScope::Session,
+            &hint_canonical_bytes("stable user", "turn one"),
+        )
+        .expect("valid test key inputs")
+    }
+
+    fn hint_fingerprint() -> InputFingerprint {
+        InputFingerprint::new(b"complete input").expect("non-empty fingerprints")
+    }
+
+    fn hint_request() -> CacheHintRequest {
+        CacheHintRequest {
+            key: hint_key(),
+            scope: CacheScope::Session,
+            fingerprint: hint_fingerprint(),
+        }
+    }
+
+    #[test]
+    fn request_echoes_key_scope_and_fingerprint() {
+        let request = hint_request();
+        assert_eq!(request.key, hint_key(), "request must echo the key");
+        assert_eq!(request.scope, CacheScope::Session);
+        assert_eq!(request.scope, request.key.scope);
+        assert_eq!(request.fingerprint, hint_fingerprint());
+        assert!(request.validate().is_ok());
+        // Deterministic: repeated construction agrees.
+        assert_eq!(request, hint_request());
+        assert_eq!(request.key, hint_key());
+    }
+
+    #[test]
+    fn scope_mismatch_refuses_fail_closed() {
+        let mut request = hint_request();
+        request.scope = CacheScope::Turn;
+        assert_eq!(
+            request.validate(),
+            Err(CacheHintError::ScopeMismatch {
+                expected: CacheScope::Session,
+                actual: CacheScope::Turn,
+            })
+        );
+        assert_eq!(
+            CacheHintError::ScopeMismatch {
+                expected: CacheScope::Session,
+                actual: CacheScope::Turn,
+            }
+            .to_string(),
+            "cache hint scope turn does not match key scope session"
+        );
+        assert_eq!(
+            CacheHintError::KeyMismatch.to_string(),
+            "cache hint response key does not echo the request key"
+        );
+    }
+
+    #[test]
+    fn hit_miss_mapping_echoes_key() {
+        let request = hint_request();
+        let hit = CacheHintResponse::hit_for(hint_key());
+        assert!(hit.hit, "hit constructor must map to a hit");
+        assert_eq!(hit.key, request.key, "hit must echo the request key");
+        assert!(hit.check_echo(&request).is_ok());
+        let miss = CacheHintResponse::miss_for(hint_key());
+        assert!(!miss.hit, "miss constructor must map to a miss");
+        assert_eq!(miss.key, request.key, "miss must echo the request key");
+        assert!(miss.check_echo(&request).is_ok());
+        assert_ne!(hit, miss, "hit and miss over one key must differ");
+        // A response for another route's key fails the echo check: same
+        // bytes under a different route stay unequal (no cross-provider
+        // reuse), so the mismatch is observable here as data.
+        let foreign_key = CacheKey::new(
+            "bitty-other",
+            "fake-chat",
+            CacheScope::Session,
+            &hint_canonical_bytes("stable user", "turn one"),
+        )
+        .expect("valid test key inputs");
+        assert_ne!(foreign_key, request.key);
+        let foreign = CacheHintResponse::hit_for(foreign_key);
+        assert_eq!(
+            foreign.check_echo(&request),
+            Err(CacheHintError::KeyMismatch)
+        );
+    }
+
+    #[test]
+    fn no_value_bytes_by_construction() {
+        // Exhaustive destructure: adding a `value` (or any) field to the
+        // response later breaks this compile, so keys-only travel is pinned
+        // by construction, not by convention.
+        let hit = CacheHintResponse::hit_for(hint_key());
+        let CacheHintResponse { key, hit: is_hit } = hit;
+        assert_eq!(key, hint_key());
+        assert!(is_hit);
+        let miss = CacheHintResponse::miss_for(hint_key());
+        let CacheHintResponse {
+            key: miss_key,
+            hit: is_miss_hit,
+        } = miss;
+        assert_eq!(miss_key, hint_key());
+        assert!(!is_miss_hit);
+        // The response carries no fingerprint either: only the key echo plus
+        // the presence bit travel.
+        assert_eq!(
+            CacheHintResponse::miss_for(hint_key()),
+            CacheHintResponse {
+                key: hint_key(),
+                hit: false,
+            }
+        );
     }
 }
