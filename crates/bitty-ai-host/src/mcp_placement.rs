@@ -963,6 +963,212 @@ pub fn diff_tool_snapshots(old: &ToolListSnapshot, new: &ToolListSnapshot) -> To
     }
 }
 
+// ── Phase 2 S2 scoped-IPC envelope types (no transport, AI-0284) ──
+//
+// Scoped-IPC pin/snapshot shapes for the MCP-placement seam so a future
+// host-side caller can cross the boundary without touching the registry,
+// adapter, or transport directly. Types-only, `std`-only, no behavior: no
+// socket, no transport, no thread, no clock, no network, no filesystem, no
+// dependency change (`Cargo.toml` stays `std`-only), no new byte bounds (the
+// S1 [`MAX_TOOL_NAME_LEN`], [`MAX_TOOL_DESCRIPTION_LEN`],
+// [`MAX_TOOL_SCHEMA_BYTES`], [`MAX_NATIVE_PLACEMENT_BYTES`],
+// [`MAX_REASON_BYTES`], [`MAX_ERROR_TEXT_BYTES`], [`MAX_ERROR_NAME_BYTES`],
+// [`MAX_TOOL_PAGES`], and [`PROTOCOL_VERSION`] values apply unchanged), no
+// version field on any envelope, and no placement execution. Every envelope
+// reuses the S1 mirror above ([`InitializeResult`],
+// [`ToolsCapabilityShape`], [`ToolListSnapshot`], [`ToolListDiff`],
+// [`ImportedTool`], [`PlacementError`], [`McpError`], [`McpStage`],
+// [`McpFailure`], [`bound_error_text`], [`diff_tool_snapshots`]) and
+// introduces no re-mirrored vocabulary.
+//
+// Gate and mapping summary (re-stated, not re-implemented): the pin envelope
+// echoes the negotiated [`InitializeResult`] (protocol version plus full
+// tools-capability shape); shape validation checks the version pin plus the
+// tools-capability presence while any capability-shape move (downgrade or
+// upgrade) is caught by pin comparison only; the snapshot envelope echoes
+// the [`ToolListSnapshot`] digest pairs plus the `list_version` / `list_stale`
+// flags as data with no enforcement (matching, staleness discipline, and
+// re-list stay MCP-owned); every [`PlacementError`] maps to the typed
+// [`McpError`] envelope form via [`placement_to_mcp_error`] (total over the
+// four declaration-refusal variants, fatal-only, names-only bounded detail).
+//
+// No placement decision or routing is modeled here (S3 trigger unmet):
+// envelopes carry pins and snapshots only — never an admit/deny verdict,
+// never a dispatch route, never a registry mutation. Rank-2 binary identity
+// stays out of scope: the envelope carries no path bytes and no hash bytes
+// (the [`McpFailure::IdentityMismatch`] server-id-only shape documents the
+// separation, same as S1). SPKI fetch, peer-key providers, spawn,
+// supervision, credential helpers, resources/prompts consumers, TOFU, and
+// auto-update stay out of scope, same as S1.
+//
+// Shared S2 convention: types-only, `std`-only, no socket/transport/dep
+// change, NO version field on any envelope (envelope versioning is a
+// host-design concern, never a silent field here), no behavior beyond pure
+// shape checks and pure error mapping, no thread/clock/net/fs.
+
+/// Scoped-IPC pin envelope: echoes the S1 [`InitializeResult`] pin.
+///
+/// Data-only carrier for the negotiated protocol facts (protocol version
+/// plus tools-capability shape). Construction performs no I/O and grants
+/// nothing; comparison and shape validation are pure. No version field, no
+/// transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinEnvelope {
+    /// Negotiated pin echoed across the boundary (S1 shape, reused).
+    pub pin: InitializeResult,
+}
+
+impl PinEnvelope {
+    /// Build a pin envelope echoing `pin`. No validation runs here: shape
+    /// checks stay in [`PinEnvelope::validate`] and drift checks in
+    /// [`PinEnvelope::matches`].
+    #[must_use]
+    pub fn new(pin: InitializeResult) -> Self {
+        Self { pin }
+    }
+
+    /// Borrow the echoed pin.
+    #[must_use]
+    pub fn pin(&self) -> &InitializeResult {
+        &self.pin
+    }
+
+    /// Whether `fresh` matches the echoed pin (protocol version plus full
+    /// [`ToolsCapabilityShape`).
+    ///
+    /// Pure delegate to [`InitializeResult::matches_pin`]: version drift and
+    /// any capability-shape move (downgrade or upgrade) report `false`; a
+    /// server-binary swap with identical protocol state still reports `true`
+    /// (binary identity is out of scope, `std`-only pin). No enforcement
+    /// runs here; the caller decides staleness.
+    #[must_use]
+    pub fn matches(&self, fresh: &InitializeResult) -> bool {
+        self.pin.matches_pin(fresh)
+    }
+
+    /// Fail-closed pin shape validation: the echoed pin must carry the
+    /// [`PROTOCOL_VERSION`] pin and must offer the tools capability.
+    ///
+    /// Any [`ToolsCapabilityShape`] is shape-valid on its own (bool vs
+    /// object, any `listChanged` flag); shape moves are drift, caught by
+    /// [`PinEnvelope::matches`], not here. Pure, deterministic, offline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpFailure::VersionMismatch`] when the echoed protocol
+    /// version differs from the pin, and [`McpFailure::NoToolCapability`]
+    /// when the echoed pin offers no tools capability.
+    pub fn validate(&self) -> Result<(), McpError> {
+        if self.pin.protocol_version != PROTOCOL_VERSION {
+            return Err(McpError::new(
+                McpStage::Handshake,
+                McpFailure::VersionMismatch {
+                    expected: PROTOCOL_VERSION.to_owned(),
+                    got: bound_error_text(&self.pin.protocol_version, MAX_ERROR_NAME_BYTES),
+                },
+            ));
+        }
+        if !self.pin.tools_supported {
+            return Err(McpError::new(
+                McpStage::Handshake,
+                McpFailure::NoToolCapability,
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Scoped-IPC snapshot envelope: echoes the S1 [`ToolListSnapshot`] digest
+/// pairs plus the `list_version` / `list_stale` flags as data.
+///
+/// Data-only carrier: `snapshot` holds the `(sanitized name, schema digest)`
+/// pairs in name order, `list_version` echoes the monotonic MCP list version
+/// (starts at `0`, saturating bumps MCP-side), and `list_stale` echoes the
+/// deny-stale flag. Both flags travel verbatim with no enforcement here:
+/// a stale envelope is still well-formed data, a version mismatch is still
+/// well-formed data, and re-list stays the sole MCP-owned un-staling path.
+/// No version field on the envelope itself, no transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEnvelope {
+    /// Digest snapshot echoed across the boundary (S1 shape, reused).
+    pub snapshot: ToolListSnapshot,
+    /// Echoed MCP list version (data only, no monotonic check here).
+    pub list_version: u64,
+    /// Echoed deny-stale flag (data only, no deny here).
+    pub list_stale: bool,
+}
+
+impl SnapshotEnvelope {
+    /// Build a snapshot envelope echoing `snapshot` plus the version/stale
+    /// flags. No enforcement runs here: any flag combination is well-formed
+    /// data.
+    #[must_use]
+    pub fn new(snapshot: ToolListSnapshot, list_version: u64, list_stale: bool) -> Self {
+        Self {
+            snapshot,
+            list_version,
+            list_stale,
+        }
+    }
+
+    /// Build a snapshot envelope from imported tools, echoing the given
+    /// version/stale flags. Pure delegate to
+    /// [`ToolListSnapshot::from_imported`]; sorting and digest rules apply
+    /// unchanged.
+    #[must_use]
+    pub fn from_imported(tools: &[ImportedTool], list_version: u64, list_stale: bool) -> Self {
+        Self {
+            snapshot: ToolListSnapshot::from_imported(tools),
+            list_version,
+            list_stale,
+        }
+    }
+
+    /// Borrow the echoed snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> &ToolListSnapshot {
+        &self.snapshot
+    }
+
+    /// Echoed list version (data only).
+    #[must_use]
+    pub fn list_version(&self) -> u64 {
+        self.list_version
+    }
+
+    /// Echoed stale flag (data only, never a deny here).
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        self.list_stale
+    }
+}
+
+/// Map a [`PlacementError`] declaration refusal to the typed [`McpError`]
+/// envelope form.
+///
+/// Total over the four S1 refusal variants (no wildcard arm): adding a
+/// [`PlacementError`] variant breaks compilation here, which is the
+/// fail-closed response to a new refusal mode (it must be classified before
+/// any envelope carries it). Every mapping reports [`McpStage::ListTools`]
+/// with [`McpFailure::HandshakeRejected`] carrying the bounded, scrubbed
+/// refusal text (mirroring the S1 [`import_tool`] precedent, which maps
+/// [`ToolSpec`] bound and validation failures to the same typed failure):
+/// the entry is not a usable import. Counts and bounds cross verbatim;
+/// names and rejected strings cross via the one bounded diagnostic policy
+/// ([`bound_error_text`] to [`MAX_ERROR_TEXT_BYTES`], printable ASCII only),
+/// so the mapped error is safe to log directly. Every mapped error is fatal
+/// (`retryable` is `false`); transport, spawn, credential, supervision,
+/// dispatch, and I/O failures have no variant here and are never produced
+/// from this mapping.
+#[must_use]
+pub fn placement_to_mcp_error(error: &PlacementError) -> McpError {
+    let detail = bound_error_text(&error.to_string(), MAX_ERROR_TEXT_BYTES);
+    McpError::new(
+        McpStage::ListTools,
+        McpFailure::HandshakeRejected { detail },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1397,5 +1603,258 @@ mod tests {
             .to_string(),
             "tool listing repeated cursor 'abc'"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2 offline tests: pin shape, snapshot echo, stale-flag data-only, error
+// axes. Deterministic, no network, no filesystem, no clock.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod placement_envelope_tests {
+    use super::*;
+
+    fn pin() -> InitializeResult {
+        InitializeResult {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::Object {
+                list_changed: Some(true),
+            },
+        }
+    }
+
+    fn raw(name: &str, schema: &[u8]) -> RawMcpTool {
+        RawMcpTool {
+            name: name.to_owned(),
+            description: "test".to_owned(),
+            schema_json: schema.to_vec(),
+        }
+    }
+
+    fn imported(name: &str, schema: &[u8]) -> ImportedTool {
+        import_tool("demo", &raw(name, schema)).expect("valid import")
+    }
+
+    #[test]
+    fn pin_envelope_echoes_and_validates_shape() {
+        let envelope = PinEnvelope::new(pin());
+        assert_eq!(envelope.pin(), &pin());
+        assert_eq!(envelope, PinEnvelope::new(pin()));
+        // Shape validation admits the pinned handshake facts.
+        assert!(envelope.validate().is_ok());
+        // Every capability shape is handshake-valid on its own: drift is
+        // caught by matches, never by validate.
+        for shape in [
+            ToolsCapabilityShape::BoolTrue,
+            ToolsCapabilityShape::Object { list_changed: None },
+            ToolsCapabilityShape::Object {
+                list_changed: Some(false),
+            },
+            ToolsCapabilityShape::Object {
+                list_changed: Some(true),
+            },
+        ] {
+            let shaped = PinEnvelope::new(InitializeResult {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                tools_supported: true,
+                tools_shape: shape,
+            });
+            assert!(shaped.validate().is_ok(), "any shape validates");
+        }
+        // Version drift refuses with the typed pin mismatch.
+        let drifted = PinEnvelope::new(InitializeResult {
+            protocol_version: "1999-01-01".to_owned(),
+            ..pin()
+        });
+        let error = drifted.validate().expect_err("version drift must fail");
+        assert_eq!(error.stage, McpStage::Handshake);
+        assert!(matches!(error.failure, McpFailure::VersionMismatch { .. }));
+        assert!(!error.retryable);
+        assert!(error.to_string().contains("protocol version mismatch"));
+        // Missing tools capability refuses with the typed absence refusal.
+        let unsupported = PinEnvelope::new(InitializeResult {
+            tools_supported: false,
+            ..pin()
+        });
+        let error = unsupported
+            .validate()
+            .expect_err("missing capability must fail");
+        assert_eq!(
+            error,
+            McpError::new(McpStage::Handshake, McpFailure::NoToolCapability)
+        );
+        assert!(!error.retryable);
+        // Pin comparison delegates to the S1 matches_pin rule.
+        assert!(envelope.matches(&pin()));
+        assert!(pin_matches(&envelope, &pin()));
+        let moved = InitializeResult {
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+            ..pin()
+        };
+        assert!(!envelope.matches(&moved));
+        // Envelopes carry no version field by construction: exact-field
+        // construction round-trips without loss.
+        let rebuilt = PinEnvelope::new(envelope.pin().clone());
+        assert_eq!(rebuilt, envelope);
+    }
+
+    fn pin_matches(envelope: &PinEnvelope, fresh: &InitializeResult) -> bool {
+        envelope.matches(fresh)
+    }
+
+    #[test]
+    fn snapshot_envelope_echoes_snapshot_and_flags() {
+        let tools = vec![
+            imported("beta", b"{}"),
+            imported("alpha", b"{}"),
+            imported("gamma", b"{\"type\":\"object\"}"),
+        ];
+        let expected = ToolListSnapshot::from_imported(&tools);
+        let envelope = SnapshotEnvelope::from_imported(&tools, 7, false);
+        assert_eq!(envelope.snapshot(), &expected);
+        assert_eq!(envelope.snapshot().entries(), expected.entries());
+        assert_eq!(envelope.list_version(), 7);
+        assert!(!envelope.is_stale());
+        assert_eq!(envelope, SnapshotEnvelope::new(expected.clone(), 7, false));
+        // Entries sort by sanitized name for deterministic diffs, echoed
+        // verbatim through the envelope.
+        let names: Vec<&str> = envelope
+            .snapshot()
+            .entries()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        assert_eq!(envelope.snapshot().len(), 3);
+        assert!(!envelope.snapshot().is_empty());
+        assert_eq!(
+            envelope.snapshot().digest_of("mcp_demo_beta"),
+            expected.digest_of("mcp_demo_beta")
+        );
+        assert!(envelope.snapshot().digest_of("mcp_demo_missing").is_none());
+        // Diff reuses the S1 pure helper over the echoed snapshots.
+        let newer = SnapshotEnvelope::from_imported(
+            &[imported("beta", b"{}"), imported("delta", b"{}")],
+            8,
+            false,
+        );
+        let diff = diff_tool_snapshots(envelope.snapshot(), newer.snapshot());
+        assert!(diff.added.contains(&"mcp_demo_delta".to_owned()));
+        assert!(!diff.is_empty());
+        assert!(diff_tool_snapshots(envelope.snapshot(), envelope.snapshot()).is_empty());
+        // Empty import echoes an empty snapshot without staleness.
+        let empty = SnapshotEnvelope::from_imported(&[], 0, false);
+        assert!(empty.snapshot().is_empty());
+        assert_eq!(empty.snapshot().len(), 0);
+        assert_eq!(empty.list_version(), 0);
+        assert!(!empty.is_stale());
+    }
+
+    #[test]
+    fn stale_flag_is_data_only_without_enforcement() {
+        let tools = vec![imported("echo", br#"{"type":"object"}"#)];
+        // A stale envelope is still well-formed data: construction admits
+        // every flag combination and the flags echo verbatim.
+        let stale = SnapshotEnvelope::from_imported(&tools, 3, true);
+        assert!(stale.is_stale());
+        assert_eq!(stale.list_version(), 3);
+        assert_eq!(stale.snapshot().len(), 1);
+        let fresh = SnapshotEnvelope::from_imported(&tools, 3, false);
+        assert!(!fresh.is_stale());
+        // Same snapshot bytes under both flags: staleness never rewrites
+        // the digest pairs.
+        assert_eq!(stale.snapshot(), fresh.snapshot());
+        // A version/stale mismatch is still well-formed data here; matching
+        // and deny-stale discipline stay caller/MCP-owned, never envelope
+        // enforcement.
+        let mismatched = SnapshotEnvelope::new(stale.snapshot().clone(), u64::MAX, true);
+        assert!(mismatched.is_stale());
+        assert_eq!(mismatched.list_version(), u64::MAX);
+        assert_eq!(mismatched.snapshot(), stale.snapshot());
+        let cleared = SnapshotEnvelope::new(stale.snapshot().clone(), u64::MAX, false);
+        assert!(!cleared.is_stale());
+        assert_eq!(cleared.snapshot(), stale.snapshot());
+    }
+
+    #[test]
+    fn placement_error_mapping_covers_all_axes() {
+        let cases = [
+            PlacementError::InvalidName {
+                name: "BAD".to_owned(),
+            },
+            PlacementError::DescriptionTooLarge {
+                limit: MAX_TOOL_DESCRIPTION_LEN,
+                actual: MAX_TOOL_DESCRIPTION_LEN + 1,
+            },
+            PlacementError::SchemaTooLarge {
+                limit: MAX_TOOL_SCHEMA_BYTES,
+                actual: MAX_TOOL_SCHEMA_BYTES + 1,
+            },
+            PlacementError::UndeclaredPlacement {
+                name: "probe_tool".to_owned(),
+            },
+        ];
+        for error in &cases {
+            let mapped = placement_to_mcp_error(error);
+            // Every declaration refusal maps to the import-stage typed
+            // failure (the S1 import precedent: the entry is not usable).
+            assert_eq!(mapped.stage, McpStage::ListTools);
+            assert!(matches!(
+                mapped.failure,
+                McpFailure::HandshakeRejected { .. }
+            ));
+            assert!(!mapped.retryable, "placement mapping is fatal-only");
+            let text = mapped.to_string();
+            assert!(text.starts_with("mcp "));
+            assert!(text.contains("handshake rejected"));
+            assert!(text.bytes().all(|b| (0x20..=0x7E).contains(&b)));
+        }
+        // Bounds cross verbatim; names cross bounded and scrubbed.
+        let over = placement_to_mcp_error(&PlacementError::SchemaTooLarge {
+            limit: MAX_TOOL_SCHEMA_BYTES,
+            actual: MAX_TOOL_SCHEMA_BYTES + 1,
+        });
+        assert!(
+            over.to_string()
+                .contains(&format!("{MAX_TOOL_SCHEMA_BYTES}"))
+        );
+        let hostile = placement_to_mcp_error(&PlacementError::InvalidName {
+            name: "bad\nname".to_owned(),
+        });
+        assert!(!hostile.to_string().contains('\n'));
+        assert!(hostile.to_string().contains("bad?name"));
+        // Long refusal text truncates to the names-only bound.
+        let long = placement_to_mcp_error(&PlacementError::UndeclaredPlacement {
+            name: "x".repeat(2048),
+        });
+        assert!(
+            long.to_string().len()
+                <= "mcp list-tools: handshake rejected: ".len() + MAX_ERROR_TEXT_BYTES
+        );
+        // Total mapping: no PlacementError variant falls through, and the
+        // mapped Display never leaks payload bytes.
+        for error in &cases {
+            let text = placement_to_mcp_error(error).to_string();
+            assert!(!text.contains('{'));
+            assert!(!text.contains('}'));
+        }
+    }
+
+    #[test]
+    fn envelope_bounds_match_s1_and_carry_no_version() {
+        // Byte bounds are the S1 values, unchanged for the envelope layer.
+        assert_eq!(MAX_TOOL_NAME_LEN, 64);
+        assert_eq!(MAX_TOOL_DESCRIPTION_LEN, 512);
+        assert_eq!(MAX_TOOL_SCHEMA_BYTES, 16 * 1024);
+        assert_eq!(MAX_NATIVE_PLACEMENT_BYTES, 512);
+        assert_eq!(MAX_REASON_BYTES, 512);
+        assert_eq!(MAX_ERROR_TEXT_BYTES, 512);
+        assert_eq!(MAX_ERROR_NAME_BYTES, 128);
+        assert_eq!(MAX_TOOL_PAGES, 5);
+        assert_eq!(PROTOCOL_VERSION, "2025-11-25");
     }
 }
