@@ -58,1015 +58,27 @@
 //! All behavior is deterministic from the registry contents plus the request:
 //! no wall clock, no threads, no filesystem, no secrets.
 
-use std::fmt::{Display, Formatter, Result as FmtResult};
-
-/// Maximum model name length in bytes.
-pub const MAX_MODEL_NAME_LEN: usize = 128;
-/// Maximum registered models per registry.
-pub const MAX_REGISTERED_MODELS: usize = 64;
-/// Maximum semantic aliases per registry.
-pub const MAX_ALIASES: usize = 32;
-/// Maximum candidates per alias.
-pub const MAX_ALIAS_CANDIDATES: usize = 8;
-
-/// Maximum provider id length in bytes (mirrors the runtime `MP-2` bound).
-const MAX_PROVIDER_ID_LEN: usize = 64;
-
-/// Model capability flags (host-side mirror of the runtime vocabulary).
-///
-/// v0.1 freeze: `Text` covers `text`, `Streaming` covers `streaming`,
-/// `ToolUse` covers `tool-use`, `ImageInput` narrows `vision` to image input;
-/// audio/video/reasoning have no spec counterpart (routing vocabulary only,
-/// never advertised; selection fails closed with
-/// [`SelectionError::NoCandidate`] when required) and `Reasoning` is an
-/// `MP-2` routing bit only. No host-side closed-vocabulary rejection is
-/// pinned for v0.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelCapability {
-    /// Plain text completion.
-    Text,
-    /// Incremental streaming output.
-    Streaming,
-    /// Model may request tool calls.
-    ToolUse,
-    /// Image understanding (vision input alongside text).
-    ImageInput,
-    /// Audio understanding (speech/sound input alongside text).
-    AudioInput,
-    /// Audio generation (speech/sound output).
-    AudioOutput,
-    /// Video understanding (moving-image input alongside text).
-    VideoInput,
-    /// Model may emit reasoning/thinking tokens (`MP-2` routing bit; no
-    /// inference or enforcement happens here).
-    Reasoning,
-}
-
-/// One registry-known model descriptor: name plus capability flags (host-side
-/// mirror of the runtime `MP-2` descriptor subset).
-///
-/// Routing metadata that exists today (`provider_id`,
-/// `context_window_tokens`, cost weights) lives on [`ModelRegistration`],
-/// not on this descriptor, and bridging stays host-side via
-/// [`ModelRegistration::snapshot_from`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelDescriptor {
-    /// Model name as referenced by a selection request.
-    pub name: String,
-    /// Capability flags for this model.
-    pub capabilities: Vec<ModelCapability>,
-}
-
-/// Provider boundary errors, host-side mirror (every variant fails closed:
-/// no partial selection is produced).
-///
-/// This mirrors the runtime taxonomy so the typed fallback policy
-/// ([`fallback_directive`]) classifies the same failure modes the same way.
-/// No I/O, no credentials, no secrets are carried here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderError {
-    /// `model` names no registry-known model.
-    UnknownModel {
-        /// Requested model name.
-        name: String,
-    },
-    /// Request would exceed the context budget.
-    BudgetExceeded {
-        /// Budget in bytes.
-        limit: usize,
-        /// Observed message bytes.
-        actual: usize,
-    },
-    /// Scripted latency exceeded the caller timeout.
-    Timeout {
-        /// Requested timeout in milliseconds.
-        timeout_ms: u64,
-        /// Observed latency in milliseconds.
-        latency_ms: u64,
-    },
-    /// Requested timeout exceeds the hard ceiling.
-    TimeoutTooLarge {
-        /// Hard ceiling in milliseconds.
-        max: u64,
-        /// Requested timeout in milliseconds.
-        actual: u64,
-    },
-    /// Provider id violates the `MP-2` shape.
-    InvalidProviderId {
-        /// Rejected id.
-        id: String,
-    },
-    /// Transport failure before any model effect (connection reset, TLS
-    /// failure, malformed envelope). No request bytes are known to have been
-    /// applied; the fallback policy may advance to the next candidate.
-    Transport {
-        /// Owning provider id.
-        provider: String,
-        /// What failed (no secrets, no credentials, no key material).
-        reason: String,
-    },
-    /// Provider refused authorization (unknown key scope, expired grant,
-    /// disabled account). This variant reports the refusal only: no
-    /// credential is stored, logged, or carried here, and the fallback
-    /// policy stops so the operator reconciles credentials instead of
-    /// spraying retries across providers.
-    Auth {
-        /// Owning provider id.
-        provider: String,
-        /// Refusal detail (no secrets, no credentials, no key material).
-        reason: String,
-    },
-    /// Provider rate limit hit. The caller may back off for
-    /// `retry_after_ms` (when known) or the fallback policy may advance to
-    /// the next candidate.
-    RateLimited {
-        /// Owning provider id.
-        provider: String,
-        /// Advised wait in milliseconds; `None` when the provider gave none.
-        retry_after_ms: Option<u64>,
-    },
-    /// Selected model lacks capabilities the request required. Selection is
-    /// a routing bug or registry drift, never a reason to try another model
-    /// blindly: the fallback policy stops so the caller reconciles.
-    CapabilityMismatch {
-        /// Owning provider id.
-        provider: String,
-        /// Requested model name.
-        model: String,
-        /// Required capabilities the model does not advertise.
-        missing: Vec<ModelCapability>,
-    },
-    /// Model is known but unavailable (disabled deployment, region without
-    /// capacity, withdrawn version). The fallback policy may advance to the
-    /// next candidate.
-    ModelUnavailable {
-        /// Owning provider id.
-        provider: String,
-        /// Unavailable model name.
-        model: String,
-    },
-    /// The effect may have happened but acknowledgement was lost. The caller
-    /// reconciles (status inspection or user direction) before retry and
-    /// never falls back blindly.
-    Unknown {
-        /// Owning provider id.
-        provider: String,
-        /// What is uncertain.
-        reason: String,
-    },
-    /// Declared sampling contract violates its validated ranges. No value is
-    /// echoed: the rejection carries no model, sampling, or host input, so
-    /// logs and reconcile reports stay static.
-    InvalidSampling,
-    /// Declared sampling contract is valid but the backend cannot carry one
-    /// or more declared fields. The refusal names the backend field kind
-    /// with a static adapter label; no caller value, model, or host input
-    /// is echoed, so logs and reconcile reports stay static.
-    UnsupportedSampling {
-        /// Static backend field label (`"top_k"`, `"reasoning"`, ...),
-        /// never caller input.
-        field: &'static str,
-    },
-}
-
-impl Display for ProviderError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            Self::UnknownModel { name } => write!(f, "unknown model: {name}"),
-            Self::BudgetExceeded { limit, actual } => write!(
-                f,
-                "context budget exceeded: {actual} bytes over {limit} byte limit"
-            ),
-            Self::Timeout {
-                timeout_ms,
-                latency_ms,
-            } => write!(
-                f,
-                "provider timed out: latency {latency_ms}ms over {timeout_ms}ms timeout"
-            ),
-            Self::TimeoutTooLarge { max, actual } => {
-                write!(f, "timeout {actual}ms exceeds ceiling {max}ms")
-            }
-            Self::InvalidProviderId { id } => write!(f, "invalid provider id: {id}"),
-            Self::Transport { provider, reason } => {
-                write!(f, "provider {provider} transport failure: {reason}")
-            }
-            Self::Auth { provider, reason } => {
-                write!(f, "provider {provider} refused authorization: {reason}")
-            }
-            Self::RateLimited {
-                provider,
-                retry_after_ms,
-            } => match retry_after_ms {
-                Some(ms) => write!(f, "provider {provider} rate limited: retry after {ms}ms"),
-                None => write!(f, "provider {provider} rate limited"),
-            },
-            Self::CapabilityMismatch {
-                provider,
-                model,
-                missing,
-            } => write!(
-                f,
-                "provider {provider} model {model} lacks {} capabilities",
-                missing.len()
-            ),
-            Self::ModelUnavailable { provider, model } => {
-                write!(f, "provider {provider} model {model} unavailable")
-            }
-            Self::Unknown { provider, reason } => {
-                write!(f, "provider {provider} effect unknown: {reason}")
-            }
-            Self::InvalidSampling => write!(f, "invalid sampling parameters"),
-            Self::UnsupportedSampling { field } => {
-                write!(f, "sampling option unsupported by backend: {field}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProviderError {}
-
-/// Validate a provider id (`MP-2` shape mirror): non-empty, at most
-/// [`MAX_PROVIDER_ID_LEN`] bytes, `^[a-z][a-z0-9_-]*$`.
-fn validate_provider_id(id: &str) -> Result<(), ProviderError> {
-    let valid = !id.is_empty()
-        && id.len() <= MAX_PROVIDER_ID_LEN
-        && id.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
-    if valid {
-        Ok(())
-    } else {
-        Err(ProviderError::InvalidProviderId { id: id.to_owned() })
-    }
-}
-
-/// Selection policy errors. Every variant fails closed: the registry (or the
-/// pending chain) is left unchanged and no candidate is executed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SelectionError {
-    /// Provider id violates the `MP-2` shape.
-    InvalidProviderId {
-        /// Rejected id.
-        id: String,
-    },
-    /// Model or alias name violates the registry shape.
-    InvalidName {
-        /// Rejected name.
-        name: String,
-    },
-    /// Registration advertises no capabilities. A capability-less entry can
-    /// never match (selection always requires at least one capability), so
-    /// it is refused at registration instead of lingering unselectable.
-    NoCapabilities {
-        /// Rejected model name.
-        name: String,
-    },
-    /// Exact re-registration (same provider, name, capabilities, and
-    /// metadata). Refused with no replacement.
-    DuplicateModel {
-        /// Owning provider id.
-        provider: String,
-        /// Rejected model name.
-        model: String,
-    },
-    /// Conflicting re-registration: same provider and name with different
-    /// capabilities or metadata. Refused with no shadowing: the kept entry
-    /// is untouched.
-    ConflictingModel {
-        /// Owning provider id.
-        provider: String,
-        /// Rejected model name.
-        model: String,
-    },
-    /// Registry exceeds [`MAX_REGISTERED_MODELS`].
-    RegistryFull {
-        /// Bound.
-        limit: usize,
-    },
-    /// Alias name is already registered. No replacement, no merge.
-    DuplicateAlias {
-        /// Rejected alias.
-        alias: String,
-    },
-    /// Alias declares no candidates.
-    EmptyAlias {
-        /// Rejected alias.
-        alias: String,
-    },
-    /// Alias declares more than [`MAX_ALIAS_CANDIDATES`] candidates.
-    TooManyCandidates {
-        /// Rejected alias.
-        alias: String,
-        /// Bound.
-        limit: usize,
-        /// Observed count.
-        actual: usize,
-    },
-    /// Registry exceeds [`MAX_ALIASES`] aliases.
-    AliasesFull {
-        /// Bound.
-        limit: usize,
-    },
-    /// Alias is not registered.
-    UnknownAlias {
-        /// Requested alias.
-        alias: String,
-    },
-    /// Selection requested zero capabilities. Matching by name or alias
-    /// alone is refused: every selection states at least one required
-    /// capability.
-    EmptyRequirement,
-    /// No registry entry satisfies the request after every gate.
-    NoCandidate {
-        /// Which requirement set matched nothing.
-        detail: String,
-    },
-}
-
-impl Display for SelectionError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        match self {
-            Self::InvalidProviderId { id } => write!(f, "invalid provider id: {id}"),
-            Self::InvalidName { name } => write!(f, "invalid model name: {name}"),
-            Self::NoCapabilities { name } => {
-                write!(f, "model {name} advertises no capabilities")
-            }
-            Self::DuplicateModel { provider, model } => {
-                write!(f, "duplicate model: provider {provider} model {model}")
-            }
-            Self::ConflictingModel { provider, model } => {
-                write!(
-                    f,
-                    "conflicting model registration: provider {provider} model {model}"
-                )
-            }
-            Self::RegistryFull { limit } => {
-                write!(f, "provider registry full at {limit} models")
-            }
-            Self::DuplicateAlias { alias } => write!(f, "duplicate alias: {alias}"),
-            Self::EmptyAlias { alias } => write!(f, "alias {alias} declares no candidates"),
-            Self::TooManyCandidates {
-                alias,
-                limit,
-                actual,
-            } => write!(
-                f,
-                "alias {alias} declares {actual} candidates over {limit} limit"
-            ),
-            Self::AliasesFull { limit } => {
-                write!(f, "alias table full at {limit} aliases")
-            }
-            Self::UnknownAlias { alias } => write!(f, "unknown alias: {alias}"),
-            Self::EmptyRequirement => write!(
-                f,
-                "selection requires at least one capability (never by name alone)"
-            ),
-            Self::NoCandidate { detail } => write!(f, "no candidate satisfies: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for SelectionError {}
-
-/// Validate a model (or alias) name: non-empty, at most
-/// [`MAX_MODEL_NAME_LEN`] bytes, starting with lowercase alphanumeric,
-/// continuing with lowercase alphanumeric or `_`, `-`, `.`, `:`, `/`
-/// (covers `fake-chat`, `llama3.1:8b`, `org/model`). Names are routing data,
-/// and capability gates still apply after resolution.
-///
-/// # Errors
-///
-/// Returns [`SelectionError::InvalidName`] when the shape is violated.
-pub fn validate_model_name(name: &str) -> Result<(), SelectionError> {
-    let valid = !name.is_empty()
-        && name.len() <= MAX_MODEL_NAME_LEN
-        && name
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        && name.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || b == b'_'
-                || b == b'-'
-                || b == b'.'
-                || b == b':'
-                || b == b'/'
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(SelectionError::InvalidName {
-            name: name.to_owned(),
-        })
-    }
-}
-
-/// One model registration: provider association, capability set, and
-/// routing metadata. Context-window and cost fields are data for
-/// routing/budget decisions, not enforcement by themselves; a
-/// `context_window_tokens` of `0` means unknown and satisfies no minimum,
-/// and a cost weight of `0` means uncalibrated: it counts as the baseline
-/// weight `1` in [`estimate_cost`] and turn accounting (never a currency).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelRegistration {
-    /// Owning provider id (`MP-2` shape).
-    pub provider_id: String,
-    /// Registry-known model name.
-    pub name: String,
-    /// Capability flags (at least one).
-    pub capabilities: Vec<ModelCapability>,
-    /// Context window in tokens (`0` = unknown).
-    pub context_window_tokens: u32,
-    /// Relative input cost weight (`0` = uncalibrated, counts as baseline `1`).
-    pub input_cost_weight: u32,
-    /// Relative output cost weight (`0` = uncalibrated, counts as baseline `1`).
-    pub output_cost_weight: u32,
-}
-
-impl ModelRegistration {
-    /// Construct and validate a registration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError`] for a malformed provider id or name, or
-    /// for an empty capability set.
-    pub fn new(
-        provider_id: impl Into<String>,
-        name: impl Into<String>,
-        capabilities: Vec<ModelCapability>,
-        context_window_tokens: u32,
-        input_cost_weight: u32,
-        output_cost_weight: u32,
-    ) -> Result<Self, SelectionError> {
-        let provider_id = provider_id.into();
-        let name = name.into();
-        validate_provider_id(&provider_id).map_err(|_| SelectionError::InvalidProviderId {
-            id: provider_id.clone(),
-        })?;
-        validate_model_name(&name)?;
-        if capabilities.is_empty() {
-            return Err(SelectionError::NoCapabilities { name });
-        }
-        Ok(Self {
-            provider_id,
-            name,
-            capabilities,
-            context_window_tokens,
-            input_cost_weight,
-            output_cost_weight,
-        })
-    }
-
-    /// Bridge a [`ModelDescriptor`] (for example one entry advertised by a
-    /// runtime-side provider) into a registration by attaching routing
-    /// metadata. The descriptor is read only; no I/O happens and no provider
-    /// is touched. The host carries no provider trait or model-listing
-    /// wiring, so callers construct the descriptor from whatever the runtime
-    /// side advertises.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError`] for a malformed provider id or descriptor
-    /// name, or for an empty capability set.
-    pub fn snapshot_from(
-        provider_id: &str,
-        descriptor: &ModelDescriptor,
-        context_window_tokens: u32,
-        input_cost_weight: u32,
-        output_cost_weight: u32,
-    ) -> Result<Self, SelectionError> {
-        Self::new(
-            provider_id,
-            descriptor.name.clone(),
-            descriptor.capabilities.clone(),
-            context_window_tokens,
-            input_cost_weight,
-            output_cost_weight,
-        )
-    }
-}
-
-/// One `(provider, model)` reference used as an alias candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelRef {
-    /// Owning provider id.
-    pub provider_id: String,
-    /// Registry-known model name.
-    pub model: String,
-}
-
-impl ModelRef {
-    /// Construct and validate a reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError`] for a malformed provider id or name.
-    pub fn new(
-        provider_id: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Result<Self, SelectionError> {
-        let provider_id = provider_id.into();
-        let model = model.into();
-        validate_provider_id(&provider_id).map_err(|_| SelectionError::InvalidProviderId {
-            id: provider_id.clone(),
-        })?;
-        validate_model_name(&model)?;
-        Ok(Self { provider_id, model })
-    }
-}
-
-/// One registry-kept model entry (validated registration).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegisteredModel {
-    /// Owning provider id.
-    pub provider_id: String,
-    /// Registry-known model name.
-    pub name: String,
-    /// Capability flags.
-    pub capabilities: Vec<ModelCapability>,
-    /// Context window in tokens (`0` = unknown).
-    pub context_window_tokens: u32,
-    /// Relative input cost weight (`0` = uncalibrated, counts as baseline `1`).
-    pub input_cost_weight: u32,
-    /// Relative output cost weight (`0` = uncalibrated, counts as baseline `1`).
-    pub output_cost_weight: u32,
-}
-
-/// One semantic alias: a name resolving to ordered candidates. The table is
-/// data, not authority: candidates still pass every selection gate in the
-/// declared order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelAlias {
-    /// Alias name.
-    pub alias: String,
-    /// Ordered candidates (highest preference first).
-    pub candidates: Vec<ModelRef>,
-}
-
-/// Deterministic provider/model registry plus alias table.
-///
-/// Entries keep registration order internally; selection output order is
-/// always derived (alias order, then provider/model lexicographic), never
-/// insertion or hash order.
-#[derive(Debug, Default)]
-pub struct ProviderRegistry {
-    models: Vec<RegisteredModel>,
-    aliases: Vec<ModelAlias>,
-}
-
-impl ProviderRegistry {
-    /// Construct an empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register one validated model entry.
-    ///
-    /// Fail-closed: an exact re-registration is refused with
-    /// [`SelectionError::DuplicateModel`]; the same provider and name with
-    /// different capabilities or metadata is refused with
-    /// [`SelectionError::ConflictingModel`]; malformed entries are refused
-    /// with their typed error even when built without
-    /// [`ModelRegistration::new`]; a full registry refuses with
-    /// [`SelectionError::RegistryFull`]. Every refusal leaves the registry
-    /// unchanged. Duplicate/conflict checks run before the capacity check,
-    /// so a duplicate reports as a duplicate even when the registry is full.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError`] as described above.
-    pub fn register(&mut self, registration: ModelRegistration) -> Result<(), SelectionError> {
-        if let Some(kept) = self.models.iter().find(|kept| {
-            kept.provider_id == registration.provider_id && kept.name == registration.name
-        }) {
-            let same = kept.capabilities == registration.capabilities
-                && kept.context_window_tokens == registration.context_window_tokens
-                && kept.input_cost_weight == registration.input_cost_weight
-                && kept.output_cost_weight == registration.output_cost_weight;
-            if same {
-                return Err(SelectionError::DuplicateModel {
-                    provider: registration.provider_id,
-                    model: registration.name,
-                });
-            }
-            return Err(SelectionError::ConflictingModel {
-                provider: registration.provider_id,
-                model: registration.name,
-            });
-        }
-        validate_provider_id(&registration.provider_id).map_err(|_| {
-            SelectionError::InvalidProviderId {
-                id: registration.provider_id.clone(),
-            }
-        })?;
-        validate_model_name(&registration.name)?;
-        if registration.capabilities.is_empty() {
-            return Err(SelectionError::NoCapabilities {
-                name: registration.name,
-            });
-        }
-        if self.models.len() >= MAX_REGISTERED_MODELS {
-            return Err(SelectionError::RegistryFull {
-                limit: MAX_REGISTERED_MODELS,
-            });
-        }
-        self.models.push(RegisteredModel {
-            provider_id: registration.provider_id,
-            name: registration.name,
-            capabilities: registration.capabilities,
-            context_window_tokens: registration.context_window_tokens,
-            input_cost_weight: registration.input_cost_weight,
-            output_cost_weight: registration.output_cost_weight,
-        });
-        Ok(())
-    }
-
-    /// Register one semantic alias.
-    ///
-    /// Fail-closed: a duplicate alias name is refused with
-    /// [`SelectionError::DuplicateAlias`] (no replacement, no merge); an
-    /// empty candidate list is refused with [`SelectionError::EmptyAlias`];
-    /// over-long lists with [`SelectionError::TooManyCandidates`]; a full
-    /// table with [`SelectionError::AliasesFull`]. Candidates must be
-    /// well-formed but need not be registered yet: unregistered candidates
-    /// are skipped in declared order at selection time, so a stale entry
-    /// degrades to the next candidate; a fully missed alias fails closed
-    /// with [`SelectionError::NoCandidate`] instead of falling through to
-    /// non-alias entries.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError`] as described above.
-    pub fn register_alias(
-        &mut self,
-        alias: impl Into<String>,
-        candidates: Vec<ModelRef>,
-    ) -> Result<(), SelectionError> {
-        let alias = alias.into();
-        if self.aliases.iter().any(|kept| kept.alias == alias) {
-            return Err(SelectionError::DuplicateAlias { alias });
-        }
-        validate_model_name(&alias)?;
-        if candidates.is_empty() {
-            return Err(SelectionError::EmptyAlias { alias });
-        }
-        if candidates.len() > MAX_ALIAS_CANDIDATES {
-            return Err(SelectionError::TooManyCandidates {
-                alias,
-                limit: MAX_ALIAS_CANDIDATES,
-                actual: candidates.len(),
-            });
-        }
-        for candidate in &candidates {
-            validate_provider_id(&candidate.provider_id).map_err(|_| {
-                SelectionError::InvalidProviderId {
-                    id: candidate.provider_id.clone(),
-                }
-            })?;
-            validate_model_name(&candidate.model)?;
-        }
-        if self.aliases.len() >= MAX_ALIASES {
-            return Err(SelectionError::AliasesFull { limit: MAX_ALIASES });
-        }
-        self.aliases.push(ModelAlias { alias, candidates });
-        Ok(())
-    }
-
-    /// Registered model count.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.models.len()
-    }
-
-    /// Whether the registry holds no model.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.models.is_empty()
-    }
-
-    /// Registered alias count.
-    #[must_use]
-    pub fn alias_len(&self) -> usize {
-        self.aliases.len()
-    }
-
-    /// Look up an entry by provider and model name.
-    #[must_use]
-    pub fn lookup(&self, provider_id: &str, name: &str) -> Option<&RegisteredModel> {
-        self.models
-            .iter()
-            .find(|entry| entry.provider_id == provider_id && entry.name == name)
-    }
-
-    /// Registered models in `(provider, name)` lexicographic order.
-    #[must_use]
-    pub fn entries(&self) -> Vec<&RegisteredModel> {
-        let mut entries: Vec<&RegisteredModel> = self.models.iter().collect();
-        entries.sort_by(|a, b| (&a.provider_id, &a.name).cmp(&(&b.provider_id, &b.name)));
-        entries
-    }
-
-    /// Resolve an alias to its declared candidates in order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError::UnknownAlias`] for an unregistered alias.
-    pub fn resolve_alias(&self, alias: &str) -> Result<Vec<&ModelRef>, SelectionError> {
-        self.aliases
-            .iter()
-            .find(|entry| entry.alias == alias)
-            .map(|entry| entry.candidates.iter().collect())
-            .ok_or_else(|| SelectionError::UnknownAlias {
-                alias: alias.to_owned(),
-            })
-    }
-
-    /// Select the ordered fallback chain for `request`.
-    ///
-    /// Gate order: alias resolution (unknown alias fails), capability-subset
-    /// match, context-window minimum, cost ceiling, then ordering
-    /// (alias-declared order when an alias is requested, else provider/model
-    /// lexicographic). The primary is element `0`; every element
-    /// independently satisfies the request, so advancing on a typed
-    /// transient error never weakens the requirement set.
-    ///
-    /// An alias is exclusive: when [`SelectRequest::alias`] is set, only the
-    /// alias candidates are eligible (each still passing every gate;
-    /// unregistered candidates are skipped in declared order) and non-alias
-    /// entries are never appended, so a full alias miss fails closed with
-    /// [`SelectionError::NoCandidate`] instead of falling through to an
-    /// arbitrary capability match.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SelectionError::EmptyRequirement`] when no capability is
-    /// required, [`SelectionError::UnknownAlias`] for an unregistered alias,
-    /// or [`SelectionError::NoCandidate`] when nothing satisfies the request
-    /// (including a fully missed alias).
-    pub fn select(&self, request: &SelectRequest) -> Result<Vec<SelectedModel>, SelectionError> {
-        if request.required.is_empty() {
-            return Err(SelectionError::EmptyRequirement);
-        }
-        let mut chain: Vec<SelectedModel> = Vec::new();
-        if let Some(alias) = &request.alias {
-            let candidates = self.resolve_alias(alias)?;
-            for candidate in candidates {
-                match self.lookup(&candidate.provider_id, &candidate.model) {
-                    Some(entry) if request.matches(entry) => {
-                        chain.push(SelectedModel::from_entry(entry));
-                    }
-                    Some(_) | None => {}
-                }
-            }
-        } else {
-            for entry in self.entries() {
-                if request.matches(entry) {
-                    chain.push(SelectedModel::from_entry(entry));
-                }
-            }
-        }
-        if chain.is_empty() {
-            return Err(SelectionError::NoCandidate {
-                detail: request.describe(),
-            });
-        }
-        Ok(chain)
-    }
-}
-
-/// One selection request: required capabilities plus optional narrowing.
-/// Every field is a filter; narrowing never widens the requirement set.
-///
-/// v0.1 freeze: capability mapping mirrors the runtime vocabulary;
-/// closed-vocabulary enforcement is deferred. The spec vocabulary is
-/// text/streaming/tool-use/vision; the code enum additionally carries
-/// `AudioInput`/`AudioOutput`/`VideoInput` (routing vocabulary only, never
-/// advertised, selection fails closed with [`SelectionError::NoCandidate`]
-/// when required) and `Reasoning` (an `MP-2` routing bit only). Mapping:
-/// `Text` covers `text`, `Streaming` covers `streaming`, `ToolUse` covers
-/// `tool-use`, `ImageInput` narrows `vision` to image input; audio/video and
-/// reasoning have no spec counterpart. No host-side closed-vocabulary
-/// rejection is pinned for v0.1.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectRequest {
-    /// Required capabilities: every candidate must advertise all of them.
-    /// Must be non-empty (selection never matches by name or alias alone).
-    pub required: Vec<ModelCapability>,
-    /// Optional semantic alias. When set it is exclusive: only the declared
-    /// candidates are eligible (each still passing every other gate, in
-    /// declared order) and a full alias miss is
-    /// [`SelectionError::NoCandidate`]; non-alias entries are never appended.
-    pub alias: Option<String>,
-    /// Optional minimum context window in tokens. Entries with an unknown
-    /// (`0`) window never satisfy a minimum.
-    pub min_context_window_tokens: Option<u32>,
-    /// Optional cost ceiling: both effective input and output weights of a
-    /// candidate must fit. An uncalibrated weight (`0`) counts as baseline
-    /// `1`, so `Some(0)` admits nothing. Routing data only, not enforcement.
-    pub max_cost_weight: Option<u32>,
-}
-
-impl SelectRequest {
-    /// Build a capability-only request.
-    #[must_use]
-    pub fn capabilities(required: Vec<ModelCapability>) -> Self {
-        Self {
-            required,
-            alias: None,
-            min_context_window_tokens: None,
-            max_cost_weight: None,
-        }
-    }
-
-    /// Whether `entry` passes every gate of this request.
-    #[must_use]
-    pub fn matches(&self, entry: &RegisteredModel) -> bool {
-        if !self
-            .required
-            .iter()
-            .all(|cap| entry.capabilities.contains(cap))
-        {
-            return false;
-        }
-        if let Some(min) = self.min_context_window_tokens {
-            if entry.context_window_tokens < min {
-                return false;
-            }
-        }
-        if let Some(max) = self.max_cost_weight {
-            if effective_cost_weight(entry.input_cost_weight) > max
-                || effective_cost_weight(entry.output_cost_weight) > max
-            {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Human-readable requirement summary for [`SelectionError::NoCandidate`].
-    #[must_use]
-    pub fn describe(&self) -> String {
-        let mut detail = format!("{} capabilities", self.required.len());
-        if let Some(alias) = &self.alias {
-            detail.push_str(&format!(" alias={alias}"));
-        }
-        if let Some(min) = self.min_context_window_tokens {
-            detail.push_str(&format!(" min_window={min}"));
-        }
-        if let Some(max) = self.max_cost_weight {
-            detail.push_str(&format!(" max_cost={max}"));
-        }
-        detail
-    }
-}
-
-/// One selected candidate: a detached snapshot of a registry entry. The
-/// caller uses the owning provider plus the model name to execute
-/// runtime-side; this snapshot itself performs no I/O and holds no authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectedModel {
-    /// Owning provider id.
-    pub provider_id: String,
-    /// Registry-known model name.
-    pub name: String,
-    /// Capability snapshot.
-    pub capabilities: Vec<ModelCapability>,
-    /// Context window in tokens (`0` = unknown).
-    pub context_window_tokens: u32,
-    /// Relative input cost weight (`0` = uncalibrated, counts as baseline `1`).
-    pub input_cost_weight: u32,
-    /// Relative output cost weight (`0` = uncalibrated, counts as baseline `1`).
-    pub output_cost_weight: u32,
-}
-
-impl SelectedModel {
-    /// Snapshot a registry entry. The snapshot is detached: later
-    /// registry changes do not leak into previously selected chains.
-    #[must_use]
-    pub fn from_entry(entry: &RegisteredModel) -> Self {
-        Self {
-            provider_id: entry.provider_id.clone(),
-            name: entry.name.clone(),
-            capabilities: entry.capabilities.clone(),
-            context_window_tokens: entry.context_window_tokens,
-            input_cost_weight: entry.input_cost_weight,
-            output_cost_weight: entry.output_cost_weight,
-        }
-    }
-
-    /// Estimated routing cost for an observed usage pair, in relative
-    /// routing units (never currency). Delegates to [`estimate_cost`].
-    #[must_use]
-    pub fn estimate_cost(&self, input_tokens: u64, output_tokens: u64) -> u64 {
-        estimate_cost(
-            input_tokens,
-            output_tokens,
-            self.input_cost_weight,
-            self.output_cost_weight,
-        )
-    }
-}
-
-/// Estimate routing cost in relative units (never currency) from observed
-/// token counts and per-model cost weights:
-///
-/// ```text
-/// cost = input_tokens * effective(input_weight)
-///      + output_tokens * effective(output_weight)
-/// effective(weight) = if weight == 0 { 1 } else { weight }
-/// ```
-///
-/// Both weights are routing data held on the model registration/selection
-/// ([`ModelRegistration`], [`RegisteredModel`], [`SelectedModel`]); a weight
-/// of `0` means uncalibrated and counts as the baseline weight `1`, the same
-/// unified rule the runtime turn loop applies, so an unset weight is never
-/// free and cost accounting cannot under-count relative to routing. Hosts
-/// calibrate by choosing weights (for example from a model card); the
-/// function itself performs no I/O, reads no clock, and authorizes nothing.
-/// Cost accounting never bypasses the byte budget
-/// ([`ProviderError::BudgetExceeded`]) or authorization gates: selection
-/// filters may consider cost, enforcement stays in the existing runtime
-/// gates. Saturates on overflow rather than wrapping.
-#[must_use]
-pub fn estimate_cost(
-    input_tokens: u64,
-    output_tokens: u64,
-    input_weight: u32,
-    output_weight: u32,
-) -> u64 {
-    (input_tokens.saturating_mul(u64::from(effective_cost_weight(input_weight)))).saturating_add(
-        output_tokens.saturating_mul(u64::from(effective_cost_weight(output_weight))),
-    )
-}
-
-/// Effective cost weight shared by selection estimation/filtering and turn
-/// accounting: a configured `0` means uncalibrated and counts as the baseline
-/// weight `1` so an uncalibrated model is never free and accounting cannot
-/// under-count. Mirrors the runtime turn loop's `effective_cost_weight`
-/// (same rule).
-fn effective_cost_weight(weight: u32) -> u32 {
-    if weight == 0 { 1 } else { weight }
-}
-
-/// Fallback directive for one provider failure: advance to the next chain
-/// element or stop. Pure and total over [`ProviderError`]: adding a variant
-/// breaks compilation here, which is the fail-closed response to a new
-/// failure mode (it must be classified before any fallback uses it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FallbackDirective {
-    /// The error is transient or provider-local: try the next chain
-    /// element with the unchanged request.
-    Advance,
-    /// Do not try another candidate. Reconcile first: fix the caller or
-    /// configuration for typed caller/config errors, reconcile by status
-    /// inspection or user direction for [`ProviderError::Unknown`].
-    Stop,
-}
-
-/// Classify one provider failure into a fallback directive.
-///
-/// - Advance (transient or provider-local, retry elsewhere is safe):
-///   [`Transport`](ProviderError::Transport),
-///   [`RateLimited`](ProviderError::RateLimited),
-///   [`ModelUnavailable`](ProviderError::ModelUnavailable),
-///   [`Timeout`](ProviderError::Timeout).
-/// - Stop (caller, configuration, or authorization bugs that another
-///   candidate cannot fix):
-///   [`UnknownModel`](ProviderError::UnknownModel) (registry drift),
-///   [`BudgetExceeded`](ProviderError::BudgetExceeded),
-///   [`TimeoutTooLarge`](ProviderError::TimeoutTooLarge),
-///   [`InvalidProviderId`](ProviderError::InvalidProviderId),
-///   [`InvalidSampling`](ProviderError::InvalidSampling) (caller-declared
-///   sampling contract),
-///   [`UnsupportedSampling`](ProviderError::UnsupportedSampling) (the
-///   selected backend cannot carry a declared field; reconcile the
-///   declaration or backend choice rather than spraying),
-///   [`Auth`](ProviderError::Auth) (reconcile credentials; never spray),
-///   [`CapabilityMismatch`](ProviderError::CapabilityMismatch) (routing bug).
-/// - Stop with reconcile (effect uncertain; blind fallback may double-apply):
-///   [`Unknown`](ProviderError::Unknown).
-#[must_use]
-pub fn fallback_directive(error: &ProviderError) -> FallbackDirective {
-    match error {
-        ProviderError::Transport { .. }
-        | ProviderError::RateLimited { .. }
-        | ProviderError::ModelUnavailable { .. }
-        | ProviderError::Timeout { .. } => FallbackDirective::Advance,
-        ProviderError::UnknownModel { .. }
-        | ProviderError::BudgetExceeded { .. }
-        | ProviderError::TimeoutTooLarge { .. }
-        | ProviderError::InvalidProviderId { .. }
-        | ProviderError::InvalidSampling
-        | ProviderError::UnsupportedSampling { .. }
-        | ProviderError::Auth { .. }
-        | ProviderError::CapabilityMismatch { .. }
-        | ProviderError::Unknown { .. } => FallbackDirective::Stop,
-    }
-}
+//! ## Canonical split (AI-0287)
+//!
+//! The S1 registry/selection vocabulary this seam needs ([`ModelCapability`],
+//! [`ModelDescriptor`], [`TerminalModelMetadata`], [`ProviderError`],
+//! [`SelectionError`], [`ModelRegistration`], [`ModelRef`],
+//! [`RegisteredModel`], [`ModelAlias`], [`ProviderRegistry`],
+//! [`SelectRequest`], [`SelectedModel`], [`estimate_cost`],
+//! [`fallback_directive`], [`validate_model_name`], [`validate_provider_id`],
+//! and the `MAX_*` bounds) is canonically owned by the
+//! [`provider_registry`](crate::provider_registry) module and only
+//! re-exported here, so both paths name the same items with no logic
+//! duplication. What this module owns is the selection-side S2 envelope
+//! layer below plus the gate-order contract above.
+//!
+pub use crate::provider_registry::{
+    FallbackDirective, MAX_ALIAS_CANDIDATES, MAX_ALIASES, MAX_MODEL_NAME_LEN, MAX_PROVIDER_ID_LEN,
+    MAX_REGISTERED_MODELS, ModelAlias, ModelCapability, ModelDescriptor, ModelRef,
+    ModelRegistration, ProviderError, ProviderRegistry, RegisteredModel, SelectRequest,
+    SelectedModel, SelectionError, TerminalModelMetadata, estimate_cost, fallback_directive,
+    validate_model_name, validate_provider_id,
+};
 
 // ── Phase 2 S2 scoped-IPC envelope types (no transport, AI-0279) ──
 //
@@ -2439,5 +1451,92 @@ mod tests {
             failed.into_result(),
             Err(SelectionError::NoCandidate { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_identity_reexport_matches_provider_registry() {
+        // AI-0287: the S1 vocabulary is canonically owned by
+        // `crate::provider_registry`; this module only re-exports it. Any
+        // reintroduced divergent copy fails these assertions (layout
+        // mismatch, cross-path assignment refusal at compile time, or
+        // behavioral disagreement at run time).
+        assert_eq!(
+            std::mem::size_of::<super::SelectedModel>(),
+            std::mem::size_of::<crate::provider_registry::SelectedModel>()
+        );
+        assert_eq!(
+            std::mem::align_of::<super::SelectRequest>(),
+            std::mem::align_of::<crate::provider_registry::SelectRequest>()
+        );
+        assert_eq!(
+            std::mem::size_of::<super::SelectionError>(),
+            std::mem::size_of::<crate::provider_registry::SelectionError>()
+        );
+        // Cross-path assignment compiles only when both paths name the same
+        // type (compile-time identity proof).
+        let unified: crate::provider_registry::SelectedModel = super::SelectedModel {
+            provider_id: "bitty-fake".to_owned(),
+            name: "chat".to_owned(),
+            capabilities: vec![Cap::Text],
+            context_window_tokens: 4_096,
+            input_cost_weight: 1,
+            output_cost_weight: 2,
+        };
+        // Behavior agrees through both paths, including the uncalibrated
+        // (`0` counts as baseline `1`) and saturating rules.
+        for (input, output, in_w, out_w) in [(10, 5, 1, 2), (7, 9, 0, 0), (u64::MAX, 1, 3, 4)] {
+            assert_eq!(
+                super::estimate_cost(input, output, in_w, out_w),
+                crate::provider_registry::estimate_cost(input, output, in_w, out_w)
+            );
+        }
+        for error in [
+            ProviderError::Transport {
+                provider: "p".to_owned(),
+                reason: "reset".to_owned(),
+            },
+            ProviderError::Unknown {
+                provider: "p".to_owned(),
+                reason: "ack lost".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                super::fallback_directive(&error),
+                fallback_directive(&error)
+            );
+            assert_eq!(
+                super::fallback_directive(&error),
+                crate::provider_registry::fallback_directive(&error)
+            );
+        }
+        for name in ["chat", "BAD NAME", ""] {
+            assert_eq!(
+                super::validate_model_name(name).is_ok(),
+                crate::provider_registry::validate_model_name(name).is_ok()
+            );
+        }
+        for id in ["bitty-fake", "BAD", ""] {
+            assert_eq!(
+                super::validate_provider_id(id).is_ok(),
+                crate::provider_registry::validate_provider_id(id).is_ok()
+            );
+        }
+        // Round-trip: a registry built via the provider path selects
+        // identically through the selection path.
+        let mut registry = crate::provider_registry::ProviderRegistry::new();
+        registry
+            .register(text_model("bitty-fake", "chat"))
+            .expect("capacity");
+        let request = super::SelectRequest::capabilities(vec![Cap::Text]);
+        let via_selection: Vec<super::SelectedModel> =
+            registry.select(&request).expect("candidate");
+        let via_provider: Vec<crate::provider_registry::SelectedModel> =
+            registry.select(&request).expect("candidate");
+        assert_eq!(via_selection, via_provider);
+        assert_eq!(via_selection[0], unified);
+        assert_eq!(
+            via_selection[0].estimate_cost(10, 5),
+            crate::provider_registry::estimate_cost(10, 5, 1, 2)
+        );
     }
 }
