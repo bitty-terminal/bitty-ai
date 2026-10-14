@@ -21,9 +21,9 @@
 //!
 //! Shape note: the seam modules are intentionally doc-only with no items and
 //! no tests — except `context_providers`, which carries the Phase 2 S1
-//! pure-type/zone mirror (bound constants, validated shapes, trust labels,
-//! fence accounting, and offline unit tests; still std-only, still no I/O,
-//! IPC, threads, or ambient authority). A test elsewhere would either assert
+//! pure-type/zone mirror, and `extension_registry`, which carries the Phase 2
+//! S1 pure-type mirror (both std-only, still no I/O, IPC, threads, or ambient
+//! authority, each with offline unit tests). A test elsewhere would either assert
 //! a vacuous truth or require introducing an item (constant or function) to
 //! assert on, and any such item would itself be behavior-adjacent surface
 //! contradicting the no-types, no-functions, no-behavior rule above. The
