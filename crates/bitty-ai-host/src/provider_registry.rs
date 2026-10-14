@@ -6,8 +6,8 @@
 //! host-boundary traversal. This module is data plus pure functions only:
 //! no `ModelProvider` trait, no `list_models`/`complete` wiring, no `MP-4`
 //! caller-scope filter, no closed-vocabulary enforcement, no currency, no
-//! IPC, no threads, no filesystem or network access, and no dependencies
-//! beyond `std`.
+//! IPC transport, no threads, no filesystem or network access, and no
+//! dependencies beyond `std`.
 //!
 //! ## Mirror discipline
 //!
@@ -45,6 +45,15 @@
 //! Deny-all posture holds by construction: nothing here grants execution
 //! authority — selection returns detached snapshots, aliases are data (never
 //! fall-through), and every refusal fails closed with no partial state.
+//!
+//! Phase 2 S2 (AI-0278) appends scoped-IPC envelope types for the provider
+//! operations below: `list_models` / `complete` request/response shapes plus
+//! a bounded [`ProviderIpcError`] envelope form of the [`ProviderError`]
+//! taxonomy. They are still data plus pure bound checks only: no socket, no
+//! transport, no encoding, no version field, no threads, no clock reads, no
+//! filesystem or network access, and no dependencies beyond `std`.
+//! Selection-side IPC envelopes (select request/response, matches views,
+//! fallback-chain envelopes) belong to AI-0279 and appear here by name only.
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
@@ -1058,6 +1067,1004 @@ pub fn fallback_directive(error: &ProviderError) -> FallbackDirective {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 S2: scoped-IPC envelope types (AI-0278).
+//
+// Request/response data shapes for the two provider operations
+// (`list_models` / `complete`) plus a bounded envelope form of the S1
+// [`ProviderError`] taxonomy. Types plus pure bound checks only: no socket,
+// no transport, no encoding, no version field on any envelope, no behavior
+// beyond fail-closed shape validation, no threads, no clock reads
+// (`now_ms` is caller-supplied), no filesystem or network access, and no
+// dependencies beyond `std`.
+//
+// What is reused, not re-mirrored: [`ModelRegistration`], [`ModelRef`],
+// [`ProviderRegistry`], [`ModelCapability`], [`ProviderError`], the
+// [`MAX_REGISTERED_MODELS`] / [`MAX_MODEL_NAME_LEN`] / [`MAX_PROVIDER_ID_LEN`]
+// bounds, and the `validate_model_name` / `validate_provider_id` shapes.
+// What is new here: the `list_models` / `complete` envelope structs, the
+// `MAX_IPC_*` payload bounds below (every value equals the cited runtime
+// bound), the [`IpcEnvelopeError`] shape refusal, and the
+// [`ProviderIpcError`] bounded error envelope with its total
+// [`ProviderIpcError::from_error`] / [`ProviderIpcError::into_error`]
+// mapping. What stays out: selection-side IPC envelopes (select
+// request/response, matches views, fallback-chain envelopes — AI-0279 owns
+// those and they appear here by name only), transport of any kind, and any
+// `version` field (envelope versioning is deferred; adding a field later is
+// a scoped task, never a silent widening).
+//
+// Normalization rule for IPC crossing: identifier fields keep their shaped
+// values truncated to their shape bound on a character boundary (shape
+// validation itself stays at [`ModelRef::new`] and at execution time);
+// free-text reason fields are scrubbed (every character outside printable
+// ASCII becomes `?`) and truncated to [`MAX_IPC_REASON_BYTES`], mirroring
+// the runtime `bridge.rs` `bound_reason` transform. No variant carries
+// secrets, credentials, or key material — neither in the S1 taxonomy nor in
+// the envelope form — and sampling refusals echo no values at all.
+// ---------------------------------------------------------------------------
+
+/// Maximum caller timeout in milliseconds (mirrors `provider.rs`
+/// `MAX_REQUEST_TIMEOUT_MS`; enforced by [`CompleteRequest::check`]).
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Maximum messages per [`CompleteRequest`] (same value as `context.rs`
+/// `MAX_CONTEXT_RECORDS`).
+pub const MAX_IPC_MESSAGES: usize = 128;
+/// Maximum bytes per envelope message content (same value as `context.rs`
+/// `MAX_RECORD_BODY_BYTES`; enforced by [`CompleteRequest::check`]).
+pub const MAX_IPC_MESSAGE_BYTES: usize = 16 * 1024;
+/// Maximum stable-id references per [`CompleteRequest`] (same value as
+/// `context.rs` `MAX_CONTEXT_RECORDS`).
+pub const MAX_IPC_CONTEXT_REFS: usize = 128;
+/// Maximum bytes per stable-id reference (same value as `context.rs`
+/// `MAX_STABLE_ID_LEN`; references resolve server-side per `CP-2`).
+pub const MAX_IPC_CONTEXT_REF_BYTES: usize = 64;
+/// Maximum tool names per [`CompleteRequest`] (same value as `tool.rs`
+/// `MAX_TOOLS_PER_SESSION`; names validate against tool consent at
+/// execution, never here).
+pub const MAX_IPC_TOOLS: usize = 32;
+/// Maximum bytes per tool name (same value as `tool.rs`
+/// `MAX_TOOL_NAME_LEN`).
+pub const MAX_IPC_TOOL_NAME_BYTES: usize = 64;
+/// Maximum assistant-text bytes per [`CompleteResponse`] (same value as
+/// `context.rs` `MAX_RECORD_BODY_BYTES`).
+pub const MAX_IPC_TEXT_BYTES: usize = 16 * 1024;
+/// Maximum tool calls per [`CompleteResponse`] (same value as `tool.rs`
+/// `MAX_TOOL_CALLS_PER_TURN`, the hard bus ceiling).
+pub const MAX_IPC_TOOL_CALLS: usize = 8;
+/// Maximum argument bytes per envelope tool call (same value as `tool.rs`
+/// `MAX_TOOL_ARGUMENTS_BYTES`; arguments stay opaque bounded JSON).
+pub const MAX_IPC_TOOL_ARGUMENTS_BYTES: usize = 16 * 1024;
+/// Maximum reason bytes kept by [`ProviderIpcError::from_error`] (same value
+/// as the runtime `bridge.rs` `MAX_REASON_BYTES`; same scrub transform).
+pub const MAX_IPC_REASON_BYTES: usize = 512;
+
+/// Typed refusal for over-bound S2 envelope construction. Every variant fails
+/// closed with no envelope value and no partial state. Variants carry counts
+/// only — never names, reasons, or payload bytes — so logging the error
+/// cannot leak caller input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcEnvelopeError {
+    /// A caller scope was declared on a `list_models` request. `MP-4`
+    /// filtering is deferred, so any scope is denied; only
+    /// [`ListModelsRequest::unfiltered`] crosses.
+    ReservedScopeDenied,
+    /// A `list_models` snapshot declares more than [`MAX_REGISTERED_MODELS`]
+    /// models.
+    TooManyModels {
+        /// Bound.
+        limit: usize,
+        /// Observed count.
+        actual: usize,
+    },
+    /// A `complete` request declares more than [`MAX_IPC_MESSAGES`] messages.
+    TooManyMessages {
+        /// Bound.
+        limit: usize,
+        /// Observed count.
+        actual: usize,
+    },
+    /// A `complete` message exceeds [`MAX_IPC_MESSAGE_BYTES`] bytes.
+    MessageTooLarge {
+        /// Bound.
+        limit: usize,
+        /// Observed bytes.
+        actual: usize,
+    },
+    /// A `complete` request declares more than [`MAX_IPC_CONTEXT_REFS`]
+    /// stable-id references.
+    TooManyContextRefs {
+        /// Bound.
+        limit: usize,
+        /// Observed count.
+        actual: usize,
+    },
+    /// A `complete` stable-id reference exceeds [`MAX_IPC_CONTEXT_REF_BYTES`]
+    /// bytes.
+    ContextRefTooLarge {
+        /// Bound.
+        limit: usize,
+        /// Observed bytes.
+        actual: usize,
+    },
+    /// A `complete` request declares more than [`MAX_IPC_TOOLS`] tool names.
+    TooManyTools {
+        /// Bound.
+        limit: usize,
+        /// Observed count.
+        actual: usize,
+    },
+    /// A `complete` tool name (or response tool-call name) exceeds
+    /// [`MAX_IPC_TOOL_NAME_BYTES`] bytes.
+    ToolNameTooLarge {
+        /// Bound.
+        limit: usize,
+        /// Observed bytes.
+        actual: usize,
+    },
+    /// A `complete` timeout exceeds [`MAX_REQUEST_TIMEOUT_MS`] (same shape as
+    /// the [`ProviderError::TimeoutTooLarge`] execution check; the envelope
+    /// refuses early and execution re-checks authoritatively).
+    TimeoutTooLarge {
+        /// Hard ceiling in milliseconds.
+        max: u64,
+        /// Requested timeout in milliseconds.
+        actual: u64,
+    },
+    /// A `complete` request's message bytes exceed its budget (same shape as
+    /// the [`ProviderError::BudgetExceeded`] pre-I/O check; the envelope
+    /// refuses early and execution re-checks authoritatively).
+    BudgetExceeded {
+        /// Budget in bytes.
+        limit: usize,
+        /// Observed message bytes.
+        actual: usize,
+    },
+    /// A `complete` response text exceeds [`MAX_IPC_TEXT_BYTES`] bytes.
+    ResponseTextTooLarge {
+        /// Bound.
+        limit: usize,
+        /// Observed bytes.
+        actual: usize,
+    },
+    /// A `complete` response declares more than [`MAX_IPC_TOOL_CALLS`] tool
+    /// calls.
+    TooManyToolCalls {
+        /// Bound.
+        limit: usize,
+        /// Observed count.
+        actual: usize,
+    },
+    /// A `complete` tool-call arguments payload exceeds
+    /// [`MAX_IPC_TOOL_ARGUMENTS_BYTES`] bytes.
+    ToolArgumentsTooLarge {
+        /// Bound.
+        limit: usize,
+        /// Observed bytes.
+        actual: usize,
+    },
+}
+
+impl Display for IpcEnvelopeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::ReservedScopeDenied => write!(
+                f,
+                "list_models caller scope is reserved and denied (MP-4 deferred)"
+            ),
+            Self::TooManyModels { limit, actual } => write!(
+                f,
+                "list_models snapshot declares {actual} models over {limit} limit"
+            ),
+            Self::TooManyMessages { limit, actual } => write!(
+                f,
+                "complete request declares {actual} messages over {limit} limit"
+            ),
+            Self::MessageTooLarge { limit, actual } => write!(
+                f,
+                "complete message is {actual} bytes over {limit} byte limit"
+            ),
+            Self::TooManyContextRefs { limit, actual } => write!(
+                f,
+                "complete request declares {actual} context refs over {limit} limit"
+            ),
+            Self::ContextRefTooLarge { limit, actual } => write!(
+                f,
+                "complete context ref is {actual} bytes over {limit} byte limit"
+            ),
+            Self::TooManyTools { limit, actual } => write!(
+                f,
+                "complete request declares {actual} tools over {limit} limit"
+            ),
+            Self::ToolNameTooLarge { limit, actual } => write!(
+                f,
+                "complete tool name is {actual} bytes over {limit} byte limit"
+            ),
+            Self::TimeoutTooLarge { max, actual } => {
+                write!(f, "timeout {actual}ms exceeds ceiling {max}ms")
+            }
+            Self::BudgetExceeded { limit, actual } => write!(
+                f,
+                "context budget exceeded: {actual} bytes over {limit} byte limit"
+            ),
+            Self::ResponseTextTooLarge { limit, actual } => {
+                write!(f, "complete text is {actual} bytes over {limit} byte limit")
+            }
+            Self::TooManyToolCalls { limit, actual } => write!(
+                f,
+                "complete response declares {actual} tool calls over {limit} limit"
+            ),
+            Self::ToolArgumentsTooLarge { limit, actual } => write!(
+                f,
+                "complete tool arguments are {actual} bytes over {limit} byte limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IpcEnvelopeError {}
+
+/// Reserved `MP-4` caller-scope marker for [`ListModelsRequest`].
+///
+/// An opaque scope label that is never interpreted: any scoped request is
+/// denied by [`ListModelsRequest::check_scope`] because caller-scope
+/// filtering is deferred host-side. The label is not echoed by the refusal
+/// ([`IpcEnvelopeError::ReservedScopeDenied`] carries no payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedCallerScope {
+    /// Opaque scope label (never interpreted; presence alone denies).
+    pub scope: String,
+}
+
+/// Scoped-IPC request for `list_models`.
+///
+/// Mirrors the unfiltered runtime `list_models` (which takes no arguments
+/// and returns the whole snapshot): the request carries no filter fields,
+/// only the reserved [`ReservedCallerScope`] marker. `None` is the
+/// unfiltered shape and the only accepted one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListModelsRequest {
+    /// Reserved `MP-4` caller scope. `None` is the unfiltered shape;
+    /// any `Some` value is denied by [`ListModelsRequest::check_scope`].
+    pub caller_scope: Option<ReservedCallerScope>,
+}
+
+impl ListModelsRequest {
+    /// The only accepted shape: an unfiltered `list_models` request.
+    #[must_use]
+    pub fn unfiltered() -> Self {
+        Self { caller_scope: None }
+    }
+
+    /// Declare a (reserved) caller scope. The request builds but never
+    /// crosses: [`ListModelsRequest::check_scope`] denies it fail-closed.
+    #[must_use]
+    pub fn scoped(scope: impl Into<String>) -> Self {
+        Self {
+            caller_scope: Some(ReservedCallerScope {
+                scope: scope.into(),
+            }),
+        }
+    }
+
+    /// Fail-closed scope gate: unfiltered passes, any declared scope is
+    /// denied because `MP-4` filtering is deferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcEnvelopeError::ReservedScopeDenied`] when a scope is
+    /// declared.
+    pub fn check_scope(&self) -> Result<(), IpcEnvelopeError> {
+        if self.caller_scope.is_some() {
+            Err(IpcEnvelopeError::ReservedScopeDenied)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Scoped-IPC response for `list_models`: detached [`ModelRegistration`]
+/// snapshots with a count bound.
+///
+/// The snapshots reuse the S1 registration type (provider association plus
+/// routing metadata) and are detached: later registry changes do not leak
+/// into a previously built response. Order follows
+/// [`ProviderRegistry::entries`] (provider/model lexicographic), never
+/// insertion order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListModelsResponse {
+    /// Detached model snapshots (at most [`MAX_REGISTERED_MODELS`]).
+    pub models: Vec<ModelRegistration>,
+}
+
+impl ListModelsResponse {
+    /// Build a response, refusing an over-count snapshot fail-closed with no
+    /// partial value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcEnvelopeError::TooManyModels`] when `models` exceeds
+    /// [`MAX_REGISTERED_MODELS`].
+    pub fn new(models: Vec<ModelRegistration>) -> Result<Self, IpcEnvelopeError> {
+        if models.len() > MAX_REGISTERED_MODELS {
+            return Err(IpcEnvelopeError::TooManyModels {
+                limit: MAX_REGISTERED_MODELS,
+                actual: models.len(),
+            });
+        }
+        Ok(Self { models })
+    }
+
+    /// Snapshot a registry into a detached response. Infallible: the registry
+    /// already enforces [`MAX_REGISTERED_MODELS`], and every entry is cloned
+    /// so later registration cannot leak into this response.
+    #[must_use]
+    pub fn from_registry(registry: &ProviderRegistry) -> Self {
+        Self {
+            models: registry
+                .entries()
+                .into_iter()
+                .map(|entry| ModelRegistration {
+                    provider_id: entry.provider_id.clone(),
+                    name: entry.name.clone(),
+                    capabilities: entry.capabilities.clone(),
+                    context_window_tokens: entry.context_window_tokens,
+                    input_cost_weight: entry.input_cost_weight,
+                    output_cost_weight: entry.output_cost_weight,
+                })
+                .collect(),
+        }
+    }
+
+    /// Snapshot model count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.models.len()
+    }
+
+    /// Whether the snapshot holds no model.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+}
+
+/// Envelope message role (the `provider.rs` `Role` vocabulary: human or host
+/// instruction, model output, tool observation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcRole {
+    /// Human or host instruction.
+    User,
+    /// Model output.
+    Assistant,
+    /// Tool observation or assembled context record (may carry untrusted
+    /// observation data).
+    Tool,
+}
+
+/// One bounded envelope message (the `provider.rs` `Message` shape: role plus
+/// content bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcMessage {
+    /// Message role.
+    pub role: IpcRole,
+    /// Message bytes (UTF-8; may carry untrusted observation data).
+    pub content: String,
+}
+
+impl IpcMessage {
+    /// Build a user message.
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: IpcRole::User,
+            content: content.into(),
+        }
+    }
+
+    /// Build an assistant message.
+    #[must_use]
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: IpcRole::Assistant,
+            content: content.into(),
+        }
+    }
+
+    /// Build a tool/observation message.
+    #[must_use]
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: IpcRole::Tool,
+            content: content.into(),
+        }
+    }
+
+    /// Byte length of the message content.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.content.len()
+    }
+}
+
+/// Sampling declaration note for [`CompleteRequest`] (`MP-5`).
+///
+/// Records only whether a sampling contract was declared caller-side. Values
+/// stay caller-side and validation stays execution-side (`validate_sampling`
+/// before any provider I/O): an absent contract (`Undeclared`) flows through
+/// untouched, and a declared one (`Declared`) is validated there — never
+/// defaulted, never hashed into keys, never echoed by refusals. The envelope
+/// therefore carries no float fields and no sampling vocabulary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SamplingNote {
+    /// No sampling contract declared; flows through untouched.
+    #[default]
+    Undeclared,
+    /// A sampling contract was declared caller-side; validated at execution.
+    Declared,
+}
+
+/// Scoped-IPC request for `complete`: `TurnRequest`-equivalent fields.
+///
+/// The model reference reuses the S1 [`ModelRef`] (shape validation stays at
+/// [`ModelRef::new`]; execution re-checks authoritatively with
+/// [`ProviderError::UnknownModel`] / [`ProviderError::InvalidProviderId`]).
+/// Build the struct literally, then [`CompleteRequest::check`] it before
+/// crossing: the check enforces the envelope payload bounds, the timeout
+/// ceiling, and the message-bytes budget pre-check in runtime `complete()`
+/// order (timeout before budget, mirroring `check_timeout` before the
+/// budget comparison). Execution re-checks every gate authoritatively —
+/// including unknown-model, sampling (`InvalidSampling` /
+/// `UnsupportedSampling`, which echo no values), and latency-vs-timeout —
+/// so an envelope pass never implies execution admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteRequest {
+    /// Target model reference (owning provider plus registry-known name).
+    pub model: ModelRef,
+    /// Bounded conversation messages (at most [`MAX_IPC_MESSAGES`], each at
+    /// most [`MAX_IPC_MESSAGE_BYTES`] bytes).
+    pub messages: Vec<IpcMessage>,
+    /// Stable-id references resolved server-side (`CP-2`; at most
+    /// [`MAX_IPC_CONTEXT_REFS`], each at most [`MAX_IPC_CONTEXT_REF_BYTES`]
+    /// bytes).
+    pub context_refs: Vec<String>,
+    /// Tool Bus names validated against tool consent at execution (at most
+    /// [`MAX_IPC_TOOLS`], each at most [`MAX_IPC_TOOL_NAME_BYTES`] bytes).
+    pub tools: Vec<String>,
+    /// Per-turn context ceiling in bytes; carries the effective bound (see
+    /// `TurnRequest::budget_bytes`), enforced pre-I/O at execution.
+    pub budget_bytes: usize,
+    /// Caller deadline in milliseconds from [`CompleteRequest::now_ms`]
+    /// (`MP-8`; at most [`MAX_REQUEST_TIMEOUT_MS`]).
+    pub timeout_ms: u64,
+    /// Caller-supplied timestamp; no wall clock is read anywhere on this
+    /// path (`CP-7`).
+    pub now_ms: u64,
+    /// Sampling declaration note (declaration only, never values).
+    pub sampling: SamplingNote,
+}
+
+impl CompleteRequest {
+    /// Total message payload bytes (envelope mirror of
+    /// `TurnRequest::total_message_bytes`, used for the pre-I/O budget
+    /// check).
+    #[must_use]
+    pub fn total_message_bytes(&self) -> usize {
+        self.messages.iter().map(IpcMessage::byte_len).sum()
+    }
+
+    /// Fail-closed envelope shape gate. Every refusal leaves no partial
+    /// state; the caller fixes the shape and retries the same request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcEnvelopeError`] for an over-count/over-byte payload, a
+    /// timeout past [`MAX_REQUEST_TIMEOUT_MS`], or message bytes over
+    /// `budget_bytes`.
+    pub fn check(&self) -> Result<(), IpcEnvelopeError> {
+        if self.messages.len() > MAX_IPC_MESSAGES {
+            return Err(IpcEnvelopeError::TooManyMessages {
+                limit: MAX_IPC_MESSAGES,
+                actual: self.messages.len(),
+            });
+        }
+        for message in &self.messages {
+            if message.content.len() > MAX_IPC_MESSAGE_BYTES {
+                return Err(IpcEnvelopeError::MessageTooLarge {
+                    limit: MAX_IPC_MESSAGE_BYTES,
+                    actual: message.content.len(),
+                });
+            }
+        }
+        if self.context_refs.len() > MAX_IPC_CONTEXT_REFS {
+            return Err(IpcEnvelopeError::TooManyContextRefs {
+                limit: MAX_IPC_CONTEXT_REFS,
+                actual: self.context_refs.len(),
+            });
+        }
+        for reference in &self.context_refs {
+            if reference.len() > MAX_IPC_CONTEXT_REF_BYTES {
+                return Err(IpcEnvelopeError::ContextRefTooLarge {
+                    limit: MAX_IPC_CONTEXT_REF_BYTES,
+                    actual: reference.len(),
+                });
+            }
+        }
+        if self.tools.len() > MAX_IPC_TOOLS {
+            return Err(IpcEnvelopeError::TooManyTools {
+                limit: MAX_IPC_TOOLS,
+                actual: self.tools.len(),
+            });
+        }
+        for tool in &self.tools {
+            if tool.len() > MAX_IPC_TOOL_NAME_BYTES {
+                return Err(IpcEnvelopeError::ToolNameTooLarge {
+                    limit: MAX_IPC_TOOL_NAME_BYTES,
+                    actual: tool.len(),
+                });
+            }
+        }
+        if self.timeout_ms > MAX_REQUEST_TIMEOUT_MS {
+            return Err(IpcEnvelopeError::TimeoutTooLarge {
+                max: MAX_REQUEST_TIMEOUT_MS,
+                actual: self.timeout_ms,
+            });
+        }
+        let actual = self.total_message_bytes();
+        if actual > self.budget_bytes {
+            return Err(IpcEnvelopeError::BudgetExceeded {
+                limit: self.budget_bytes,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One envelope tool call (the `provider.rs` `ToolCallRequest` shape:
+/// registered tool name plus opaque bounded JSON arguments, dispatched by
+/// the Tool Bus and never executed here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteToolCall {
+    /// Registered tool name (at most [`MAX_IPC_TOOL_NAME_BYTES`] bytes).
+    pub name: String,
+    /// Opaque bounded JSON arguments (at most
+    /// [`MAX_IPC_TOOL_ARGUMENTS_BYTES`] bytes).
+    pub arguments: Vec<u8>,
+}
+
+impl CompleteToolCall {
+    /// Build a tool call, refusing over-bound payloads fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcEnvelopeError::ToolNameTooLarge`] or
+    /// [`IpcEnvelopeError::ToolArgumentsTooLarge`] for over-bound input.
+    pub fn new(name: impl Into<String>, arguments: Vec<u8>) -> Result<Self, IpcEnvelopeError> {
+        let name = name.into();
+        if name.len() > MAX_IPC_TOOL_NAME_BYTES {
+            return Err(IpcEnvelopeError::ToolNameTooLarge {
+                limit: MAX_IPC_TOOL_NAME_BYTES,
+                actual: name.len(),
+            });
+        }
+        if arguments.len() > MAX_IPC_TOOL_ARGUMENTS_BYTES {
+            return Err(IpcEnvelopeError::ToolArgumentsTooLarge {
+                limit: MAX_IPC_TOOL_ARGUMENTS_BYTES,
+                actual: arguments.len(),
+            });
+        }
+        Ok(Self { name, arguments })
+    }
+}
+
+/// Estimated token usage for one envelope turn, in whole tokens (mirrors the
+/// `provider.rs` `ProviderUsage` shape: observed usage, not billed usage; a
+/// zero pair means unreported and the turn loop falls back to a
+/// deterministic byte-based estimate. Cache slots are provider-reported
+/// prompt-cache accounting in whole tokens; `0` means unreported, never a
+/// measured zero-hit. No currency is implied or carried).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompleteUsage {
+    /// Estimated input tokens observed for this turn.
+    pub input_tokens: u32,
+    /// Estimated output tokens observed for this turn.
+    pub output_tokens: u32,
+    /// Prompt tokens served from cache (`0` = unreported).
+    pub cached_tokens: u32,
+    /// Prompt tokens written to cache (`0` = unreported).
+    pub cache_write_tokens: u32,
+}
+
+/// Scoped-IPC response for `complete`: `ProviderTurn`-equivalent (assistant
+/// text plus follow-up tool calls, token usage, and observed latency).
+/// Owns every payload byte, so a built response is detached by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteResponse {
+    /// Assistant text for this turn (at most [`MAX_IPC_TEXT_BYTES`] bytes).
+    pub text: String,
+    /// Tool calls requested after the text, bounded by the Tool Bus at
+    /// dispatch (at most [`MAX_IPC_TOOL_CALLS`]).
+    pub tool_calls: Vec<CompleteToolCall>,
+    /// Estimated token usage observed for this turn.
+    pub usage: CompleteUsage,
+    /// Observed provider latency in milliseconds, checked deterministically
+    /// against the request timeout at execution.
+    pub latency_ms: u64,
+}
+
+impl CompleteResponse {
+    /// Build a response, revalidating every tool call (entries built without
+    /// [`CompleteToolCall::new`] are re-checked here, mirroring the
+    /// registry's revalidation of entries built without `new`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcEnvelopeError`] for over-bound text, too many tool
+    /// calls, or any over-bound tool call.
+    pub fn new(
+        text: String,
+        tool_calls: Vec<CompleteToolCall>,
+        usage: CompleteUsage,
+        latency_ms: u64,
+    ) -> Result<Self, IpcEnvelopeError> {
+        if text.len() > MAX_IPC_TEXT_BYTES {
+            return Err(IpcEnvelopeError::ResponseTextTooLarge {
+                limit: MAX_IPC_TEXT_BYTES,
+                actual: text.len(),
+            });
+        }
+        if tool_calls.len() > MAX_IPC_TOOL_CALLS {
+            return Err(IpcEnvelopeError::TooManyToolCalls {
+                limit: MAX_IPC_TOOL_CALLS,
+                actual: tool_calls.len(),
+            });
+        }
+        for call in &tool_calls {
+            if call.name.len() > MAX_IPC_TOOL_NAME_BYTES {
+                return Err(IpcEnvelopeError::ToolNameTooLarge {
+                    limit: MAX_IPC_TOOL_NAME_BYTES,
+                    actual: call.name.len(),
+                });
+            }
+            if call.arguments.len() > MAX_IPC_TOOL_ARGUMENTS_BYTES {
+                return Err(IpcEnvelopeError::ToolArgumentsTooLarge {
+                    limit: MAX_IPC_TOOL_ARGUMENTS_BYTES,
+                    actual: call.arguments.len(),
+                });
+            }
+        }
+        Ok(Self {
+            text,
+            tool_calls,
+            usage,
+            latency_ms,
+        })
+    }
+}
+
+/// Truncate an identifier to a byte bound on a character boundary (never
+/// splits a character). Values within the bound pass through untouched.
+fn truncate_to_bound(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// Scrub and bound a free-text reason for IPC crossing (mirrors the runtime
+/// `bridge.rs` `bound_reason` transform with the same value): every
+/// character outside printable ASCII (`0x20..=0x7E`, so spaces are kept)
+/// becomes `?`, which defuses CR/LF log injection, terminal escapes, and
+/// confusable non-ASCII bytes; the result is then truncated to
+/// [`MAX_IPC_REASON_BYTES`] bytes. Deterministic, silent (no ellipsis
+/// marker that could itself exceed the bound), and never splits a
+/// character, so the normalized value is safe to log directly.
+fn scrub_reason(reason: &str) -> String {
+    let mut bounded = String::with_capacity(reason.len().min(MAX_IPC_REASON_BYTES));
+    for character in reason.chars() {
+        if bounded.len() >= MAX_IPC_REASON_BYTES {
+            break;
+        }
+        if character.is_ascii_graphic() || character == ' ' {
+            bounded.push(character);
+        } else {
+            bounded.push('?');
+        }
+    }
+    bounded
+}
+
+/// Bounded scoped-IPC envelope form of [`ProviderError`]: the same 13
+/// variants, normalized for boundary crossing.
+///
+/// Identifier fields keep their shaped values truncated to their shape bound
+/// ([`MAX_MODEL_NAME_LEN`] for model names, [`MAX_PROVIDER_ID_LEN`] for
+/// provider ids) on a character boundary; free-text reason fields are
+/// scrubbed and truncated to [`MAX_IPC_REASON_BYTES`] (see
+/// [`ProviderIpcError::from_error`]); counts, timeouts, budgets, and the
+/// `retry_after_ms` hint cross unchanged; `missing` capability bits cross as
+/// typed routing data; the `UnsupportedSampling` backend label is a static
+/// adapter string, never caller input. Sampling refusals echo no values, so
+/// logs and reconcile reports stay static. No variant carries secrets,
+/// credentials, or key material.
+///
+/// The [`ProviderIpcError::from_error`] / [`ProviderIpcError::into_error`]
+/// mapping is total and exhaustive (no wildcard arm): adding a
+/// [`ProviderError`] variant breaks compilation here, which is the
+/// fail-closed response to a new failure mode (it must be classified before
+/// any envelope carries it). Fallback classification over these errors stays
+/// on the selection side: convert back with [`ProviderIpcError::into_error`]
+/// and classify there (AI-0279 owns the select/matches/fallback envelopes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderIpcError {
+    /// `model` names no registry-known model (name truncated to
+    /// [`MAX_MODEL_NAME_LEN`]).
+    UnknownModel {
+        /// Requested model name.
+        name: String,
+    },
+    /// Request would exceed the context budget in bytes.
+    BudgetExceeded {
+        /// Budget in bytes.
+        limit: usize,
+        /// Observed message bytes.
+        actual: usize,
+    },
+    /// Scripted latency exceeded the caller timeout.
+    Timeout {
+        /// Requested timeout in milliseconds.
+        timeout_ms: u64,
+        /// Observed latency in milliseconds.
+        latency_ms: u64,
+    },
+    /// Requested timeout exceeds the hard ceiling.
+    TimeoutTooLarge {
+        /// Hard ceiling in milliseconds.
+        max: u64,
+        /// Requested timeout in milliseconds.
+        actual: u64,
+    },
+    /// Provider id violates the `MP-2` shape (id truncated to
+    /// [`MAX_PROVIDER_ID_LEN`]).
+    InvalidProviderId {
+        /// Rejected id.
+        id: String,
+    },
+    /// Transport failure before any model effect (provider truncated to
+    /// [`MAX_PROVIDER_ID_LEN`], reason scrubbed to [`MAX_IPC_REASON_BYTES`]).
+    Transport {
+        /// Owning provider id.
+        provider: String,
+        /// What failed (no secrets, no credentials, no key material).
+        reason: String,
+    },
+    /// Provider refused authorization (provider truncated, reason scrubbed;
+    /// reports the refusal only, never credentials).
+    Auth {
+        /// Owning provider id.
+        provider: String,
+        /// Refusal detail (no secrets, no credentials, no key material).
+        reason: String,
+    },
+    /// Provider rate limit hit (provider truncated to
+    /// [`MAX_PROVIDER_ID_LEN`]).
+    RateLimited {
+        /// Owning provider id.
+        provider: String,
+        /// Advised wait in milliseconds; `None` when the provider gave none.
+        retry_after_ms: Option<u64>,
+    },
+    /// Selected model lacks capabilities the request required (provider and
+    /// model truncated; `missing` crosses as typed routing bits).
+    CapabilityMismatch {
+        /// Owning provider id.
+        provider: String,
+        /// Requested model name.
+        model: String,
+        /// Required capabilities the model does not advertise.
+        missing: Vec<ModelCapability>,
+    },
+    /// Model is known but unavailable (provider and model truncated).
+    ModelUnavailable {
+        /// Owning provider id.
+        provider: String,
+        /// Unavailable model name.
+        model: String,
+    },
+    /// The effect may have happened but acknowledgement was lost (provider
+    /// truncated, reason scrubbed; reconcile before retry, never fall back
+    /// blindly).
+    Unknown {
+        /// Owning provider id.
+        provider: String,
+        /// What is uncertain.
+        reason: String,
+    },
+    /// Declared sampling contract violates its validated ranges. No value is
+    /// echoed, so logs stay static.
+    InvalidSampling,
+    /// Declared sampling contract is valid but the backend cannot carry one
+    /// or more declared fields. Names the backend field kind with a static
+    /// label; no caller value is echoed.
+    UnsupportedSampling {
+        /// Static backend field label (never caller input).
+        field: &'static str,
+    },
+}
+
+impl ProviderIpcError {
+    /// Normalize a [`ProviderError`] for IPC crossing: identifiers truncated
+    /// to their shape bound, reasons scrubbed and truncated to
+    /// [`MAX_IPC_REASON_BYTES`]. Total over the source taxonomy: every one
+    /// of the 13 variants maps, with no wildcard arm.
+    #[must_use]
+    pub fn from_error(error: &ProviderError) -> Self {
+        match error {
+            ProviderError::UnknownModel { name } => Self::UnknownModel {
+                name: truncate_to_bound(name, MAX_MODEL_NAME_LEN),
+            },
+            ProviderError::BudgetExceeded { limit, actual } => Self::BudgetExceeded {
+                limit: *limit,
+                actual: *actual,
+            },
+            ProviderError::Timeout {
+                timeout_ms,
+                latency_ms,
+            } => Self::Timeout {
+                timeout_ms: *timeout_ms,
+                latency_ms: *latency_ms,
+            },
+            ProviderError::TimeoutTooLarge { max, actual } => Self::TimeoutTooLarge {
+                max: *max,
+                actual: *actual,
+            },
+            ProviderError::InvalidProviderId { id } => Self::InvalidProviderId {
+                id: truncate_to_bound(id, MAX_PROVIDER_ID_LEN),
+            },
+            ProviderError::Transport { provider, reason } => Self::Transport {
+                provider: truncate_to_bound(provider, MAX_PROVIDER_ID_LEN),
+                reason: scrub_reason(reason),
+            },
+            ProviderError::Auth { provider, reason } => Self::Auth {
+                provider: truncate_to_bound(provider, MAX_PROVIDER_ID_LEN),
+                reason: scrub_reason(reason),
+            },
+            ProviderError::RateLimited {
+                provider,
+                retry_after_ms,
+            } => Self::RateLimited {
+                provider: truncate_to_bound(provider, MAX_PROVIDER_ID_LEN),
+                retry_after_ms: *retry_after_ms,
+            },
+            ProviderError::CapabilityMismatch {
+                provider,
+                model,
+                missing,
+            } => Self::CapabilityMismatch {
+                provider: truncate_to_bound(provider, MAX_PROVIDER_ID_LEN),
+                model: truncate_to_bound(model, MAX_MODEL_NAME_LEN),
+                missing: missing.clone(),
+            },
+            ProviderError::ModelUnavailable { provider, model } => Self::ModelUnavailable {
+                provider: truncate_to_bound(provider, MAX_PROVIDER_ID_LEN),
+                model: truncate_to_bound(model, MAX_MODEL_NAME_LEN),
+            },
+            ProviderError::Unknown { provider, reason } => Self::Unknown {
+                provider: truncate_to_bound(provider, MAX_PROVIDER_ID_LEN),
+                reason: scrub_reason(reason),
+            },
+            ProviderError::InvalidSampling => Self::InvalidSampling,
+            ProviderError::UnsupportedSampling { field } => Self::UnsupportedSampling { field },
+        }
+    }
+
+    /// Recover the [`ProviderError`] carried by this envelope. Total: every
+    /// one of the 13 envelope variants maps back, with no wildcard arm.
+    #[must_use]
+    pub fn into_error(self) -> ProviderError {
+        match self {
+            Self::UnknownModel { name } => ProviderError::UnknownModel { name },
+            Self::BudgetExceeded { limit, actual } => {
+                ProviderError::BudgetExceeded { limit, actual }
+            }
+            Self::Timeout {
+                timeout_ms,
+                latency_ms,
+            } => ProviderError::Timeout {
+                timeout_ms,
+                latency_ms,
+            },
+            Self::TimeoutTooLarge { max, actual } => ProviderError::TimeoutTooLarge { max, actual },
+            Self::InvalidProviderId { id } => ProviderError::InvalidProviderId { id },
+            Self::Transport { provider, reason } => ProviderError::Transport { provider, reason },
+            Self::Auth { provider, reason } => ProviderError::Auth { provider, reason },
+            Self::RateLimited {
+                provider,
+                retry_after_ms,
+            } => ProviderError::RateLimited {
+                provider,
+                retry_after_ms,
+            },
+            Self::CapabilityMismatch {
+                provider,
+                model,
+                missing,
+            } => ProviderError::CapabilityMismatch {
+                provider,
+                model,
+                missing,
+            },
+            Self::ModelUnavailable { provider, model } => {
+                ProviderError::ModelUnavailable { provider, model }
+            }
+            Self::Unknown { provider, reason } => ProviderError::Unknown { provider, reason },
+            Self::InvalidSampling => ProviderError::InvalidSampling,
+            Self::UnsupportedSampling { field } => ProviderError::UnsupportedSampling { field },
+        }
+    }
+}
+
+impl Display for ProviderIpcError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::UnknownModel { name } => write!(f, "unknown model: {name}"),
+            Self::BudgetExceeded { limit, actual } => write!(
+                f,
+                "context budget exceeded: {actual} bytes over {limit} byte limit"
+            ),
+            Self::Timeout {
+                timeout_ms,
+                latency_ms,
+            } => write!(
+                f,
+                "provider timed out: latency {latency_ms}ms over {timeout_ms}ms timeout"
+            ),
+            Self::TimeoutTooLarge { max, actual } => {
+                write!(f, "timeout {actual}ms exceeds ceiling {max}ms")
+            }
+            Self::InvalidProviderId { id } => write!(f, "invalid provider id: {id}"),
+            Self::Transport { provider, reason } => {
+                write!(f, "provider {provider} transport failure: {reason}")
+            }
+            Self::Auth { provider, reason } => {
+                write!(f, "provider {provider} refused authorization: {reason}")
+            }
+            Self::RateLimited {
+                provider,
+                retry_after_ms,
+            } => match retry_after_ms {
+                Some(ms) => write!(f, "provider {provider} rate limited: retry after {ms}ms"),
+                None => write!(f, "provider {provider} rate limited"),
+            },
+            Self::CapabilityMismatch {
+                provider,
+                model,
+                missing,
+            } => write!(
+                f,
+                "provider {provider} model {model} lacks {} capabilities",
+                missing.len()
+            ),
+            Self::ModelUnavailable { provider, model } => {
+                write!(f, "provider {provider} model {model} unavailable")
+            }
+            Self::Unknown { provider, reason } => {
+                write!(f, "provider {provider} effect unknown: {reason}")
+            }
+            Self::InvalidSampling => write!(f, "invalid sampling parameters"),
+            Self::UnsupportedSampling { field } => {
+                write!(f, "sampling option unsupported by backend: {field}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderIpcError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1853,5 +2860,510 @@ mod tests {
         };
         assert_eq!(fallback_directive(&unknown), FallbackDirective::Stop);
         assert_eq!(unknown.to_string(), "provider p effect unknown: ack lost");
+    }
+}
+
+#[cfg(test)]
+mod ipc_envelope_tests {
+    use super::*;
+
+    fn complete_request() -> CompleteRequest {
+        CompleteRequest {
+            model: ModelRef::new("bitty-fake", "fake-chat").expect("valid ref"),
+            messages: vec![IpcMessage::user("hello")],
+            context_refs: vec!["stable-id-1".to_owned()],
+            tools: vec!["read".to_owned()],
+            budget_bytes: 32 * 1024,
+            timeout_ms: 5_000,
+            now_ms: 1_000,
+            sampling: SamplingNote::Undeclared,
+        }
+    }
+
+    fn registration_at(index: usize) -> ModelRegistration {
+        ModelRegistration::new(
+            "bitty-fake",
+            format!("model-{index}"),
+            vec![ModelCapability::Text],
+            4_096,
+            1,
+            2,
+        )
+        .expect("valid registration")
+    }
+
+    #[test]
+    fn ipc_bounds_match_source_values() {
+        assert_eq!(MAX_REQUEST_TIMEOUT_MS, 30_000);
+        assert_eq!(MAX_IPC_MESSAGES, 128);
+        assert_eq!(MAX_IPC_MESSAGE_BYTES, 16 * 1024);
+        assert_eq!(MAX_IPC_CONTEXT_REFS, 128);
+        assert_eq!(MAX_IPC_CONTEXT_REF_BYTES, 64);
+        assert_eq!(MAX_IPC_TOOLS, 32);
+        assert_eq!(MAX_IPC_TOOL_NAME_BYTES, 64);
+        assert_eq!(MAX_IPC_TEXT_BYTES, 16 * 1024);
+        assert_eq!(MAX_IPC_TOOL_CALLS, 8);
+        assert_eq!(MAX_IPC_TOOL_ARGUMENTS_BYTES, 16 * 1024);
+        assert_eq!(MAX_IPC_REASON_BYTES, 512);
+    }
+
+    #[test]
+    fn list_models_scope_gate() {
+        // The unfiltered shape (and the default, which is unfiltered) passes.
+        assert!(ListModelsRequest::unfiltered().check_scope().is_ok());
+        assert!(ListModelsRequest::default().check_scope().is_ok());
+        assert_eq!(
+            ListModelsRequest::default(),
+            ListModelsRequest::unfiltered()
+        );
+        // Any declared scope is denied: MP-4 filtering is deferred.
+        let scoped = ListModelsRequest::scoped("team-a");
+        assert_eq!(
+            scoped.check_scope().expect_err("scoped must fail"),
+            IpcEnvelopeError::ReservedScopeDenied
+        );
+        // The refusal echoes no scope payload.
+        assert_eq!(
+            IpcEnvelopeError::ReservedScopeDenied.to_string(),
+            "list_models caller scope is reserved and denied (MP-4 deferred)"
+        );
+    }
+
+    #[test]
+    fn list_models_response_count_bound() {
+        let fitting: Vec<ModelRegistration> =
+            (0..MAX_REGISTERED_MODELS).map(registration_at).collect();
+        let response = ListModelsResponse::new(fitting).expect("64 fits");
+        assert_eq!(response.len(), MAX_REGISTERED_MODELS);
+        assert!(!response.is_empty());
+        assert!(ListModelsResponse::default().is_empty());
+        let mut burst: Vec<ModelRegistration> =
+            (0..MAX_REGISTERED_MODELS).map(registration_at).collect();
+        burst.push(registration_at(MAX_REGISTERED_MODELS));
+        assert_eq!(
+            ListModelsResponse::new(burst).expect_err("65 must fail"),
+            IpcEnvelopeError::TooManyModels {
+                limit: MAX_REGISTERED_MODELS,
+                actual: MAX_REGISTERED_MODELS + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn list_models_response_is_detached_snapshot() {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                ModelRegistration::new("bitty-b", "chat", vec![ModelCapability::Text], 4_096, 1, 2)
+                    .expect("valid registration"),
+            )
+            .expect("capacity");
+        registry
+            .register(
+                ModelRegistration::new(
+                    "bitty-a",
+                    "vision",
+                    vec![ModelCapability::Text, ModelCapability::ImageInput],
+                    32_768,
+                    3,
+                    4,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        let response = ListModelsResponse::from_registry(&registry);
+        // Deterministic entries() order (provider/model lexicographic),
+        // detached clones of the registry state.
+        let order: Vec<(&str, &str)> = response
+            .models
+            .iter()
+            .map(|item| (item.provider_id.as_str(), item.name.as_str()))
+            .collect();
+        assert_eq!(order, vec![("bitty-a", "vision"), ("bitty-b", "chat")]);
+        // Later registry state cannot leak into the snapshot.
+        registry
+            .register(
+                ModelRegistration::new(
+                    "bitty-c",
+                    "fresh",
+                    vec![ModelCapability::Text],
+                    4_096,
+                    1,
+                    1,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        assert_eq!(response.len(), 2);
+        assert_eq!(registry.len(), 3);
+    }
+
+    #[test]
+    fn complete_request_accepts_bounded_shape() {
+        let request = complete_request();
+        assert_eq!(request.total_message_bytes(), "hello".len());
+        assert!(request.check().is_ok());
+        // Declared sampling is a note only: no values cross, nothing to
+        // validate at the envelope, so the check still passes.
+        let declared = CompleteRequest {
+            sampling: SamplingNote::Declared,
+            ..request
+        };
+        assert!(declared.check().is_ok());
+        assert_eq!(SamplingNote::default(), SamplingNote::Undeclared);
+    }
+
+    #[test]
+    fn complete_request_refuses_over_count_bounds() {
+        let burst_messages = CompleteRequest {
+            messages: (0..MAX_IPC_MESSAGES + 1)
+                .map(|index| IpcMessage::user(format!("m{index}")))
+                .collect(),
+            ..complete_request()
+        };
+        assert_eq!(
+            burst_messages.check().expect_err("too many messages"),
+            IpcEnvelopeError::TooManyMessages {
+                limit: MAX_IPC_MESSAGES,
+                actual: MAX_IPC_MESSAGES + 1,
+            }
+        );
+        let burst_refs = CompleteRequest {
+            context_refs: (0..MAX_IPC_CONTEXT_REFS + 1)
+                .map(|index| format!("ref-{index}"))
+                .collect(),
+            ..complete_request()
+        };
+        assert_eq!(
+            burst_refs.check().expect_err("too many refs"),
+            IpcEnvelopeError::TooManyContextRefs {
+                limit: MAX_IPC_CONTEXT_REFS,
+                actual: MAX_IPC_CONTEXT_REFS + 1,
+            }
+        );
+        let burst_tools = CompleteRequest {
+            tools: (0..MAX_IPC_TOOLS + 1)
+                .map(|index| format!("tool-{index}"))
+                .collect(),
+            ..complete_request()
+        };
+        assert_eq!(
+            burst_tools.check().expect_err("too many tools"),
+            IpcEnvelopeError::TooManyTools {
+                limit: MAX_IPC_TOOLS,
+                actual: MAX_IPC_TOOLS + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn complete_request_refuses_over_byte_bounds() {
+        let big_message = CompleteRequest {
+            messages: vec![IpcMessage::user("x".repeat(MAX_IPC_MESSAGE_BYTES + 1))],
+            budget_bytes: usize::MAX,
+            ..complete_request()
+        };
+        assert_eq!(
+            big_message.check().expect_err("message too large"),
+            IpcEnvelopeError::MessageTooLarge {
+                limit: MAX_IPC_MESSAGE_BYTES,
+                actual: MAX_IPC_MESSAGE_BYTES + 1,
+            }
+        );
+        let big_ref = CompleteRequest {
+            context_refs: vec!["r".repeat(MAX_IPC_CONTEXT_REF_BYTES + 1)],
+            ..complete_request()
+        };
+        assert_eq!(
+            big_ref.check().expect_err("ref too large"),
+            IpcEnvelopeError::ContextRefTooLarge {
+                limit: MAX_IPC_CONTEXT_REF_BYTES,
+                actual: MAX_IPC_CONTEXT_REF_BYTES + 1,
+            }
+        );
+        let big_tool = CompleteRequest {
+            tools: vec!["t".repeat(MAX_IPC_TOOL_NAME_BYTES + 1)],
+            ..complete_request()
+        };
+        assert_eq!(
+            big_tool.check().expect_err("tool too large"),
+            IpcEnvelopeError::ToolNameTooLarge {
+                limit: MAX_IPC_TOOL_NAME_BYTES,
+                actual: MAX_IPC_TOOL_NAME_BYTES + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn complete_request_refuses_timeout_and_budget() {
+        // Exact-limit values pass: the ceiling is inclusive and message
+        // bytes equal to the budget are within budget.
+        let edge = CompleteRequest {
+            timeout_ms: MAX_REQUEST_TIMEOUT_MS,
+            budget_bytes: "hello".len(),
+            ..complete_request()
+        };
+        assert!(edge.check().is_ok());
+        let slow = CompleteRequest {
+            timeout_ms: MAX_REQUEST_TIMEOUT_MS + 1,
+            ..complete_request()
+        };
+        assert_eq!(
+            slow.check().expect_err("timeout too large"),
+            IpcEnvelopeError::TimeoutTooLarge {
+                max: MAX_REQUEST_TIMEOUT_MS,
+                actual: MAX_REQUEST_TIMEOUT_MS + 1,
+            }
+        );
+        // Same wording as the execution-side ceiling refusal.
+        assert_eq!(
+            IpcEnvelopeError::TimeoutTooLarge {
+                max: 30_000,
+                actual: 60_000,
+            }
+            .to_string(),
+            "timeout 60000ms exceeds ceiling 30000ms"
+        );
+        let over_budget = CompleteRequest {
+            budget_bytes: "hello".len() - 1,
+            ..complete_request()
+        };
+        assert_eq!(
+            over_budget.check().expect_err("budget exceeded"),
+            IpcEnvelopeError::BudgetExceeded {
+                limit: "hello".len() - 1,
+                actual: "hello".len(),
+            }
+        );
+        assert_eq!(
+            IpcEnvelopeError::BudgetExceeded {
+                limit: 1,
+                actual: 2
+            }
+            .to_string(),
+            "context budget exceeded: 2 bytes over 1 byte limit"
+        );
+    }
+
+    #[test]
+    fn complete_response_accepts_bounded_shape() {
+        let response = CompleteResponse::new(
+            "done".to_owned(),
+            vec![CompleteToolCall::new("read", br#"{"path":"x"}"#.to_vec()).expect("bounded")],
+            CompleteUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            120,
+        )
+        .expect("bounded response builds");
+        assert_eq!(response.text, "done");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.latency_ms, 120);
+    }
+
+    #[test]
+    fn complete_response_refuses_over_bounds() {
+        let usage = CompleteUsage::default();
+        assert_eq!(
+            CompleteResponse::new("x".repeat(MAX_IPC_TEXT_BYTES + 1), Vec::new(), usage, 0)
+                .expect_err("text too large"),
+            IpcEnvelopeError::ResponseTextTooLarge {
+                limit: MAX_IPC_TEXT_BYTES,
+                actual: MAX_IPC_TEXT_BYTES + 1,
+            }
+        );
+        let burst: Vec<CompleteToolCall> = (0..MAX_IPC_TOOL_CALLS)
+            .map(|index| {
+                CompleteToolCall::new(format!("tool-{index}"), Vec::new()).expect("bounded call")
+            })
+            .collect();
+        assert!(CompleteResponse::new("ok".to_owned(), burst, usage, 0).is_ok());
+        let too_many: Vec<CompleteToolCall> = (0..MAX_IPC_TOOL_CALLS + 1)
+            .map(|index| {
+                CompleteToolCall::new(format!("tool-{index}"), Vec::new()).expect("bounded call")
+            })
+            .collect();
+        assert_eq!(
+            CompleteResponse::new("ok".to_owned(), too_many, usage, 0).expect_err("too many calls"),
+            IpcEnvelopeError::TooManyToolCalls {
+                limit: MAX_IPC_TOOL_CALLS,
+                actual: MAX_IPC_TOOL_CALLS + 1,
+            }
+        );
+        // Entries built without `new` are revalidated here: no smuggling.
+        let smuggled_name = CompleteToolCall {
+            name: "n".repeat(MAX_IPC_TOOL_NAME_BYTES + 1),
+            arguments: Vec::new(),
+        };
+        assert_eq!(
+            CompleteResponse::new("ok".to_owned(), vec![smuggled_name], usage, 0)
+                .expect_err("smuggled name must fail"),
+            IpcEnvelopeError::ToolNameTooLarge {
+                limit: MAX_IPC_TOOL_NAME_BYTES,
+                actual: MAX_IPC_TOOL_NAME_BYTES + 1,
+            }
+        );
+        let smuggled_args = CompleteToolCall {
+            name: "read".to_owned(),
+            arguments: vec![0u8; MAX_IPC_TOOL_ARGUMENTS_BYTES + 1],
+        };
+        assert_eq!(
+            CompleteResponse::new("ok".to_owned(), vec![smuggled_args], usage, 0)
+                .expect_err("smuggled args must fail"),
+            IpcEnvelopeError::ToolArgumentsTooLarge {
+                limit: MAX_IPC_TOOL_ARGUMENTS_BYTES,
+                actual: MAX_IPC_TOOL_ARGUMENTS_BYTES + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn complete_tool_call_constructor_bounds() {
+        assert!(CompleteToolCall::new("read", vec![1, 2, 3]).is_ok());
+        assert_eq!(
+            CompleteToolCall::new("n".repeat(MAX_IPC_TOOL_NAME_BYTES + 1), Vec::new())
+                .expect_err("name too large"),
+            IpcEnvelopeError::ToolNameTooLarge {
+                limit: MAX_IPC_TOOL_NAME_BYTES,
+                actual: MAX_IPC_TOOL_NAME_BYTES + 1,
+            }
+        );
+        assert_eq!(
+            CompleteToolCall::new("read", vec![0u8; MAX_IPC_TOOL_ARGUMENTS_BYTES + 1])
+                .expect_err("args too large"),
+            IpcEnvelopeError::ToolArgumentsTooLarge {
+                limit: MAX_IPC_TOOL_ARGUMENTS_BYTES,
+                actual: MAX_IPC_TOOL_ARGUMENTS_BYTES + 1,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_ipc_error_mapping_is_total() {
+        // Every one of the 13 source variants maps and round-trips,
+        // including Unknown (reconcile-before-retry, never blind fallback).
+        let cases = [
+            ProviderError::UnknownModel {
+                name: "m".to_owned(),
+            },
+            ProviderError::BudgetExceeded {
+                limit: 1,
+                actual: 2,
+            },
+            ProviderError::Timeout {
+                timeout_ms: 5_000,
+                latency_ms: 6_000,
+            },
+            ProviderError::TimeoutTooLarge {
+                max: 30_000,
+                actual: 60_000,
+            },
+            ProviderError::InvalidProviderId {
+                id: "BAD".to_owned(),
+            },
+            ProviderError::Transport {
+                provider: "p".to_owned(),
+                reason: "reset".to_owned(),
+            },
+            ProviderError::Auth {
+                provider: "p".to_owned(),
+                reason: "revoked".to_owned(),
+            },
+            ProviderError::RateLimited {
+                provider: "p".to_owned(),
+                retry_after_ms: Some(1_000),
+            },
+            ProviderError::RateLimited {
+                provider: "p".to_owned(),
+                retry_after_ms: None,
+            },
+            ProviderError::CapabilityMismatch {
+                provider: "p".to_owned(),
+                model: "m".to_owned(),
+                missing: vec![ModelCapability::ImageInput],
+            },
+            ProviderError::ModelUnavailable {
+                provider: "p".to_owned(),
+                model: "m".to_owned(),
+            },
+            ProviderError::Unknown {
+                provider: "p".to_owned(),
+                reason: "ack lost".to_owned(),
+            },
+            ProviderError::InvalidSampling,
+            ProviderError::UnsupportedSampling { field: "top_k" },
+        ];
+        for error in &cases {
+            let envelope = ProviderIpcError::from_error(error);
+            assert_eq!(envelope.clone().into_error(), *error);
+            assert_eq!(envelope.to_string(), error.to_string());
+        }
+    }
+
+    #[test]
+    fn provider_ipc_error_truncates_and_scrubs() {
+        // Over-long identifiers truncate to their shape bound on a
+        // character boundary (never splitting a character).
+        let long_name = "n".repeat(MAX_MODEL_NAME_LEN + 1);
+        let envelope =
+            ProviderIpcError::from_error(&ProviderError::UnknownModel { name: long_name });
+        match envelope {
+            ProviderIpcError::UnknownModel { name } => {
+                assert_eq!(name.len(), MAX_MODEL_NAME_LEN);
+            }
+            other => panic!("unexpected envelope: {other:?}"),
+        }
+        let multibyte_provider = format!("{}é", "a".repeat(MAX_PROVIDER_ID_LEN - 1));
+        assert_eq!(multibyte_provider.len(), MAX_PROVIDER_ID_LEN + 1);
+        let envelope = ProviderIpcError::from_error(&ProviderError::Transport {
+            provider: multibyte_provider,
+            reason: "reset".to_owned(),
+        });
+        match envelope {
+            ProviderIpcError::Transport { provider, .. } => {
+                // Cutting the two-byte `é` would split it, so the envelope
+                // keeps the 63 ASCII bytes.
+                assert_eq!(provider, "a".repeat(MAX_PROVIDER_ID_LEN - 1));
+            }
+            other => panic!("unexpected envelope: {other:?}"),
+        }
+        // Free-text reasons scrub to printable ASCII and truncate.
+        let hostile = format!("boom\n\u{1b}[2J{}", "x".repeat(MAX_IPC_REASON_BYTES * 2));
+        let envelope = ProviderIpcError::from_error(&ProviderError::Unknown {
+            provider: "p".to_owned(),
+            reason: hostile,
+        });
+        match envelope {
+            ProviderIpcError::Unknown { reason, .. } => {
+                assert_eq!(reason.len(), MAX_IPC_REASON_BYTES);
+                assert!(
+                    reason.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+                    "unscrubbed reason: {reason:?}"
+                );
+                assert!(reason.starts_with("boom??[2J"));
+            }
+            other => panic!("unexpected envelope: {other:?}"),
+        }
+        // Sampling refusals echo no values.
+        assert_eq!(
+            ProviderIpcError::from_error(&ProviderError::InvalidSampling),
+            ProviderIpcError::InvalidSampling
+        );
+        assert_eq!(
+            ProviderIpcError::InvalidSampling.to_string(),
+            "invalid sampling parameters"
+        );
+        // The Unknown display matches the source taxonomy exactly.
+        assert_eq!(
+            ProviderIpcError::Unknown {
+                provider: "p".to_owned(),
+                reason: "ack lost".to_owned(),
+            }
+            .to_string(),
+            "provider p effect unknown: ack lost"
+        );
     }
 }
