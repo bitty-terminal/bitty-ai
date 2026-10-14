@@ -20,10 +20,10 @@ workspace = true
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
 # AI-0194 remote transport: first network dependency in the workspace.
 # Reuse path (a): http+https via NetworkService. Mirrors the exact pin used
-# by bitty-ai-slice (rev c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95); the
+# by bitty-ai-slice (rev 2aa466387db8e7b2092ce31a09c51040e38ec3e0); the
 # runtime kernel stays std-only, only this client takes the dependency.
 # AI-0259: bumped to the CTX-0073 accessor rev (same rev the slice takes) so
 # the workspace builds one network revision. No new dependency: the real SPKI
 # provider lives in the slice (AI-0259 experiment); this crate's consumer
 # seam is untouched.
-bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95" }
+bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "2aa466387db8e7b2092ce31a09c51040e38ec3e0" }

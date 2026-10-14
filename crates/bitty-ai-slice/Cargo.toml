@@ -41,12 +41,12 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled
 # AI-0156 transport-adapter prototype (slice-only): bitty-network-api consumer
 # vocabulary for TurnRequest mapping into Request with budget_bytes, timeout_ms,
 # and secret redaction.
-bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95" }
+bitty-network-api = { git = "https://github.com/bitty-terminal/bitty-network", rev = "2aa466387db8e7b2092ce31a09c51040e38ec3e0" }
 # AI-0259 slice experiment (slice-only): real SPKI provider via the CTX-0073
 # peer-leaf accessor. Direct `bitty-network-tls` edge (lightest: no reqwest,
 # no backend), same repo+rev as `bitty-network-api` above. `bitty-ai-mcp` stays
 # untouched: only the slice takes these edges.
-bitty-network-tls = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95" }
+bitty-network-tls = { git = "https://github.com/bitty-terminal/bitty-network", rev = "2aa466387db8e7b2092ce31a09c51040e38ec3e0" }
 # AI-0259 slice experiment (slice-only): the `PeerKeyProvider` trait plus
 # `FakePeerKeys` shape reference live in `bitty-ai-mcp`; the slice implements
 # the trait, never the reverse (no cycle: mcp depends only on the runtime).
@@ -58,4 +58,4 @@ bitty-ai-mcp = { path = "../bitty-ai-mcp" }
 # shipped graph; same repo+rev as bitty-network-api above. `http` enables the
 # reqwest/rustls backend, `proxy` lets the probe inherit standard proxy env
 # (HTTPS_PROXY/NO_PROXY) in sandboxed runs. bitty-ai-runtime stays std-only.
-bitty-network = { git = "https://github.com/bitty-terminal/bitty-network", rev = "c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95", features = ["http", "proxy"] }
+bitty-network = { git = "https://github.com/bitty-terminal/bitty-network", rev = "2aa466387db8e7b2092ce31a09c51040e38ec3e0", features = ["http", "proxy"] }
