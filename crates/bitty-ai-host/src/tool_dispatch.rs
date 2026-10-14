@@ -1307,6 +1307,247 @@ pub const GATE_ORDER_DOC: &str = "native: authorize -> consent -> cap -> executo
     mcp: stale -> narrowing -> allowlist-lookup -> tier -> authorizer -> consent -> dispatch; \
     agent: narrow -> prompt -> precheck -> dispatch";
 
+// ── Phase 2 S2 scoped-IPC envelope types (no transport, AI-0280) ──
+//
+// Scoped-IPC request/outcome shapes for the tool-dispatch seam so a future
+// host-side caller can cross the boundary without touching the bus directly.
+// Types-only, `std`-only, no behavior: no socket, no transport, no thread,
+// no clock, no network, no filesystem, no dependency change (`Cargo.toml`
+// stays `std`-only), no new byte bounds (the S1 [`MAX_TOOL_NAME_LEN`],
+// [`MAX_TOOLS_PER_SESSION`], and [`MAX_REASON_BYTES`] values apply
+// unchanged), no version field on any envelope, and no dispatch execution.
+// Every envelope reuses the S1 mirror above ([`AuthBase`],
+// [`ExecutionId`], [`ToolError`], [`ToolStatus`],
+// [`ResultDisposition`], [`UsageEvent`], [`bound_reason`],
+// [`validate_tool_name`], [`narrowing_omits`], [`narrowing_denial`],
+// [`consent_denial`]) and introduces no re-mirrored vocabulary.
+//
+// Gate and mapping summary (re-stated, not re-implemented): the transport
+// re-imposes `authorize -> consent -> cap -> executor` at the dispatch
+// `now_ms` (native order from [`GATE_ORDER_DOC`]; the MCP six-gate and the
+// agent narrow-prompt-precheck compositions keep their documented positions).
+// Consent is always the exact `(protocol, tool, scope)` triple at the
+// dispatch `now_ms` with the exclusive-expiry rule (`now_ms < expires_at_ms`
+// allows, equality denies, matching [`ConsentGrant::covers`]); the envelope
+// carries only the inputs the gates need, never the grant table, and the
+// ledger check itself stays transport-executed. The prompt never grants (it
+// only narrows what the dispatcher would allow). Every pre-contact refusal —
+// stale (`tool list stale; re-list required`), narrowing
+// (`tool '<name>' omitted by per-call narrowing`), allowlist miss, tier,
+// authorizer, consent, or prompt — is admission-only with zero
+// executor/transport contact, reported as [`ToolError::Denied`] (never
+// `Failed`/`Unknown`/`ProtocolRejected`).
+
+/// Transient dispatch identity for one scoped-IPC call (mirrors the runtime
+/// [`ExecutionContext`](bitty_ai_runtime::tool::ExecutionContext) shape).
+///
+/// Data-only: the attribution handle plus the caller-supplied dispatch
+/// timestamp. Transient by construction — travels as a separate parameter,
+/// never stored, never logged, no borrowed data (the narrowed allow-set
+/// travels separately on [`DispatchRequest`], as the runtime keeps
+/// [`ExecutionContext`](bitty_ai_runtime::tool::ExecutionContext) free of
+/// borrowed data). No version field, no transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExecutionContext {
+    /// Attribution handle for this dispatch issued by the runtime.
+    pub execution_id: ExecutionId,
+    /// Caller-supplied dispatch timestamp in milliseconds (no clock is read).
+    pub now_ms: u64,
+}
+
+impl ExecutionContext {
+    /// Build a transient dispatch identity. Pure data carrier; no clock is
+    /// read and no gate runs here.
+    #[must_use]
+    pub fn new(execution_id: ExecutionId, now_ms: u64) -> Self {
+        Self {
+            execution_id,
+            now_ms,
+        }
+    }
+}
+
+/// Scoped-IPC dispatch request envelope: what crosses the boundary to ask
+/// for one tool call.
+///
+/// Carries the tool name, the FNV-1a-64 digest of the raw argument bytes
+/// (digest only, never raw args — the [`UsageEvent::args_digest`] precedent;
+/// the transport binds its own argument bytes to this digest out-of-band),
+/// the caller [`AuthBase`] triple (who plus tier), the narrowed allow-set
+/// echo (`None` constrains nothing; `Some(list)` admits only the listed
+/// names, with an explicit empty list narrowing everything away, mirroring
+/// [`narrowing_omits`]), and the caller-supplied dispatch `now_ms` (no clock
+/// is read). No version field, no transport.
+///
+/// Byte bounds (S1 values, fail-closed in [`DispatchRequest::new`]): `tool`
+/// satisfies [`validate_tool_name`] (non-empty, `^[a-z][a-z0-9_]*$`, at most
+/// [`MAX_TOOL_NAME_LEN`] bytes); `allowed` holds at most
+/// [`MAX_TOOLS_PER_SESSION`] entries with each entry satisfying
+/// [`validate_tool_name`], mirroring the registry population the echo
+/// constrains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRequest {
+    /// Requested tool name.
+    pub tool: String,
+    /// FNV-1a-64 over the raw argument bytes (digest only, never raw args).
+    pub args_digest: u64,
+    /// Caller identity and tier.
+    pub caller: AuthBase,
+    /// Narrowed allow-set echo (`None` = no constraint).
+    pub allowed: Option<Vec<String>>,
+    /// Caller-supplied dispatch timestamp in milliseconds.
+    pub now_ms: u64,
+}
+
+impl DispatchRequest {
+    /// Build an envelope request, validating the S1 byte bounds fail-closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidName`] for a malformed `tool` or allow-set
+    /// entry, and [`ToolError::RegistryFull`] when the echoed allow-set names
+    /// more tools than the registry can hold ([`MAX_TOOLS_PER_SESSION`]).
+    pub fn new(
+        tool: String,
+        args_digest: u64,
+        caller: AuthBase,
+        allowed: Option<Vec<String>>,
+        now_ms: u64,
+    ) -> Result<Self, ToolError> {
+        validate_tool_name(&tool)?;
+        if let Some(list) = &allowed {
+            if list.len() > MAX_TOOLS_PER_SESSION {
+                return Err(ToolError::RegistryFull {
+                    limit: MAX_TOOLS_PER_SESSION,
+                });
+            }
+            for entry in list {
+                validate_tool_name(entry)?;
+            }
+        }
+        Ok(Self {
+            tool,
+            args_digest,
+            caller,
+            allowed,
+            now_ms,
+        })
+    }
+
+    /// Deterministic digest of raw call arguments for [`DispatchRequest`].
+    ///
+    /// Delegates to the S1 [`UsageEvent::args_digest`] precedent (FNV-1a-64
+    /// over exactly the argument bytes; never `DefaultHasher`/`RandomState`):
+    /// same bytes give the same digest on every platform and process. The
+    /// envelope stores the returned `u64`, never the raw bytes.
+    #[must_use]
+    pub fn digest_args(args: &[u8]) -> u64 {
+        UsageEvent::args_digest(args)
+    }
+
+    /// View the echoed allow-set as the [`narrowing_omits`] input the
+    /// transport feeds it to. Pure data view; the narrowing gate itself stays
+    /// transport-executed.
+    #[must_use]
+    pub fn allowed_slice(&self) -> Option<&[String]> {
+        self.allowed.as_deref()
+    }
+}
+
+/// Scoped-IPC dispatch outcome envelope: the terminal attribution for one
+/// [`DispatchRequest`] without any result payload bytes.
+///
+/// Reuses the S1 outcome axes verbatim (no re-mirrored taxonomy): `status`
+/// carries the effect axis ([`ToolStatus`]), `result_disposition` carries the
+/// acceptance axis ([`ResultDisposition`]), `reason` carries the bounded
+/// diagnostic derived from `status` (empty for success, [`bound_reason`]
+/// plus [`ToolStatus::normalized`] policy, matching
+/// [`ToolStatus::normalized`]), and `usage` echoes the observed
+/// [`UsageEvent`] (attribution, never payload). No version field, no
+/// transport.
+///
+/// Full taxonomy mapping (re-stated, not re-implemented; every pre-contact
+/// refusal is admission-only with zero contact):
+///
+/// - `Refused` carrying [`ToolError::Denied`] with
+///   [`ResultDisposition::Accepted`] (nothing attempted): admission-only
+///   validation/authorization/narrowing/stale/prompt/consent/cap refusal
+///   (narrowed-away `tool '<name>' omitted by per-call narrowing`, stale
+///   `tool list stale; re-list required`, authorizer/consent/prompt `Denied`
+///   causes), never `Failed`/`Unknown`/`ProtocolRejected`.
+/// - `Success` with [`ResultDisposition::Accepted`]: host executed and
+///   acknowledged.
+/// - `Failed` with [`ResultDisposition::Accepted`]: executed-then-failed
+///   ([`ToolError::Failed`]).
+/// - `Denied` with [`ResultDisposition::Accepted`]: host/policy refusal after
+///   contact ([`ToolError::Denied`]), distinct from admission `Refused`.
+/// - `Rejected` carrying [`ToolError::ProtocolRejected`]: the server refused
+///   the frame before any effect (non-executed, never `Denied`/`Unknown`/
+///   `Failed`); the runtime records this arm as [`ToolStatus::Failed`] with a
+///   non-executed reason so the turn continues model-observable exactly like
+///   an executed failure while the attribution stays distinct — the envelope
+///   preserves the true cause via `reason` plus the `usage` echo.
+///   Over-bound success payloads ([`ToolError::SummaryTooLarge`]/
+///   [`ToolError::ResultTooLarge`]) keep [`ToolStatus::Success`] (the effect
+///   happened) with [`ResultDisposition::Rejected`], never a generic failure.
+/// - `Unknown` with [`ResultDisposition::Accepted`]: ack-loss
+///   ([`ToolError::EffectUnknown`]; the effect may have happened but
+///   acknowledgement was lost — reconcile before retry, never blindly
+///   retry, never `Failed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    /// Effect axis of the dispatch outcome.
+    pub status: ToolStatus,
+    /// Result-acceptance axis of the dispatch outcome.
+    pub result_disposition: ResultDisposition,
+    /// Bounded diagnostic reason derived from `status` (empty for success).
+    pub reason: String,
+    /// Observed attribution echo (never payload).
+    pub usage: UsageEvent,
+}
+
+impl DispatchOutcome {
+    /// Build an outcome envelope, normalizing `status` and bounding `reason`
+    /// per the S1 [`bound_reason`]/[`ToolStatus::normalized`] policy. The
+    /// `usage` echo travels verbatim (already bounded at ring-push time).
+    /// Pure data carrier; no gate runs here.
+    #[must_use]
+    pub fn new(
+        status: ToolStatus,
+        result_disposition: ResultDisposition,
+        reason: String,
+        usage: UsageEvent,
+    ) -> Self {
+        Self {
+            status: status.normalized(),
+            result_disposition,
+            reason: bound_reason(&reason),
+            usage,
+        }
+    }
+
+    /// Whether this outcome is an admission refusal (before any executor
+    /// contact). Pure delegate to [`ToolStatus::is_admission_refusal`].
+    #[must_use]
+    pub fn is_admission_refusal(&self) -> bool {
+        self.status.is_admission_refusal()
+    }
+
+    /// Whether this outcome is ack-loss. Pure delegate to
+    /// [`ToolStatus::is_ack_loss`].
+    #[must_use]
+    pub fn is_ack_loss(&self) -> bool {
+        self.status.is_ack_loss()
+    }
+
+    /// Whether the effect happened but its payload was refused. Pure delegate
+    /// to [`ResultDisposition::is_rejection`].
+    #[must_use]
+    pub fn is_rejection(&self) -> bool {
+        self.result_disposition.is_rejection()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1819,5 +2060,337 @@ mod tests {
         assert!(!matches!(cause, ToolError::Failed { .. }));
         assert!(!matches!(cause, ToolError::EffectUnknown { .. }));
         assert!(!matches!(cause, ToolError::ProtocolRejected { .. }));
+    }
+
+    #[test]
+    fn envelope_request_bounds() {
+        let caller = base();
+        let digest = DispatchRequest::digest_args(b"{}");
+
+        // Unconstrained allow-set builds with every field echoed verbatim.
+        let request =
+            DispatchRequest::new("workspace_read".to_owned(), digest, caller, None, 1_000)
+                .expect("bounded request builds");
+        assert_eq!(request.tool, "workspace_read");
+        assert_eq!(request.args_digest, digest);
+        assert_eq!(request.caller, caller);
+        assert_eq!(request.allowed_slice(), None);
+        assert_eq!(request.now_ms, 1_000);
+
+        // Constrained allow-set echoes verbatim for transport-side narrowing.
+        let request = DispatchRequest::new(
+            "workspace_read".to_owned(),
+            digest,
+            caller,
+            Some(vec!["workspace_read".to_owned()]),
+            1_000,
+        )
+        .expect("listed request builds");
+        assert_eq!(
+            request.allowed_slice(),
+            Some(&["workspace_read".to_owned()][..])
+        );
+        assert!(!narrowing_omits(request.allowed_slice(), "workspace_read"));
+        assert!(narrowing_omits(request.allowed_slice(), "other_tool"));
+
+        // Explicit empty list is a valid envelope: it narrows everything
+        // away at execution time, but construction stays total.
+        let request = DispatchRequest::new(
+            "workspace_read".to_owned(),
+            digest,
+            caller,
+            Some(Vec::new()),
+            1_000,
+        )
+        .expect("empty allow-set is a valid echo");
+        assert!(narrowing_omits(request.allowed_slice(), "workspace_read"));
+
+        // Over-bound tool refuses with the S1 name shape.
+        let err = DispatchRequest::new(
+            "a".repeat(MAX_TOOL_NAME_LEN + 1),
+            digest,
+            caller,
+            None,
+            1_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidName { .. }));
+        let err = DispatchRequest::new("Read".to_owned(), digest, caller, None, 1_000).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidName { .. }));
+
+        // Over-count allow-set refuses against the registry population bound.
+        let many: Vec<String> = (0..(MAX_TOOLS_PER_SESSION + 1))
+            .map(|index| format!("tool_{index}"))
+            .collect();
+        let err = DispatchRequest::new(
+            "workspace_read".to_owned(),
+            digest,
+            caller,
+            Some(many),
+            1_000,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ToolError::RegistryFull {
+                limit: MAX_TOOLS_PER_SESSION
+            }
+        );
+
+        // Malformed allow-set entry refuses with the S1 name shape.
+        let err = DispatchRequest::new(
+            "workspace_read".to_owned(),
+            digest,
+            caller,
+            Some(vec!["BAD".to_owned()]),
+            1_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn envelope_outcome_axes_incl_narrowed_and_stale_denied() {
+        // Narrowed-away denial: admission-only Refused carrying Denied.
+        let narrowed = narrowing_denial("workspace_read");
+        assert_eq!(
+            narrowed,
+            ToolError::Denied {
+                name: "workspace_read".to_owned(),
+                reason: "tool 'workspace_read' omitted by per-call narrowing".to_owned(),
+            }
+        );
+        let status = ToolStatus::Refused {
+            cause: narrowed.clone(),
+        };
+        assert!(status.is_admission_refusal());
+        assert!(!status.is_ack_loss());
+        let outcome = DispatchOutcome::new(
+            status,
+            ResultDisposition::Accepted,
+            narrowed.to_string(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(outcome.is_admission_refusal());
+        assert!(!outcome.is_ack_loss());
+        assert!(!outcome.is_rejection());
+        assert!(outcome.reason.contains("omitted by per-call narrowing"));
+
+        // Stale denial: same admission axis, MCP deny-stale wording.
+        let stale = ToolError::Denied {
+            name: "workspace_read".to_owned(),
+            reason: "tool list stale; re-list required".to_owned(),
+        };
+        assert!(format!("{stale}").contains("tool list stale; re-list required"));
+        assert!(!matches!(stale, ToolError::Failed { .. }));
+        assert!(!matches!(stale, ToolError::EffectUnknown { .. }));
+        assert!(!matches!(stale, ToolError::ProtocolRejected { .. }));
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Refused { cause: stale },
+            ResultDisposition::Accepted,
+            "tool list stale; re-list required".to_owned(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(outcome.is_admission_refusal());
+        assert!(outcome.reason.contains("tool list stale; re-list required"));
+
+        // Success: executed and accepted, empty reason.
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Success,
+            ResultDisposition::Accepted,
+            String::new(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(!outcome.is_admission_refusal());
+        assert!(!outcome.is_ack_loss());
+        assert!(!outcome.is_rejection());
+        assert!(outcome.reason.is_empty());
+
+        // Failed: executed-then-failed, never admission or ack-loss.
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Failed {
+                reason: "host reported failure".to_owned(),
+            },
+            ResultDisposition::Accepted,
+            "host reported failure".to_owned(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(!outcome.is_admission_refusal());
+        assert!(!outcome.is_ack_loss());
+
+        // Denied: host/policy refusal after contact, never admission.
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Denied {
+                reason: "host denied execution".to_owned(),
+            },
+            ResultDisposition::Accepted,
+            "host denied execution".to_owned(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(!outcome.is_admission_refusal());
+        assert!(!outcome.is_ack_loss());
+
+        // Rejected carrying ProtocolRejected: non-executed protocol refusal.
+        // The runtime records this arm as Failed status so the turn continues
+        // model-observable like an executed failure; the envelope preserves
+        // the true non-executed cause via reason plus the usage echo.
+        let rejected = ToolError::ProtocolRejected {
+            name: "workspace_read".to_owned(),
+            reason: "-32602 invalid params".to_owned(),
+        };
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Failed {
+                reason: "protocol rejected before execution: -32602 invalid params".to_owned(),
+            },
+            ResultDisposition::Accepted,
+            rejected.to_string(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(!outcome.is_admission_refusal());
+        assert!(!outcome.is_ack_loss());
+        assert!(!outcome.is_rejection());
+        assert!(outcome.reason.contains("-32602"));
+
+        // Disposition rejection keeps Success (the effect happened): the
+        // over-bound payload refusal is never a generic failure.
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Success,
+            ResultDisposition::Rejected {
+                cause: ToolError::SummaryTooLarge {
+                    limit: 1,
+                    actual: 2,
+                },
+            },
+            String::new(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(outcome.is_rejection());
+        assert!(!outcome.is_admission_refusal());
+
+        // Unknown: ack-loss, never Failed, reconcile before retry.
+        let unknown = ToolError::EffectUnknown {
+            name: "workspace_read".to_owned(),
+            reason: "ack lost".to_owned(),
+        };
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Unknown {
+                reason: "ack lost".to_owned(),
+            },
+            ResultDisposition::Accepted,
+            unknown.to_string(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert!(outcome.is_ack_loss());
+        assert!(!outcome.is_admission_refusal());
+        assert!(!matches!(outcome.status, ToolStatus::Failed { .. }));
+    }
+
+    #[test]
+    fn envelope_reason_bounds_and_normalized() {
+        // Host-supplied text is scrubbed to printable ASCII and bounded.
+        let evil = "ok\nline\x1besc\u{00e9}";
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Failed {
+                reason: evil.to_owned(),
+            },
+            ResultDisposition::Accepted,
+            evil.to_owned(),
+            usage_event("tool_a", 1_000),
+        );
+        match &outcome.status {
+            ToolStatus::Failed { reason } => {
+                assert!(!reason.contains('\n'));
+                assert!(!reason.contains('\x1b'));
+                assert!(reason.contains('?'));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!outcome.reason.contains('\n'));
+        assert!(outcome.reason.contains('?'));
+
+        let long = "x".repeat(MAX_REASON_BYTES + 100);
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Denied {
+                reason: long.clone(),
+            },
+            ResultDisposition::Accepted,
+            long,
+            usage_event("tool_a", 1_000),
+        );
+        match &outcome.status {
+            ToolStatus::Denied { reason } => assert_eq!(reason.len(), MAX_REASON_BYTES),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(outcome.reason.len(), MAX_REASON_BYTES);
+    }
+
+    #[test]
+    fn envelope_digest_determinism_and_no_raw_args() {
+        // Same bytes give the same digest on every platform and process;
+        // any byte change moves it. The envelope delegate matches the S1
+        // ring precedent exactly (no re-mirrored hash).
+        let raw = b"{\"secret\":1}";
+        let first = DispatchRequest::digest_args(raw);
+        assert_eq!(first, UsageEvent::args_digest(raw));
+        assert_eq!(first, DispatchRequest::digest_args(b"{\"secret\":1}"));
+        assert_ne!(first, DispatchRequest::digest_args(b"{\"secret\":2}"));
+
+        // No raw args by construction: the envelope stores only the digest,
+        // so a Debug render never leaks the payload bytes.
+        let request = DispatchRequest::new("workspace_read".to_owned(), first, base(), None, 1_000)
+            .expect("digest-only request builds");
+        assert_eq!(request.args_digest, first);
+        assert!(!format!("{:?}", request).contains("secret"));
+    }
+
+    #[test]
+    fn envelope_bounds_match_s1_and_carry_no_version() {
+        // Byte bounds are the S1 values, unchanged for the envelope layer.
+        assert_eq!(MAX_TOOL_NAME_LEN, 64);
+        assert_eq!(MAX_TOOLS_PER_SESSION, 32);
+        assert_eq!(MAX_REASON_BYTES, 512);
+
+        // Transient dispatch identity round-trips its two fields.
+        let context = ExecutionContext::new(ExecutionId(7), 1_000);
+        assert_eq!(context.execution_id, ExecutionId(7));
+        assert_eq!(context.now_ms, 1_000);
+        assert_eq!(context, ExecutionContext::new(ExecutionId(7), 1_000));
+
+        // Envelopes carry no version field by construction: exact-field
+        // construction round-trips without loss.
+        let request = DispatchRequest::new(
+            "workspace_read".to_owned(),
+            DispatchRequest::digest_args(b"{}"),
+            base(),
+            Some(vec!["workspace_read".to_owned()]),
+            1_000,
+        )
+        .expect("bounded request builds");
+        assert_eq!(
+            DispatchRequest::new(
+                request.tool.clone(),
+                request.args_digest,
+                request.caller,
+                request.allowed.clone(),
+                request.now_ms,
+            )
+            .expect("rebuild"),
+            request
+        );
+        let outcome = DispatchOutcome::new(
+            ToolStatus::Success,
+            ResultDisposition::Accepted,
+            String::new(),
+            usage_event("workspace_read", 1_000),
+        );
+        assert_eq!(
+            DispatchOutcome::new(
+                outcome.status.clone(),
+                outcome.result_disposition.clone(),
+                outcome.reason.clone(),
+                outcome.usage.clone(),
+            ),
+            outcome
+        );
     }
 }
