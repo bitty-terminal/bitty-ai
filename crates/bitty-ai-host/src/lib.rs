@@ -20,10 +20,10 @@
 //! - Per-seam behavior (stays with separately scoped Phase 2 tasks).
 //!
 //! Shape note: the seam modules are intentionally doc-only with no items and
-//! no tests — except `extension_registry`, which carries the Phase 2 S1
-//! pure-type mirror (8-point enum, manifest shape, per-point descriptor data
-//! shapes, and offline unit tests; still std-only, still no I/O, IPC,
-//! threads, or ambient authority). A test elsewhere would either assert
+//! no tests — except `context_providers`, which carries the Phase 2 S1
+//! pure-type/zone mirror, and `extension_registry`, which carries the Phase 2
+//! S1 pure-type mirror (both std-only, still no I/O, IPC, threads, or ambient
+//! authority, each with offline unit tests). A test elsewhere would either assert
 //! a vacuous truth or require introducing an item (constant or function) to
 //! assert on, and any such item would itself be behavior-adjacent surface
 //! contradicting the no-types, no-functions, no-behavior rule above. The
