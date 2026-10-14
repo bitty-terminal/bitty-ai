@@ -1548,6 +1548,101 @@ impl DispatchOutcome {
     }
 }
 
+// ── Phase 2 S3 deny-all ledger + placement-routing hook stub (AI-0292) ──
+//
+// Deny-all stub for the CTX-0150 candidate unified-backend section of
+// `architecture/tool-transport-r2.md` (candidate only, no acceptance claim,
+// no identifier minted). `std`-only, offline, no behavior beyond refusal:
+// no storage, no state, no routing, no selection, no I/O, no threads, no
+// clock, no network, no filesystem, no `Cargo.toml` change. Reuses the S1
+// mirror ([`ConsentQuery`], [`ConsentDecision`], [`ConsentLedger`],
+// [`ToolPlacement`], [`ToolError`], [`bound_reason`], [`consent_denial`])
+// and the S2 envelopes above; introduces no re-mirrored vocabulary and no
+// new byte bounds.
+//
+// Gate summary (re-stated, not re-implemented): authorizer-then-consent at
+// the same position on both paths — after authenticated principal,
+// `ToolSpec` plus schema resolution, and caller/target/generation
+// authorization, and before budget reservation, placed dispatch, redaction,
+// and attributed outcome (native order from [`GATE_ORDER_DOC`]; the MCP
+// six-gate and the agent narrow-prompt-precheck compositions keep their
+// documented positions). The ledger check evaluates at the dispatch
+// `now_ms` carried on the query (caller-supplied, no clock is read); there
+// is no caching of grant decisions across dispatches. The prompt never
+// grants (it only narrows). Every pre-contact refusal is admission-only
+// with zero executor/transport contact, reported as [`ToolError::Denied`]
+// (never `Failed`/`Unknown`/`ProtocolRejected`).
+
+/// Shared deny-all ledger reason (byte-identical for every triple).
+///
+/// Constant by construction so any two [`DenyAllLedger`] denials compare
+/// byte-equal on the `reason` field regardless of the queried
+/// `(protocol, tool, scope)` triple or `now_ms`. Maps to the dispatch path
+/// via the S1 [`consent_denial`] helper (`consent denied: ...`), keeping
+/// the native and MCP paths byte-identical pre-contact.
+pub const DENY_ALL_LEDGER_REASON: &str = "default-deny: no ledger grant";
+
+/// Deny-all host consent ledger (unified-backend stub, no storage).
+///
+/// Implements the ledger-seam [`ConsentLedger`] check interface and denies
+/// every `(protocol, tool, scope)` triple — including an exact match that a
+/// live ledger would grant — with the shared [`DENY_ALL_LEDGER_REASON`].
+/// Zero-sized by construction: no grant table, no revocation list, no
+/// expiry queue, no capacity, no `drain_expired`, no state of any kind.
+#[derive(Debug, Default)]
+pub struct DenyAllLedger;
+
+impl DenyAllLedger {
+    /// Empty deny-all ledger. Pure constructor; no clock is read and no
+    /// gate runs here.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ConsentLedger for DenyAllLedger {
+    fn check(&self, _query: &ConsentQuery) -> ConsentDecision {
+        ConsentDecision::Deny {
+            reason: DENY_ALL_LEDGER_REASON.to_owned(),
+        }
+    }
+}
+
+/// Typed placement-routing refusal for one tool name.
+///
+/// [`ToolError::Denied`] naming the tool (never `UnknownTool`/`Failed`/
+/// `EffectUnknown`/`ProtocolRejected`, and never
+/// [`ToolError::UndeclaredPlacement`], which is registration-time only),
+/// normalized because the refused name is caller-supplied. Wording carries
+/// the tool identity plus the constant suffix `placement not routed: no
+/// reviewed backend listed`, so the same tool denied under either placement
+/// compares byte-equal.
+#[must_use]
+pub fn placement_denial(tool: &str) -> ToolError {
+    ToolError::Denied {
+        name: tool.to_owned(),
+        reason: format!("tool '{tool}' placement not routed: no reviewed backend listed"),
+    }
+    .normalized()
+}
+
+/// Placement-routing hook stub: every placement denies until reviewed.
+///
+/// Takes the declared [`ToolPlacement`] but performs no routing, no backend
+/// selection, and no I/O: `Mcp` and `Native` alike deny with
+/// [`placement_denial`] until a backend is reviewed and listed. A declared
+/// placement (valid registry entry) is therefore still unroutable here;
+/// declaration and routing stay separate facts.
+///
+/// # Errors
+///
+/// Always returns [`placement_denial`] for `tool`.
+pub fn route_placement(tool: &str, placement: ToolPlacement) -> Result<(), ToolError> {
+    let _ = placement;
+    Err(placement_denial(tool))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2392,5 +2487,215 @@ mod tests {
             ),
             outcome
         );
+    }
+
+    #[test]
+    fn s3_deny_all_ledger_denies_every_triple_incl_exact_match() {
+        let ledger = DenyAllLedger::new();
+        fn query<'a>(
+            protocol: &'a str,
+            tool: &'a str,
+            scope: &'a str,
+            now_ms: u64,
+        ) -> ConsentQuery<'a> {
+            ConsentQuery {
+                protocol_id: protocol,
+                agent_instance: AgentInstanceId(1),
+                tool,
+                scope,
+                now_ms,
+            }
+        }
+        // A live grant would cover this exact triple at this now_ms, but
+        // the deny-all stub still denies: no storage, no grant table.
+        let grant = ConsentGrant {
+            protocol: "local.assistant".to_owned(),
+            tool: "workspace_read".to_owned(),
+            scope: "workspace.read".to_owned(),
+            expires_at_ms: 9_000,
+        };
+        let exact = query("local.assistant", "workspace_read", "workspace.read", 1_000);
+        assert!(grant.covers(&exact));
+        assert!(matches!(ledger.check(&exact), ConsentDecision::Deny { .. }));
+
+        // Other triples deny too: unknown, mismatched scope, and expired.
+        assert!(matches!(
+            ledger.check(&query(
+                "other.assistant",
+                "workspace_read",
+                "workspace.read",
+                1_000
+            )),
+            ConsentDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.write",
+                1_000
+            )),
+            ConsentDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            ledger.check(&query(
+                "local.assistant",
+                "workspace_read",
+                "workspace.read",
+                9_001
+            )),
+            ConsentDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn s3_deny_all_ledger_reason_byte_identical_and_maps_to_denied() {
+        let ledger = DenyAllLedger::new();
+        fn query<'a>(
+            protocol: &'a str,
+            tool: &'a str,
+            scope: &'a str,
+            now_ms: u64,
+        ) -> ConsentQuery<'a> {
+            ConsentQuery {
+                protocol_id: protocol,
+                agent_instance: AgentInstanceId(1),
+                tool,
+                scope,
+                now_ms,
+            }
+        }
+        let queries = [
+            query("local.assistant", "workspace_read", "workspace.read", 1_000),
+            query("other.assistant", "other_tool", "other.scope", 2_000),
+            query("local.assistant", "workspace_read", "workspace.read", 9_001),
+        ];
+        let mut reasons = Vec::new();
+        for probe in &queries {
+            match ledger.check(probe) {
+                ConsentDecision::Deny { reason } => {
+                    assert_eq!(reason, DENY_ALL_LEDGER_REASON);
+                    reasons.push(reason);
+                }
+                ConsentDecision::Allow => panic!("deny-all ledger must deny"),
+            }
+        }
+        // Byte-identical across triples and timestamps.
+        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons[0].as_bytes(), reasons[1].as_bytes());
+        assert_eq!(reasons[0].as_bytes(), reasons[2].as_bytes());
+
+        // Shared mapping to the dispatch-path refusal: Denied only, with the
+        // established `consent denied: ...` wording, byte-identical reasons
+        // for the same tool.
+        let first = consent_denial("workspace_read", &reasons[0]);
+        let second = consent_denial("workspace_read", &reasons[1]);
+        assert!(matches!(first, ToolError::Denied { .. }));
+        assert_eq!(first, second);
+        assert!(format!("{first}").contains("consent denied:"));
+        assert!(format!("{first}").contains(DENY_ALL_LEDGER_REASON));
+        assert!(!matches!(first, ToolError::Failed { .. }));
+        assert!(!matches!(first, ToolError::EffectUnknown { .. }));
+        assert!(!matches!(first, ToolError::ProtocolRejected { .. }));
+    }
+
+    #[test]
+    fn s3_deny_all_ledger_has_no_state_no_storage() {
+        // Zero-sized by construction: no table, no queue, no state.
+        assert_eq!(std::mem::size_of::<DenyAllLedger>(), 0);
+        let first = DenyAllLedger::new();
+        let second = DenyAllLedger;
+        let probe = ConsentQuery {
+            protocol_id: "local.assistant",
+            agent_instance: AgentInstanceId(1),
+            tool: "workspace_read",
+            scope: "workspace.read",
+            now_ms: 1_000,
+        };
+        // Deterministic: separate instances deny identically (no hidden
+        // state, no clock, caller-supplied now_ms only).
+        assert_eq!(first.check(&probe), second.check(&probe));
+        assert_eq!(first.check(&probe), first.check(&probe));
+    }
+
+    #[test]
+    fn s3_placement_hook_denies_all_incl_declared() {
+        // Declared placements are valid registry entries, yet the routing
+        // hook still denies: declaration and routing stay separate facts.
+        let mut registry = ToolRegistry::new();
+        registry.register(mcp_spec("workspace_read")).unwrap();
+        let native = ToolSpec::new(
+            "native_tool",
+            "test",
+            br#"{"type":"object"}"#.to_vec(),
+            "test.scope",
+            false,
+            ToolPlacement::Native,
+            Some(NativePlacement {
+                reason: "host-native".to_owned(),
+                backend: "backend".to_owned(),
+            }),
+        )
+        .expect("native with detail admits");
+        registry.register(native).expect("capacity");
+        assert_eq!(registry.len(), 2);
+
+        let mcp_err = route_placement("workspace_read", ToolPlacement::Mcp).unwrap_err();
+        let native_err = route_placement("native_tool", ToolPlacement::Native).unwrap_err();
+        for err in [&mcp_err, &native_err] {
+            assert!(matches!(err, ToolError::Denied { .. }));
+            assert!(!matches!(err, ToolError::UndeclaredPlacement { .. }));
+            assert!(!matches!(err, ToolError::Failed { .. }));
+            assert!(!matches!(err, ToolError::EffectUnknown { .. }));
+            assert!(!matches!(err, ToolError::ProtocolRejected { .. }));
+        }
+        // Same tool under either placement compares byte-equal: the hook
+        // performs no selection between placements.
+        let mcp_again = route_placement("workspace_read", ToolPlacement::Mcp).unwrap_err();
+        let native_same_tool =
+            route_placement("workspace_read", ToolPlacement::Native).unwrap_err();
+        assert_eq!(mcp_err, mcp_again);
+        assert_eq!(mcp_err, native_same_tool);
+        assert!(format!("{mcp_err}").contains("placement not routed"));
+        assert!(format!("{mcp_err}").contains("no reviewed backend listed"));
+
+        // Direct refusal constructor agrees with the hook and keeps the
+        // tool identity.
+        let direct = placement_denial("workspace_read");
+        assert_eq!(direct, mcp_err);
+    }
+
+    #[test]
+    fn s3_authorizer_then_consent_same_position_at_dispatch_now_ms() {
+        // Same-position order at the caller-supplied dispatch now_ms: the
+        // authorizer runs first, then the ledger, both denying here with no
+        // clock read (now_ms travels on the query).
+        let now_ms = 1_000;
+        let authorizer = DenyAllAuthorizer;
+        let ledger = DenyAllLedger::new();
+        let auth = authorizer.authorize(&AuthContext {
+            base: base(),
+            tool: "workspace_read",
+            required_scope: "workspace.read",
+            read_only: true,
+        });
+        assert!(matches!(auth, AuthDecision::Deny { .. }));
+        let consent = ledger.check(&ConsentQuery {
+            protocol_id: "local.assistant",
+            agent_instance: AgentInstanceId(1),
+            tool: "workspace_read",
+            scope: "workspace.read",
+            now_ms,
+        });
+        assert!(matches!(consent, ConsentDecision::Deny { .. }));
+        // Deterministic at the same now_ms: no caching, no clock.
+        let again = ledger.check(&ConsentQuery {
+            protocol_id: "local.assistant",
+            agent_instance: AgentInstanceId(1),
+            tool: "workspace_read",
+            scope: "workspace.read",
+            now_ms,
+        });
+        assert_eq!(consent, again);
     }
 }
