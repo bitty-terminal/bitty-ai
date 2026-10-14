@@ -1574,6 +1574,295 @@ impl ContextReadResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2 S3 retention deny-all stub (AI-0293).
+//
+// Deny-all stub for the CTX-0151 candidate `retention classes and durable
+// scope for usage rows` section of `architecture/context-retention-r3.md`
+// (candidate only, no acceptance claim, no identifier minted, no shipped
+// behavior). `std`-only, offline, no behavior beyond refusal: no storage,
+// no state, no scheduler, no pruning execution, no journal, no durable
+// writes, no redaction execution, no `0600` enforcement, no I/O, no threads,
+// no clock, no network, no filesystem, no `Cargo.toml` change. Reuses the S1
+// mirror ([`ContextRecord`], [`AssembledRecord`], [`AssembledContext`],
+// [`ArtifactStore`], [`ArtifactAbsence`], [`ContextMirrorError`],
+// [`ContextRequest`]) and the S2 envelopes above ([`ContextReadRequest`],
+// [`ContextReadResponse`], [`ContextReadAbsence`], [`ContextReadError`]);
+// introduces no re-mirrored vocabulary and no new byte bounds beyond the
+// explicit ring-scale row cap below.
+//
+// Candidate summary (re-stated, not re-implemented): two retention classes
+// for usage and observation rows — consented digest-only usage rows held
+// under the durable-scope bound, and transient observation rows held only in
+// the bounded in-memory session with no durability promise. Both classes
+// retain only what is authorized, redacted, and still retained; anything
+// missing, expired, deleted, or never recorded resolves as typed unavailable
+// with an explicit reason (the S1 [`ArtifactAbsence`] taxonomy plus
+// [`ContextMirrorError`]), never as silently recovered bytes. Each class
+// carries an explicit row cap at ring scale; when a new row arrives at a
+// full bound the oldest rows are deleted in the same transaction as the
+// insert, with no background scheduler, no deferred collection pass, and no
+// unbounded growth. Pruned rows are hard-deleted, leaving only permitted
+// absence metadata, and are excluded from export, backup, snapshot, replay,
+// and debugging surfaces by construction. The durable projection is a single
+// isolated `usage_log`-class file holding digest-only columns only
+// (identifiers, scope labels, timestamps, outcome axes, bounded reason text,
+// digests; no raw argument bytes, no working-directory bytes, no summaries,
+// no result bytes, no secrets), user-only (`0600`), fail-closed when mode
+// enforcement, consent, or redaction machinery is unavailable, constructed
+// via `open_durable`-only plus `open_in_memory` for tests. The Wheel triple
+// stays `DurableGated` under the CTX-0146 pre-approved post-v0.1 durable
+// `usage_log` shape, taken here as the durable-scope reference without
+// restating or widening it; this stub proposes no second durable path and no
+// change to any gated constructor posture.
+//
+// Gate summary for this stub: consent-bounded, no scheduler. Every
+// retain/record call refuses with the typed consent reason below, including
+// an input that a live consented store would keep. The bounded prune policy
+// is echoed as data only (row cap plus oldest-delete in the same transaction,
+// scheduler permanently absent): it is never executed here. The
+// journal/durable hook refuses every durable write with the gated posture,
+// preserving the Wheel `DurableGated` reference; the bounded in-memory
+// session shapes ([`ArtifactStore::new`]/`store`/`resolve`, the S2 envelope
+// `validate` paths) are untouched and keep working.
+// ---------------------------------------------------------------------------
+
+/// Shared deny-all retention reason (byte-identical for every record).
+///
+/// Constant by construction so any two [`RetentionStub`] refusals compare
+/// byte-equal on the `reason` field regardless of the offered [`ContextRecord`]
+/// or [`AssembledRecord`]. Static text only: hostile record content is never
+/// echoed.
+pub const RETENTION_DENY_REASON: &str = "retention denied: no applicable consent";
+
+/// Durable-gate reason for the journal/durable hook stub.
+///
+/// Preserves the Wheel `DurableGated` posture by reference (CTX-0146
+/// pre-approved post-v0.1 durable `usage_log` shape): no durable `usage_log`
+/// path is listed here, so every durable write refuses. Static text only.
+pub const RETENTION_DURABLE_GATE_REASON: &str =
+    "durable gated: no durable usage_log path (Wheel DurableGated)";
+
+/// Explicit row cap at ring scale for both retention classes.
+///
+/// One ring-scale bound shared by the consented usage class and the transient
+/// observation class. Carried as data by [`RetentionPrunePolicy`]; never
+/// executed here (no insert, no delete, no scheduler).
+pub const RETENTION_ROW_CAP: usize = 32;
+
+/// Retention classes (candidate vocabulary, data only).
+///
+/// - [`RetentionClass::ConsentedUsage`]: consented digest-only usage rows held
+///   under the durable-scope bound.
+/// - [`RetentionClass::TransientObservation`]: transient observation rows held
+///   only in the bounded in-memory session with no durability promise.
+///
+/// The kind carries no bytes, only the class, so denial reasons can never
+/// echo retained content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionClass {
+    /// Consented digest-only usage rows (durable-scope bound).
+    ConsentedUsage,
+    /// Transient observation rows (bounded in-memory session only).
+    TransientObservation,
+}
+
+impl Display for RetentionClass {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::ConsentedUsage => write!(f, "consented-usage"),
+            Self::TransientObservation => write!(f, "transient-observation"),
+        }
+    }
+}
+
+/// Bounded prune policy echoed as data (never executed).
+///
+/// Carries the explicit row cap plus the in-transaction oldest-delete rule
+/// for one [`RetentionClass`]: when a new row would arrive at a full bound,
+/// the oldest rows would be deleted in the same transaction as the insert.
+/// There is deliberately no scheduler, no deferred collection pass, and no
+/// execution here — construction and inspection are the only operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPrunePolicy {
+    class: RetentionClass,
+    row_cap: usize,
+}
+
+impl RetentionPrunePolicy {
+    /// Echo the bounded prune policy for one class (data only, no execution).
+    #[must_use]
+    pub fn new(class: RetentionClass) -> Self {
+        Self {
+            class,
+            row_cap: RETENTION_ROW_CAP,
+        }
+    }
+
+    /// Which retention class this policy describes.
+    #[must_use]
+    pub fn class(&self) -> RetentionClass {
+        self.class
+    }
+
+    /// Explicit row cap (always [`RETENTION_ROW_CAP`]).
+    #[must_use]
+    pub fn row_cap(&self) -> usize {
+        self.row_cap
+    }
+
+    /// Oldest-delete in the same transaction as the insert (always true).
+    ///
+    /// Data echo of the candidate rule, not an execution: this stub deletes
+    /// nothing.
+    #[must_use]
+    pub fn deletes_oldest_same_txn(&self) -> bool {
+        true
+    }
+
+    /// Whether a background scheduler exists (always false).
+    ///
+    /// The candidate proposes no scheduler; this stub runs none.
+    #[must_use]
+    pub fn has_scheduler(&self) -> bool {
+        false
+    }
+}
+
+/// Typed retention refusal.
+///
+/// Reasons are static literals only: hostile record content is never echoed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionError {
+    /// Retain/record refused: no applicable consent (consent-bounded, no
+    /// scheduler). Carries [`RETENTION_DENY_REASON`].
+    ConsentRequired {
+        /// Static reason (never caller content).
+        reason: &'static str,
+    },
+    /// Durable write refused: no durable `usage_log` path listed (Wheel
+    /// `DurableGated` posture preserved by reference). Carries
+    /// [`RETENTION_DURABLE_GATE_REASON`].
+    DurableGated {
+        /// Static reason (never caller content).
+        reason: &'static str,
+    },
+}
+
+impl Display for RetentionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::ConsentRequired { reason } => write!(f, "retention denied: {reason}"),
+            Self::DurableGated { reason } => write!(f, "retention durable write denied: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for RetentionError {}
+
+/// Typed deny-all retention refusal for one retain/record call.
+///
+/// Static [`RETENTION_DENY_REASON`] regardless of the offered record, so any
+/// two refusals compare byte-equal.
+#[must_use]
+pub fn retention_denial() -> RetentionError {
+    RetentionError::ConsentRequired {
+        reason: RETENTION_DENY_REASON,
+    }
+}
+
+/// Typed durable-gate refusal for one journal/durable write.
+///
+/// Static [`RETENTION_DURABLE_GATE_REASON`], preserving the Wheel
+/// `DurableGated` posture by reference without restating it.
+#[must_use]
+pub fn retention_durable_denial() -> RetentionError {
+    RetentionError::DurableGated {
+        reason: RETENTION_DURABLE_GATE_REASON,
+    }
+}
+
+/// Deny-all retention handle (candidate stub, no storage).
+///
+/// Implements the retention seam as pure refusal: every retain/record call
+/// denies — including an input a live consented store would keep — with the
+/// shared [`RETENTION_DENY_REASON`]. Zero-sized by construction: no retained
+/// rows, no grant table, no expiry queue, no capacity, no scheduler, no state
+/// of any kind.
+#[derive(Debug, Default)]
+pub struct RetentionStub;
+
+impl RetentionStub {
+    /// Empty deny-all retention handle. Pure constructor; no clock is read
+    /// and no gate runs here.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Echo the bounded prune policy for one class (data only, no execution).
+    #[must_use]
+    pub fn prune_policy(&self, class: RetentionClass) -> RetentionPrunePolicy {
+        RetentionPrunePolicy::new(class)
+    }
+
+    /// Refuse one usage-row retain (consented digest-only class, S1 shape).
+    ///
+    /// Takes the S1 [`ContextRecord`] shape as data and refuses without
+    /// inspecting it: consent-bounded, no scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`retention_denial`].
+    pub fn retain(&self, _record: &ContextRecord) -> Result<(), RetentionError> {
+        Err(retention_denial())
+    }
+
+    /// Refuse one observation-row record (transient in-memory class, S1 shape).
+    ///
+    /// Takes the S1 [`AssembledRecord`] shape (the same shape the S2
+    /// [`ContextReadResponse`] carries) as data and refuses without
+    /// inspecting it: consent-bounded, no scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`retention_denial`].
+    pub fn record(&self, _assembled: &AssembledRecord) -> Result<(), RetentionError> {
+        Err(retention_denial())
+    }
+
+    /// Refuse one durable journal write (durable hook stub).
+    ///
+    /// Takes the S1 [`ContextRecord`] shape as data and refuses with the
+    /// gated posture: no durable `usage_log` path is listed here, so the
+    /// Wheel `DurableGated` reference holds. Performs no I/O and creates no
+    /// file; the bounded in-memory session shapes stay untouched.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`retention_durable_denial`].
+    pub fn write_durable(&self, _record: &ContextRecord) -> Result<(), RetentionError> {
+        Err(retention_durable_denial())
+    }
+}
+
+/// Journal/durable hook stub: every durable write denies until reviewed.
+///
+/// Takes the S1 [`ContextRecord`] shape but performs no journal append, no
+/// backend selection, and no I/O: consented and unconsented inputs alike deny
+/// with [`retention_durable_denial`] until a durable path is reviewed and
+/// listed. A valid record (one that [`ContextRecord::validate`] accepts) is
+/// therefore still ungateable here; validation and durability stay separate
+/// facts. The Wheel triple stays `DurableGated` by reference; this hook
+/// proposes no second durable path.
+///
+/// # Errors
+///
+/// Always returns [`retention_durable_denial`] for `record`.
+pub fn journal_write_durable(_record: &ContextRecord) -> Result<(), RetentionError> {
+    Err(retention_durable_denial())
+}
+
+// ---------------------------------------------------------------------------
 // Offline tests: shape / budget / trust-label / fence-length / admit-deny.
 // Deterministic, no network, no filesystem, no clock.
 // ---------------------------------------------------------------------------
@@ -2209,5 +2498,217 @@ mod read_envelope_tests {
                 actual: MAX_ARTIFACTS + 1,
             })
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3 offline tests: deny-all retain/record, prune-policy data-only,
+// durable-hook refuses, in-memory unaffected.
+// Deterministic, no network, no filesystem, no clock.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod retention_stub_tests {
+    use super::*;
+
+    fn stub_owner() -> StableId {
+        StableId::new("window-1").expect("valid test owner")
+    }
+
+    fn stub_record() -> ContextRecord {
+        ContextRecord {
+            id: "rec-1".to_owned(),
+            provider: "project".to_owned(),
+            owner: stub_owner(),
+            generation: 7,
+            collected_at_ms: 1_700_000_000_000,
+            priority: ContextPriority::High,
+            summary: "summary".to_owned(),
+            body: RecordBody::Inline(vec![1, 2, 3]),
+            supersedes: None,
+            is_untrusted_surface: false,
+        }
+    }
+
+    fn stub_assembled() -> AssembledRecord {
+        AssembledRecord {
+            id: "rec-1".to_owned(),
+            provider: "project".to_owned(),
+            summary: "summary".to_owned(),
+            content: AssembledContent::Inline(vec![9]),
+            is_untrusted_surface: false,
+        }
+    }
+
+    #[test]
+    fn s3_retain_and_record_deny_all_with_typed_consent_reason() {
+        let stub = RetentionStub::new();
+        // A live consented store would keep this valid input, but the
+        // deny-all stub still refuses: no storage, no consent table.
+        let record = stub_record();
+        assert!(record.validate().is_ok());
+        assert_eq!(stub.retain(&record), Err(retention_denial()));
+        assert_eq!(
+            stub.retain(&record),
+            Err(RetentionError::ConsentRequired {
+                reason: RETENTION_DENY_REASON
+            })
+        );
+        let assembled = stub_assembled();
+        assert_eq!(stub.record(&assembled), Err(retention_denial()));
+        assert_eq!(
+            stub.record(&assembled),
+            Err(RetentionError::ConsentRequired {
+                reason: RETENTION_DENY_REASON
+            })
+        );
+        // Byte-identical across shapes and instances: the reason carries no
+        // record content.
+        let other = RetentionStub;
+        assert_eq!(stub.retain(&record), other.retain(&record));
+        assert_eq!(stub.record(&assembled), other.record(&assembled));
+        assert_eq!(stub.retain(&record), stub.record(&assembled));
+        let denied = stub.retain(&record).expect_err("deny-all must refuse");
+        assert!(!format!("{denied}").contains("rec-1"));
+        assert!(!format!("{denied}").contains("summary"));
+        assert!(format!("{denied}").contains(RETENTION_DENY_REASON));
+    }
+
+    #[test]
+    fn s3_retention_stub_has_no_state_no_scheduler() {
+        // Zero-sized by construction: no rows, no table, no queue, no state.
+        assert_eq!(std::mem::size_of::<RetentionStub>(), 0);
+        let first = RetentionStub::new();
+        let second = RetentionStub;
+        let record = stub_record();
+        let assembled = stub_assembled();
+        // Deterministic: separate instances deny identically (no hidden
+        // state, no clock, caller-supplied generation only).
+        assert_eq!(first.retain(&record), second.retain(&record));
+        assert_eq!(first.record(&assembled), second.record(&assembled));
+        assert_eq!(first.retain(&record), first.retain(&record));
+        // No scheduler exists on either the handle or the echoed policy.
+        assert!(
+            !first
+                .prune_policy(RetentionClass::ConsentedUsage)
+                .has_scheduler()
+        );
+        assert!(
+            !first
+                .prune_policy(RetentionClass::TransientObservation)
+                .has_scheduler()
+        );
+    }
+
+    #[test]
+    fn s3_prune_policy_is_data_only_with_same_txn_no_execution() {
+        assert_eq!(RETENTION_ROW_CAP, 32);
+        let stub = RetentionStub::new();
+        for class in [
+            RetentionClass::ConsentedUsage,
+            RetentionClass::TransientObservation,
+        ] {
+            let policy = stub.prune_policy(class);
+            assert_eq!(policy.class(), class);
+            assert_eq!(policy.row_cap(), RETENTION_ROW_CAP);
+            // Oldest-delete in the same transaction, scheduler absent: data
+            // echo, never executed here.
+            assert!(policy.deletes_oldest_same_txn());
+            assert!(!policy.has_scheduler());
+            assert_eq!(policy, RetentionPrunePolicy::new(class));
+            assert_eq!(policy, stub.prune_policy(class));
+        }
+        // Distinct classes share the ring-scale cap but stay distinct data.
+        let usage = stub.prune_policy(RetentionClass::ConsentedUsage);
+        let transient = stub.prune_policy(RetentionClass::TransientObservation);
+        assert_eq!(usage.row_cap(), transient.row_cap());
+        assert_ne!(usage, transient);
+        assert_eq!(
+            RetentionClass::ConsentedUsage.to_string(),
+            "consented-usage"
+        );
+        assert_eq!(
+            RetentionClass::TransientObservation.to_string(),
+            "transient-observation"
+        );
+    }
+
+    #[test]
+    fn s3_durable_hook_refuses_with_gated_posture() {
+        let stub = RetentionStub::new();
+        let record = stub_record();
+        // Method and free hook agree, both gated (never consent-required).
+        let via_method = stub.write_durable(&record).expect_err("must gate");
+        let via_hook = journal_write_durable(&record).expect_err("must gate");
+        assert_eq!(via_method, retention_durable_denial());
+        assert_eq!(via_hook, retention_durable_denial());
+        assert_eq!(via_method, via_hook);
+        assert_eq!(
+            via_method,
+            RetentionError::DurableGated {
+                reason: RETENTION_DURABLE_GATE_REASON
+            }
+        );
+        assert!(!matches!(
+            via_method,
+            RetentionError::ConsentRequired { .. }
+        ));
+        // Deterministic and content-free: a second record denies identically.
+        let mut other = stub_record();
+        other.id = "rec-2".to_owned();
+        assert_eq!(stub.write_durable(&other), Err(via_method));
+        assert_eq!(journal_write_durable(&other), Err(via_hook));
+        assert!(format!("{via_method}").contains(RETENTION_DURABLE_GATE_REASON));
+        assert!(!format!("{via_method}").contains("rec-2"));
+        // Direct constructors agree with the hooks.
+        assert_eq!(retention_durable_denial(), via_method);
+        assert_ne!(retention_denial(), retention_durable_denial());
+    }
+
+    #[test]
+    fn s3_in_memory_shapes_unaffected() {
+        // The bounded in-memory session keeps working: store round-trips and
+        // the S2 envelope validates while the stub denies around it.
+        let stub = RetentionStub::new();
+        let mut store = ArtifactStore::new();
+        let reference = store.store(vec![7; 16], 7).expect("in-memory stores");
+        assert_eq!(store.resolve(&reference, 7).expect("resolve").len(), 16);
+        assert_eq!(
+            store.absence_reason(&reference, 7),
+            ArtifactAbsence::Available
+        );
+        // The stub still denies the same bytes it just stored in memory:
+        // retention and session storage stay separate facts.
+        let record = stub_record();
+        assert!(stub.retain(&record).is_err());
+        assert!(stub.write_durable(&record).is_err());
+        assert_eq!(store.len(), 1);
+        // S2 envelope validation is untouched (fence echo as data).
+        let request = ContextReadRequest {
+            scopes: vec![StableId::new("window-1").expect("valid")],
+            request: ContextRequest {
+                max_tokens: None,
+                max_bytes: None,
+                current_generation: 7,
+            },
+            detail: DetailLevel::Standard,
+        };
+        assert!(request.validate().is_ok());
+        let response = ContextReadResponse {
+            current_generation: 7,
+            assembled: AssembledContext {
+                records: vec![stub_assembled()],
+                context_refs: vec!["rec-1".to_owned()],
+                omitted_ids: Vec::new(),
+                pruned_ids: Vec::new(),
+                externalized: 0,
+                truncated_bytes: 0,
+                truncated_tokens_estimate: 0,
+                truncated_providers: Vec::new(),
+                budget_bytes: 32 * 1024,
+            },
+            absences: Vec::new(),
+        };
+        assert!(response.validate().is_ok());
     }
 }
