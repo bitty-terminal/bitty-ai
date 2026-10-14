@@ -1146,10 +1146,9 @@ impl SnapshotEnvelope {
 /// Map a [`PlacementError`] declaration refusal to the typed [`McpError`]
 /// envelope form.
 ///
-/// Total over the four S1 refusal variants (no wildcard arm): adding a
-/// [`PlacementError`] variant breaks compilation here, which is the
-/// fail-closed response to a new refusal mode (it must be classified before
-/// any envelope carries it). Every mapping reports [`McpStage::ListTools`]
+/// Uniform single-path mapping over all S1 refusal variants via [`Display`]:
+/// coverage is test-enforced (not compiler-enforced), so classify a new
+/// refusal text before any envelope carries it. Every mapping reports [`McpStage::ListTools`]
 /// with [`McpFailure::HandshakeRejected`] carrying the bounded, scrubbed
 /// refusal text (mirroring the S1 [`import_tool`] precedent, which maps
 /// [`ToolSpec`] bound and validation failures to the same typed failure):
