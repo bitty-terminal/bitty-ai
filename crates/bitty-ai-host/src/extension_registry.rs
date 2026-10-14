@@ -66,6 +66,16 @@
 //! performs no I/O and bestows no capability. An empty `points` list admits
 //! nothing, a populated one still grants nothing, and there is no item here
 //! that executes, renders, resolves, or authorizes.
+//!
+//! Phase 2 S2 appendage (AI-0282): scoped-IPC envelope types, no transport.
+//! [`DeclarationEnvelope`] echoes a [`Manifest`] (host verbatim, never
+//! parsed) and [`ContributionEnvelope`] echoes one per-point descriptor per
+//! value. Both carry declarations only and grant nothing: activation — grant
+//! parsing, authorization, tool registration, consent evaluation — is NOT
+//! modeled here (the deny-all stub stays out; the S3 trigger is unmet).
+//! Shared S2 convention: types only, `std` only, no socket/transport/dep
+//! change, NO version field, no behavior beyond trivial construction and
+//! borrowing, no thread/clock/net/fs.
 
 /// The eight declared extension-point categories.
 ///
@@ -303,11 +313,101 @@ impl UiDescriptor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 S2: scoped-IPC envelope types (no transport).
+// ---------------------------------------------------------------------------
+
+/// Declaration envelope: a [`Manifest`] echo for scoped IPC.
+///
+/// Carries the manifest — name, version, verbatim `host` predicate, and
+/// contributed `points` — as data only. `host` stays an opaque string:
+/// stored verbatim, never parsed here. This envelope declares which points
+/// an extension contributes; it grants nothing. Activation (grant parsing,
+/// authorization, tool registration, consent evaluation) is NOT modeled:
+/// there is no registry to admit into, no resolver to convince, and no
+/// executor to reach.
+///
+/// Shared S2 convention: types only, `std` only, no socket/transport, no
+/// dependency change, NO version field, no thread/clock/net/fs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclarationEnvelope {
+    /// Echoed manifest declaration (host verbatim, never parsed).
+    pub manifest: Manifest,
+}
+
+impl DeclarationEnvelope {
+    /// Wrap a manifest declaration as data.
+    #[must_use]
+    pub fn new(manifest: Manifest) -> Self {
+        Self { manifest }
+    }
+
+    /// Borrow the echoed manifest declaration.
+    #[must_use]
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+}
+
+/// Contribution envelope: one per-point descriptor echo per value.
+///
+/// Each variant carries exactly one S1 descriptor struct verbatim — the
+/// same opaque-string shapes the runtime `*Point` traits return — so
+/// independence holds as it does for the descriptors: constructing one
+/// variant contributes no value of any other point's type. A holder wanting
+/// two points sends two envelopes explicitly; there is no cross-point
+/// coercion. Like [`DeclarationEnvelope`], this carries declarations only
+/// and grants nothing: activation is NOT modeled here.
+///
+/// Shared S2 convention: types only, `std` only, no socket/transport, no
+/// dependency change, NO version field, no thread/clock/net/fs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContributionEnvelope {
+    /// Model capability descriptor echo.
+    Model(ModelDescriptor),
+    /// Tool effect-class descriptor echo.
+    Tool(ToolDescriptor),
+    /// Scoped read descriptor echo.
+    Context(ContextDescriptor),
+    /// Retention-class descriptor echo.
+    Memory(MemoryDescriptor),
+    /// Compaction-strategy descriptor echo.
+    Compactor(CompactorDescriptor),
+    /// Agent-capability descriptor echo.
+    Agent(AgentDescriptor),
+    /// Command registration descriptor echo.
+    Command(CommandDescriptor),
+    /// Presentation descriptor echo (plain text; never rendered here).
+    Ui(UiDescriptor),
+}
+
+impl ContributionEnvelope {
+    /// Which extension point this contribution declares.
+    ///
+    /// Pure projection over the variant; no I/O, no parsing, no
+    /// authorization. Match is exhaustive with no wildcard so adding a
+    /// ninth point breaks at compile time.
+    #[must_use]
+    pub fn point(&self) -> ExtensionPoint {
+        match self {
+            Self::Model(_) => ExtensionPoint::Model,
+            Self::Tool(_) => ExtensionPoint::Tool,
+            Self::Context(_) => ExtensionPoint::Context,
+            Self::Memory(_) => ExtensionPoint::Memory,
+            Self::Compactor(_) => ExtensionPoint::Compactor,
+            Self::Agent(_) => ExtensionPoint::Agent,
+            Self::Command(_) => ExtensionPoint::Command,
+            Self::Ui(_) => ExtensionPoint::Ui,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentDescriptor, CommandDescriptor, CompactorDescriptor, ContextDescriptor, ExtensionPoint,
-        Manifest, MemoryDescriptor, ModelDescriptor, ToolDescriptor, UiDescriptor,
+        AgentDescriptor, CommandDescriptor, CompactorDescriptor, ContextDescriptor,
+        ContributionEnvelope, DeclarationEnvelope, ExtensionPoint, Manifest, MemoryDescriptor,
+        ModelDescriptor, ToolDescriptor, UiDescriptor,
     };
 
     /// Exhaustive match with no wildcard: adding a ninth point breaks this
@@ -438,5 +538,155 @@ mod tests {
         // Both accessors resolve only because both fields exist above.
         assert_eq!(both.tool.effect_class(), "read-only");
         assert_eq!(both.model.declared_model(), "fake-chat");
+    }
+
+    fn example_manifest() -> Manifest {
+        Manifest {
+            name: "example-extension".to_owned(),
+            version: "0.1.0".to_owned(),
+            host: "bitty-ai >=0.1.0".to_owned(),
+            points: vec![ExtensionPoint::Tool, ExtensionPoint::Command],
+        }
+    }
+
+    #[test]
+    fn declaration_envelope_round_trip() {
+        let envelope = DeclarationEnvelope::new(example_manifest());
+        let round_tripped = envelope.clone();
+        assert_eq!(envelope, round_tripped);
+        assert_eq!(envelope.manifest().name, "example-extension");
+        assert_eq!(envelope.manifest().version, "0.1.0");
+        assert_eq!(envelope.manifest().host, "bitty-ai >=0.1.0");
+        assert_eq!(
+            envelope.manifest().points,
+            [ExtensionPoint::Tool, ExtensionPoint::Command]
+        );
+        // The echo is the manifest: no version field, no transport, no grant.
+        assert_eq!(envelope.manifest, example_manifest());
+    }
+
+    #[test]
+    fn declaration_envelope_host_is_verbatim_never_parsed() {
+        // A predicate no semver parser would accept round-trips byte for
+        // byte through the envelope: no normalization or evaluation.
+        let host = "bitty-ai >=0.1.0, <2.0.0 || custom-predicate (never parsed)".to_owned();
+        let envelope = DeclarationEnvelope::new(Manifest {
+            name: "verbatim-extension".to_owned(),
+            version: "0.1.0".to_owned(),
+            host: host.clone(),
+            points: vec![ExtensionPoint::Model],
+        });
+        assert_eq!(envelope.manifest().host, host);
+        assert_eq!(envelope, envelope.clone());
+    }
+
+    #[test]
+    fn declaration_envelope_empty_points_admits_nothing_grants_nothing() {
+        let envelope = DeclarationEnvelope::new(Manifest {
+            name: "empty-extension".to_owned(),
+            version: "0.0.0".to_owned(),
+            host: "bitty-ai *".to_owned(),
+            points: Vec::new(),
+        });
+        assert!(envelope.manifest().points.is_empty());
+        assert_eq!(envelope, envelope.clone());
+    }
+
+    /// Exhaustive match with no wildcard: adding a ninth contribution
+    /// variant breaks this function at compile time, so the eight-point
+    /// envelope set stays closed by construction.
+    fn contribution_point_name(envelope: &ContributionEnvelope) -> &'static str {
+        match envelope {
+            ContributionEnvelope::Model(_) => "model",
+            ContributionEnvelope::Tool(_) => "tool",
+            ContributionEnvelope::Context(_) => "context",
+            ContributionEnvelope::Memory(_) => "memory",
+            ContributionEnvelope::Compactor(_) => "compactor",
+            ContributionEnvelope::Agent(_) => "agent",
+            ContributionEnvelope::Command(_) => "command",
+            ContributionEnvelope::Ui(_) => "ui",
+        }
+    }
+
+    fn all_contributions() -> Vec<ContributionEnvelope> {
+        vec![
+            ContributionEnvelope::Model(ModelDescriptor::new("fake-chat".to_owned())),
+            ContributionEnvelope::Tool(ToolDescriptor::new("read-only".to_owned())),
+            ContributionEnvelope::Context(ContextDescriptor::new("workspace.read".to_owned())),
+            ContributionEnvelope::Memory(MemoryDescriptor::new("session".to_owned())),
+            ContributionEnvelope::Compactor(CompactorDescriptor::new("truncate-head".to_owned())),
+            ContributionEnvelope::Agent(AgentDescriptor::new("single-turn".to_owned())),
+            ContributionEnvelope::Command(CommandDescriptor::new("ai.ask".to_owned())),
+            ContributionEnvelope::Ui(UiDescriptor::new("panel: transcript".to_owned())),
+        ]
+    }
+
+    #[test]
+    fn contribution_envelopes_round_trip() {
+        let envelopes = all_contributions();
+        assert_eq!(envelopes.len(), 8);
+        for envelope in &envelopes {
+            assert_eq!(envelope, &envelope.clone());
+        }
+    }
+
+    #[test]
+    fn contribution_envelope_point_projection_is_exhaustive() {
+        let envelopes = all_contributions();
+        let points: Vec<ExtensionPoint> =
+            envelopes.iter().map(ContributionEnvelope::point).collect();
+        assert_eq!(
+            points,
+            [
+                ExtensionPoint::Model,
+                ExtensionPoint::Tool,
+                ExtensionPoint::Context,
+                ExtensionPoint::Memory,
+                ExtensionPoint::Compactor,
+                ExtensionPoint::Agent,
+                ExtensionPoint::Command,
+                ExtensionPoint::Ui,
+            ]
+        );
+        let names: Vec<&'static str> = envelopes.iter().map(contribution_point_name).collect();
+        assert_eq!(
+            names,
+            [
+                "model",
+                "tool",
+                "context",
+                "memory",
+                "compactor",
+                "agent",
+                "command",
+                "ui"
+            ]
+        );
+    }
+
+    #[test]
+    fn contribution_envelopes_stay_independent() {
+        // One variant contributes no value of any other point's type: each
+        // envelope matches exactly its own variant and projects exactly its
+        // own point.
+        let model = ContributionEnvelope::Model(ModelDescriptor::new("fake-chat".to_owned()));
+        assert_eq!(model.point(), ExtensionPoint::Model);
+        assert!(matches!(model, ContributionEnvelope::Model(_)));
+        assert!(!matches!(model, ContributionEnvelope::Tool(_)));
+
+        let tool = ContributionEnvelope::Tool(ToolDescriptor::new("read-only".to_owned()));
+        assert_eq!(tool.point(), ExtensionPoint::Tool);
+        assert!(matches!(tool, ContributionEnvelope::Tool(_)));
+        assert!(!matches!(tool, ContributionEnvelope::Model(_)));
+
+        // A holder wanting two points sends two envelopes explicitly: one
+        // envelope never stands in for another point.
+        let pair = [
+            ContributionEnvelope::Tool(ToolDescriptor::new("read-only".to_owned())),
+            ContributionEnvelope::Model(ModelDescriptor::new("fake-chat".to_owned())),
+        ];
+        assert_eq!(pair[0].point(), ExtensionPoint::Tool);
+        assert_eq!(pair[1].point(), ExtensionPoint::Model);
+        assert_ne!(pair[0], pair[1]);
     }
 }
