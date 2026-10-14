@@ -160,7 +160,7 @@ dependencies = [
 [[package]]
 name = "bitty-network"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=2aa466387db8e7b2092ce31a09c51040e38ec3e0#2aa466387db8e7b2092ce31a09c51040e38ec3e0"
 dependencies = [
  "bitty-network-api",
  "bitty-network-core",
@@ -173,12 +173,12 @@ dependencies = [
 [[package]]
 name = "bitty-network-api"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=2aa466387db8e7b2092ce31a09c51040e38ec3e0#2aa466387db8e7b2092ce31a09c51040e38ec3e0"
 
 [[package]]
 name = "bitty-network-core"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=2aa466387db8e7b2092ce31a09c51040e38ec3e0#2aa466387db8e7b2092ce31a09c51040e38ec3e0"
 dependencies = [
  "bitty-network-api",
  "idna",
@@ -187,12 +187,12 @@ dependencies = [
 [[package]]
 name = "bitty-network-dns"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=2aa466387db8e7b2092ce31a09c51040e38ec3e0#2aa466387db8e7b2092ce31a09c51040e38ec3e0"
 
 [[package]]
 name = "bitty-network-tls"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-network?rev=c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95#c7509ae2b3ee9f94f65f54a00ce4c70bca42bd95"
+source = "git+https://github.com/bitty-terminal/bitty-network?rev=2aa466387db8e7b2092ce31a09c51040e38ec3e0#2aa466387db8e7b2092ce31a09c51040e38ec3e0"
 dependencies = [
  "bitty-network-api",
  "idna",
@@ -1260,9 +1260,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
