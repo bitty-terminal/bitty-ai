@@ -2065,6 +2065,262 @@ impl Display for ProviderIpcError {
 
 impl std::error::Error for ProviderIpcError {}
 
+// ---------------------------------------------------------------------------
+// Phase 2 S3: MP-4 caller-scope filter (AI-0290).
+//
+// Host-side intersection-only narrowing over the S1 mirrored registry per the
+// `MP-4 caller-scope filter` candidate in `provider-plugin-boundary.md`
+// (scope vocabulary plus filter semantics paragraphs; the `MCP placement
+// policy` paragraphs belong to AI-0296 and appear here by name only).
+//
+// What is reused, not re-mirrored: [`ModelRegistration`],
+// [`ProviderRegistry`], [`ListModelsResponse`], [`ListModelsRequest`] (its
+// unfiltered shape), [`MAX_REGISTERED_MODELS`], [`MAX_PROVIDER_ID_LEN`],
+// `validate_provider_id`, and `truncate_to_bound`. What is new here:
+// [`MAX_CALLER_SCOPE_LEN`], [`CallerScopeEcho`], [`ScopeFilterError`],
+// [`validate_caller_scope`], and
+// [`ProviderRegistry::list_models_filtered`]. What stays out: selection-side
+// envelopes (AI-0291 owns those), transport of any kind, any `version` field,
+// and any change to the S1/S2 paths below.
+//
+// Contract summary (re-stated, not re-implemented):
+//
+// - Scope vocabulary stays narrow and reuses existing authority. A scope
+//   string is a bounded, printable-ASCII, slash-separated name with a closed
+//   character set and a stated length ceiling ([`MAX_CALLER_SCOPE_LEN`]); an
+//   empty, overlong, or out-of-grammar value stays invalid with
+//   [`ScopeFilterError::InvalidScope`]. The `provider/<provider_id>` semantic
+//   prefix used here is the S3 placement for this seam; any other well-formed
+//   prefix stays unknown, never invalid.
+// - Filter semantics are intersection-only narrowing with deny-by-default.
+//   The unfiltered snapshot ([`ListModelsResponse::from_registry`], plus the
+//   S2 [`ListModelsRequest::unfiltered`] / `check_scope` path) stays preserved
+//   as-is; a filtered view is a subset of that snapshot for the same dispatch
+//   `now_ms` and never wider. Adding a scope never widens visibility. An
+//   unknown scope fails closed with [`ScopeFilterError::UnknownScope`]
+//   carrying names only (requested scope plus `provider/model` entry names),
+//   never credential values or raw vendor text.
+// - Enforcement stays host-side at dispatch `now_ms`: the request envelope
+//   carries a [`CallerScopeEcho`] for audit while the host — never the
+//   adapter — applies the filter before selection and provider I/O. The echo
+//   is observation data, not authority: constructing an echo grants nothing,
+//   and `now_ms` (caller-supplied, `CP-7`) does not widen or narrow the set.
+//   The filter reads no clock and performs no I/O.
+// - Types plus pure checks only: `std`-only, no threads, no clock reads, no
+//   filesystem or network access, no `Cargo.toml` changes, and no behavior
+//   outside the filter.
+// ---------------------------------------------------------------------------
+
+/// Maximum caller-scope string length in bytes (S3 ceiling for the `MP-4`
+/// scope vocabulary; chosen to match [`MAX_PROVIDER_ID_LEN`] so a
+/// `provider/<provider_id>` scope always fits when the id fits).
+pub const MAX_CALLER_SCOPE_LEN: usize = 64;
+
+/// Caller scope echo for audit (observation data, not authority).
+///
+/// Carries the caller-declared scope string plus the caller-supplied dispatch
+/// timestamp (`CP-7`, same convention as `CompleteRequest::now_ms`: no wall
+/// clock is read anywhere on this path). Constructing this value grants
+/// nothing: only [`ProviderRegistry::list_models_filtered`] enforces
+/// host-side, and `now_ms` never widens or narrows the set (the same scope
+/// over the same registry yields the same subset for any `now_ms`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerScopeEcho {
+    /// Caller-declared scope observation (validated at filter time).
+    pub scope: String,
+    /// Caller-supplied dispatch timestamp in milliseconds (audit only).
+    pub now_ms: u64,
+}
+
+impl CallerScopeEcho {
+    /// Record a scope observation for audit. No validation happens here and
+    /// no authority is granted; validation plus enforcement stay host-side in
+    /// [`ProviderRegistry::list_models_filtered`].
+    #[must_use]
+    pub fn new(scope: impl Into<String>, now_ms: u64) -> Self {
+        Self {
+            scope: scope.into(),
+            now_ms,
+        }
+    }
+}
+
+/// Typed refusal for the S3 caller-scope filter. Every variant fails closed
+/// with no partial view. Variants carry names only (scope strings plus
+/// `provider/model` entry names, all validated printable-ASCII); no variant
+/// carries secrets, credentials, key material, or raw vendor text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeFilterError {
+    /// Scope string violates the narrow vocabulary: empty, overlong, or
+    /// out-of-grammar (missing slash, leading/trailing slash, `//`, or a
+    /// byte outside `a-z0-9_-/` or a segment starting outside `a-z0-9`).
+    /// Carries the rejected string truncated to [`MAX_CALLER_SCOPE_LEN`] on
+    /// a character boundary plus a static reason (`"empty"`, `"overlong"`,
+    /// or `"grammar"`); no caller value beyond that bounded echo.
+    InvalidScope {
+        /// Rejected scope truncated to the ceiling.
+        scope: String,
+        /// Static reason label (never caller input).
+        reason: &'static str,
+    },
+    /// Scope string is well-formed but matches no registry entry (unknown
+    /// provider, non-`provider/` prefix, or a known provider with zero
+    /// entries in this snapshot). Carries the requested scope plus the
+    /// snapshot entry names as `provider/model` pairs in
+    /// [`ProviderRegistry::entries`] order for reconcile; the `Display`
+    /// shows the requested scope plus the entry count only, so logs stay
+    /// bounded while the struct keeps the full names for audit.
+    UnknownScope {
+        /// Requested scope name (bounded, well-formed).
+        requested: String,
+        /// Snapshot entry names (`provider/model`, lexicographic).
+        available: Vec<String>,
+    },
+}
+
+impl Display for ScopeFilterError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match self {
+            Self::InvalidScope { scope, reason } => {
+                write!(f, "invalid caller scope ({reason}): {scope}")
+            }
+            Self::UnknownScope {
+                requested,
+                available,
+            } => write!(
+                f,
+                "unknown caller scope: {requested} ({} known entries)",
+                available.len()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScopeFilterError {}
+
+/// Validate a caller-scope string against the narrow S3 vocabulary:
+/// non-empty, at most [`MAX_CALLER_SCOPE_LEN`] bytes, containing at least one
+/// `/`, never leading/trailing `/`, never `//`, every byte in
+/// `a-z0-9_-/`, and every slash-separated segment starting with `a-z0-9`.
+///
+/// Pure shape check only: well-formed does not mean known (a well-formed
+/// non-`provider/` scope or a `provider/` scope with no entries still fails
+/// with [`ScopeFilterError::UnknownScope`] at filter time).
+///
+/// # Errors
+///
+/// Returns [`ScopeFilterError::InvalidScope`] with reason `"empty"`,
+/// `"overlong"`, or `"grammar"` when the shape is violated.
+pub fn validate_caller_scope(scope: &str) -> Result<(), ScopeFilterError> {
+    if scope.is_empty() {
+        return Err(ScopeFilterError::InvalidScope {
+            scope: String::new(),
+            reason: "empty",
+        });
+    }
+    if scope.len() > MAX_CALLER_SCOPE_LEN {
+        return Err(ScopeFilterError::InvalidScope {
+            scope: truncate_to_bound(scope, MAX_CALLER_SCOPE_LEN),
+            reason: "overlong",
+        });
+    }
+    let grammar_invalid = !scope.contains('/')
+        || scope.starts_with('/')
+        || scope.ends_with('/')
+        || scope.contains("//")
+        || !scope.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'/'
+        })
+        || scope.split('/').any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    if grammar_invalid {
+        return Err(ScopeFilterError::InvalidScope {
+            scope: truncate_to_bound(scope, MAX_CALLER_SCOPE_LEN),
+            reason: "grammar",
+        });
+    }
+    Ok(())
+}
+
+/// Snapshot entry names as `provider/model` pairs in
+/// [`ProviderRegistry::entries`] order (names only, never secrets).
+fn available_entry_names(registry: &ProviderRegistry) -> Vec<String> {
+    registry
+        .entries()
+        .into_iter()
+        .map(|entry| format!("{}/{}", entry.provider_id, entry.name))
+        .collect()
+}
+
+/// Build the fail-closed unknown-scope refusal for `requested` over
+/// `registry` (names only).
+fn unknown_scope_error(requested: String, registry: &ProviderRegistry) -> ScopeFilterError {
+    ScopeFilterError::UnknownScope {
+        requested,
+        available: available_entry_names(registry),
+    }
+}
+
+impl ProviderRegistry {
+    /// Filtered `list_models` view for one caller-scope echo (S3, `MP-4`).
+    ///
+    /// Intersection-only narrowing with deny-by-default, enforced host-side:
+    /// the `provider/<provider_id>` scope selects the snapshot entries whose
+    /// `provider_id` equals `<provider_id>`, in [`ProviderRegistry::entries`]
+    /// order, as detached [`ModelRegistration`] clones (later registry
+    /// changes do not leak into the returned view). The unfiltered path
+    /// ([`ListModelsResponse::from_registry`]) is untouched: the filtered
+    /// view is always a subset of that snapshot for the same dispatch
+    /// `now_ms` and never wider. `echo.now_ms` is audit observation only
+    /// (caller-supplied `CP-7`, no clock read): it does not affect
+    /// membership. The echo alone grants nothing; only this host-side call
+    /// enforces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeFilterError::InvalidScope`] for a malformed scope
+    /// string, or [`ScopeFilterError::UnknownScope`] (names only) when the
+    /// scope is well-formed but matches no entry.
+    pub fn list_models_filtered(
+        &self,
+        echo: &CallerScopeEcho,
+    ) -> Result<ListModelsResponse, ScopeFilterError> {
+        validate_caller_scope(&echo.scope)?;
+        let provider = echo
+            .scope
+            .strip_prefix("provider/")
+            .ok_or_else(|| unknown_scope_error(echo.scope.clone(), self))?;
+        if validate_provider_id(provider).is_err() {
+            return Err(unknown_scope_error(echo.scope.clone(), self));
+        }
+        let filtered: Vec<ModelRegistration> = self
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.provider_id == provider)
+            .map(|entry| ModelRegistration {
+                provider_id: entry.provider_id.clone(),
+                name: entry.name.clone(),
+                capabilities: entry.capabilities.clone(),
+                context_window_tokens: entry.context_window_tokens,
+                input_cost_weight: entry.input_cost_weight,
+                output_cost_weight: entry.output_cost_weight,
+            })
+            .collect();
+        if filtered.is_empty() {
+            return Err(unknown_scope_error(echo.scope.clone(), self));
+        }
+        // Bound holds by construction: `filtered` is a subset of a registry
+        // that already enforces `MAX_REGISTERED_MODELS`, so no count refusal
+        // is reachable here.
+        Ok(ListModelsResponse { models: filtered })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3365,5 +3621,246 @@ mod ipc_envelope_tests {
             .to_string(),
             "provider p effect unknown: ack lost"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_filter_tests {
+    use super::*;
+
+    fn text_registration(provider: &str, name: &str) -> ModelRegistration {
+        ModelRegistration::new(provider, name, vec![ModelCapability::Text], 4_096, 1, 2)
+            .expect("valid registration")
+    }
+
+    fn fixture_registry() -> ProviderRegistry {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(text_registration("bitty-b", "chat"))
+            .expect("capacity");
+        registry
+            .register(
+                ModelRegistration::new(
+                    "bitty-a",
+                    "vision",
+                    vec![ModelCapability::Text, ModelCapability::ImageInput],
+                    32_768,
+                    3,
+                    4,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        registry
+    }
+
+    #[test]
+    fn scope_ceiling_matches_documented_bound() {
+        assert_eq!(MAX_CALLER_SCOPE_LEN, 64);
+    }
+
+    #[test]
+    fn unfiltered_path_preserved_as_is() {
+        let registry = fixture_registry();
+        // The mirrored unfiltered snapshot keeps its S1/S2 shape: count,
+        // lexicographic order, and detached clones.
+        let unfiltered = ListModelsResponse::from_registry(&registry);
+        assert_eq!(unfiltered.len(), 2);
+        let order: Vec<(&str, &str)> = unfiltered
+            .models
+            .iter()
+            .map(|item| (item.provider_id.as_str(), item.name.as_str()))
+            .collect();
+        assert_eq!(order, vec![("bitty-a", "vision"), ("bitty-b", "chat")]);
+        // The S2 unfiltered request shape still passes, and the reserved
+        // scoped shape is still denied: S3 adds alongside, never rewrites.
+        assert!(ListModelsRequest::unfiltered().check_scope().is_ok());
+        assert!(ListModelsRequest::default().check_scope().is_ok());
+        assert_eq!(
+            ListModelsRequest::scoped("provider/bitty-a")
+                .check_scope()
+                .expect_err("reserved scoped shape stays denied"),
+            IpcEnvelopeError::ReservedScopeDenied
+        );
+        // Later registry state cannot leak into the unfiltered snapshot.
+        let mut registry = registry;
+        registry
+            .register(text_registration("bitty-c", "fresh"))
+            .expect("capacity");
+        assert_eq!(unfiltered.len(), 2);
+        assert_eq!(registry.len(), 3);
+    }
+
+    #[test]
+    fn filtered_is_subset_never_wider_same_now_ms() {
+        let registry = fixture_registry();
+        let now_ms = 1_000;
+        let unfiltered = ListModelsResponse::from_registry(&registry);
+        let echo = CallerScopeEcho::new("provider/bitty-a", now_ms);
+        let filtered = registry
+            .list_models_filtered(&echo)
+            .expect("known provider scope filters");
+        // Intersection-only narrowing: one entry, the provider's own.
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.models[0].provider_id, "bitty-a");
+        assert_eq!(filtered.models[0].name, "vision");
+        // Subset of the same-`now_ms` unfiltered snapshot, never wider.
+        assert!(filtered.len() <= unfiltered.len());
+        for item in &filtered.models {
+            assert!(
+                unfiltered
+                    .models
+                    .iter()
+                    .any(|kept| kept.provider_id == item.provider_id
+                        && kept.name == item.name
+                        && kept.capabilities == item.capabilities),
+                "filtered entry must exist in unfiltered: {item:?}"
+            );
+        }
+        // The other provider's scope is disjoint but still a subset.
+        let other = registry
+            .list_models_filtered(&CallerScopeEcho::new("provider/bitty-b", now_ms))
+            .expect("second provider filters");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other.models[0].name, "chat");
+        // Detached: later registry state cannot leak into a filtered view.
+        let mut registry = registry;
+        registry
+            .register(text_registration("bitty-a", "fresh"))
+            .expect("capacity");
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn unknown_scope_refuses_fail_closed_names_only() {
+        let registry = fixture_registry();
+        // Well-formed `provider/` scope with no entries in this snapshot.
+        let echo = CallerScopeEcho::new("provider/bitty-gone", 7);
+        let error = registry
+            .list_models_filtered(&echo)
+            .expect_err("unknown provider must refuse");
+        match &error {
+            ScopeFilterError::UnknownScope {
+                requested,
+                available,
+            } => {
+                assert_eq!(requested, "provider/bitty-gone");
+                assert_eq!(
+                    *available,
+                    vec!["bitty-a/vision".to_owned(), "bitty-b/chat".to_owned(),]
+                );
+            }
+            other => panic!("unknown must be UnknownScope: {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            "unknown caller scope: provider/bitty-gone (2 known entries)"
+        );
+        // Well-formed but non-provider prefix is unknown, never invalid.
+        let error = registry
+            .list_models_filtered(&CallerScopeEcho::new("team-a/read", 7))
+            .expect_err("non-provider prefix must refuse as unknown");
+        assert!(matches!(error, ScopeFilterError::UnknownScope { .. }));
+        // No partial state and no secrets in the refusal.
+        assert_eq!(registry.len(), 2);
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("key"));
+    }
+
+    #[test]
+    fn empty_scope_is_invalid() {
+        let registry = fixture_registry();
+        let error = registry
+            .list_models_filtered(&CallerScopeEcho::new("", 1))
+            .expect_err("empty scope must refuse");
+        assert_eq!(
+            error,
+            ScopeFilterError::InvalidScope {
+                scope: String::new(),
+                reason: "empty",
+            }
+        );
+        assert_eq!(error.to_string(), "invalid caller scope (empty): ");
+        assert!(matches!(
+            validate_caller_scope(""),
+            Err(ScopeFilterError::InvalidScope {
+                reason: "empty",
+                ..
+            })
+        ));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn malformed_scopes_are_invalid_never_unknown() {
+        // Overlong stays invalid with a bounded echo.
+        let overlong = format!("provider/{}", "a".repeat(MAX_CALLER_SCOPE_LEN));
+        assert!(overlong.len() > MAX_CALLER_SCOPE_LEN);
+        match validate_caller_scope(&overlong).expect_err("overlong must fail") {
+            ScopeFilterError::InvalidScope { scope, reason } => {
+                assert_eq!(reason, "overlong");
+                assert_eq!(scope.len(), MAX_CALLER_SCOPE_LEN);
+            }
+            other => panic!("overlong must be InvalidScope: {other:?}"),
+        }
+        // Grammar violations: missing slash, edges, doubling, charset.
+        for bad in [
+            "bitty-a",
+            "/provider/bitty-a",
+            "provider/bitty-a/",
+            "provider//bitty-a",
+            "Provider/bitty-a",
+            "provider/Bad",
+            "provider/has space",
+            "provider/has.dot",
+            "provider/_leading",
+        ] {
+            assert!(
+                matches!(
+                    validate_caller_scope(bad),
+                    Err(ScopeFilterError::InvalidScope {
+                        reason: "grammar",
+                        ..
+                    })
+                ),
+                "must be grammar-invalid: {bad:?}"
+            );
+            let registry = fixture_registry();
+            assert!(
+                matches!(
+                    registry.list_models_filtered(&CallerScopeEcho::new(bad, 1)),
+                    Err(ScopeFilterError::InvalidScope { .. })
+                ),
+                "filter must stay invalid (never unknown): {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn echo_is_observation_not_authority() {
+        let registry = fixture_registry();
+        // The same scope at different dispatch timestamps yields the same
+        // subset: `now_ms` is audit observation, never filter authority.
+        let first = registry
+            .list_models_filtered(&CallerScopeEcho::new("provider/bitty-a", 1_000))
+            .expect("filters");
+        let second = registry
+            .list_models_filtered(&CallerScopeEcho::new("provider/bitty-a", 2_000))
+            .expect("filters at another now_ms");
+        assert_eq!(first, second);
+        // Constructing an echo alone grants nothing: no host call means no
+        // view, and an unknown echo still refuses host-side.
+        let echo = CallerScopeEcho::new("provider/bitty-gone", 1_000);
+        assert!(registry.list_models_filtered(&echo).is_err());
+        // The returned view is detached: mutating the echo afterwards cannot
+        // widen a previously enforced view.
+        let mut echo = CallerScopeEcho::new("provider/bitty-a", 1_000);
+        let view = registry
+            .list_models_filtered(&echo)
+            .expect("known scope filters");
+        echo.scope = "provider/bitty-b".to_owned();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.models[0].provider_id, "bitty-a");
     }
 }
