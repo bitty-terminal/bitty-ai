@@ -50,15 +50,37 @@
 //! ## Roadmap pointers
 //!
 //! - E1a: read-only wiring (`model_select`, fallback, cost, `provider_list`,
-//!   `cache_hint`, `mcp_pin`, `mcp_snapshot`, extension echoes).
-//! - E1b: `context_read` wiring.
-//! - E1c: `provider_complete` plus the injection seam.
-//! - E1d: `tool_dispatch` digest-only plus host per-tool consent on top.
-//! - E2: params-schema plug-in plus the tolerant S-1 correlator field.
+//!   `cache_hint`, `mcp_pin`, `mcp_snapshot`, extension echoes) — DONE via
+//!   [`dispatch_with`] plus [`ReadOnlyView`]. Gates 1-6 and [`dispatch`]
+//!   (E0 behavior) are unchanged; E1b/c/d methods still return
+//!   [`DispatchOutcome::NotWired`].
+//! - E1b: `context_read` wiring (pending).
+//! - E1c: `provider_complete` plus the injection seam (pending).
+//! - E1d: `tool_dispatch` digest-only plus host per-tool consent on top
+//!   (pending).
+//! - E2: params-schema plug-in plus the tolerant S-1 correlator field
+//!   (pending; the per-method decode table below names the extension seam,
+//!   which stays unbuilt until gate 5 accepts the field).
 //! - E3: loopback admit/deny matrix, reassembler TTL, forged-tier vectors.
 //! - S-F (separate follow-up, deferred): correlator enforcement and the full
 //!   host-boundary lint gate re-establishment. No producer emits snapshot
 //!   versions yet, so enforcing now would deny everything.
+//!
+//! ## E1a handler contract
+//!
+//! [`dispatch_with`] admits exactly like [`dispatch`] (same six gates, same
+//! order, gates untouched), then wires the ten read-only methods end to
+//! end: decode validated params to per-method request shapes (hand-rolled
+//! depth-capped decode reusing the schema validators' bounds, no `serde`,
+//! no new dependency), run the pure read-only runtime/host logic, and
+//! encode the S-C result JSON. Logic-level failures map to typed refusals
+//! (never panics); `ai.extension_activate` wires the S3 always-deny
+//! explicitly via the real activation stub. No provider I/O, no tool
+//! execution, no context assembly, no writes: the view carries data
+//! references only (a runtime registry snapshot plus the MCP pin/snapshot
+//! envelopes), never a behavior trait, so there is no execution seam to
+//! misuse. Unknown fields stay refused upstream at gate 5; decode failures
+//! below map to `InvalidRequest`-class refusals.
 //!
 //! ## Normative precedence
 //!
@@ -134,6 +156,20 @@ pub enum DispatchOutcome {
         method: String,
         /// Scope the call was admitted under.
         scope: Scope,
+    },
+    /// Admitted and answered by an E1a wired handler.
+    ///
+    /// // POLICY (AI-0302-E1a): `result` is the S-C result JSON text for
+    /// `method`, validated against `validate_ai_result` by tests. Only
+    /// the ten read-only E1a methods produce this variant; E1b/c/d arms
+    /// keep returning `NotWired`.
+    Ready {
+        /// Method that was admitted and answered.
+        method: String,
+        /// Scope the call was admitted under.
+        scope: Scope,
+        /// S-C result JSON text.
+        result: String,
     },
 }
 
@@ -221,6 +257,9 @@ pub fn admit(input: &DispatchInput<'_>) -> Result<DispatchPosture, IpcError> {
 /// [`DispatchOutcome::NotWired`] typed refusal until E1 wires per-method
 /// handlers. Gate refusals pass through unchanged as
 /// [`DispatchOutcome::Refused`].
+///
+/// E1a keeps this entry byte-for-byte E0: callers with read-only tables use
+/// [`dispatch_with`]. Every existing E0 test exercises this entry only.
 pub fn dispatch(input: &DispatchInput<'_>) -> DispatchOutcome {
     let probe = GateProbe::default();
     match run_gates(input, &probe) {
@@ -231,6 +270,1420 @@ pub fn dispatch(input: &DispatchInput<'_>) -> DispatchOutcome {
             scope,
         },
         Err(error) => DispatchOutcome::Refused(error),
+    }
+}
+
+// ── E1a read-only wiring ────────────────────────────────────────────────────
+//
+// Decode (validated params JSON to per-method request shapes) -> pure
+// read-only logic (real runtime/host entry points) -> encode (S-C result
+// JSON). No provider I/O, no tool execution, no context assembly, no
+// writes anywhere, no clock/threads/net: every value below is caller
+// supplied or derived from caller-supplied values.
+
+use bitty_ai_host::cache_disclosure::{
+    CacheHintRequest, CacheHintResponse, CacheKey as HostCacheKey, CacheScope as HostCacheScope,
+    InputFingerprint as HostFingerprint,
+};
+use bitty_ai_host::extension_registry::{
+    ActivationStub, DENY_ALL_ACTIVATION_REASON, DeclarationEnvelope, ExtensionPoint,
+    Manifest as HostManifest, activation_point_name, parse_activation_point,
+};
+use bitty_ai_host::mcp_placement::{
+    McpFailure, PinEnvelope, SnapshotEnvelope, ToolsCapabilityShape,
+};
+use bitty_ai_host::model_selection::{
+    EstimateCostEnvelopeRequest, FallbackDirectiveEnvelopeRequest, SelectEnvelopeRequest,
+};
+use bitty_ai_host::provider_registry::{
+    ListModelsResponse, ModelCapability as HostCapability, ModelRegistration as HostRegistration,
+    ProviderError as HostProviderError, validate_model_name as validate_host_model_name,
+    validate_provider_id as validate_host_provider_id,
+};
+use bitty_ai_runtime::{
+    ModelCapability as RuntimeCapability, ProviderRegistry, SelectRequest as RuntimeSelectRequest,
+    SelectionError as RuntimeSelectionError,
+};
+use bitty_ipc_api::{
+    MAX_AGENT_ALIAS_BYTES, MAX_JSON_DEPTH, MAX_MANIFEST_FIELD_BYTES,
+    MAX_SCHEMA_ACTIVATION_POINT_BYTES, MAX_SCHEMA_CANONICAL_PREFIX_BYTES, MAX_SCHEMA_ENABLE_LIST,
+    MAX_SCHEMA_MODEL_NAME_BYTES, MAX_SCHEMA_PROVIDER_ID_BYTES, MAX_SCHEMA_REASON_BYTES,
+};
+
+/// Caller-supplied read-only tables for the E1a wired methods.
+//
+// POLICY (AI-0302-E1a): data references only, never behavior: the runtime registry snapshot plus
+/// the MCP pin/snapshot envelopes. No `ModelProvider` trait object, no
+/// executor, no store handle crosses here, so the handlers below cannot
+/// perform provider I/O or execution even by accident — the structural
+/// no-execution proof is that this type has no behavior field to call.
+#[derive(Debug)]
+pub struct ReadOnlyView<'a> {
+    /// Registry snapshot the select/list handlers read (runtime is
+    /// authoritative; entries are detached data, never executed).
+    pub registry: &'a ProviderRegistry,
+    /// MCP pin envelope the `mcp_pin` handler echoes after validation.
+    pub mcp_pin: &'a PinEnvelope,
+    /// MCP snapshot envelope the `mcp_snapshot` handler echoes.
+    pub mcp_snapshot: &'a SnapshotEnvelope,
+}
+
+/// E1a dispatch entry: admit exactly like [`dispatch`], then wire the ten
+/// read-only methods end to end.
+///
+/// Gate refusals pass through unchanged as [`DispatchOutcome::Refused`].
+/// Admitted E1b/c/d methods (`ai.context_read`, `ai.provider_complete`,
+/// `ai.tool_dispatch`) return [`DispatchOutcome::NotWired`]; admitted E1a
+/// methods return [`DispatchOutcome::Ready`] with the S-C result JSON or a
+/// typed logic-level refusal as [`DispatchOutcome::Refused`}.
+pub fn dispatch_with(input: &DispatchInput<'_>, view: &ReadOnlyView<'_>) -> DispatchOutcome {
+    let probe = GateProbe::default();
+    let scope = match run_gates(input, &probe) {
+        // POLICY (AI-0302-E1a): gates run first and unchanged; no handler
+        // contact before admission, same as E0.
+        Ok(scope) => scope,
+        Err(error) => return DispatchOutcome::Refused(error),
+    };
+    // POLICY (AI-0302-E1a): explicit per-method wiring table. E1b/c/d arms
+    // stay NotWired; any future method added upstream without an E-phase
+    // arm lands on the fallback NotWired, never on a guessed handler.
+    let result = match input.method {
+        "ai.model_select" => handle_select(view, input.params),
+        "ai.model_fallback" => handle_fallback(input.params),
+        "ai.model_cost" => handle_cost(input.params),
+        "ai.provider_list" => handle_list(view, input.params),
+        "ai.cache_hint" => handle_cache_hint(input.params),
+        "ai.mcp_pin" => handle_pin(view, input.params),
+        "ai.mcp_snapshot" => handle_snapshot(view, input.params),
+        "ai.extension_manifest" => handle_manifest(input.params),
+        "ai.extension_contribute" => handle_contribute(input.params),
+        "ai.extension_activate" => handle_activate(input.params),
+        "ai.context_read" | "ai.provider_complete" | "ai.tool_dispatch" => {
+            return DispatchOutcome::NotWired {
+                method: input.method.to_string(),
+                scope,
+            };
+        }
+        _ => {
+            return DispatchOutcome::NotWired {
+                method: input.method.to_string(),
+                scope,
+            };
+        }
+    };
+    match result {
+        Ok(result) => DispatchOutcome::Ready {
+            method: input.method.to_string(),
+            scope,
+            result,
+        },
+        Err(error) => DispatchOutcome::Refused(error),
+    }
+}
+
+// ── outcome extension ───────────────────────────────────────────────────────
+// (The `Ready` variant lives on the E0 `DispatchOutcome` enum above so both
+// entries share one outcome vocabulary.)
+
+/// Minimal JSON value model for params decode.
+///
+/// Gate 5 already ran the canonical byte rules plus the per-method schema,
+/// so this parser is a second structural read, not a validator: it must be
+/// total over any input (never panic) and map every failure to an
+/// `InvalidRequest`-class refusal. Depth re-capped at [`MAX_JSON_DEPTH`]
+/// (defense in depth for direct callers; the canonical layer already
+/// confirmed it).
+#[derive(Debug, Clone, PartialEq)]
+enum JVal {
+    Null,
+    Bool(bool),
+    Num(JsonNum),
+    Str(String),
+    Arr(Vec<JVal>),
+    Obj(Vec<(String, JVal)>),
+}
+
+/// Raw JSON number token kept verbatim; integer views reject negatives,
+/// fractions, and exponents (params integers here are ids, counts, and
+/// byte budgets, never floats).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonNum(String);
+
+impl JVal {
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Num(raw) => {
+                if raw.0.is_empty() || !raw.0.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                raw.0.parse::<u64>().ok()
+            }
+            _ => None,
+        }
+    }
+
+    fn as_u32(&self) -> Option<u32> {
+        self.as_u64().and_then(|v| u32::try_from(v).ok())
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn as_arr(&self) -> Option<&[JVal]> {
+        match self {
+            Self::Arr(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    fn as_obj(&self) -> Option<&[(String, JVal)]> {
+        match self {
+            Self::Obj(fields) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// First-wins field lookup. Duplicates are already refused at gate 5;
+    /// first-wins keeps decode deterministic for direct callers.
+    ///
+    /// // POLICY (AI-0302-E1a): first-wins (never last-wins): a duplicated
+    /// // field that ever reached decode must resolve to the caller's
+    /// // original value, not an overriding shadow.
+    fn field(&self, name: &str) -> Option<&JVal> {
+        self.as_obj()?
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+}
+
+fn decode_invalid(reason: &str) -> IpcError {
+    // POLICY (AI-0302-E1a): every decode failure is an `InvalidRequest`
+    // naming the schema-vocabulary field or bound, never caller bytes.
+    IpcError::InvalidRequest {
+        reason: reason.into(),
+    }
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl JsonParser<'_> {
+    fn ws(&mut self) {
+        while self.pos < self.bytes.len()
+            && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn expect_byte(&mut self, want: u8) -> Result<(), IpcError> {
+        if self.peek() == Some(want) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(decode_invalid("params must be well-formed JSON"))
+        }
+    }
+
+    fn value(&mut self, depth: usize) -> Result<JVal, IpcError> {
+        if depth > MAX_JSON_DEPTH {
+            return Err(decode_invalid("params nest past the depth bound"));
+        }
+        self.ws();
+        match self.peek() {
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
+            Some(b'"') => Ok(JVal::Str(self.string()?)),
+            Some(b't') => self.literal("true", JVal::Bool(true)),
+            Some(b'f') => self.literal("false", JVal::Bool(false)),
+            Some(b'n') => self.literal("null", JVal::Null),
+            Some(b'-') | Some(b'0'..=b'9') => Ok(JVal::Num(self.number()?)),
+            _ => Err(decode_invalid("params must be well-formed JSON")),
+        }
+    }
+
+    fn literal(&mut self, word: &str, value: JVal) -> Result<JVal, IpcError> {
+        let end = self.pos.saturating_add(word.len());
+        if self.bytes.get(self.pos..end) == Some(word.as_bytes()) {
+            self.pos = end;
+            Ok(value)
+        } else {
+            Err(decode_invalid("params must be well-formed JSON"))
+        }
+    }
+
+    fn number(&mut self) -> Result<JsonNum, IpcError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+        if self.pos == start {
+            return Err(decode_invalid("params must be well-formed JSON"));
+        }
+        let raw = self
+            .bytes
+            .get(start..self.pos)
+            .ok_or_else(|| decode_invalid("params must be well-formed JSON"))?;
+        let text = std::str::from_utf8(raw)
+            .map_err(|_| decode_invalid("params must be well-formed JSON"))?;
+        Ok(JsonNum(text.to_owned()))
+    }
+
+    fn hex4(&mut self) -> Result<u32, IpcError> {
+        let mut code: u32 = 0;
+        for _ in 0..4 {
+            let digit = self
+                .peek()
+                .ok_or_else(|| decode_invalid("params must be well-formed JSON"))?;
+            let v = (digit as char)
+                .to_digit(16)
+                .ok_or_else(|| decode_invalid("params must be well-formed JSON"))?;
+            code = code.saturating_mul(16).saturating_add(v);
+            self.pos += 1;
+        }
+        Ok(code)
+    }
+
+    fn string(&mut self) -> Result<String, IpcError> {
+        // Caller guarantees the opening quote via `value`.
+        self.pos += 1;
+        let mut out = String::new();
+        loop {
+            let byte = self
+                .peek()
+                .ok_or_else(|| decode_invalid("params must be well-formed JSON"))?;
+            match byte {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(b'"') => {
+                            out.push('"');
+                            self.pos += 1;
+                        }
+                        Some(b'\\') => {
+                            out.push('\\');
+                            self.pos += 1;
+                        }
+                        Some(b'/') => {
+                            out.push('/');
+                            self.pos += 1;
+                        }
+                        Some(b'b') => {
+                            out.push('\u{0008}');
+                            self.pos += 1;
+                        }
+                        Some(b'f') => {
+                            out.push('\u{000C}');
+                            self.pos += 1;
+                        }
+                        Some(b'n') => {
+                            out.push('\n');
+                            self.pos += 1;
+                        }
+                        Some(b'r') => {
+                            out.push('\r');
+                            self.pos += 1;
+                        }
+                        Some(b't') => {
+                            out.push('\t');
+                            self.pos += 1;
+                        }
+                        Some(b'u') => {
+                            self.pos += 1;
+                            let high = self.hex4()?;
+                            let ch = if (0xD800..0xDC00).contains(&high) {
+                                let save = self.pos;
+                                if self.bytes.get(save..save + 2) == Some(b"\\u".as_slice()) {
+                                    self.pos += 2;
+                                    let low = self.hex4()?;
+                                    if (0xDC00..0xE000).contains(&low) {
+                                        let pair =
+                                            0x1_0000 + (high - 0xD800) * 0x400 + (low - 0xDC00);
+                                        char::from_u32(pair).ok_or_else(|| {
+                                            decode_invalid("params must be well-formed JSON")
+                                        })?
+                                    } else {
+                                        return Err(decode_invalid(
+                                            "params must be well-formed JSON",
+                                        ));
+                                    }
+                                } else {
+                                    return Err(decode_invalid("params must be well-formed JSON"));
+                                }
+                            } else if (0xDC00..0xE000).contains(&high) {
+                                return Err(decode_invalid("params must be well-formed JSON"));
+                            } else {
+                                char::from_u32(high).ok_or_else(|| {
+                                    decode_invalid("params must be well-formed JSON")
+                                })?
+                            };
+                            out.push(ch);
+                        }
+                        _ => {
+                            return Err(decode_invalid("params must be well-formed JSON"));
+                        }
+                    }
+                }
+                0x00..=0x1F => {
+                    return Err(decode_invalid("params must be well-formed JSON"));
+                }
+                _ => {
+                    // Consume one UTF-8 scalar; raw bytes were validated
+                    // UTF-8 at gate 5, and direct callers get a typed
+                    // refusal instead of a panic here.
+                    let rest = self
+                        .bytes
+                        .get(self.pos..)
+                        .ok_or_else(|| decode_invalid("params must be well-formed JSON"))?;
+                    let text = std::str::from_utf8(rest)
+                        .map_err(|_| decode_invalid("params must be well-formed JSON"))?;
+                    let ch = text
+                        .chars()
+                        .next()
+                        .ok_or_else(|| decode_invalid("params must be well-formed JSON"))?;
+                    out.push(ch);
+                    self.pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Result<JVal, IpcError> {
+        self.expect_byte(b'[')?;
+        let mut items = Vec::new();
+        self.ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(JVal::Arr(items));
+        }
+        loop {
+            items.push(self.value(depth + 1)?);
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(JVal::Arr(items));
+                }
+                _ => return Err(decode_invalid("params must be well-formed JSON")),
+            }
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Result<JVal, IpcError> {
+        self.expect_byte(b'{')?;
+        let mut fields = Vec::new();
+        self.ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(JVal::Obj(fields));
+        }
+        loop {
+            self.ws();
+            if self.peek() != Some(b'"') {
+                return Err(decode_invalid("params must be a JSON object"));
+            }
+            let key = self.string()?;
+            self.ws();
+            self.expect_byte(b':')?;
+            let value = self.value(depth + 1)?;
+            fields.push((key, value));
+            self.ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(JVal::Obj(fields));
+                }
+                _ => return Err(decode_invalid("params must be well-formed JSON")),
+            }
+        }
+    }
+}
+
+/// Parse validated params bytes to the top-level object value.
+fn parse_params_object(params: &[u8]) -> Result<JVal, IpcError> {
+    let mut parser = JsonParser {
+        bytes: params,
+        pos: 0,
+    };
+    let value = parser.value(0)?;
+    parser.ws();
+    if parser.pos != params.len() {
+        return Err(decode_invalid("params must be well-formed JSON"));
+    }
+    match value {
+        JVal::Obj(_) => Ok(value),
+        _ => Err(decode_invalid("params must be a JSON object")),
+    }
+}
+
+// ── per-method decode table ─────────────────────────────────────────────────
+//
+// One decoder per E1a method, looked up by method name. Gate 5 already
+// refused unknown fields and schema violations, so each decoder re-checks
+// the rules it relies on (same bounds, same closed vocabularies as the
+// schema validators) and maps any deviation to `InvalidRequest`.
+//
+// E2 EXTENSION SEAM (noted, not built; POLICY (AI-0302-E1a)): the tolerant S-1 correlator field
+// lands here — each decoder takes the top-level object and would accept one
+// optional, bounded correlator field alongside its method fields once gate
+// 5 stops refusing it as unknown. No correlator is accepted today: an
+// extra field still refuses upstream at gate 5, and these decoders must
+// not pre-accept it.
+
+// Closed capability vocabulary (IPC-side canonical spellings, same set the
+// schema validator enforces).
+fn decode_capability(name: &str) -> Option<HostCapability> {
+    match name {
+        "text" => Some(HostCapability::Text),
+        "streaming" => Some(HostCapability::Streaming),
+        "tool_use" => Some(HostCapability::ToolUse),
+        "image_input" => Some(HostCapability::ImageInput),
+        "audio_input" => Some(HostCapability::AudioInput),
+        "audio_output" => Some(HostCapability::AudioOutput),
+        "video_input" => Some(HostCapability::VideoInput),
+        "reasoning" => Some(HostCapability::Reasoning),
+        _ => None,
+    }
+}
+
+fn host_capability_to_runtime(cap: &HostCapability) -> RuntimeCapability {
+    // POLICY (AI-0302-E1a): total mirror mapping (host envelope shape to
+    // authoritative runtime logic); no wildcard so a ninth capability
+    // breaks compilation here instead of misrouting.
+    match cap {
+        HostCapability::Text => RuntimeCapability::Text,
+        HostCapability::Streaming => RuntimeCapability::Streaming,
+        HostCapability::ToolUse => RuntimeCapability::ToolUse,
+        HostCapability::ImageInput => RuntimeCapability::ImageInput,
+        HostCapability::AudioInput => RuntimeCapability::AudioInput,
+        HostCapability::AudioOutput => RuntimeCapability::AudioOutput,
+        HostCapability::VideoInput => RuntimeCapability::VideoInput,
+        HostCapability::Reasoning => RuntimeCapability::Reasoning,
+    }
+}
+
+fn runtime_capability_to_name(cap: &RuntimeCapability) -> &'static str {
+    // POLICY (AI-0302-E1a): IPC-side canonical spellings, one per runtime
+    // variant (same table the schema validator enforces for results).
+    match cap {
+        RuntimeCapability::Text => "text",
+        RuntimeCapability::Streaming => "streaming",
+        RuntimeCapability::ToolUse => "tool_use",
+        RuntimeCapability::ImageInput => "image_input",
+        RuntimeCapability::AudioInput => "audio_input",
+        RuntimeCapability::AudioOutput => "audio_output",
+        RuntimeCapability::VideoInput => "video_input",
+        RuntimeCapability::Reasoning => "reasoning",
+    }
+}
+
+fn decode_cache_scope(name: &str) -> Option<HostCacheScope> {
+    match name {
+        "session" => Some(HostCacheScope::Session),
+        "turn" => Some(HostCacheScope::Turn),
+        "round" => Some(HostCacheScope::Round),
+        _ => None,
+    }
+}
+
+/// Decoded per-method request shapes (owned data, no input borrows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedRequest {
+    Select(SelectEnvelopeRequest),
+    Fallback(HostProviderError),
+    Cost {
+        input_tokens: u64,
+        output_tokens: u64,
+        input_weight: u32,
+        output_weight: u32,
+    },
+    List,
+    CacheHint {
+        key: HostCacheKey,
+        scope: HostCacheScope,
+        fingerprint: HostFingerprint,
+    },
+    Pin,
+    Snapshot,
+    Manifest(HostManifest),
+    Contribute {
+        point: ExtensionPoint,
+        value: String,
+    },
+    Activate {
+        point: String,
+        enabled: Vec<String>,
+    },
+}
+
+fn req_field<'v>(top: &'v JVal, method: &str, name: &'static str) -> Result<&'v JVal, IpcError> {
+    top.field(name)
+        .ok_or_else(|| decode_invalid(&format!("{method} params: missing required field '{name}'")))
+}
+
+fn opt_field<'v>(top: &'v JVal, name: &str) -> Option<&'v JVal> {
+    top.field(name)
+}
+
+fn req_str_field(top: &JVal, method: &str, name: &'static str) -> Result<String, IpcError> {
+    req_field(top, method, name)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| decode_invalid(&format!("{method} params: field '{name}' must be a string")))
+}
+
+fn req_u64_field(top: &JVal, method: &str, name: &'static str) -> Result<u64, IpcError> {
+    req_field(top, method, name)?.as_u64().ok_or_else(|| {
+        decode_invalid(&format!(
+            "{method} params: field '{name}' must be an integer"
+        ))
+    })
+}
+
+fn req_u32_field(top: &JVal, method: &str, name: &'static str) -> Result<u32, IpcError> {
+    req_field(top, method, name)?.as_u32().ok_or_else(|| {
+        decode_invalid(&format!(
+            "{method} params: field '{name}' must be an integer"
+        ))
+    })
+}
+
+fn opt_u32_field(top: &JVal, method: &str, name: &'static str) -> Result<Option<u32>, IpcError> {
+    match opt_field(top, name) {
+        None => Ok(None),
+        Some(v) => v.as_u32().map(Some).ok_or_else(|| {
+            decode_invalid(&format!(
+                "{method} params: field '{name}' must be an integer"
+            ))
+        }),
+    }
+}
+
+fn bound_len(value: &str, method: &str, name: &'static str, limit: usize) -> Result<(), IpcError> {
+    if value.len() > limit {
+        return Err(decode_invalid(&format!(
+            "{method} params: field '{name}' past its byte bound"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_select(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.model_select";
+    let required = req_field(top, METHOD, "required")?
+        .as_arr()
+        .ok_or_else(|| {
+            decode_invalid("ai.model_select params: field 'required' must be an array")
+        })?;
+    if required.is_empty() {
+        return Err(decode_invalid(
+            "ai.model_select params: field 'required' must be non-empty",
+        ));
+    }
+    let mut caps = Vec::with_capacity(required.len());
+    for item in required {
+        let name = item.as_str().ok_or_else(|| {
+            decode_invalid("ai.model_select params: capability not in closed vocabulary")
+        })?;
+        caps.push(decode_capability(name).ok_or_else(|| {
+            decode_invalid("ai.model_select params: capability not in closed vocabulary")
+        })?);
+    }
+    let alias = match opt_field(top, "alias") {
+        None => None,
+        Some(v) => {
+            let alias = v.as_str().ok_or_else(|| {
+                decode_invalid("ai.model_select params: field 'alias' must be a string")
+            })?;
+            bound_len(alias, METHOD, "alias", MAX_AGENT_ALIAS_BYTES)?;
+            Some(alias.to_owned())
+        }
+    };
+    let min_context_window_tokens = opt_u32_field(top, METHOD, "min_context_window_tokens")?;
+    let max_cost_weight = opt_u32_field(top, METHOD, "max_cost_weight")?;
+    Ok(DecodedRequest::Select(SelectEnvelopeRequest::new(
+        caps,
+        alias,
+        min_context_window_tokens,
+        max_cost_weight,
+    )))
+}
+
+fn decode_fallback(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.model_fallback";
+    let name = req_str_field(top, METHOD, "error")?;
+    // POLICY (AI-0302-E1a): the echoed error crosses as its variant name
+    // only (same rule the schema validator enforces); classification keys
+    // on the variant, so each arm constructs its variant with neutral
+    // payloads (empty strings, zeros, `None`, empty lists, one static
+    // label). Payloads are never read here — only the variant feeds
+    // `FallbackDirectiveEnvelopeRequest::resolve`.
+    let error = match name.as_str() {
+        "unknown_model" => HostProviderError::UnknownModel {
+            name: String::new(),
+        },
+        "budget_exceeded" => HostProviderError::BudgetExceeded {
+            limit: 0,
+            actual: 0,
+        },
+        "timeout" => HostProviderError::Timeout {
+            timeout_ms: 0,
+            latency_ms: 0,
+        },
+        "timeout_too_large" => HostProviderError::TimeoutTooLarge { max: 0, actual: 0 },
+        "invalid_provider_id" => HostProviderError::InvalidProviderId { id: String::new() },
+        "transport" => HostProviderError::Transport {
+            provider: String::new(),
+            reason: String::new(),
+        },
+        "auth" => HostProviderError::Auth {
+            provider: String::new(),
+            reason: String::new(),
+        },
+        "rate_limited" => HostProviderError::RateLimited {
+            provider: String::new(),
+            retry_after_ms: None,
+        },
+        "capability_mismatch" => HostProviderError::CapabilityMismatch {
+            provider: String::new(),
+            model: String::new(),
+            missing: Vec::new(),
+        },
+        "model_unavailable" => HostProviderError::ModelUnavailable {
+            provider: String::new(),
+            model: String::new(),
+        },
+        "unknown" => HostProviderError::Unknown {
+            provider: String::new(),
+            reason: String::new(),
+        },
+        "invalid_sampling" => HostProviderError::InvalidSampling,
+        "unsupported_sampling" => HostProviderError::UnsupportedSampling { field: "top_k" },
+        _ => {
+            return Err(decode_invalid(
+                "ai.model_fallback params: field 'error' not in closed vocabulary",
+            ));
+        }
+    };
+    if let Some(detail) = opt_field(top, "detail") {
+        let text = detail.as_str().ok_or_else(|| {
+            decode_invalid("ai.model_fallback params: field 'detail' must be a string")
+        })?;
+        bound_len(text, METHOD, "detail", MAX_SCHEMA_REASON_BYTES)?;
+    }
+    Ok(DecodedRequest::Fallback(error))
+}
+
+fn decode_cost(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.model_cost";
+    Ok(DecodedRequest::Cost {
+        input_tokens: req_u64_field(top, METHOD, "input_tokens")?,
+        output_tokens: req_u64_field(top, METHOD, "output_tokens")?,
+        input_weight: req_u32_field(top, METHOD, "input_weight")?,
+        output_weight: req_u32_field(top, METHOD, "output_weight")?,
+    })
+}
+
+fn decode_cache_hint(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.cache_hint";
+    let key = req_field(top, METHOD, "key")?
+        .as_obj()
+        .ok_or_else(|| decode_invalid("ai.cache_hint params: field 'key' must be an object"))?;
+    let key_view = JVal::Obj(key.to_vec());
+    let provider_id = req_str_field(&key_view, METHOD, "provider_id")?;
+    bound_len(
+        &provider_id,
+        METHOD,
+        "key.provider_id",
+        MAX_SCHEMA_PROVIDER_ID_BYTES,
+    )?;
+    // POLICY (AI-0302-E1a): name grammars stay S2-owned (batch-1 item 2
+    // rule 6): over-grammar ids cross gate 5 bytes-only and refuse typed
+    // here via the real S2 shape checks, never pass through unchecked.
+    validate_host_provider_id(&provider_id).map_err(|_| {
+        decode_invalid("ai.cache_hint params: field 'key.provider_id' has a bad shape")
+    })?;
+    let model_id = req_str_field(&key_view, METHOD, "model_id")?;
+    bound_len(
+        &model_id,
+        METHOD,
+        "key.model_id",
+        MAX_SCHEMA_MODEL_NAME_BYTES,
+    )?;
+    validate_host_model_name(&model_id).map_err(|_| {
+        decode_invalid("ai.cache_hint params: field 'key.model_id' has a bad shape")
+    })?;
+    let key_scope_name = req_str_field(&key_view, METHOD, "scope")?;
+    let key_scope = decode_cache_scope(&key_scope_name).ok_or_else(|| {
+        decode_invalid("ai.cache_hint params: field 'key.scope' not in closed vocabulary")
+    })?;
+    let stable_prefix_hash = req_u64_field(&key_view, METHOD, "stable_prefix_hash")?;
+    let prefix_len_raw = req_u64_field(&key_view, METHOD, "prefix_len")?;
+    if prefix_len_raw > MAX_SCHEMA_CANONICAL_PREFIX_BYTES as u64 {
+        return Err(decode_invalid(
+            "ai.cache_hint params: field 'key.prefix_len' past its byte bound",
+        ));
+    }
+    let ask_scope =
+        decode_cache_scope(&req_str_field(top, METHOD, "ask_scope")?).ok_or_else(|| {
+            decode_invalid("ai.cache_hint params: field 'ask_scope' not in closed vocabulary")
+        })?;
+    let print = req_field(top, METHOD, "fingerprint")?
+        .as_obj()
+        .ok_or_else(|| {
+            decode_invalid("ai.cache_hint params: field 'fingerprint' must be an object")
+        })?;
+    let print_view = JVal::Obj(print.to_vec());
+    let digest = req_u64_field(&print_view, METHOD, "digest")?;
+    let input_len_raw = req_u64_field(&print_view, METHOD, "input_len")?;
+    let prefix_len = usize::try_from(prefix_len_raw)
+        .map_err(|_| decode_invalid("ai.cache_hint params: field 'key.prefix_len' is too large"))?;
+    let input_len = usize::try_from(input_len_raw)
+        .map_err(|_| decode_invalid("ai.cache_hint params: field 'input_len' is too large"))?;
+    Ok(DecodedRequest::CacheHint {
+        key: HostCacheKey {
+            provider_id,
+            model_id,
+            scope: key_scope,
+            stable_prefix_hash,
+            prefix_len,
+        },
+        scope: ask_scope,
+        fingerprint: HostFingerprint { digest, input_len },
+    })
+}
+
+fn decode_manifest(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.extension_manifest";
+    let manifest = req_field(top, METHOD, "manifest")?
+        .as_obj()
+        .ok_or_else(|| {
+            decode_invalid("ai.extension_manifest params: field 'manifest' must be an object")
+        })?;
+    let view = JVal::Obj(manifest.to_vec());
+    let name = req_str_field(&view, METHOD, "name")?;
+    bound_len(&name, METHOD, "manifest.name", MAX_MANIFEST_FIELD_BYTES)?;
+    let version = req_str_field(&view, METHOD, "version")?;
+    bound_len(
+        &version,
+        METHOD,
+        "manifest.version",
+        MAX_MANIFEST_FIELD_BYTES,
+    )?;
+    let host = req_str_field(&view, METHOD, "host")?;
+    bound_len(&host, METHOD, "manifest.host", MAX_MANIFEST_FIELD_BYTES)?;
+    let points = req_field(&view, METHOD, "points")?
+        .as_arr()
+        .ok_or_else(|| {
+            decode_invalid("ai.extension_manifest params: field 'points' must be an array")
+        })?;
+    let mut parsed = Vec::with_capacity(points.len());
+    for item in points {
+        let point = item.as_str().ok_or_else(|| {
+            decode_invalid("ai.extension_manifest params: point not in closed vocabulary")
+        })?;
+        parsed.push(parse_activation_point(point).map_err(|_| {
+            decode_invalid("ai.extension_manifest params: point not in closed vocabulary")
+        })?);
+    }
+    Ok(DecodedRequest::Manifest(HostManifest {
+        name,
+        version,
+        host,
+        points: parsed,
+    }))
+}
+
+fn decode_contribute(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.extension_contribute";
+    let point_name = req_str_field(top, METHOD, "point")?;
+    let point = parse_activation_point(&point_name).map_err(|_| {
+        decode_invalid("ai.extension_contribute params: field 'point' not in closed vocabulary")
+    })?;
+    let value = req_str_field(top, METHOD, "value")?;
+    bound_len(&value, METHOD, "value", MAX_MANIFEST_FIELD_BYTES)?;
+    Ok(DecodedRequest::Contribute { point, value })
+}
+
+fn decode_activate(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.extension_activate";
+    let point = req_str_field(top, METHOD, "point")?;
+    bound_len(&point, METHOD, "point", MAX_SCHEMA_ACTIVATION_POINT_BYTES)?;
+    if point.is_empty() {
+        return Err(decode_invalid(
+            "ai.extension_activate params: field 'point' must be non-empty",
+        ));
+    }
+    let mut enabled = Vec::new();
+    if let Some(list) = opt_field(top, "enabled") {
+        let items = list.as_arr().ok_or_else(|| {
+            decode_invalid("ai.extension_activate params: field 'enabled' must be an array")
+        })?;
+        if items.len() > MAX_SCHEMA_ENABLE_LIST {
+            return Err(decode_invalid(
+                "ai.extension_activate params: field 'enabled' past its count bound",
+            ));
+        }
+        for item in items {
+            let name = item.as_str().ok_or_else(|| {
+                decode_invalid("ai.extension_activate params: enabled entries must be strings")
+            })?;
+            bound_len(name, METHOD, "enabled", MAX_SCHEMA_ACTIVATION_POINT_BYTES)?;
+            if name.is_empty() {
+                return Err(decode_invalid(
+                    "ai.extension_activate params: enabled entries must be non-empty",
+                ));
+            }
+            enabled.push(name.to_owned());
+        }
+    }
+    Ok(DecodedRequest::Activate { point, enabled })
+}
+
+type DecodeFn = fn(&JVal) -> Result<DecodedRequest, IpcError>;
+
+/// Per-method decode table: the E1a methods that carry a body shape.
+///
+/// Fieldless methods (`ai.provider_list`, `ai.mcp_pin`, `ai.mcp_snapshot`)
+/// decode without a table arm: an empty-or-`{}` body is the whole request.
+const DECODE_TABLE: &[(&str, DecodeFn)] = &[
+    ("ai.model_select", decode_select),
+    ("ai.model_fallback", decode_fallback),
+    ("ai.model_cost", decode_cost),
+    ("ai.cache_hint", decode_cache_hint),
+    ("ai.extension_manifest", decode_manifest),
+    ("ai.extension_contribute", decode_contribute),
+    ("ai.extension_activate", decode_activate),
+];
+
+fn decode_request(method: &str, params: &[u8]) -> Result<DecodedRequest, IpcError> {
+    // POLICY (AI-0302-E1a): empty bodies parse as no fields for the
+    // fieldless methods only (same rule `validate_ai_params` enforces at
+    // gate 5); every other method decodes its table arm.
+    if params.is_empty() {
+        match method {
+            "ai.provider_list" => return Ok(DecodedRequest::List),
+            "ai.mcp_pin" => return Ok(DecodedRequest::Pin),
+            "ai.mcp_snapshot" => return Ok(DecodedRequest::Snapshot),
+            _ => return Err(decode_invalid("params must be a JSON object")),
+        }
+    }
+    let top = parse_params_object(params)?;
+    match method {
+        "ai.provider_list" | "ai.mcp_pin" | "ai.mcp_snapshot" => match &top {
+            JVal::Obj(fields) if fields.is_empty() => match method {
+                "ai.provider_list" => Ok(DecodedRequest::List),
+                "ai.mcp_pin" => Ok(DecodedRequest::Pin),
+                _ => Ok(DecodedRequest::Snapshot),
+            },
+            _ => Err(decode_invalid("params must be an empty object")),
+        },
+        _ => DECODE_TABLE
+            .iter()
+            .find(|(name, _)| *name == method)
+            .map(|(_, decode)| decode(&top))
+            .ok_or_else(|| IpcError::Internal {
+                reason: "admitted method has no E1a decoder".into(),
+            })?,
+    }
+}
+
+// ── result encoding ─────────────────────────────────────────────────────────
+//
+// Hand-rolled JSON text (no `serde`, no new dependency). Every encoder
+// emits exactly the S-C shapes `validate_ai_result` enforces; tests prove
+// each output validates.
+
+fn escape_into(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\u{0000}'..='\u{001F}' => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn encode_str(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    escape_into(&mut out, text);
+    out.push('"');
+    out
+}
+
+fn encode_model_entry(
+    out: &mut String,
+    provider_id: &str,
+    name: &str,
+    capabilities: &[RuntimeCapability],
+    context_window_tokens: u32,
+    input_cost_weight: u32,
+    output_cost_weight: u32,
+) {
+    out.push_str("{\"provider_id\":");
+    out.push_str(&encode_str(provider_id));
+    out.push_str(",\"name\":");
+    out.push_str(&encode_str(name));
+    out.push_str(",\"capabilities\":[");
+    for (i, cap) in capabilities.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&encode_str(runtime_capability_to_name(cap)));
+    }
+    out.push_str("],\"context_window_tokens\":");
+    out.push_str(&context_window_tokens.to_string());
+    out.push_str(",\"input_cost_weight\":");
+    out.push_str(&input_cost_weight.to_string());
+    out.push_str(",\"output_cost_weight\":");
+    out.push_str(&output_cost_weight.to_string());
+    out.push('}');
+}
+
+// ── per-method handlers ─────────────────────────────────────────────────────
+
+fn handle_select(view: &ReadOnlyView<'_>, params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Select(envelope) = decode_request("ai.model_select", params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): host envelope carries the shape, the
+    // authoritative runtime registry runs the selection. The capability
+    // map is total; a ninth capability breaks compilation, never routing.
+    let runtime_request = RuntimeSelectRequest {
+        required: envelope
+            .required
+            .iter()
+            .map(host_capability_to_runtime)
+            .collect(),
+        alias: envelope.alias.clone(),
+        min_context_window_tokens: envelope.min_context_window_tokens,
+        max_cost_weight: envelope.max_cost_weight,
+    };
+    match view.registry.select(&runtime_request) {
+        Ok(chain) => {
+            let mut out = String::from("{\"status\":\"selected\",\"chain\":[");
+            for (i, selected) in chain.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                encode_model_entry(
+                    &mut out,
+                    &selected.provider_id,
+                    &selected.name,
+                    &selected.capabilities,
+                    selected.context_window_tokens,
+                    selected.input_cost_weight,
+                    selected.output_cost_weight,
+                );
+            }
+            out.push_str("]}");
+            Ok(out)
+        }
+        Err(error) => match error {
+            // POLICY (AI-0302-E1a): an unknown alias names no registry
+            // entry, so it refuses `NotFound` with a static reason (never
+            // the caller-supplied name); an empty match over a known
+            // request shape is selection data, carried as the
+            // `failed`-status result the schema provides for it.
+            RuntimeSelectionError::UnknownAlias { .. } => Err(IpcError::NotFound {
+                reason: "unknown model alias".into(),
+            }),
+            RuntimeSelectionError::NoCandidate { .. } => Ok(
+                "{\"status\":\"failed\",\"error\":\"no candidate satisfies the request\"}"
+                    .to_owned(),
+            ),
+            RuntimeSelectionError::EmptyRequirement => Err(decode_invalid(
+                "ai.model_select params: field 'required' must be non-empty",
+            )),
+            _ => Err(IpcError::Internal {
+                reason: "selection refused outside its select-time taxonomy".into(),
+            }),
+        },
+    }
+}
+
+fn handle_fallback(params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Fallback(error) = decode_request("ai.model_fallback", params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): classification runs the real host fallback
+    // envelope (`Advance` on transport/rate-limit/unavailable/timeout,
+    // `Stop` otherwise including `Unknown`); the directive echoes as the
+    // closed two-word vocabulary the schema enforces.
+    let response = FallbackDirectiveEnvelopeRequest::new(error).resolve();
+    let directive = match response.directive {
+        bitty_ai_host::model_selection::FallbackDirective::Advance => "advance",
+        bitty_ai_host::model_selection::FallbackDirective::Stop => "stop",
+    };
+    Ok(format!("{{\"directive\":\"{directive}\"}}"))
+}
+
+fn handle_cost(params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Cost {
+        input_tokens,
+        output_tokens,
+        input_weight,
+        output_weight,
+    } = decode_request("ai.model_cost", params)?
+    else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): arithmetic runs the real host cost envelope
+    // (relative routing units, never currency; `effective(0) = 1`,
+    // saturating on overflow). The result echoes the four inputs plus the
+    // estimate, the exact S-C cost shape.
+    let response =
+        EstimateCostEnvelopeRequest::new(input_tokens, output_tokens, input_weight, output_weight)
+            .estimate();
+    Ok(format!(
+        "{{\"input_tokens\":{},\"output_tokens\":{},\"input_weight\":{},\"output_weight\":{},\"cost\":{}}}",
+        response.input_tokens,
+        response.output_tokens,
+        response.input_weight,
+        response.output_weight,
+        response.cost
+    ))
+}
+
+fn handle_list(view: &ReadOnlyView<'_>, params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::List = decode_request("ai.provider_list", params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the list answers from the caller-supplied
+    // registry snapshot only. The reserved scoped variant never crosses
+    // (gate 5 refuses its fields as unknown), so the request builds
+    // unfiltered and its scope gate runs for real; the response builds
+    // through the real envelope constructor (fail-closed count bound) over
+    // detached snapshots in provider/model lexicographic order. No
+    // provider trait is touched: this is data, never execution.
+    let request = bitty_ai_host::provider_registry::ListModelsRequest::unfiltered();
+    request.check_scope().map_err(|_| IpcError::Internal {
+        reason: "unfiltered list request failed its scope gate".into(),
+    })?;
+    let models: Vec<HostRegistration> = view
+        .registry
+        .entries()
+        .iter()
+        .map(|entry| HostRegistration {
+            provider_id: entry.provider_id.clone(),
+            name: entry.name.clone(),
+            capabilities: entry
+                .capabilities
+                .iter()
+                .map(|cap| match cap {
+                    RuntimeCapability::Text => HostCapability::Text,
+                    RuntimeCapability::Streaming => HostCapability::Streaming,
+                    RuntimeCapability::ToolUse => HostCapability::ToolUse,
+                    RuntimeCapability::ImageInput => HostCapability::ImageInput,
+                    RuntimeCapability::AudioInput => HostCapability::AudioInput,
+                    RuntimeCapability::AudioOutput => HostCapability::AudioOutput,
+                    RuntimeCapability::VideoInput => HostCapability::VideoInput,
+                    RuntimeCapability::Reasoning => HostCapability::Reasoning,
+                })
+                .collect(),
+            context_window_tokens: entry.context_window_tokens,
+            input_cost_weight: entry.input_cost_weight,
+            output_cost_weight: entry.output_cost_weight,
+        })
+        .collect();
+    let response = ListModelsResponse::new(models).map_err(|_| IpcError::Internal {
+        reason: "registry snapshot past the list envelope bound".into(),
+    })?;
+    let mut out = String::from("{\"models\":[");
+    for (i, model) in response.models.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let runtime_caps: Vec<RuntimeCapability> = model
+            .capabilities
+            .iter()
+            .map(host_capability_to_runtime)
+            .collect();
+        encode_model_entry(
+            &mut out,
+            &model.provider_id,
+            &model.name,
+            &runtime_caps,
+            model.context_window_tokens,
+            model.input_cost_weight,
+            model.output_cost_weight,
+        );
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
+fn handle_cache_hint(params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::CacheHint {
+        key,
+        scope,
+        fingerprint,
+    } = decode_request("ai.cache_hint", params)?
+    else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the scope-equality gate runs the real
+    // `CacheHintRequest::validate`, mapped through the AgentRefusal table
+    // (shape refusal, never an authorization verdict). Presence answers
+    // `miss_for`: no store exists on this path, so presence is never
+    // claimed, and a hit would never authorize reuse under the S3
+    // deny-all admission posture anyway. The echo self-check runs for
+    // real over the same key.
+    let request = CacheHintRequest {
+        key,
+        scope,
+        fingerprint,
+    };
+    request
+        .validate()
+        .map_err(|_| bitty_ipc_api::AgentRefusal::CacheScopeMismatch.to_ipc_error())?;
+    let response = CacheHintResponse::miss_for(request.key.clone());
+    response
+        .check_echo(&request)
+        .map_err(|_| IpcError::Internal {
+            reason: "cache hint echo failed over its own key".into(),
+        })?;
+    let scope_name = match response.key.scope {
+        HostCacheScope::Session => "session",
+        HostCacheScope::Turn => "turn",
+        HostCacheScope::Round => "round",
+    };
+    let mut out = String::from("{\"key\":{\"provider_id\":");
+    out.push_str(&encode_str(&response.key.provider_id));
+    out.push_str(",\"model_id\":");
+    out.push_str(&encode_str(&response.key.model_id));
+    out.push_str(",\"scope\":");
+    out.push_str(&encode_str(scope_name));
+    out.push_str(",\"stable_prefix_hash\":");
+    out.push_str(&response.key.stable_prefix_hash.to_string());
+    out.push_str(",\"prefix_len\":");
+    out.push_str(&(response.key.prefix_len as u64).to_string());
+    out.push_str("},\"hit\":false}");
+    Ok(out)
+}
+
+fn handle_pin(view: &ReadOnlyView<'_>, params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Pin = decode_request("ai.mcp_pin", params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the pin query echoes the caller-supplied pin
+    // only when the real `PinEnvelope::validate` passes (pinned protocol
+    // version plus tools capability). A drifted or capability-less pin is
+    // a fail-closed stop — mapped to `Denied` with the `McpFailure` name
+    // as the open-ended code and a static reason (never the drifted
+    // version string) — because re-list, not a blind answer, is the
+    // recovery path.
+    view.mcp_pin
+        .validate()
+        .map_err(|error| match error.failure {
+            McpFailure::VersionMismatch { .. } => IpcError::Denied {
+                code: "VersionMismatch".into(),
+                reason: "mcp pin protocol version drifted; re-list to refresh the pin".into(),
+            },
+            McpFailure::NoToolCapability => IpcError::Denied {
+                code: "NoToolCapability".into(),
+                reason: "mcp pin offers no tools capability; re-list to refresh the pin".into(),
+            },
+            _ => IpcError::Internal {
+                reason: "pin validation refused outside its validation taxonomy".into(),
+            },
+        })?;
+    let pin = view.mcp_pin.pin();
+    let mut out = String::from("{\"protocol_version\":");
+    out.push_str(&encode_str(&pin.protocol_version));
+    out.push_str(",\"tools_supported\":");
+    out.push_str(if pin.tools_supported { "true" } else { "false" });
+    out.push_str(",\"tools_shape\":");
+    match &pin.tools_shape {
+        ToolsCapabilityShape::BoolTrue => out.push_str("{\"kind\":\"bool_true\"}"),
+        ToolsCapabilityShape::Object { list_changed } => {
+            out.push_str("{\"kind\":\"object\"");
+            if let Some(flag) = list_changed {
+                out.push_str(",\"list_changed\":");
+                out.push_str(if *flag { "true" } else { "false" });
+            }
+            out.push('}');
+        }
+    }
+    out.push('}');
+    Ok(out)
+}
+
+fn handle_snapshot(view: &ReadOnlyView<'_>, params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Snapshot = decode_request("ai.mcp_snapshot", params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the snapshot echoes the caller-supplied
+    // envelope verbatim through its real readers (name-ordered digest
+    // pairs plus the version/stale flags as data). A stale envelope stays
+    // well-formed data with `list_stale` set: staleness is reported,
+    // never enforced here.
+    let snapshot = view.mcp_snapshot;
+    let mut out = String::from("{\"entries\":[");
+    for (i, (name, digest)) in snapshot.snapshot().entries().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        out.push_str(&encode_str(name));
+        out.push_str(",\"digest\":");
+        out.push_str(&digest.to_string());
+        out.push('}');
+    }
+    out.push_str("],\"list_version\":");
+    out.push_str(&snapshot.list_version().to_string());
+    out.push_str(",\"list_stale\":");
+    out.push_str(if snapshot.is_stale() { "true" } else { "false" });
+    out.push('}');
+    Ok(out)
+}
+
+fn handle_manifest(params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Manifest(manifest) = decode_request("ai.extension_manifest", params)?
+    else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the manifest echoes verbatim through the real
+    // declaration envelope (declarations only, grants nothing either
+    // direction). Point names render through the real closed-vocabulary
+    // projection.
+    let envelope = DeclarationEnvelope::new(manifest);
+    let manifest = envelope.manifest();
+    let mut out = String::from("{\"manifest\":{\"name\":");
+    out.push_str(&encode_str(&manifest.name));
+    out.push_str(",\"version\":");
+    out.push_str(&encode_str(&manifest.version));
+    out.push_str(",\"host\":");
+    out.push_str(&encode_str(&manifest.host));
+    out.push_str(",\"points\":[");
+    for (i, point) in manifest.points.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&encode_str(activation_point_name(*point)));
+    }
+    out.push_str("]}}");
+    Ok(out)
+}
+
+fn handle_contribute(params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Contribute { point, value } =
+        decode_request("ai.extension_contribute", params)?
+    else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the contribution echoes verbatim (point plus
+    // opaque descriptor value, grants nothing). No `ContributionEnvelope`
+    // is constructed: its variants carry typed per-point descriptors the
+    // params do not supply (one opaque string covers all eight points),
+    // so building one would invent data the caller never sent.
+    let mut out = String::from("{\"point\":");
+    out.push_str(&encode_str(activation_point_name(point)));
+    out.push_str(",\"value\":");
+    out.push_str(&encode_str(&value));
+    out.push('}');
+    Ok(out)
+}
+
+fn handle_activate(params: &[u8]) -> Result<String, IpcError> {
+    let DecodedRequest::Activate { point, enabled } =
+        decode_request("ai.extension_activate", params)?
+    else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1a): the S3 always-deny wires explicitly through
+    // the real activation stub (no success shape exists: `validate_ai_result`
+    // refuses every activate body). Known points deny fail-closed even when
+    // listed as explicitly enabled; unknown names refuse typed. The enable
+    // list passes through ignored-fail-closed per the stub contract.
+    // Reasons stay static (the shared deny-all constant, never the
+    // caller-supplied point name).
+    let enabled_refs: Vec<&str> = enabled.iter().map(String::as_str).collect();
+    match ActivationStub::new().check_named(&point, &enabled_refs) {
+        Ok(()) => Err(IpcError::Internal {
+            reason: "activation stub admitted under deny-all".into(),
+        }),
+        Err(error) => match error {
+            bitty_ai_host::extension_registry::ActivationError::Denied { .. } => {
+                Err(IpcError::Denied {
+                    code: "ActivationDenied".into(),
+                    reason: DENY_ALL_ACTIVATION_REASON.to_owned(),
+                })
+            }
+            bitty_ai_host::extension_registry::ActivationError::UnknownPoint { .. } => {
+                Err(IpcError::NotFound {
+                    reason: "unknown extension point".into(),
+                })
+            }
+        },
     }
 }
 
@@ -617,5 +2070,683 @@ mod tests {
             ENDPOINT_MANIFEST.contains(r#"rev = "d0c4ecd""#),
             "endpoint manifest must pin bitty-ipc-api at rev d0c4ecd"
         );
+    }
+}
+
+#[cfg(test)]
+mod e1a_tests {
+    use super::*;
+    use bitty_ipc_api::validate_ai_result;
+
+    const CLIENT: &str = "agent-7";
+
+    fn granted_inspect() -> ScopeSet {
+        ScopeSet::single(Scope::AiInspect)
+    }
+
+    fn granted_invoke() -> ScopeSet {
+        ScopeSet::single(Scope::AiInvoke)
+    }
+
+    fn ledger_for(scope: Scope) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(CLIENT.to_owned(), scope, 0, 10_000, "user".to_owned())
+            .expect("grant fits in an empty ledger");
+        ledger
+    }
+
+    fn input<'a>(
+        method: &'a str,
+        granted: &'a ScopeSet,
+        ledger: &'a ConsentLedger,
+        params: &'a [u8],
+    ) -> DispatchInput<'a> {
+        DispatchInput {
+            method,
+            request_id: 7,
+            granted,
+            ledger,
+            client_id: CLIENT,
+            now_ms: 1_000,
+            created_at_ms: 0,
+            timeout_ms: 5_000,
+            params,
+        }
+    }
+
+    /// Registry with two text models plus one vision model and an alias.
+    ///
+    /// Built through the sanctioned data bridge (`FakeProvider::list_models`
+    /// plus `ModelRegistration::snapshot_from`): the behavior trait supplies
+    /// descriptors, the registry owns the snapshot, and dispatch never
+    /// touches the provider again.
+    fn registry_two() -> ProviderRegistry {
+        use bitty_ai_runtime::{ModelCapability as Cap, ModelDescriptor, ModelProvider as _};
+        let provider =
+            bitty_ai_runtime::FakeProvider::new("bitty-fake").expect("valid provider id");
+        assert_eq!(provider.complete_calls(), 0);
+        let mut registry = ProviderRegistry::new();
+        for descriptor in provider.list_models() {
+            let ModelDescriptor { name, capabilities } = descriptor;
+            registry
+                .register(
+                    bitty_ai_runtime::ModelRegistration::new(
+                        "bitty-fake",
+                        name,
+                        capabilities,
+                        4_096,
+                        1,
+                        2,
+                    )
+                    .expect("valid registration"),
+                )
+                .expect("capacity");
+        }
+        registry
+            .register(
+                bitty_ai_runtime::ModelRegistration::new(
+                    "bitty-a",
+                    "vision",
+                    vec![Cap::Text, Cap::ImageInput],
+                    32_768,
+                    3,
+                    4,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        registry
+            .register_alias(
+                "chat",
+                vec![
+                    bitty_ai_runtime::ModelRef::new("bitty-fake", "fake-chat").expect("valid ref"),
+                ],
+            )
+            .expect("capacity");
+        assert_eq!(provider.complete_calls(), 0);
+        registry
+    }
+
+    fn valid_pin() -> PinEnvelope {
+        use bitty_ai_host::mcp_placement::{InitializeResult, ToolsCapabilityShape};
+        PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        })
+    }
+
+    fn snapshot_two() -> SnapshotEnvelope {
+        use bitty_ai_host::mcp_placement::{
+            ImportedTool, ToolListSnapshot, ToolPlacement, ToolSpec,
+        };
+        // POLICY (AI-0302-E1a): the fixture builds one imported tool
+        // through the real declaration path (`ToolSpec::new` plus the
+        // spec digest), so the snapshot envelope echoes genuine
+        // name/digest data, never invented pairs.
+        let spec = ToolSpec::new(
+            "mcp_demo_search",
+            "demo search",
+            b"{}".to_vec(),
+            "tools",
+            true,
+            ToolPlacement::Mcp,
+            None,
+        )
+        .expect("valid test tool declaration");
+        let digest = spec.schema_digest();
+        let tool = ImportedTool {
+            spec,
+            digest,
+            server_id: "demo".to_owned(),
+            raw_name: "search".to_owned(),
+        };
+        let snapshot = ToolListSnapshot::from_imported(std::slice::from_ref(&tool));
+        assert_eq!(snapshot.len(), 1);
+        SnapshotEnvelope::new(snapshot, 3, false)
+    }
+
+    fn view<'a>(
+        registry: &'a ProviderRegistry,
+        pin: &'a PinEnvelope,
+        snapshot: &'a SnapshotEnvelope,
+    ) -> ReadOnlyView<'a> {
+        ReadOnlyView {
+            registry,
+            mcp_pin: pin,
+            mcp_snapshot: snapshot,
+        }
+    }
+
+    fn ready_result(outcome: DispatchOutcome) -> String {
+        match outcome {
+            DispatchOutcome::Ready { result, .. } => result,
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    fn refused_error(outcome: DispatchOutcome) -> IpcError {
+        match outcome {
+            DispatchOutcome::Refused(error) => error,
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_happy_path_returns_ordered_chain() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.model_select",
+            &granted,
+            &ledger,
+            br#"{"required":["text"]}"#,
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.model_select", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"status\":\"selected\""), "{result}");
+        // Lexicographic order: bitty-a/vision before bitty-fake/fake-chat.
+        let vision = result.find("\"vision\"").expect("vision selected");
+        let chat = result.find("\"fake-chat\"").expect("chat selected");
+        assert!(vision < chat, "{result}");
+    }
+
+    #[test]
+    fn select_narrowing_filters_chain() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        // Alias-exclusive plus window minimum plus cost ceiling: only the
+        // aliased fake-chat survives (vision is not an alias candidate).
+        let scoped = input(
+            "ai.model_select",
+            &granted,
+            &ledger,
+            br#"{"required":["text"],"alias":"chat","min_context_window_tokens":1024,"max_cost_weight":4}"#,
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.model_select", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"fake-chat\""), "{result}");
+        assert!(!result.contains("\"vision\""), "{result}");
+    }
+
+    #[test]
+    fn select_unknown_alias_refuses_not_found() {
+        // POLICY (AI-0302-E1a): an alias naming no registry entry refuses
+        // `NotFound` with a static reason, never the caller-supplied name.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.model_select",
+            &granted,
+            &ledger,
+            br#"{"required":["text"],"alias":"ghost"}"#,
+        );
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert!(
+            matches!(error, IpcError::NotFound { ref reason } if reason == "unknown model alias"),
+            "unexpected: {error:?}"
+        );
+        let shown = format!("{error:?}");
+        assert!(!shown.contains("ghost"), "{shown}");
+    }
+
+    #[test]
+    fn select_empty_match_returns_failed_result() {
+        // POLICY (AI-0302-E1a): a well-shaped request nothing satisfies is
+        // selection data, carried as the `failed`-status result the schema
+        // provides — not a refusal.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.model_select",
+            &granted,
+            &ledger,
+            br#"{"required":["reasoning"]}"#,
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.model_select", result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"status\":\"failed\",\"error\":\"no candidate satisfies the request\"}"
+        );
+    }
+
+    #[test]
+    fn fallback_maps_all_thirteen_errors() {
+        // POLICY (AI-0302-E1a): total over the 13-variant vocabulary —
+        // transient/provider-local advances, everything else (including
+        // `unknown`, which reconciles before retry) stops.
+        let cases: [(&str, &str); 13] = [
+            ("unknown_model", "stop"),
+            ("budget_exceeded", "stop"),
+            ("timeout", "advance"),
+            ("timeout_too_large", "stop"),
+            ("invalid_provider_id", "stop"),
+            ("transport", "advance"),
+            ("auth", "stop"),
+            ("rate_limited", "advance"),
+            ("capability_mismatch", "stop"),
+            ("model_unavailable", "advance"),
+            ("unknown", "stop"),
+            ("invalid_sampling", "stop"),
+            ("unsupported_sampling", "stop"),
+        ];
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        for (error, directive) in cases {
+            let params = format!("{{\"error\":\"{error}\",\"detail\":\"d\"}}");
+            let scoped = input("ai.model_fallback", &granted, &ledger, params.as_bytes());
+            let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+            validate_ai_result("ai.model_fallback", result.as_bytes()).expect("S-C result shape");
+            assert_eq!(
+                result,
+                format!("{{\"directive\":\"{directive}\"}}"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_echoes_inputs_with_effective_weights() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        // Zero weights count as baseline 1: 10*1 + 5*1 = 15.
+        let scoped = input(
+            "ai.model_cost",
+            &granted,
+            &ledger,
+            b"{\"input_tokens\":10,\"output_tokens\":5,\"input_weight\":0,\"output_weight\":0}",
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.model_cost", result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"input_tokens\":10,\"output_tokens\":5,\"input_weight\":0,\"output_weight\":0,\"cost\":15}"
+        );
+        // Host envelope agrees with the authoritative runtime arithmetic.
+        let envelope = EstimateCostEnvelopeRequest::new(10, 5, 0, 0).estimate();
+        assert!(envelope.is_consistent());
+        assert_eq!(envelope.cost, bitty_ai_runtime::estimate_cost(10, 5, 0, 0));
+    }
+
+    #[test]
+    fn list_answers_from_registry_snapshot_without_provider_io() {
+        // POLICY (AI-0302-E1a): no-execution proof — a live `FakeProvider`
+        // sits beside the call while the handler reads only the bridged
+        // registry snapshot; its call counters stay zero throughout.
+        use bitty_ai_runtime::ModelProvider as _;
+        let provider =
+            bitty_ai_runtime::FakeProvider::new("bitty-fake").expect("valid provider id");
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        for body in [&b"{}"[..], &b""[..]] {
+            let scoped = input("ai.provider_list", &granted, &ledger, body);
+            let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+            validate_ai_result("ai.provider_list", result.as_bytes()).expect("S-C result shape");
+            assert!(result.contains("\"fake-chat\""), "{result}");
+            assert!(result.contains("\"vision\""), "{result}");
+        }
+        assert_eq!(provider.complete_calls(), 0);
+        assert_eq!(provider.script_len(), 0);
+    }
+
+    #[test]
+    fn cache_hint_answers_miss_with_key_echo() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.cache_hint",
+            &granted,
+            &ledger,
+            br#"{"key":{"provider_id":"bitty-fake","model_id":"fake-chat","scope":"session","stable_prefix_hash":99,"prefix_len":12},"ask_scope":"session","fingerprint":{"digest":7,"input_len":12}}"#,
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.cache_hint", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"hit\":false"), "{result}");
+        assert!(result.contains("\"stable_prefix_hash\":99"), "{result}");
+    }
+
+    #[test]
+    fn cache_hint_over_grammar_id_refuses_invalid_request() {
+        // POLICY (AI-0302-E1a): bytes-only ids cross gate 5 but refuse
+        // typed at decode via the real S2 shape checks (uppercase violates
+        // `MP-2`), never passing through unchecked.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.cache_hint",
+            &granted,
+            &ledger,
+            br#"{"key":{"provider_id":"BITTY","model_id":"fake-chat","scope":"session","stable_prefix_hash":99,"prefix_len":12},"ask_scope":"session","fingerprint":{"digest":7,"input_len":12}}"#,
+        );
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn pin_echoes_validated_pin() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input("ai.mcp_pin", &granted, &ledger, b"{}");
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.mcp_pin", result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"protocol_version\":\"2025-11-25\",\"tools_supported\":true,\"tools_shape\":{\"kind\":\"bool_true\"}}"
+        );
+    }
+
+    #[test]
+    fn pin_object_shape_echoes_list_changed() {
+        use bitty_ai_host::mcp_placement::{InitializeResult, ToolsCapabilityShape};
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::Object {
+                list_changed: Some(true),
+            },
+        });
+        let snapshot = snapshot_two();
+        let scoped = input("ai.mcp_pin", &granted, &ledger, b"");
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.mcp_pin", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"kind\":\"object\""), "{result}");
+        assert!(result.contains("\"list_changed\":true"), "{result}");
+    }
+
+    #[test]
+    fn stale_pin_refuses_denied() {
+        // POLICY (AI-0302-E1a): a drifted pin (stale protocol version) is
+        // a fail-closed stop mapped to `Denied`; the drifted version
+        // string never crosses into the refusal.
+        use bitty_ai_host::mcp_placement::{InitializeResult, ToolsCapabilityShape};
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let stale = PinEnvelope::new(InitializeResult {
+            protocol_version: "1999-01-01".to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        });
+        let snapshot = snapshot_two();
+        let scoped = input("ai.mcp_pin", &granted, &ledger, b"{}");
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &stale, &snapshot)));
+        assert!(
+            matches!(
+                error,
+                IpcError::Denied { ref code, .. } if code == "VersionMismatch"
+            ),
+            "unexpected: {error:?}"
+        );
+        assert!(!format!("{error:?}").contains("1999"), "{error:?}");
+        let no_tools = PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: false,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        });
+        let scoped = input("ai.mcp_pin", &granted, &ledger, b"{}");
+        let error = refused_error(dispatch_with(
+            &scoped,
+            &view(&registry, &no_tools, &snapshot),
+        ));
+        assert!(
+            matches!(
+                error,
+                IpcError::Denied { ref code, .. } if code == "NoToolCapability"
+            ),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_echoes_entries_and_flags() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input("ai.mcp_snapshot", &granted, &ledger, b"{}");
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.mcp_snapshot", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"name\":\"mcp_demo_search\""), "{result}");
+        assert!(result.contains("\"list_version\":3"), "{result}");
+        assert!(result.contains("\"list_stale\":false"), "{result}");
+        // A stale envelope stays well-formed data with the flag reported.
+        let stale = SnapshotEnvelope::new(
+            bitty_ai_host::mcp_placement::ToolListSnapshot::from_imported(&[]),
+            4,
+            true,
+        );
+        let scoped = input("ai.mcp_snapshot", &granted, &ledger, b"");
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &stale)));
+        validate_ai_result("ai.mcp_snapshot", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"list_stale\":true"), "{result}");
+        assert!(result.contains("\"list_version\":4"), "{result}");
+    }
+
+    #[test]
+    fn manifest_echoes_declaration() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.extension_manifest",
+            &granted,
+            &ledger,
+            br#"{"manifest":{"name":"demo","version":"1.0","host":">=0.1","points":["tool","ui"]}}"#,
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.extension_manifest", result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"manifest\":{\"name\":\"demo\",\"version\":\"1.0\",\"host\":\">=0.1\",\"points\":[\"tool\",\"ui\"]}}"
+        );
+    }
+
+    #[test]
+    fn contribute_echoes_point_and_value() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input(
+            "ai.extension_contribute",
+            &granted,
+            &ledger,
+            br#"{"point":"tool","value":"effect-class:read-only"}"#,
+        );
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.extension_contribute", result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"point\":\"tool\",\"value\":\"effect-class:read-only\"}"
+        );
+    }
+
+    #[test]
+    fn activate_always_denies_explicitly() {
+        // POLICY (AI-0302-E1a): the S3 always-deny wires explicitly — known
+        // points deny fail-closed even when listed as enabled, unknown
+        // names refuse typed, and no success shape is ever emitted.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        for params in [
+            br#"{"point":"tool"}"#.as_slice(),
+            br#"{"point":"tool","enabled":["tool"]}"#.as_slice(),
+        ] {
+            let scoped = input("ai.extension_activate", &granted, &ledger, params);
+            let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+            assert!(
+                matches!(
+                    error,
+                    IpcError::Denied { ref code, ref reason }
+                    if code == "ActivationDenied"
+                        && reason == DENY_ALL_ACTIVATION_REASON
+                ),
+                "unexpected: {error:?}"
+            );
+        }
+        let scoped = input(
+            "ai.extension_activate",
+            &granted,
+            &ledger,
+            br#"{"point":"teleport"}"#,
+        );
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert!(
+            matches!(error, IpcError::NotFound { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(!format!("{error:?}").contains("teleport"));
+    }
+
+    #[test]
+    fn e1b_c_d_methods_still_return_not_wired() {
+        // POLICY (AI-0302-E1a): E1b (`context_read`), E1c
+        // (`provider_complete`), and E1d (`tool_dispatch`) stay NotWired
+        // after this change; only the ten E1a methods wire.
+        let invoke_granted = granted_invoke();
+        let invoke_ledger = ledger_for(Scope::AiInvoke);
+        let inspect_granted = granted_inspect();
+        let inspect_ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let cases: [(&str, &ScopeSet, &ConsentLedger, &[u8]); 3] = [
+            (
+                "ai.context_read",
+                &inspect_granted,
+                &inspect_ledger,
+                br#"{"scopes":["a"],"request":{"current_generation":1}}"#,
+            ),
+            (
+                "ai.provider_complete",
+                &invoke_granted,
+                &invoke_ledger,
+                br#"{"model":{"provider_id":"p","model":"m"},"messages":[],"budget_bytes":0,"timeout_ms":1000,"now_ms":5}"#,
+            ),
+            (
+                "ai.tool_dispatch",
+                &invoke_granted,
+                &invoke_ledger,
+                br#"{"tool":"t","args_digest":1,"caller":{"agent_instance_id":1,"session_id":2,"level":"inspect"},"now_ms":3}"#,
+            ),
+        ];
+        for (method, granted, ledger, params) in cases {
+            let scoped = input(method, granted, ledger, params);
+            match dispatch_with(&scoped, &view(&registry, &pin, &snapshot)) {
+                DispatchOutcome::NotWired { method: got, scope } => {
+                    assert_eq!(got, method);
+                    let _ = scope;
+                }
+                other => panic!("{method}: expected NotWired, got {other:?}"),
+            }
+            // The E0 entry agrees: admission without wiring.
+            assert!(
+                matches!(dispatch(&scoped), DispatchOutcome::NotWired { .. }),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn wired_entry_keeps_gate_order() {
+        // POLICY (AI-0302-E1a): `dispatch_with` admits through the same
+        // six gates in the same order — an unknown method refuses
+        // `NotFound` before any later gate runs, and a missing grant
+        // refuses `ScopeDenied` without consulting handlers.
+        let granted = ScopeSet::all();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_two();
+        let scoped = input("ai.evil", &granted, &ledger, b"{malformed");
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert!(matches!(error, IpcError::NotFound { .. }), "{error:?}");
+        let cli = ScopeSet::cli_default();
+        let scoped = input(
+            "ai.model_select",
+            &cli,
+            &ledger,
+            br#"{"required":["text"]}"#,
+        );
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert!(matches!(error, IpcError::ScopeDenied { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn decode_never_panics_on_adversarial_bytes() {
+        // POLICY (AI-0302-E1a): decode is total — truncation, deep
+        // nesting, bad escapes, and non-object tops all map to typed
+        // refusals, never panics (gate 5 owns production input; this
+        // proves the decoder alone cannot trap).
+        let hostile: [&[u8]; 8] = [
+            b"{",
+            b"[1,2",
+            br#"{"required":"#,
+            b"\xff\xfe",
+            br#"{"a":"\ud800"}"#,
+            br#"{"a":"\x"}"#,
+            b"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+            b"{\"required\":[\"text\"],}",
+        ];
+        for params in hostile {
+            let _ = decode_request("ai.model_select", params);
+            let _ = parse_params_object(params);
+        }
+    }
+
+    #[test]
+    fn json_escape_round_trips() {
+        // Names carrying quotes, backslashes, and control bytes echo
+        // byte-exact through encode/decode.
+        let tricky = "q\"u\\ote\nline\u{0001}end";
+        let encoded = encode_str(tricky);
+        let wrapped = format!("{{\"value\":{encoded}}}");
+        let parsed = parse_params_object(wrapped.as_bytes()).expect("encodes valid JSON");
+        assert_eq!(parsed.field("value").and_then(JVal::as_str), Some(tricky));
     }
 }
