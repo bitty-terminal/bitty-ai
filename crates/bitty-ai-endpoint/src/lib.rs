@@ -1999,15 +1999,31 @@ fn handle_context_read(ctx: &ContextView<'_>, params: &[u8]) -> Result<String, I
     let mut records_json = String::from("[");
     let mut refs_json = String::from("[");
     let mut absences_json = String::from("[");
-    let mut selected = 0usize;
     let mut absent = 0usize;
-    for record in ctx.records.iter().filter(|record| {
-        record.generation == generation
-            && envelope
-                .scopes
-                .iter()
-                .any(|scope| scope.as_str() == record.owner.as_str())
-    }) {
+    for (index, record) in ctx
+        .records
+        .iter()
+        .filter(|record| {
+            record.generation == generation
+                && envelope
+                    .scopes
+                    .iter()
+                    .any(|scope| scope.as_str() == record.owner.as_str())
+        })
+        .enumerate()
+    {
+        // POLICY (AI-0302-E1b): fail fast on the count bound BEFORE
+        // encoding the next record — the view slice is caller-supplied
+        // and unbounded, so checking after the loop would build an
+        // arbitrarily large payload first. `actual` reports the first
+        // over-limit count (limit + 1), not the total.
+        if index >= HOST_MAX_CONTEXT_RECORDS {
+            return Err(IpcError::LimitExceeded {
+                field: "context.records".into(),
+                limit: HOST_MAX_CONTEXT_RECORDS,
+                actual: index.saturating_add(1),
+            });
+        }
         // POLICY (AI-0302-E1b): stored-record shape failures refuse the
         // whole call fail-closed with static reasons (never record
         // content); bounds echo as numbers only. Mirrors assembly's
@@ -2087,6 +2103,17 @@ fn handle_context_read(ctx: &ContextView<'_>, params: &[u8]) -> Result<String, I
                         })?;
                     }
                     classified => {
+                        // POLICY (AI-0302-E1b): fail fast on the absence
+                        // bound BEFORE appending — same unbounded-payload
+                        // reason as the record check above; `actual` is
+                        // the first over-limit count.
+                        if absent >= HOST_MAX_ARTIFACTS {
+                            return Err(IpcError::LimitExceeded {
+                                field: "context.absences".into(),
+                                limit: HOST_MAX_ARTIFACTS,
+                                actual: absent.saturating_add(1),
+                            });
+                        }
                         if absent > 0 {
                             absences_json.push(',');
                         }
@@ -2104,7 +2131,7 @@ fn handle_context_read(ctx: &ContextView<'_>, params: &[u8]) -> Result<String, I
                 content
             }
         };
-        if selected > 0 {
+        if index > 0 {
             records_json.push(',');
             refs_json.push(',');
         }
@@ -2129,27 +2156,10 @@ fn handle_context_read(ctx: &ContextView<'_>, params: &[u8]) -> Result<String, I
         });
         records_json.push('}');
         refs_json.push_str(&encode_str(&record.id));
-        selected += 1;
     }
-    // POLICY (AI-0302-E1b): the envelope bound check mirrors
-    // `ContextReadResponse::validate` over the same S2 constants (the
-    // response value itself is unconstructible for reference arms — the
-    // mirror `ArtifactRef` has no public constructor — so the two
-    // comparisons run here against the shared bounds; no logic drifts).
-    if selected > HOST_MAX_CONTEXT_RECORDS {
-        return Err(IpcError::LimitExceeded {
-            field: "context.records".into(),
-            limit: HOST_MAX_CONTEXT_RECORDS,
-            actual: selected,
-        });
-    }
-    if absent > HOST_MAX_ARTIFACTS {
-        return Err(IpcError::LimitExceeded {
-            field: "context.absences".into(),
-            limit: HOST_MAX_ARTIFACTS,
-            actual: absent,
-        });
-    }
+    // POLICY (AI-0302-E1b): no post-loop count checks — both bounds
+    // refuse inside the loop before the exceeding item is encoded, so a
+    // post-loop check could never fire.
     records_json.push(']');
     refs_json.push(']');
     absences_json.push(']');
@@ -3926,6 +3936,96 @@ mod e1b_tests {
             ),
             "129 scopes must exceed the bound"
         );
+    }
+
+    #[test]
+    fn oversized_record_set_refuses_fail_fast_at_first_over_limit() {
+        // POLICY (AI-0302-E1b): the count bound refuses BEFORE encoding
+        // the exceeding record — a caller-supplied view larger than the
+        // bound must not build the payload first. `actual` reports the
+        // first over-limit count (CodeRabbit PR#497 review).
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let records: Vec<RuntimeRecord> = (0..(HOST_MAX_CONTEXT_RECORDS + 5))
+            .map(|i| {
+                inline_record(
+                    &format!("r-{i}"),
+                    "window-1",
+                    "project",
+                    "s",
+                    b"b",
+                    false,
+                    7,
+                )
+            })
+            .collect();
+        let params = read_params("\"window-1\"", 7);
+        let scoped = input("ai.context_read", &granted, &ledger, params.as_bytes());
+        let error = refused_error(dispatch_with_context(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&records, &store),
+        ));
+        match error {
+            IpcError::LimitExceeded {
+                field,
+                limit,
+                actual,
+            } => {
+                assert_eq!(field, "context.records");
+                assert_eq!(limit, HOST_MAX_CONTEXT_RECORDS);
+                assert_eq!(actual, HOST_MAX_CONTEXT_RECORDS + 1);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_absence_set_refuses_fail_fast_at_first_over_limit() {
+        // POLICY (AI-0302-E1b): same fail-fast rule for absences — refuse
+        // before appending the exceeding entry (CodeRabbit PR#497 review).
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let mut store = RuntimeArtifactStore::new();
+        let mut references = Vec::new();
+        for i in 0..(HOST_MAX_ARTIFACTS + 3) {
+            let reference = store.store(vec![i as u8], 7).expect("seed artifact");
+            assert!(store.invalidate(&reference));
+            references.push(reference);
+        }
+        let records: Vec<RuntimeRecord> = references
+            .iter()
+            .enumerate()
+            .map(|(i, reference)| {
+                artifact_record(&format!("a-{i}"), "project", false, reference.clone())
+            })
+            .collect();
+        let params = read_params("\"window-1\"", 7);
+        let scoped = input("ai.context_read", &granted, &ledger, params.as_bytes());
+        let error = refused_error(dispatch_with_context(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&records, &store),
+        ));
+        match error {
+            IpcError::LimitExceeded {
+                field,
+                limit,
+                actual,
+            } => {
+                assert_eq!(field, "context.absences");
+                assert_eq!(limit, HOST_MAX_ARTIFACTS);
+                assert_eq!(actual, HOST_MAX_ARTIFACTS + 1);
+            }
+            other => panic!("expected LimitExceeded, got {other:?}"),
+        }
     }
 
     #[test]
