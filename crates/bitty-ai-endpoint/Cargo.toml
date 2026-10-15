@@ -1,0 +1,25 @@
+[package]
+name = "bitty-ai-endpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Helper-side ai.* handler endpoint skeleton (AI-0302 E0: six-gate dispatcher shell, no per-method wiring)"
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# POLICY (AI-0302-E0): exactly three edges, authorized by the AI-0302 scoping
+# note (PX-1297) and owner decisions (PX-1298). The runtime edge (path) is for
+# E1 handler wiring; the host edge (path) is for the S2 envelope vocabulary;
+# the bitty-ipc-api edge (git, one-way dep into bitty-ai) carries the gate
+# pieces the E0 dispatcher walks. No other dependencies: no sockets, frames,
+# clocks, or threads on this path.
+bitty-ai-runtime = { path = "../bitty-ai-runtime" }
+bitty-ai-host = { path = "../bitty-ai-host" }
+bitty-ipc-api = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "d0c4ecd" }

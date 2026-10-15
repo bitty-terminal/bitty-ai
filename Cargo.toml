@@ -13,6 +13,9 @@ members = [
   # Host-boundary shell skeleton, Phase 1 per CTX-0147 (AI-0261). Names only,
   # no behavior; same quality posture as sibling crates from day one.
   "crates/bitty-ai-host",
+  # Helper-side ai.* handler endpoint skeleton, S-E per AI-0302 (E0: six-gate
+  # dispatcher shell, no per-method wiring; edges to runtime, host, ipc-api).
+  "crates/bitty-ai-endpoint",
   # Future crates:
   # - crates/bitty-ai-model-provider
   # - crates/bitty-ai-context-provider

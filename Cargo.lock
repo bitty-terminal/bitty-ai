@@ -86,6 +86,15 @@ version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-agent?rev=a8e4112#a8e4112116a7e6c74382ab8294a98096f74d2a14"
 
 [[package]]
+name = "bitty-ai-endpoint"
+version = "0.0.1"
+dependencies = [
+ "bitty-ai-host",
+ "bitty-ai-runtime",
+ "bitty-ipc-api",
+]
+
+[[package]]
 name = "bitty-ai-host"
 version = "0.0.1"
 
@@ -148,6 +157,11 @@ dependencies = [
 name = "bitty-ipc"
 version = "0.0.20"
 source = "git+https://github.com/bitty-terminal/bitty?rev=cfeffa2d8e1387029850940af2b64877dbfbe25f#cfeffa2d8e1387029850940af2b64877dbfbe25f"
+
+[[package]]
+name = "bitty-ipc-api"
+version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=d0c4ecd#d0c4ecd8f68ffef0301d10e2fe23f2ad8a3dcb0e"
 
 [[package]]
 name = "bitty-lua"
