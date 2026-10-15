@@ -2882,6 +2882,19 @@ fn handle_complete(
         Ok(turn) => turn,
         Err(error) => return Err(provider_error_refusal(input, &error)),
     };
+    // POLICY (AI-0302-E1c): over-timeout results refuse — a provider that
+    // returns latency past the requested timeout gets the timeout refusal,
+    // never a success (CodeRabbit PR#498 review). The synchronous call
+    // cannot be interrupted, but its result is never honored past deadline.
+    if turn.latency_ms > decoded.timeout_ms {
+        return Err(provider_error_refusal(
+            input,
+            &RuntimeProviderError::Timeout {
+                timeout_ms: decoded.timeout_ms,
+                latency_ms: turn.latency_ms,
+            },
+        ));
+    }
     // POLICY (AI-0302-E1c): provider output crosses back UNTRUSTED — the
     // text wraps verbatim at the boundary (empty stays empty, never
     // defaulted) and only unwraps into the S2 response constructor.
@@ -5162,6 +5175,67 @@ mod e1c_tests {
         assert!(!result.contains("cost"), "{result}");
         // POLICY (AI-0302-E1c): single attempt on success — exactly one
         // provider call, never retried.
+        assert_eq!(provider.complete_calls(), 1);
+    }
+
+    #[test]
+    fn over_timeout_result_refuses_instead_of_succeeding() {
+        // POLICY (AI-0302-E1c): a provider that returns latency past the
+        // requested timeout gets the timeout refusal, never a success
+        // (CodeRabbit PR#498 review). The call cannot be interrupted, but
+        // its result is never honored past deadline. Uses a dedicated
+        // double because FakeProvider self-polices scripted latency
+        // (refuses without counting) — this test must reach the
+        // endpoint-level check with an Ok turn.
+        struct SlowOkProvider {
+            calls: u64,
+        }
+        impl ModelProvider for SlowOkProvider {
+            fn provider_id(&self) -> &str {
+                PROVIDER_ID
+            }
+            fn list_models(&self) -> Vec<ModelDescriptor> {
+                Vec::new()
+            }
+            fn complete(
+                &mut self,
+                _request: &RuntimeTurnRequest,
+            ) -> Result<ProviderTurn, RuntimeProviderError> {
+                self.calls += 1;
+                Ok(ProviderTurn {
+                    text: "too slow".to_owned(),
+                    tool_calls: Vec::new(),
+                    latency_ms: 1500,
+                    usage: ProviderUsage::default(),
+                })
+            }
+            fn scripted_turns_remaining(&self) -> usize {
+                0
+            }
+            fn complete_calls(&self) -> u64 {
+                self.calls
+            }
+        }
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = SlowOkProvider { calls: 0 };
+        let params = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        match error {
+            IpcError::Timeout { timeout_ms, .. } => assert_eq!(timeout_ms, 1000),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
         assert_eq!(provider.complete_calls(), 1);
     }
 
