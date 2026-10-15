@@ -42,4 +42,5 @@ pub mod extension_registry;
 pub mod mcp_placement;
 pub mod model_selection;
 pub mod provider_registry;
+pub mod snapshot;
 pub mod tool_dispatch;
