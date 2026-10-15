@@ -61,4 +61,8 @@ allow-git = [
   # AI-0257: `bitty-agent-api` dev-dep for the vocabulary conformance
   # ledger (exact rev pin a8e4112, test-only). Named URL only, same rule.
   "https://github.com/bitty-terminal/bitty-agent",
+  # AI-0302 E0: `bitty-ipc-api` prod edge for the endpoint six-gate
+  # dispatcher (rev d0c4ecd per PX-1298, 7-char per workspace git-pin
+  # policy). Named URL only, same rule.
+  "https://github.com/bitty-terminal/bitty-ipc",
 ]
