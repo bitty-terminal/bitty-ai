@@ -59,7 +59,11 @@
 //!   and [`dispatch_with`] (E1a behavior) still returns
 //!   [`DispatchOutcome::NotWired`] for `ai.context_read`; only the new entry
 //!   wires it. E1c/d methods still return [`DispatchOutcome::NotWired`].
-//! - E1c: `provider_complete` plus the injection seam (pending).
+//! - E1c: `provider_complete` plus the injection seam — DONE via
+//!   [`dispatch_with_complete`] plus [`CompleteView`]. Gates 1-6,
+//!   [`dispatch`], [`dispatch_with`], and [`dispatch_with_context`]
+//!   behaviors are unchanged; `ai.tool_dispatch` still returns
+//!   [`DispatchOutcome::NotWired`] through every entry.
 //! - E1d: `tool_dispatch` digest-only plus host per-tool consent on top
 //!   (pending).
 //! - E2: params-schema plug-in plus the tolerant S-1 correlator field
@@ -115,6 +119,36 @@
 //! // takes a context result and returns dispatch input (separate types, no
 //! // `From` impl, explicit separation test).
 //!
+//! ## E1c handler contract
+//!
+//! [`dispatch_with_complete`] admits exactly like [`dispatch`] (same six
+//! gates, same order, gates untouched), then wires `ai.provider_complete`
+//! end to end over a caller-supplied [`CompleteView`]: decode validated
+//! params to the host `CompleteRequest` shape (hand-rolled depth-capped
+//! decode reusing the schema validators' bounds, no `serde`, no new
+//! dependency), run the pre-I/O gates (caller-scope filter with MP-4
+//! `provider/<id>` semantics, injected-provider identity match, budget fit,
+//! timeout ceiling, caller-`now_ms` deadline freshness), make exactly one
+//! [`ModelProvider`](bitty_ai_runtime::ModelProvider) call through the
+//! INJECTED provider only, and encode the S-C result JSON. Provider output
+//! crosses back UNTRUSTED (verbatim text tag, never defaulted) with
+//! usage/cost scalars echoed as attribution only (cost stays parked).
+//! Provider failures map through the `model_fallback` directive taxonomy
+//! (Advance-eligible shapes report advisability in the refusal; the rest
+//! stop with reconcile) with exactly one attempt — no retry loop here.
+//!
+//! // POLICY (AI-0302-E1c): injected-only provider — the view carries the
+//! // provider handle the caller selected at `ai.model_select`; the handler
+//! // never constructs, resolves, or selects a provider (no ambient, no
+//! // default, no fallback). Single attempt only: no loop surrounds the
+//! // provider call.
+//!
+//! // POLICY (AI-0302-E1c): provider-overrun residual (accepted) — the
+//! // provider trait takes no deadline, so the call itself cannot be
+//! // bounded; the handler refuses an already-past deadline before I/O and
+//! // documents that a slow provider may still overrun. No threads or
+//! // timers are spawned to fake a bound (no clock, no threads, no net).
+
 //! ## Normative precedence
 //!
 //! On any conflict between this skeleton and the accepted
@@ -195,12 +229,14 @@ pub enum DispatchOutcome {
         /// Scope the call was admitted under.
         scope: Scope,
     },
-    /// Admitted and answered by an E1a wired handler.
+    /// Admitted and answered by a wired E1 handler.
     ///
     /// // POLICY (AI-0302-E1a): `result` is the S-C result JSON text for
-    /// `method`, validated against `validate_ai_result` by tests. Only
-    /// the ten read-only E1a methods produce this variant; E1b/c/d arms
-    /// keep returning `NotWired`.
+    /// `method`, validated against `validate_ai_result` by tests. Each
+    /// dispatch entry wires only its own E-phase methods and keeps later
+    /// phases `NotWired` (`dispatch_with`: ten read-only methods;
+    /// `dispatch_with_context` adds `context_read`; `dispatch_with_complete`
+    /// adds `provider_complete`).
     Ready {
         /// Method that was admitted and answered.
         method: String,
@@ -914,6 +950,7 @@ enum DecodedRequest {
         enabled: Vec<String>,
     },
     ContextRead(ContextReadParams),
+    Complete(CompleteParams),
 }
 
 fn req_field<'v>(top: &'v JVal, method: &str, name: &'static str) -> Result<&'v JVal, IpcError> {
@@ -1256,7 +1293,7 @@ fn decode_activate(top: &JVal) -> Result<DecodedRequest, IpcError> {
 type DecodeFn = fn(&JVal) -> Result<DecodedRequest, IpcError>;
 
 /// Per-method decode table: the E1a methods that carry a body shape, plus
-/// the E1b `ai.context_read` arm.
+/// the E1b `ai.context_read` arm and the E1c `ai.provider_complete` arm.
 ///
 /// Fieldless methods (`ai.provider_list`, `ai.mcp_pin`, `ai.mcp_snapshot`)
 /// decode without a table arm: an empty-or-`{}` body is the whole request.
@@ -1271,6 +1308,14 @@ const DECODE_TABLE: &[(&str, DecodeFn)] = &[
     // POLICY (AI-0302-E1b): the E1b arm decodes through the real host
     // envelope vocabulary (`StableId`, `DetailLevel`); see `decode_context_read`.
     ("ai.context_read", decode_context_read),
+    // POLICY (AI-0302-E1c): the E1c arm decodes through the real host
+    // envelope vocabulary (`ModelRef`, `IpcMessage`/`IpcRole`,
+    // `SamplingNote`); see `decode_complete`. Shape bounds mirror gate 5;
+    // fit/range/freshness stay handler pre-I/O gates (also enforced at
+    // gate 5 on the dispatch path; the handler re-checks for direct
+    // callers), so decode passes fit-violating bodies through instead of
+    // refusing them early.
+    ("ai.provider_complete", decode_complete),
 ];
 
 fn decode_request(method: &str, params: &[u8]) -> Result<DecodedRequest, IpcError> {
@@ -2180,6 +2225,724 @@ fn handle_context_read(ctx: &ContextView<'_>, params: &[u8]) -> Result<String, I
     out.push_str(&budget.to_string());
     out.push_str(",\"absences\":");
     out.push_str(&absences_json);
+    out.push('}');
+    Ok(out)
+}
+
+// ── E1c provider_complete wiring ────────────────────────────────────────────
+//
+// Decode (validated params JSON to the host `CompleteRequest` shape) ->
+// pre-I/O gates (caller-scope filter, injected-provider identity match,
+// budget fit, timeout ceiling, caller-`now_ms` deadline freshness) ->
+// exactly one injected-provider call -> encode (S-C result JSON with the
+// completion text tagged untrusted and usage scalars echoed). No provider
+// construction, resolution, or selection anywhere; no retry loop; no
+// clock/threads/net: every value below is caller supplied or derived from
+// caller-supplied values.
+
+use bitty_ai_host::provider_registry::{
+    CallerScopeEcho, CompleteRequest, CompleteResponse, CompleteToolCall, CompleteUsage,
+    IpcEnvelopeError as HostEnvelopeError, IpcMessage, IpcRole, MAX_REQUEST_TIMEOUT_MS,
+    ModelRef as HostModelRef, SamplingNote, validate_caller_scope,
+};
+use bitty_ai_runtime::provider::Message as RuntimeMessage;
+use bitty_ai_runtime::{
+    ModelProvider, ProviderError as RuntimeProviderError, Role as RuntimeRole,
+    TurnRequest as RuntimeTurnRequest,
+};
+use bitty_ipc_api::{
+    AgentRefusal, MAX_SCHEMA_CONTEXT_REF_BYTES, MAX_SCHEMA_CONTEXT_REFS, MAX_SCHEMA_MESSAGE_BYTES,
+    MAX_SCHEMA_MESSAGES, MAX_SCHEMA_TOOL_NAME_BYTES, MAX_SCHEMA_TOOLS,
+};
+
+/// Caller-supplied execution view for the E1c wired method.
+///
+/// // POLICY (AI-0302-E1c): injected-only provider — the provider handle
+/// arrives here from the caller (selected at `ai.model_select`), and the
+/// handler takes it as given. The sibling [`ReadOnlyView`] stays
+/// behavior-free (its structural no-execution proof is untouched); this
+/// sibling type is the single place a behavior trait crosses, and it
+/// crosses only toward the `ai.provider_complete` arm.
+pub struct CompleteView<'a> {
+    /// Injected provider the single completion call runs against. Never
+    /// constructed, resolved, or selected inside the handler: the identity
+    /// match gate verifies it serves the referenced provider id, and
+    /// anything else refuses fail-closed.
+    pub provider: &'a mut dyn ModelProvider,
+    /// Caller scope observation for the MP-4 filter (audit data, not
+    /// authority: constructing it grants nothing; only the handler's
+    /// host-side check enforces).
+    pub caller_scope: CallerScopeEcho,
+}
+
+// POLICY (AI-0302-E1c): manual `Debug` (no derive): `dyn ModelProvider`
+// carries no `Debug` bound, and the impl prints the provider id plus the
+// scope echo only — never scripted turns, usage, or sampling values.
+impl std::fmt::Debug for CompleteView<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompleteView")
+            .field("provider_id", &self.provider.provider_id())
+            .field("caller_scope", &self.caller_scope)
+            .finish()
+    }
+}
+
+/// E1c dispatch entry: admit exactly like [`dispatch`], then wire
+/// `ai.provider_complete` end to end over `complete`.
+///
+/// Gate refusals pass through unchanged as [`DispatchOutcome::Refused`].
+/// Every other method delegates to [`dispatch_with_context`] verbatim
+/// (same E1b table, same `NotWired` fallback), so this entry extends the
+/// wiring without restructuring it.
+pub fn dispatch_with_complete(
+    input: &DispatchInput<'_>,
+    view: &ReadOnlyView<'_>,
+    ctx: &ContextView<'_>,
+    complete: &mut CompleteView<'_>,
+) -> DispatchOutcome {
+    // POLICY (AI-0302-E1c): the injected provider is consulted on the
+    // `ai.provider_complete` arm only. All other methods share the E1b
+    // entry untouched, so provider behavior cannot influence any other
+    // dispatch.
+    if input.method != "ai.provider_complete" {
+        return dispatch_with_context(input, view, ctx);
+    }
+    let probe = GateProbe::default();
+    let scope = match run_gates(input, &probe) {
+        // POLICY (AI-0302-E1c): gates run first and unchanged; no handler
+        // contact before admission, same as E0/E1a/E1b.
+        Ok(scope) => scope,
+        Err(error) => return DispatchOutcome::Refused(error),
+    };
+    match handle_complete(input, complete) {
+        Ok(result) => DispatchOutcome::Ready {
+            method: input.method.to_string(),
+            scope,
+            result,
+        },
+        Err(error) => DispatchOutcome::Refused(error),
+    }
+}
+
+/// Decoded `ai.provider_complete` params (owned data, no input borrows).
+///
+/// Shapes arrive as the real host envelope vocabulary: [`HostModelRef`]
+/// for the model reference (grammar checked by the real host constructor
+/// at decode), [`IpcMessage`]/[`IpcRole`] for the conversation, and
+/// [`SamplingNote`] for the declaration note. Fit (budget), range
+/// (timeout), and freshness (deadline) are NOT decode checks: they are
+/// handler pre-I/O gates so direct callers get the same order proof as
+/// the dispatch path (gate 5 enforces them there first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompleteParams {
+    /// Target model reference (validated shapes).
+    model: HostModelRef,
+    /// Bounded conversation messages.
+    messages: Vec<IpcMessage>,
+    /// Stable-id references resolved server-side (absent = none).
+    context_refs: Vec<String>,
+    /// Tool Bus names validated against tool consent at execution.
+    tools: Vec<String>,
+    /// Per-turn context ceiling in bytes.
+    budget_bytes: usize,
+    /// Caller deadline in milliseconds from `now_ms`.
+    timeout_ms: u64,
+    /// Caller-supplied timestamp; no wall clock is read.
+    now_ms: u64,
+    /// Sampling declaration note (declaration only, never values).
+    sampling: SamplingNote,
+}
+
+fn decode_role(name: &str) -> Option<IpcRole> {
+    // POLICY (AI-0302-E1c): closed role vocabulary (same set the schema
+    // validator enforces); no wildcard so a fourth role breaks
+    // compilation here instead of misrouting.
+    match name {
+        "user" => Some(IpcRole::User),
+        "assistant" => Some(IpcRole::Assistant),
+        "tool" => Some(IpcRole::Tool),
+        _ => None,
+    }
+}
+
+fn decode_complete(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.provider_complete";
+    let model_fields = req_field(top, METHOD, "model")?.as_obj().ok_or_else(|| {
+        decode_invalid("ai.provider_complete params: field 'model' must be an object")
+    })?;
+    let model_view = JVal::Obj(model_fields.to_vec());
+    let provider_id = req_str_field(&model_view, METHOD, "provider_id")?;
+    bound_len(
+        &provider_id,
+        METHOD,
+        "model.provider_id",
+        MAX_SCHEMA_PROVIDER_ID_BYTES,
+    )?;
+    let model_name = req_str_field(&model_view, METHOD, "model")?;
+    bound_len(
+        &model_name,
+        METHOD,
+        "model.model",
+        MAX_SCHEMA_MODEL_NAME_BYTES,
+    )?;
+    // POLICY (AI-0302-E1c): name grammars stay S2-owned (same
+    // bytes-only-cross-then-shape-check rule as the E1a cache_hint ids):
+    // over-grammar references refuse typed here via the real S2 shape
+    // checks, never pass through unchecked.
+    let model = HostModelRef::new(provider_id, model_name).map_err(|_| {
+        decode_invalid("ai.provider_complete params: model reference has a bad shape")
+    })?;
+    let messages = req_field(top, METHOD, "messages")?
+        .as_arr()
+        .ok_or_else(|| {
+            decode_invalid("ai.provider_complete params: field 'messages' must be an array")
+        })?;
+    if messages.len() > MAX_SCHEMA_MESSAGES {
+        return Err(IpcError::LimitExceeded {
+            field: "messages".into(),
+            limit: MAX_SCHEMA_MESSAGES,
+            actual: messages.len(),
+        });
+    }
+    let mut decoded_messages = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        let fields = message.as_obj().ok_or_else(|| {
+            decode_invalid(&format!(
+                "ai.provider_complete params: messages[{index}] must be an object"
+            ))
+        })?;
+        let item = JVal::Obj(fields.to_vec());
+        let role_name = req_str_field(&item, METHOD, "role")?;
+        let role = decode_role(&role_name).ok_or_else(|| {
+            decode_invalid("ai.provider_complete params: role not in closed vocabulary")
+        })?;
+        let content = req_str_field(&item, METHOD, "content")?;
+        if content.len() > MAX_SCHEMA_MESSAGE_BYTES {
+            return Err(IpcError::LimitExceeded {
+                field: "messages.content".into(),
+                limit: MAX_SCHEMA_MESSAGE_BYTES,
+                actual: content.len(),
+            });
+        }
+        decoded_messages.push(IpcMessage { role, content });
+    }
+    // POLICY (AI-0302-E1c): optional, default `[]` (absent = no refs;
+    // least data crosses — same rule the schema validator enforces).
+    let context_refs = match opt_field(top, "context_refs") {
+        None => Vec::new(),
+        Some(value) => {
+            let refs = value.as_arr().ok_or_else(|| {
+                decode_invalid("ai.provider_complete params: field 'context_refs' must be an array")
+            })?;
+            if refs.len() > MAX_SCHEMA_CONTEXT_REFS {
+                return Err(IpcError::LimitExceeded {
+                    field: "context_refs".into(),
+                    limit: MAX_SCHEMA_CONTEXT_REFS,
+                    actual: refs.len(),
+                });
+            }
+            let mut out = Vec::with_capacity(refs.len());
+            for entry in refs {
+                match entry {
+                    JVal::Str(text)
+                        if !text.is_empty() && text.len() <= MAX_SCHEMA_CONTEXT_REF_BYTES =>
+                    {
+                        out.push(text.clone());
+                    }
+                    JVal::Str(text) => {
+                        return Err(IpcError::LimitExceeded {
+                            field: "context_refs".into(),
+                            limit: MAX_SCHEMA_CONTEXT_REF_BYTES,
+                            actual: text.len(),
+                        });
+                    }
+                    _ => {
+                        return Err(decode_invalid(
+                            "ai.provider_complete params: context_refs entries must be strings",
+                        ));
+                    }
+                }
+            }
+            out
+        }
+    };
+    // POLICY (AI-0302-E1c): optional, default `[]`; bytes only, no
+    // tool-name grammar (same rule the schema validator enforces).
+    let tools = match opt_field(top, "tools") {
+        None => Vec::new(),
+        Some(value) => {
+            let names = value.as_arr().ok_or_else(|| {
+                decode_invalid("ai.provider_complete params: field 'tools' must be an array")
+            })?;
+            if names.len() > MAX_SCHEMA_TOOLS {
+                return Err(IpcError::LimitExceeded {
+                    field: "tools".into(),
+                    limit: MAX_SCHEMA_TOOLS,
+                    actual: names.len(),
+                });
+            }
+            let mut out = Vec::with_capacity(names.len());
+            for entry in names {
+                match entry {
+                    JVal::Str(text)
+                        if !text.is_empty() && text.len() <= MAX_SCHEMA_TOOL_NAME_BYTES =>
+                    {
+                        out.push(text.clone());
+                    }
+                    JVal::Str(text) => {
+                        return Err(IpcError::LimitExceeded {
+                            field: "tools".into(),
+                            limit: MAX_SCHEMA_TOOL_NAME_BYTES,
+                            actual: text.len(),
+                        });
+                    }
+                    _ => {
+                        return Err(decode_invalid(
+                            "ai.provider_complete params: tools entries must be strings",
+                        ));
+                    }
+                }
+            }
+            out
+        }
+    };
+    let budget_raw = req_u64_field(top, METHOD, "budget_bytes")?;
+    let budget_bytes = usize::try_from(budget_raw).map_err(|_| {
+        decode_invalid("ai.provider_complete params: field 'budget_bytes' is too large")
+    })?;
+    let timeout_ms = req_u64_field(top, METHOD, "timeout_ms")?;
+    let now_ms = req_u64_field(top, METHOD, "now_ms")?;
+    // POLICY (AI-0302-E1c): optional, default `Undeclared` (absent flows
+    // through untouched — matches the S2 `#[default]`); a declared note
+    // is accepted here and refused at the handler gate (values never
+    // cross, so there is nothing to validate or pass).
+    let sampling = match opt_field(top, "sampling") {
+        None => SamplingNote::Undeclared,
+        Some(value) => {
+            let name = value.as_str().ok_or_else(|| {
+                decode_invalid(
+                    "ai.provider_complete params: field 'sampling' not in closed vocabulary",
+                )
+            })?;
+            match name {
+                "undeclared" => SamplingNote::Undeclared,
+                "declared" => SamplingNote::Declared,
+                _ => {
+                    return Err(decode_invalid(
+                        "ai.provider_complete params: field 'sampling' not in closed vocabulary",
+                    ));
+                }
+            }
+        }
+    };
+    Ok(DecodedRequest::Complete(CompleteParams {
+        model,
+        messages: decoded_messages,
+        context_refs,
+        tools,
+        budget_bytes,
+        timeout_ms,
+        now_ms,
+        sampling,
+    }))
+}
+
+/// Provider completion text tagged UNTRUSTED at the boundary.
+///
+/// The field is private so the only path in is [`UntrustedText::new`]
+/// (verbatim, never defaulted: empty stays empty) and the only path out
+/// is [`UntrustedText::into_inner`] into the S2 response constructor.
+/// There is no trust upgrade: a completion Ready result is untrusted
+/// observation data, same discipline as the E1b span labels, and must
+/// never feed a `tool_dispatch` input automatically.
+struct UntrustedText(String);
+
+impl UntrustedText {
+    fn new(text: String) -> Self {
+        Self(text)
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+/// Scope denial naming the required scope derived from the shaped model
+/// reference (`provider/<provider_id>`).
+///
+/// // POLICY (AI-0302-E1c): the denial echoes the required scope only —
+/// never the raw caller scope string (unvalidated bytes) and never another
+/// entry's name. The provider id crossed shaped (real S2 grammar at
+/// decode) and bounded, so the echo is safe to log.
+fn complete_scope_denial(model: &HostModelRef, method: &str) -> IpcError {
+    IpcError::ScopeDenied {
+        scope: format!("provider/{}", model.provider_id),
+        action: method.into(),
+    }
+}
+
+/// Map an S2 request-envelope refusal to its IPC expression.
+///
+/// Total with no wildcard: adding an [`HostEnvelopeError`] variant breaks
+/// compilation here instead of misclassifying. Request-count overruns map
+/// to `LimitExceeded` (same count-pair precedent as the context-read
+/// rows); timeout/budget map through [`AgentRefusal`]; the reserved-scope
+/// and response-side arms are unreachable on this path and refuse
+/// `Internal` fail-closed if they ever fire.
+fn envelope_refusal(error: HostEnvelopeError) -> IpcError {
+    match error {
+        HostEnvelopeError::TooManyMessages { limit, actual } => IpcError::LimitExceeded {
+            field: "messages".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::MessageTooLarge { limit, actual } => IpcError::LimitExceeded {
+            field: "messages.content".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::TooManyContextRefs { limit, actual } => IpcError::LimitExceeded {
+            field: "context_refs".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::ContextRefTooLarge { limit, actual } => IpcError::LimitExceeded {
+            field: "context_refs".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::TooManyTools { limit, actual } => IpcError::LimitExceeded {
+            field: "tools".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::ToolNameTooLarge { limit, actual } => IpcError::LimitExceeded {
+            field: "tools".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::TimeoutTooLarge { max, actual } => {
+            AgentRefusal::TimeoutTooLarge { max, actual }.to_ipc_error()
+        }
+        HostEnvelopeError::BudgetExceeded { limit, actual } => {
+            AgentRefusal::BudgetExceeded { limit, actual }.to_ipc_error()
+        }
+        HostEnvelopeError::ReservedScopeDenied => IpcError::Internal {
+            reason: "complete request carries no caller scope field".into(),
+        },
+        HostEnvelopeError::TooManyModels { .. } => IpcError::Internal {
+            reason: "request check refused outside its request taxonomy".into(),
+        },
+        HostEnvelopeError::ResponseTextTooLarge { .. }
+        | HostEnvelopeError::TooManyToolCalls { .. }
+        | HostEnvelopeError::ToolArgumentsTooLarge { .. } => IpcError::Internal {
+            reason: "request check refused outside its request taxonomy".into(),
+        },
+    }
+}
+
+/// Map an S2 response-envelope refusal to its IPC expression.
+///
+/// Total with no wildcard. Text/tool-call overruns map to `LimitExceeded`
+/// (fail-closed, never truncated silently); the request-side arms are
+/// unreachable here and refuse `Internal` fail-closed if they ever fire.
+fn response_refusal(error: HostEnvelopeError) -> IpcError {
+    match error {
+        HostEnvelopeError::ResponseTextTooLarge { limit, actual } => IpcError::LimitExceeded {
+            field: "text".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::TooManyToolCalls { limit, actual } => IpcError::LimitExceeded {
+            field: "tool_calls".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::ToolNameTooLarge { limit, actual } => IpcError::LimitExceeded {
+            field: "tool_calls.name".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::ToolArgumentsTooLarge { limit, actual } => IpcError::LimitExceeded {
+            field: "tool_calls.arguments".into(),
+            limit,
+            actual,
+        },
+        HostEnvelopeError::TooManyMessages { .. }
+        | HostEnvelopeError::MessageTooLarge { .. }
+        | HostEnvelopeError::TooManyContextRefs { .. }
+        | HostEnvelopeError::ContextRefTooLarge { .. }
+        | HostEnvelopeError::TooManyTools { .. }
+        | HostEnvelopeError::TimeoutTooLarge { .. }
+        | HostEnvelopeError::BudgetExceeded { .. }
+        | HostEnvelopeError::TooManyModels { .. }
+        | HostEnvelopeError::ReservedScopeDenied => IpcError::Internal {
+            reason: "response constructor refused outside its response taxonomy".into(),
+        },
+    }
+}
+
+/// Map one provider failure to its single-attempt refusal.
+///
+/// Total with no wildcard: adding a [`RuntimeProviderError`] variant breaks
+/// compilation here instead of misrouting. The four transient or
+/// provider-local variants (`Transport`, `RateLimited`,
+/// `ModelUnavailable`, `Timeout`) refuse with Advance-eligible shapes —
+/// advisability is reported in the refusal, never acted on here (no retry
+/// loop; the caller drives any retry via `ai.model_fallback` plus a fresh
+/// call). Everything else stops: caller/config shapes refuse
+/// `InvalidRequest`, unknown models refuse `NotFound`, authorization
+/// refuses through [`AgentRefusal::ProviderAuthDenied`], and uncertain
+/// effects refuse through [`AgentRefusal::UnknownAckLoss`]
+/// (reconcile-before-retry, never blind fallback). The `e1c` taxonomy test
+/// locks every arm against `fallback_directive`, so drift between this
+/// table and `model_fallback` fails loudly. All reasons stay static: no
+/// provider-echoed string crosses (no secrets, no vendor text, no key
+/// material).
+fn provider_error_refusal(input: &DispatchInput<'_>, error: &RuntimeProviderError) -> IpcError {
+    match error {
+        RuntimeProviderError::UnknownModel { .. } => IpcError::NotFound {
+            reason: "unknown model".into(),
+        },
+        RuntimeProviderError::BudgetExceeded { limit, actual } => AgentRefusal::BudgetExceeded {
+            limit: *limit,
+            actual: *actual,
+        }
+        .to_ipc_error(),
+        RuntimeProviderError::Timeout { timeout_ms, .. } => IpcError::Timeout {
+            request_id: input.request_id,
+            timeout_ms: *timeout_ms,
+        },
+        RuntimeProviderError::TimeoutTooLarge { max, actual } => AgentRefusal::TimeoutTooLarge {
+            max: *max,
+            actual: *actual,
+        }
+        .to_ipc_error(),
+        RuntimeProviderError::InvalidProviderId { .. } => {
+            decode_invalid("ai.provider_complete params: provider id has a bad shape")
+        }
+        RuntimeProviderError::Transport { .. } => IpcError::Transport {
+            reason: "provider transport failure; advance to the next candidate".into(),
+        },
+        RuntimeProviderError::Auth { .. } => AgentRefusal::ProviderAuthDenied.to_ipc_error(),
+        RuntimeProviderError::RateLimited { .. } => IpcError::Denied {
+            code: "RateLimited".into(),
+            reason: "provider rate limited; back off or advance to the next candidate".into(),
+        },
+        RuntimeProviderError::CapabilityMismatch { .. } => {
+            decode_invalid("ai.provider_complete result: model lacks required capabilities")
+        }
+        RuntimeProviderError::ModelUnavailable { .. } => IpcError::Unavailable {
+            reason: "model unavailable; advance to the next candidate".into(),
+        },
+        RuntimeProviderError::Unknown { .. } => AgentRefusal::UnknownAckLoss.to_ipc_error(),
+        RuntimeProviderError::InvalidSampling => {
+            decode_invalid("ai.provider_complete params: invalid sampling contract")
+        }
+        RuntimeProviderError::UnsupportedSampling { .. } => {
+            decode_invalid("ai.provider_complete params: sampling option unsupported by backend")
+        }
+    }
+}
+
+fn handle_complete(
+    input: &DispatchInput<'_>,
+    view: &mut CompleteView<'_>,
+) -> Result<String, IpcError> {
+    const METHOD: &str = "ai.provider_complete";
+    let DecodedRequest::Complete(decoded) = decode_request(METHOD, input.params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1c): a declared sampling note carries no values
+    // across IPC, so there is nothing to validate and nothing to pass.
+    // Refusing fail-closed beats fabricating a contract (never defaulted)
+    // or silently downgrading to undeclared. Sampling-value carriage is
+    // deferred: MP-5 values stay caller-side.
+    if decoded.sampling == SamplingNote::Declared {
+        return Err(decode_invalid(
+            "ai.provider_complete params: declared sampling carries no values",
+        ));
+    }
+    // POLICY (AI-0302-E1c): pre-I/O gates run in this order — caller-scope
+    // filter, identity match, budget fit, timeout ceiling, deadline
+    // freshness — and every refusal precedes the single provider call
+    // below. The order proof lives in the `e1c` gate-order tests (poisoned
+    // provider, direct handler calls).
+    //
+    // Caller-scope filter with MP-4 host semantics: the scope string must
+    // be well-formed (`validate_caller_scope`) and name exactly
+    // `provider/<referenced provider id>` (intersection-only narrowing;
+    // any other well-formed prefix stays unknown, never widening).
+    validate_caller_scope(&view.caller_scope.scope)
+        .map_err(|_| complete_scope_denial(&decoded.model, METHOD))?;
+    let granted = view
+        .caller_scope
+        .scope
+        .strip_prefix("provider/")
+        .ok_or_else(|| complete_scope_denial(&decoded.model, METHOD))?;
+    if granted != decoded.model.provider_id {
+        return Err(complete_scope_denial(&decoded.model, METHOD));
+    }
+    // POLICY (AI-0302-E1c): identity before spend — the injected provider
+    // must serve the referenced provider id. The registry select already
+    // happened at `ai.model_select`; this check only verifies the match
+    // and refuses fail-closed (static reason, never the disagreeing ids).
+    if view.provider.provider_id() != decoded.model.provider_id {
+        return Err(IpcError::NotFound {
+            reason: "provider and model reference disagree".into(),
+        });
+    }
+    // POLICY (AI-0302-E1c): budget gate refuses before I/O
+    // (never spend-then-check): message bytes past `budget_bytes` map
+    // through `AgentRefusal::BudgetExceeded`, same expression as gate 5.
+    let mut total_bytes = 0usize;
+    for message in &decoded.messages {
+        total_bytes = total_bytes.saturating_add(message.content.len());
+    }
+    if total_bytes > decoded.budget_bytes {
+        return Err(AgentRefusal::BudgetExceeded {
+            limit: decoded.budget_bytes,
+            actual: total_bytes,
+        }
+        .to_ipc_error());
+    }
+    // POLICY (AI-0302-E1c): timeout ceiling refuses before I/O through
+    // `AgentRefusal::TimeoutTooLarge` (same S2 `MAX_REQUEST_TIMEOUT_MS`
+    // bound the envelope enforces).
+    if decoded.timeout_ms == 0 || decoded.timeout_ms > MAX_REQUEST_TIMEOUT_MS {
+        return Err(AgentRefusal::TimeoutTooLarge {
+            max: MAX_REQUEST_TIMEOUT_MS,
+            actual: decoded.timeout_ms,
+        }
+        .to_ipc_error());
+    }
+    // POLICY (AI-0302-E1c): the S2 envelope backstop re-checks the shape
+    // through the real `CompleteRequest::check` (timeout-before-budget
+    // order inside is moot: both gates already passed with identical
+    // arithmetic, so this confirms rather than decides).
+    let envelope = CompleteRequest {
+        model: HostModelRef {
+            provider_id: decoded.model.provider_id.clone(),
+            model: decoded.model.model.clone(),
+        },
+        messages: decoded.messages.clone(),
+        context_refs: decoded.context_refs.clone(),
+        tools: decoded.tools.clone(),
+        budget_bytes: decoded.budget_bytes,
+        timeout_ms: decoded.timeout_ms,
+        now_ms: decoded.now_ms,
+        sampling: SamplingNote::Undeclared,
+    };
+    envelope.check().map_err(envelope_refusal)?;
+    // POLICY (AI-0302-E1c): deadline freshness refuses before I/O — when
+    // the caller clock already stands past the params deadline
+    // (`now_ms >= params.now_ms + params.timeout_ms`, same expiry rule as
+    // gate 4), the call refuses `Timeout` instead of running Unbounded.
+    // Residual (accepted): the synchronous provider call itself takes no
+    // deadline — the trait has no deadline parameter — so a slow provider
+    // may still overrun after this check passes. No threads or timers are
+    // spawned to fake a bound.
+    if input.now_ms >= domain_deadline_ms(decoded.now_ms, decoded.timeout_ms) {
+        return Err(IpcError::Timeout {
+            request_id: input.request_id,
+            timeout_ms: decoded.timeout_ms,
+        });
+    }
+    let turn_request = RuntimeTurnRequest {
+        model: decoded.model.model.clone(),
+        messages: decoded
+            .messages
+            .iter()
+            .map(|message| RuntimeMessage {
+                role: match message.role {
+                    IpcRole::User => RuntimeRole::User,
+                    IpcRole::Assistant => RuntimeRole::Assistant,
+                    IpcRole::Tool => RuntimeRole::Tool,
+                },
+                content: message.content.clone(),
+            })
+            .collect(),
+        context_refs: decoded.context_refs.clone(),
+        tools: decoded.tools.clone(),
+        budget_bytes: decoded.budget_bytes,
+        timeout_ms: decoded.timeout_ms,
+        now_ms: decoded.now_ms,
+        // POLICY (AI-0302-E1c): undeclared flows untouched (`Declared`
+        // refused above; `None` is never defaulted into a contract here).
+        sampling: None,
+    };
+    // POLICY (AI-0302-E1c): exactly one provider call — no retry loop, no
+    // fallback chain. Advance-eligible failures report advisability
+    // through the refusal shape (see `provider_error_refusal`); the caller
+    // drives any retry via `ai.model_fallback` plus a fresh call.
+    let turn = match view.provider.complete(&turn_request) {
+        Ok(turn) => turn,
+        Err(error) => return Err(provider_error_refusal(input, &error)),
+    };
+    // POLICY (AI-0302-E1c): provider output crosses back UNTRUSTED — the
+    // text wraps verbatim at the boundary (empty stays empty, never
+    // defaulted) and only unwraps into the S2 response constructor.
+    let text = UntrustedText::new(turn.text);
+    let mut tool_calls = Vec::with_capacity(turn.tool_calls.len());
+    for call in &turn.tool_calls {
+        tool_calls.push(CompleteToolCall {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        });
+    }
+    // POLICY (AI-0302-E1c): usage/cost scalars echo attribution only —
+    // the AI-0219 cache slots echo verbatim (never settled) and cost stays
+    // parked (no cost field exists anywhere on this path).
+    let response = CompleteResponse::new(
+        text.into_inner(),
+        tool_calls,
+        CompleteUsage {
+            input_tokens: turn.usage.input_tokens,
+            output_tokens: turn.usage.output_tokens,
+            cached_tokens: turn.usage.cached_tokens,
+            cache_write_tokens: turn.usage.cache_write_tokens,
+        },
+        turn.latency_ms,
+    )
+    .map_err(response_refusal)?;
+    encode_complete_response(&response)
+}
+
+fn encode_complete_response(response: &CompleteResponse) -> Result<String, IpcError> {
+    // Hand-rolled S-C result JSON (no `serde`, no new dependency): exactly
+    // the shape `validate_ai_result` enforces for `ai.provider_complete`.
+    let mut out = String::from("{\"text\":");
+    out.push_str(&encode_str(&response.text));
+    out.push_str(",\"tool_calls\":[");
+    for (index, call) in response.tool_calls.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        // POLICY (AI-0302-E1c): arguments cross as UTF-8 text only (the
+        // S-C rule, same as E1b inline bytes); binary payloads refuse
+        // typed rather than crossing smuggled or dropping silent.
+        let arguments = std::str::from_utf8(&call.arguments).map_err(|_| {
+            decode_invalid("ai.provider_complete result: tool arguments are not UTF-8 text")
+        })?;
+        out.push_str("{\"name\":");
+        out.push_str(&encode_str(&call.name));
+        out.push_str(",\"arguments\":");
+        out.push_str(&encode_str(arguments));
+        out.push('}');
+    }
+    out.push_str("],\"usage\":{\"input_tokens\":");
+    out.push_str(&response.usage.input_tokens.to_string());
+    out.push_str(",\"output_tokens\":");
+    out.push_str(&response.usage.output_tokens.to_string());
+    out.push_str(",\"cached_tokens\":");
+    out.push_str(&response.usage.cached_tokens.to_string());
+    out.push_str(",\"cache_write_tokens\":");
+    out.push_str(&response.usage.cache_write_tokens.to_string());
+    out.push_str("},\"latency_ms\":");
+    out.push_str(&response.latency_ms.to_string());
     out.push('}');
     Ok(out)
 }
@@ -4120,5 +4883,952 @@ mod e1b_tests {
             matches!(error, IpcError::InvalidRequest { .. }),
             "unexpected: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod e1c_tests {
+    use super::*;
+    use bitty_ai_runtime::{
+        FakeProvider, ModelDescriptor, ProviderTurn, ProviderUsage, ToolCallRequest,
+        fallback_directive,
+    };
+    use bitty_ipc_api::validate_ai_result;
+
+    const CLIENT: &str = "agent-7";
+    const COMPLETE_METHOD: &str = "ai.provider_complete";
+    const PROVIDER_ID: &str = "bitty-fake";
+
+    fn granted_invoke() -> ScopeSet {
+        ScopeSet::single(Scope::AiInvoke)
+    }
+
+    fn ledger_for(scope: Scope) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(CLIENT.to_owned(), scope, 0, 10_000, "user".to_owned())
+            .expect("grant fits in an empty ledger");
+        ledger
+    }
+
+    fn input<'a>(
+        method: &'a str,
+        granted: &'a ScopeSet,
+        ledger: &'a ConsentLedger,
+        now_ms: u64,
+        created_at_ms: u64,
+        timeout_ms: u64,
+        params: &'a [u8],
+    ) -> DispatchInput<'a> {
+        DispatchInput {
+            method,
+            request_id: 7,
+            granted,
+            ledger,
+            client_id: CLIENT,
+            now_ms,
+            created_at_ms,
+            timeout_ms,
+            params,
+        }
+    }
+
+    fn registry_two() -> ProviderRegistry {
+        use bitty_ai_runtime::{ModelCapability as Cap, ModelProvider as _};
+        let provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut registry = ProviderRegistry::new();
+        for descriptor in provider.list_models() {
+            let ModelDescriptor { name, capabilities } = descriptor;
+            registry
+                .register(
+                    bitty_ai_runtime::ModelRegistration::new(
+                        PROVIDER_ID,
+                        name,
+                        capabilities,
+                        4_096,
+                        1,
+                        2,
+                    )
+                    .expect("valid registration"),
+                )
+                .expect("capacity");
+        }
+        registry
+            .register(
+                bitty_ai_runtime::ModelRegistration::new(
+                    "bitty-a",
+                    "vision",
+                    vec![Cap::Text, Cap::ImageInput],
+                    32_768,
+                    3,
+                    4,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        registry
+    }
+
+    fn valid_pin() -> PinEnvelope {
+        use bitty_ai_host::mcp_placement::{InitializeResult, ToolsCapabilityShape};
+        PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        })
+    }
+
+    fn snapshot_empty() -> SnapshotEnvelope {
+        SnapshotEnvelope::new(
+            bitty_ai_host::mcp_placement::ToolListSnapshot::from_imported(&[]),
+            1,
+            false,
+        )
+    }
+
+    fn view<'a>(
+        registry: &'a ProviderRegistry,
+        pin: &'a PinEnvelope,
+        snapshot: &'a SnapshotEnvelope,
+    ) -> ReadOnlyView<'a> {
+        ReadOnlyView {
+            registry,
+            mcp_pin: pin,
+            mcp_snapshot: snapshot,
+        }
+    }
+
+    fn ctx_view<'a>(
+        records: &'a [RuntimeRecord],
+        store: &'a RuntimeArtifactStore,
+    ) -> ContextView<'a> {
+        ContextView {
+            records,
+            artifacts: store,
+        }
+    }
+
+    fn complete_view<'a>(
+        provider: &'a mut dyn ModelProvider,
+        scope: &str,
+        now_ms: u64,
+    ) -> CompleteView<'a> {
+        CompleteView {
+            provider,
+            caller_scope: CallerScopeEcho::new(scope, now_ms),
+        }
+    }
+
+    fn ready_result(outcome: DispatchOutcome) -> String {
+        match outcome {
+            DispatchOutcome::Ready { result, .. } => result,
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    fn refused_error(outcome: DispatchOutcome) -> IpcError {
+        match outcome {
+            DispatchOutcome::Refused(error) => error,
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    /// Minimal lawful complete params: one 2-byte user message, budget 64,
+    /// timeout 1000 from caller time 500.
+    fn lawful_params() -> Vec<u8> {
+        br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":1000,"now_ms":500}"#.to_vec()
+    }
+
+    fn full_dispatch<'a>(
+        granted: &'a ScopeSet,
+        ledger: &'a ConsentLedger,
+        params: &'a [u8],
+    ) -> DispatchInput<'a> {
+        // Caller clock 1000, created 0, transport timeout 5000: gate 4
+        // passes (1000 < 5000) and the params deadline (500 + 1000 = 1500)
+        // stays fresh (1000 < 1500).
+        input(COMPLETE_METHOD, granted, ledger, 1_000, 0, 5_000, params)
+    }
+
+    fn scripted_turn(text: &str) -> ProviderTurn {
+        ProviderTurn {
+            text: text.to_owned(),
+            tool_calls: Vec::new(),
+            latency_ms: 10,
+            usage: ProviderUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_tokens: 3,
+                cache_write_tokens: 4,
+            },
+        }
+    }
+
+    /// Provider that panics on contact: passing tests prove the pre-I/O
+    /// gates refused first. Lives under `#[cfg(test)]` only.
+    struct PanicProvider;
+
+    impl ModelProvider for PanicProvider {
+        fn provider_id(&self) -> &str {
+            PROVIDER_ID
+        }
+
+        fn list_models(&self) -> Vec<ModelDescriptor> {
+            Vec::new()
+        }
+
+        fn complete(
+            &mut self,
+            _request: &RuntimeTurnRequest,
+        ) -> Result<ProviderTurn, RuntimeProviderError> {
+            panic!("provider contacted before pre-I/O gates passed");
+        }
+
+        fn scripted_turns_remaining(&self) -> usize {
+            0
+        }
+
+        fn complete_calls(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Provider that always fails transport and counts every call: proves
+    /// exactly one attempt on the error path. Lives under `#[cfg(test)]`
+    /// only.
+    struct FailProvider {
+        calls: u64,
+    }
+
+    impl ModelProvider for FailProvider {
+        fn provider_id(&self) -> &str {
+            PROVIDER_ID
+        }
+
+        fn list_models(&self) -> Vec<ModelDescriptor> {
+            Vec::new()
+        }
+
+        fn complete(
+            &mut self,
+            _request: &RuntimeTurnRequest,
+        ) -> Result<ProviderTurn, RuntimeProviderError> {
+            self.calls += 1;
+            Err(RuntimeProviderError::Transport {
+                provider: PROVIDER_ID.to_owned(),
+                reason: "boom".to_owned(),
+            })
+        }
+
+        fn scripted_turns_remaining(&self) -> usize {
+            0
+        }
+
+        fn complete_calls(&self) -> u64 {
+            self.calls
+        }
+    }
+
+    #[test]
+    fn happy_path_echoes_untrusted_text_and_usage() {
+        // POLICY (AI-0302-E1c): end-to-end over the injected FakeProvider
+        // (zero real I/O): decoded params -> pre-I/O gates -> exactly one
+        // provider call -> S-C result JSON. The completion text echoes
+        // verbatim (untrusted observation, never defaulted) and the
+        // AI-0219 usage slots echo as attribution only (cost stays parked:
+        // no `cost` field exists).
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        provider.push_turn(scripted_turn("hello"));
+        let params = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &params);
+        let result = ready_result(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        validate_ai_result(COMPLETE_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"text\":\"hello\",\"tool_calls\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"cached_tokens\":3,\"cache_write_tokens\":4},\"latency_ms\":10}"
+        );
+        assert!(!result.contains("cost"), "{result}");
+        // POLICY (AI-0302-E1c): single attempt on success — exactly one
+        // provider call, never retried.
+        assert_eq!(provider.complete_calls(), 1);
+    }
+
+    #[test]
+    fn empty_text_stays_empty_and_tool_calls_echo() {
+        // POLICY (AI-0302-E1c): output-untrusted means verbatim — an empty
+        // script turn stays empty (never defaulted into a helpful string),
+        // and model-requested tool calls echo as data (never executed).
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        provider.push_turn(ProviderTurn {
+            text: String::new(),
+            tool_calls: vec![ToolCallRequest {
+                name: "t".to_owned(),
+                arguments: b"{}".to_vec(),
+            }],
+            latency_ms: 0,
+            usage: ProviderUsage::default(),
+        });
+        let params = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &params);
+        let result = ready_result(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        validate_ai_result(COMPLETE_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            result,
+            "{\"text\":\"\",\"tool_calls\":[{\"name\":\"t\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cached_tokens\":0,\"cache_write_tokens\":0},\"latency_ms\":0}"
+        );
+        assert_eq!(provider.complete_calls(), 1);
+    }
+
+    #[test]
+    fn pre_io_gates_refuse_in_order_before_contact() {
+        // POLICY (AI-0302-E1c): handler pre-I/O order is scope, then
+        // budget, then timeout. Direct handler calls (six gates bypassed)
+        // with a poisoned provider prove each gate refuses before contact
+        // and earlier gates win over later ones.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let over_budget =
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":1,"timeout_ms":0,"now_ms":500}"#;
+        let under_budget =
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":0,"now_ms":500}"#;
+        // Scope mismatch beats budget and timeout violations.
+        let scoped = input(
+            COMPLETE_METHOD,
+            &granted,
+            &ledger,
+            1_000,
+            0,
+            5_000,
+            over_budget,
+        );
+        let mut poisoned = PanicProvider;
+        let error = handle_complete(
+            &scoped,
+            &mut complete_view(&mut poisoned, "provider/other", 500),
+        )
+        .expect_err("scope gate must refuse first");
+        assert!(
+            matches!(error, IpcError::ScopeDenied { .. }),
+            "unexpected: {error:?}"
+        );
+        // Budget beats timeout: scope passes, budget fails, timeout fails.
+        let scoped = input(
+            COMPLETE_METHOD,
+            &granted,
+            &ledger,
+            1_000,
+            0,
+            5_000,
+            over_budget,
+        );
+        let mut poisoned = PanicProvider;
+        let error = handle_complete(
+            &scoped,
+            &mut complete_view(&mut poisoned, "provider/bitty-fake", 500),
+        )
+        .expect_err("budget gate must refuse before the timeout gate");
+        assert!(
+            matches!(&error, IpcError::Denied { code, .. } if code == "PayloadCap"),
+            "unexpected: {error:?}"
+        );
+        // Timeout ceiling: scope and budget pass, timeout fails.
+        let scoped = input(
+            COMPLETE_METHOD,
+            &granted,
+            &ledger,
+            1_000,
+            0,
+            5_000,
+            under_budget,
+        );
+        let mut poisoned = PanicProvider;
+        let error = handle_complete(
+            &scoped,
+            &mut complete_view(&mut poisoned, "provider/bitty-fake", 500),
+        )
+        .expect_err("timeout gate must refuse before contact");
+        assert!(
+            matches!(&error, IpcError::InvalidRequest { reason } if reason.contains("exceeds ceiling")),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn stale_params_deadline_refuses_timeout_before_contact() {
+        // POLICY (AI-0302-E1c): caller time already past the params
+        // deadline refuses `Timeout` before I/O (same expiry rule as gate
+        // 4: `now >= deadline`). The poisoned provider proves no contact.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let params = lawful_params();
+        // Caller clock 5000 stands past the params deadline 1500, while
+        // the dispatch deadline (0 + 30_000) stays live.
+        let scoped = input(
+            COMPLETE_METHOD,
+            &granted,
+            &ledger,
+            5_000,
+            0,
+            30_000,
+            &params,
+        );
+        let mut poisoned = PanicProvider;
+        let error = handle_complete(
+            &scoped,
+            &mut complete_view(&mut poisoned, "provider/bitty-fake", 500),
+        )
+        .expect_err("deadline freshness must refuse before contact");
+        assert!(
+            matches!(
+                error,
+                IpcError::Timeout {
+                    request_id: 7,
+                    timeout_ms: 1_000
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn declared_sampling_refuses_before_contact() {
+        // POLICY (AI-0302-E1c): a declared sampling note carries no values
+        // across IPC, so there is nothing to validate or pass — fail
+        // closed instead of fabricating a contract or silently
+        // downgrading. Gate 5 accepts the vocab; the handler refuses the
+        // semantics before contact.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let params = br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":1000,"now_ms":500,"sampling":"declared"}"#;
+        let scoped = full_dispatch(&granted, &ledger, params);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut poisoned = PanicProvider;
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut poisoned, "provider/bitty-fake", 500),
+        ));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn scope_mismatch_refuses_scope_denial_without_contact() {
+        // POLICY (AI-0302-E1c): the model reference must sit within the
+        // granted caller scope (MP-4 `provider/<id>` semantics). A
+        // well-formed scope naming another provider denies fail-closed.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let params = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/other", 500),
+        ));
+        match error {
+            IpcError::ScopeDenied { scope, action } => {
+                assert_eq!(scope, "provider/bitty-fake");
+                assert_eq!(action, COMPLETE_METHOD);
+            }
+            other => panic!("expected ScopeDenied, got {other:?}"),
+        }
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn malformed_scope_refuses_scope_denial_without_contact() {
+        // POLICY (AI-0302-E1c): a scope outside the narrow MP-4 vocabulary
+        // (here: no slash) denies the same way — the denial names the
+        // required scope, never the malformed string.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let params = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "noslash", 500),
+        ));
+        assert!(
+            matches!(error, IpcError::ScopeDenied { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(!format!("{error:?}").contains("noslash"), "{error:?}");
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn provider_view_mismatch_refuses_not_found_without_contact() {
+        // POLICY (AI-0302-E1c): the injected provider must serve the
+        // referenced provider id. A scope matching the reference but a
+        // provider serving another id refuses fail-closed (static reason,
+        // never the disagreeing ids).
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let params = br#"{"model":{"provider_id":"other","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":1000,"now_ms":500}"#;
+        let scoped = full_dispatch(&granted, &ledger, params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/other", 500),
+        ));
+        assert!(
+            matches!(error, IpcError::NotFound { .. }),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn unknown_model_refuses_not_found() {
+        // POLICY (AI-0302-E1c): the model NAME check is the provider's
+        // authoritative call-time verdict (no registry resolution inside
+        // the handler): an unknown name surfaces as `NotFound` with a
+        // static reason.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let params = br#"{"model":{"provider_id":"bitty-fake","model":"nope"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":1000,"now_ms":500}"#;
+        let scoped = full_dispatch(&granted, &ledger, params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        assert!(
+            matches!(error, IpcError::NotFound { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(!format!("{error:?}").contains("nope"), "{error:?}");
+    }
+
+    #[test]
+    fn budget_exceeded_refuses_before_io() {
+        // POLICY (AI-0302-E1c): never spend-then-check. The 2-byte message
+        // against a 1-byte budget refuses before I/O (gate 5 owns the
+        // dispatch-path refusal; the handler re-checks for direct
+        // callers, proven by the order test above).
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let params = br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":1,"timeout_ms":1000,"now_ms":500}"#;
+        let scoped = full_dispatch(&granted, &ledger, params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        assert!(
+            matches!(
+                error,
+                IpcError::LimitExceeded { .. } | IpcError::Denied { .. }
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn timeout_refused_before_io() {
+        // POLICY (AI-0302-E1c): a past-ceiling timeout refuses before I/O
+        // (gate 4 owns the dispatch-path refusal for `timeout_ms: 0`; the
+        // handler re-checks for direct callers, proven by the order test
+        // above).
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let params = br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":0,"now_ms":500}"#;
+        let scoped = full_dispatch(&granted, &ledger, params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn provider_error_attempts_once_and_reports_advisability() {
+        // POLICY (AI-0302-E1c): single attempt on the error path too — the
+        // always-failing provider records exactly one call, and the
+        // transport refusal reports Advance advisability without acting on
+        // it (no retry here; the caller drives retry via `model_fallback`
+        // plus a fresh call).
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FailProvider { calls: 0 };
+        let params = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &params);
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        assert!(
+            matches!(error, IpcError::Transport { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(
+            format!("{error:?}").contains("advance"),
+            "refusal must report Advance advisability: {error:?}"
+        );
+        assert!(
+            !format!("{error:?}").contains("boom"),
+            "provider-echoed text must never cross: {error:?}"
+        );
+        assert_eq!(provider.complete_calls(), 1);
+        assert_eq!(provider.calls, 1);
+    }
+
+    #[test]
+    fn provider_error_taxonomy_matches_model_fallback() {
+        // POLICY (AI-0302-E1c): every provider failure maps through the
+        // `model_fallback` directive taxonomy — Advance-eligible variants
+        // (transport, rate-limited, unavailable, timeout) refuse with
+        // Advance-reporting shapes; the rest stop with reconcile shapes.
+        // This test locks each arm against `fallback_directive`, so drift
+        // between this table and `model_fallback` fails loudly.
+        use bitty_ai_runtime::FallbackDirective;
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let lawful = lawful_params();
+        let scoped = full_dispatch(&granted, &ledger, &lawful);
+        let cases: [(
+            RuntimeProviderError,
+            FallbackDirective,
+            bitty_ipc_api::ErrorClass,
+        ); 13] = [
+            (
+                RuntimeProviderError::UnknownModel {
+                    name: String::new(),
+                },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::NotFound,
+            ),
+            (
+                RuntimeProviderError::BudgetExceeded {
+                    limit: 0,
+                    actual: 0,
+                },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Denied,
+            ),
+            (
+                RuntimeProviderError::Timeout {
+                    timeout_ms: 0,
+                    latency_ms: 0,
+                },
+                FallbackDirective::Advance,
+                bitty_ipc_api::ErrorClass::Timeout,
+            ),
+            (
+                RuntimeProviderError::TimeoutTooLarge { max: 0, actual: 0 },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Validation,
+            ),
+            (
+                RuntimeProviderError::InvalidProviderId { id: String::new() },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Validation,
+            ),
+            (
+                RuntimeProviderError::Transport {
+                    provider: String::new(),
+                    reason: String::new(),
+                },
+                FallbackDirective::Advance,
+                bitty_ipc_api::ErrorClass::Transport,
+            ),
+            (
+                RuntimeProviderError::Auth {
+                    provider: String::new(),
+                    reason: String::new(),
+                },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Denied,
+            ),
+            (
+                RuntimeProviderError::RateLimited {
+                    provider: String::new(),
+                    retry_after_ms: None,
+                },
+                FallbackDirective::Advance,
+                bitty_ipc_api::ErrorClass::Denied,
+            ),
+            (
+                RuntimeProviderError::CapabilityMismatch {
+                    provider: String::new(),
+                    model: String::new(),
+                    missing: Vec::new(),
+                },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Validation,
+            ),
+            (
+                RuntimeProviderError::ModelUnavailable {
+                    provider: String::new(),
+                    model: String::new(),
+                },
+                FallbackDirective::Advance,
+                bitty_ipc_api::ErrorClass::Unavailable,
+            ),
+            (
+                RuntimeProviderError::Unknown {
+                    provider: String::new(),
+                    reason: String::new(),
+                },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Unavailable,
+            ),
+            (
+                RuntimeProviderError::InvalidSampling,
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Validation,
+            ),
+            (
+                RuntimeProviderError::UnsupportedSampling { field: "top_k" },
+                FallbackDirective::Stop,
+                bitty_ipc_api::ErrorClass::Validation,
+            ),
+        ];
+        for (error, directive, class) in &cases {
+            assert_eq!(&fallback_directive(error), directive, "{error:?}");
+            let mapped = provider_error_refusal(&scoped, error);
+            assert_eq!(mapped.error_class(), *class, "{error:?} -> {mapped:?}");
+        }
+    }
+
+    #[test]
+    fn decode_is_total_for_complete() {
+        // POLICY (AI-0302-E1c): decode never panics; malformed,
+        // over-bound, over-count, or over-grammar bodies map to typed
+        // refusals (fit/range/freshness pass through to the handler
+        // gates by design — see the order test).
+        let hostile: [&[u8]; 11] = [
+            b"",
+            b"null",
+            b"[]",
+            b"{",
+            b"{}",
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"}}"#,
+            br#"{"model":{"provider_id":"BITTY-FAKE","model":"fake-chat"},"messages":[],"budget_bytes":0,"timeout_ms":1000,"now_ms":5}"#,
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"shout","content":"hi"}],"budget_bytes":64,"timeout_ms":1000,"now_ms":5}"#,
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[],"budget_bytes":0,"timeout_ms":1000,"now_ms":5,"sampling":"sometimes"}"#,
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":"hi","budget_bytes":0,"timeout_ms":1000,"now_ms":5}"#,
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[],"budget_bytes":"many","timeout_ms":1000,"now_ms":5}"#,
+        ];
+        for params in hostile {
+            assert!(
+                decode_request(COMPLETE_METHOD, params).is_err(),
+                "{params:?}"
+            );
+        }
+        // Fit/range violations pass decode (handler gates own them).
+        for params in [
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":1,"timeout_ms":1000,"now_ms":500}"#.as_slice(),
+            br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[],"budget_bytes":0,"timeout_ms":0,"now_ms":5}"#.as_slice(),
+        ] {
+            assert!(
+                decode_request(COMPLETE_METHOD, params).is_ok(),
+                "{params:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn later_phases_stay_not_wired_through_every_entry() {
+        // POLICY (AI-0302-E1c): E1d (`tool_dispatch`) stays shut through
+        // every entry, and the older entries keep `provider_complete`
+        // NotWired (only the new entry wires it).
+        let invoke_granted = granted_invoke();
+        let invoke_ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let tool_params = br#"{"tool":"t","args_digest":1,"caller":{"agent_instance_id":1,"session_id":2,"level":"inspect"},"now_ms":3}"#;
+        let scoped = input(
+            "ai.tool_dispatch",
+            &invoke_granted,
+            &invoke_ledger,
+            1_000,
+            0,
+            5_000,
+            tool_params,
+        );
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        assert!(
+            matches!(
+                dispatch_with_complete(
+                    &scoped,
+                    &view(&registry, &pin, &snapshot),
+                    &ctx_view(&empty, &store),
+                    &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+                ),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "new entry must keep tool_dispatch NotWired"
+        );
+        assert!(
+            matches!(
+                dispatch_with(&scoped, &view(&registry, &pin, &snapshot)),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "old E1a entry must keep tool_dispatch NotWired"
+        );
+        assert!(
+            matches!(dispatch(&scoped), DispatchOutcome::NotWired { .. }),
+            "E0 entry must keep tool_dispatch NotWired"
+        );
+        // Older entries never wire provider_complete.
+        let params = lawful_params();
+        let scoped = full_dispatch(&invoke_granted, &invoke_ledger, &params);
+        assert!(
+            matches!(
+                dispatch_with(&scoped, &view(&registry, &pin, &snapshot)),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "old E1a entry must keep provider_complete NotWired"
+        );
+        assert!(
+            matches!(
+                dispatch_with_context(
+                    &scoped,
+                    &view(&registry, &pin, &snapshot),
+                    &ctx_view(&empty, &store)
+                ),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "old E1b entry must keep provider_complete NotWired"
+        );
+        assert!(
+            matches!(dispatch(&scoped), DispatchOutcome::NotWired { .. }),
+            "E0 entry must keep provider_complete NotWired"
+        );
+    }
+
+    #[test]
+    fn new_entry_keeps_gate_order_for_other_methods() {
+        // POLICY (AI-0302-E1c): the new entry admits through the same six
+        // gates in the same order for delegated methods — an unknown
+        // method refuses `NotFound` and a missing grant refuses
+        // `ScopeDenied`, both without provider contact.
+        let granted = ScopeSet::all();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let scoped = input("ai.evil", &granted, &ledger, 1_000, 0, 5_000, b"{malformed");
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        assert!(matches!(error, IpcError::NotFound { .. }), "{error:?}");
+        let cli = ScopeSet::cli_default();
+        let lawful = lawful_params();
+        let scoped = input(
+            "ai.provider_complete",
+            &cli,
+            &ledger,
+            1_000,
+            0,
+            5_000,
+            &lawful,
+        );
+        let error = refused_error(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut complete_view(&mut provider, "provider/bitty-fake", 500),
+        ));
+        assert!(matches!(error, IpcError::ScopeDenied { .. }), "{error:?}");
+        assert_eq!(provider.complete_calls(), 0);
     }
 }
