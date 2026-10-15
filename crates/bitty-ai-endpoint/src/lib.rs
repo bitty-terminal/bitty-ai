@@ -62,10 +62,13 @@
 //! - E1c: `provider_complete` plus the injection seam — DONE via
 //!   [`dispatch_with_complete`] plus [`CompleteView`]. Gates 1-6,
 //!   [`dispatch`], [`dispatch_with`], and [`dispatch_with_context`]
-//!   behaviors are unchanged; `ai.tool_dispatch` still returns
-//!   [`DispatchOutcome::NotWired`] through every entry.
-//! - E1d: `tool_dispatch` digest-only plus host per-tool consent on top
-//!   (pending).
+//!   behaviors are unchanged; `ai.tool_dispatch` returns
+//!   [`DispatchOutcome::NotWired`] through every pre-E1d entry.
+//! - E1d: `tool_dispatch` digest gate plus host per-tool consent on top —
+//!   DONE via [`dispatch_with_tools`] plus [`ToolView`]. Gates 1-6 and all
+//!   earlier entries are unchanged; only the new entry wires
+//!   `ai.tool_dispatch` (single tool per call, single executor attempt;
+//!   executor-after-contact outcomes cross as Ready status vocabulary).
 //! - E2: params-schema plug-in plus the tolerant S-1 correlator field
 //!   (pending; the per-method decode table below names the extension seam,
 //!   which stays unbuilt until gate 5 accepts the field).
@@ -148,6 +151,46 @@
 //! // bounded; the handler refuses an already-past deadline before I/O and
 //! // documents that a slow provider may still overrun. No threads or
 //! // timers are spawned to fake a bound (no clock, no threads, no net).
+//!
+//! ## E1d handler contract
+//!
+//! [`dispatch_with_tools`] admits exactly like [`dispatch`] (same six
+//! gates, same order, gates untouched), then wires `ai.tool_dispatch` end
+//! to end over a caller-supplied [`ToolView`]: decode validated params to
+//! the tool name plus digest triple (hand-rolled depth-capped decode
+//! reusing the schema validators' bounds, no `serde`, no new dependency),
+//! run the admission gates (out-of-band argument bound, FNV digest match,
+//! `ai.invoke` scope assertion, tool-name shape, registry lookup, host
+//! per-tool consent triple, per-call narrowing), make exactly one
+//! [`ToolExecutor`](bitty_ai_runtime::ToolExecutor) call through the
+//! INJECTED executor only, and encode the S-C result JSON with the outcome
+//! axis (`success`/`failed`/`denied`/`unknown`) plus attribution-only usage
+//! echo (execution id, tool name, digest echo, dispatch timestamp).
+//! Admission refusals (unknown tool, scope, consent, digest mismatch,
+//! narrowing) return typed refusals with zero executor contact;
+//! executor-after-contact outcomes cross as `Ready` results keeping their
+//! axis — never collapsed into admission refusals, never retried.
+//! Tool result bytes stay host-side (recorded, never settled here); only
+//! the digest echo crosses.
+//!
+//! // POLICY (AI-0302-E1d): digest-mismatch-refuses — the S-C params carry
+//! // the FNV-1a-64 digest only, never raw args; the raw bytes arrive
+//! // out-of-band on the view. The handler recomputes the digest over the
+//! // received bytes and refuses fail-closed on mismatch (tamper evidence),
+//! // never dispatching.
+//!
+//! // POLICY (AI-0302-E1d): method-necessary-not-sufficient — the six gates
+//! // granted `ai.invoke`, but the tool's own `(protocol, tool, scope)`
+//! // triple must also allow at the dispatch `now_ms`. A missing or denied
+//! // per-tool grant refuses even with the method granted.
+//!
+//! // POLICY (AI-0302-E1d): single-tool-per-call — the params name exactly
+//! // one tool; the `allowed` allow-set only narrows that one call and never
+//! // fans out into a batch.
+//!
+//! // POLICY (AI-0302-E1d): single-attempt — exactly one executor call, no
+//! // retry loop. Effect-uncertain (`Unknown`) outcomes report reconcile
+//! // semantics in the result; the caller drives any retry as a fresh call.
 
 //! ## Normative precedence
 //!
@@ -236,7 +279,8 @@ pub enum DispatchOutcome {
     /// dispatch entry wires only its own E-phase methods and keeps later
     /// phases `NotWired` (`dispatch_with`: ten read-only methods;
     /// `dispatch_with_context` adds `context_read`; `dispatch_with_complete`
-    /// adds `provider_complete`).
+    /// adds `provider_complete`; `dispatch_with_tools` adds `tool_dispatch`
+    /// (executor-after-contact outcomes cross as `Ready` status vocabulary).
     Ready {
         /// Method that was admitted and answered.
         method: String,
@@ -951,6 +995,7 @@ enum DecodedRequest {
     },
     ContextRead(ContextReadParams),
     Complete(CompleteParams),
+    ToolDispatch(ToolDispatchParams),
 }
 
 fn req_field<'v>(top: &'v JVal, method: &str, name: &'static str) -> Result<&'v JVal, IpcError> {
@@ -1316,6 +1361,13 @@ const DECODE_TABLE: &[(&str, DecodeFn)] = &[
     // callers), so decode passes fit-violating bodies through instead of
     // refusing them early.
     ("ai.provider_complete", decode_complete),
+    // POLICY (AI-0302-E1d): the E1d arm decodes the tool name plus digest
+    // triple through the schema bounds (bytes-only names, no ambient
+    // grammar); see `decode_tool_dispatch`. Tamper (digest), registry,
+    // consent, and narrowing checks stay handler admission gates (also
+    // enforced at gate 5 on the dispatch path where the schema reaches;
+    // the handler re-checks for direct callers).
+    ("ai.tool_dispatch", decode_tool_dispatch),
 ];
 
 fn decode_request(method: &str, params: &[u8]) -> Result<DecodedRequest, IpcError> {
@@ -2958,6 +3010,531 @@ fn encode_complete_response(response: &CompleteResponse) -> Result<String, IpcEr
     out.push_str(&response.latency_ms.to_string());
     out.push('}');
     Ok(out)
+}
+
+// ── E1d tool_dispatch wiring ──────────────────────────────────────────────
+//
+// Decode (validated params JSON to the tool name plus digest triple) ->
+// admission gates (out-of-band argument bound, FNV digest match, ai.invoke
+// scope assertion, tool-name shape, registry lookup, host per-tool consent
+// triple, per-call narrowing) -> exactly one injected-executor call ->
+// encode (S-C result JSON with the outcome axis plus attribution-only usage
+// echo). No executor construction, resolution, or selection anywhere; no
+// retry loop; no usage-ring push and no cost settlement (host-side, recorded
+// from the attribution echo, never settled here); no clock/threads/net:
+// every value below is caller supplied or derived from caller-supplied
+// values.
+//
+// The S-C params carry the FNV-1a-64 digest only, never raw args (S2
+// `UsageEvent::args_digest` precedent): the transport binds its own argument
+// bytes out-of-band on the view. The S-C result carries the outcome axis
+// (`success`/`failed`/`denied`/`unknown`) plus the attribution echo only;
+// richer S2 detail (required-scope strings, server/task labels, placement,
+// typed error causes, result bytes) stays host-side and never crosses.
+
+use bitty_ai_host::tool_dispatch::{
+    AgentInstanceId as HostAgentInstanceId, AgentLevel as HostAgentLevel,
+    ConsentDecision as HostConsentDecision, ConsentLedger as HostConsentLedger,
+    ConsentQuery as HostConsentQuery, MAX_TOOL_ARGUMENTS_BYTES as HOST_MAX_TOOL_ARGUMENTS_BYTES,
+    MAX_TOOL_RESULT_BYTES as HOST_MAX_TOOL_RESULT_BYTES, ToolRegistry as HostToolRegistry,
+    UsageEvent as HostUsageEvent, bound_reason as host_bound_reason,
+    narrowing_omits as host_narrowing_omits, validate_tool_name as validate_host_tool_name,
+};
+use bitty_ai_runtime::context::MAX_SUMMARY_BYTES as RUNTIME_MAX_SUMMARY_BYTES;
+use bitty_ai_runtime::tool::{ToolError as RuntimeToolError, ToolExecutor as RuntimeToolExecutor};
+use bitty_ipc_api::MAX_SCHEMA_ALLOWED;
+
+/// Caller-supplied execution view for the E1d wired method.
+///
+/// // POLICY (AI-0302-E1d): injected-only executor — the executor handle
+/// arrives here from the caller, and the handler takes it as given. The
+/// sibling [`ReadOnlyView`] stays behavior-free (its structural
+/// no-execution proof is untouched); this sibling type is the single place
+/// a tool executor crosses, and it crosses only toward the
+/// `ai.tool_dispatch` arm. Raw argument bytes ride the view because the
+/// S-C params bind them by digest only; the digest gate verifies the
+/// binding before any other gate runs.
+pub struct ToolView<'a> {
+    /// Injected executor the single dispatch call runs against. Never
+    /// constructed, resolved, or selected inside the handler.
+    pub executor: &'a mut dyn RuntimeToolExecutor,
+    /// Raw argument bytes bound out-of-band (digest-bound to the params by
+    /// the digest gate; never logged, never echoed, only digested).
+    pub arguments: &'a [u8],
+    /// Registry for the unknown-tool lookup and the consent-triple scope.
+    pub registry: &'a HostToolRegistry,
+    /// Per-tool consent ledger behind the host seam.
+    pub consent: &'a dyn HostConsentLedger,
+    /// Wire protocol principal charged for consent.
+    pub protocol_id: &'a str,
+    /// Attribution handle echoed in the result usage block.
+    pub execution_id: u64,
+}
+
+// POLICY (AI-0302-E1d): manual `Debug` (no derive): `dyn
+// RuntimeToolExecutor` carries no `Debug` bound, and the impl prints the
+// attribution handle plus byte counts only — never raw arguments, consent
+// state, or scripted outcomes.
+impl std::fmt::Debug for ToolView<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolView")
+            .field("execution_id", &self.execution_id)
+            .field("protocol_id", &self.protocol_id)
+            .field("arguments_len", &self.arguments.len())
+            .field("registry_len", &self.registry.len())
+            .finish()
+    }
+}
+
+/// E1d dispatch entry: admit exactly like [`dispatch`], then wire
+/// `ai.tool_dispatch` end to end over `tools`.
+///
+/// Gate refusals pass through unchanged as [`DispatchOutcome::Refused`].
+/// Every other method delegates to [`dispatch_with_complete`] verbatim
+/// (same E1c table, same `NotWired` fallback), so this entry extends the
+/// wiring without restructuring it.
+pub fn dispatch_with_tools(
+    input: &DispatchInput<'_>,
+    view: &ReadOnlyView<'_>,
+    ctx: &ContextView<'_>,
+    complete: &mut CompleteView<'_>,
+    tools: &mut ToolView<'_>,
+) -> DispatchOutcome {
+    // POLICY (AI-0302-E1d): the injected executor is consulted on the
+    // `ai.tool_dispatch` arm only. All other methods share the E1c entry
+    // untouched, so tool execution cannot influence any other dispatch.
+    if input.method != "ai.tool_dispatch" {
+        return dispatch_with_complete(input, view, ctx, complete);
+    }
+    let probe = GateProbe::default();
+    let scope = match run_gates(input, &probe) {
+        // POLICY (AI-0302-E1d): gates run first and unchanged; no handler
+        // contact before admission, same as E0/E1a/E1b/E1c.
+        Ok(scope) => scope,
+        Err(error) => return DispatchOutcome::Refused(error),
+    };
+    match handle_tool_dispatch(scope, input, tools) {
+        Ok(result) => DispatchOutcome::Ready {
+            method: input.method.to_string(),
+            scope,
+            result,
+        },
+        Err(error) => DispatchOutcome::Refused(error),
+    }
+}
+
+/// Decoded `ai.tool_dispatch` params (owned data, no input borrows).
+///
+/// Carries only what the handler consumes: the tool name, the caller-bound
+/// digest, the consent-triple identity, the narrowing allow-set, and the
+/// dispatch timestamp. The caller `session_id` and authority `level` are
+/// validated at decode (closed vocabularies, same bounds as gate 5) but
+/// deliberately not carried: the S1 consent triple is exactly
+/// `(protocol, tool, scope)` with no session element, and tier-vs-`read_only`
+/// enforcement stays host-side with the authorizer (E1d wires the digest
+/// plus per-tool consent on top of the six gates; see the residual note on
+/// [`handle_tool_dispatch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolDispatchParams {
+    /// Requested tool name (bytes-only, non-empty, bounded; S2-owned shape
+    /// checked at the lookup gate).
+    tool: String,
+    /// Caller-bound FNV-1a-64 over the out-of-band argument bytes.
+    args_digest: u64,
+    /// Agent instance charged in the consent triple.
+    agent_instance_id: u64,
+    /// Per-call narrowing allow-set (`None` = no constraint; an explicit
+    /// empty list narrows everything away).
+    allowed: Option<Vec<String>>,
+    /// Caller-supplied dispatch timestamp; consent and executor contact both
+    /// run at this `now_ms` (no wall clock is read).
+    now_ms: u64,
+}
+
+fn decode_tool_level(name: &str) -> Option<HostAgentLevel> {
+    // POLICY (AI-0302-E1d): closed tier vocabulary (same set the schema
+    // validator enforces); no wildcard so a fifth tier breaks compilation
+    // here instead of misrouting. Validated at decode, carried nowhere
+    // (tier enforcement stays host-side with the authorizer).
+    match name {
+        "inspect" => Some(HostAgentLevel::Inspect),
+        "own" => Some(HostAgentLevel::Own),
+        "workspace" => Some(HostAgentLevel::Workspace),
+        "all" => Some(HostAgentLevel::All),
+        _ => None,
+    }
+}
+
+fn decode_tool_dispatch(top: &JVal) -> Result<DecodedRequest, IpcError> {
+    const METHOD: &str = "ai.tool_dispatch";
+    let tool = req_str_field(top, METHOD, "tool")?;
+    if tool.is_empty() || tool.len() > MAX_SCHEMA_TOOL_NAME_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "tool".into(),
+            limit: MAX_SCHEMA_TOOL_NAME_BYTES,
+            actual: tool.len(),
+        });
+    }
+    // POLICY (AI-0302-E1d): bytes only plus non-empty, no `^[a-z]...`
+    // grammar here (batch-1 item 2 rule 6, same as gate 5); malformed names
+    // cross and the lookup gate refuses them typed via the real S2 shape
+    // check, never passing through unchecked.
+    let args_digest = req_u64_field(top, METHOD, "args_digest")?;
+    let caller_fields = req_field(top, METHOD, "caller")?.as_obj().ok_or_else(|| {
+        decode_invalid("ai.tool_dispatch params: field 'caller' must be an object")
+    })?;
+    let caller = JVal::Obj(caller_fields.to_vec());
+    let agent_instance_id = req_u64_field(&caller, METHOD, "agent_instance_id")?;
+    // Validated (required u64, same rule the schema validator enforces),
+    // then dropped: the S1 consent triple carries no session element.
+    req_u64_field(&caller, METHOD, "session_id")?;
+    let level_name = req_str_field(&caller, METHOD, "level")?;
+    decode_tool_level(&level_name).ok_or_else(|| {
+        decode_invalid("ai.tool_dispatch params: field 'caller.level' not in closed vocabulary")
+    })?;
+    // POLICY (AI-0302-E1d): optional, default unconstrained (absent =
+    // no constraint); entries are bytes-only tool names, same rule the
+    // schema validator enforces.
+    let allowed = match opt_field(top, "allowed") {
+        None => None,
+        Some(value) => {
+            let names = value.as_arr().ok_or_else(|| {
+                decode_invalid("ai.tool_dispatch params: field 'allowed' must be an array")
+            })?;
+            if names.len() > MAX_SCHEMA_ALLOWED {
+                return Err(IpcError::LimitExceeded {
+                    field: "allowed".into(),
+                    limit: MAX_SCHEMA_ALLOWED,
+                    actual: names.len(),
+                });
+            }
+            let mut out = Vec::with_capacity(names.len());
+            for entry in names {
+                match entry {
+                    JVal::Str(text)
+                        if !text.is_empty() && text.len() <= MAX_SCHEMA_TOOL_NAME_BYTES =>
+                    {
+                        out.push(text.clone());
+                    }
+                    JVal::Str(text) => {
+                        return Err(IpcError::LimitExceeded {
+                            field: "allowed".into(),
+                            limit: MAX_SCHEMA_TOOL_NAME_BYTES,
+                            actual: text.len(),
+                        });
+                    }
+                    _ => {
+                        return Err(decode_invalid(
+                            "ai.tool_dispatch params: allowed entries must be strings",
+                        ));
+                    }
+                }
+            }
+            Some(out)
+        }
+    };
+    let now_ms = req_u64_field(top, METHOD, "now_ms")?;
+    Ok(DecodedRequest::ToolDispatch(ToolDispatchParams {
+        tool,
+        args_digest,
+        agent_instance_id,
+        allowed,
+        now_ms,
+    }))
+}
+
+/// IpcError expression for one per-tool consent denial.
+///
+/// A `Denied` with the E1d `ToolConsent` code (never `ScopeDenied`, which is
+/// the six-gate method-grant verdict, and never `Unauthenticated`, which is
+/// the transport peer-credential verdict): the method grant passed, the
+/// tool's own triple did not. Reason keeps the S1 `consent denied: ...`
+/// wording over the bounded ledger text.
+fn tool_consent_refusal(reason: &str) -> IpcError {
+    IpcError::Denied {
+        code: "ToolConsent".into(),
+        reason: host_bound_reason(&format!("consent denied: {reason}")),
+    }
+}
+
+/// IpcError expression for one narrowing omission.
+///
+/// A `Denied` with the E1d `ToolNarrowed` code carrying the byte-identical
+/// S1 narrowing wording (never `UnknownTool`/`Failed`/`EffectUnknown`:
+/// a pre-contact refusal executed nothing).
+fn tool_narrowing_refusal(tool: &str) -> IpcError {
+    IpcError::Denied {
+        code: "ToolNarrowed".into(),
+        reason: host_bound_reason(&format!("tool '{tool}' omitted by per-call narrowing")),
+    }
+}
+
+/// Map one executor-after-contact failure to its S-C status vocabulary.
+///
+/// Total with no wildcard: adding a [`RuntimeToolError`] variant breaks
+/// compilation here instead of misrouting. The four in-contract executor
+/// outcomes keep their S2 axis exactly (`Denied` after contact stays
+/// `denied`, distinct from admission refusals; `Failed` stays `failed`; a
+/// pre-effect protocol rejection records `failed` with its non-executed
+/// reason, the runtime bus precedent that keeps the turn model-observable;
+/// `EffectUnknown` stays `unknown` with reconcile-before-retry semantics).
+/// Every other executor error is out-of-contract here (validation already
+/// passed above) and refuses `Internal` fail-closed — never retried, never
+/// misclassified onto an axis.
+fn tool_status_vocab(error: &RuntimeToolError) -> Option<&'static str> {
+    match error {
+        RuntimeToolError::Denied { .. } => Some("denied"),
+        RuntimeToolError::Failed { .. } | RuntimeToolError::ProtocolRejected { .. } => {
+            Some("failed")
+        }
+        RuntimeToolError::EffectUnknown { .. } => Some("unknown"),
+        RuntimeToolError::InvalidName { .. }
+        | RuntimeToolError::UnknownTool { .. }
+        | RuntimeToolError::DuplicateTool { .. }
+        | RuntimeToolError::ArgumentsTooLarge { .. }
+        | RuntimeToolError::ResultTooLarge { .. }
+        | RuntimeToolError::SummaryTooLarge { .. }
+        | RuntimeToolError::CallLimitExceeded { .. }
+        | RuntimeToolError::RegistryFull { .. }
+        | RuntimeToolError::DescriptionTooLarge { .. }
+        | RuntimeToolError::SchemaTooLarge { .. }
+        | RuntimeToolError::UndeclaredPlacement { .. } => None,
+    }
+}
+
+/// Bounded diagnostic reason for one executor-after-contact outcome.
+///
+/// Executor reasons are host-supplied text entering the IPC result surface,
+/// so they cross the one bounded diagnostic policy here (defense in depth:
+/// executors normalize at their own boundary; this re-bounds idempotently).
+/// Success carries no text (empty, the runtime `status_reason` precedent).
+fn tool_outcome_reason(error: &RuntimeToolError) -> String {
+    match error {
+        RuntimeToolError::Denied { reason, .. }
+        | RuntimeToolError::Failed { reason, .. }
+        | RuntimeToolError::ProtocolRejected { reason, .. }
+        | RuntimeToolError::EffectUnknown { reason, .. } => host_bound_reason(reason),
+        RuntimeToolError::InvalidName { .. }
+        | RuntimeToolError::UnknownTool { .. }
+        | RuntimeToolError::DuplicateTool { .. }
+        | RuntimeToolError::ArgumentsTooLarge { .. }
+        | RuntimeToolError::ResultTooLarge { .. }
+        | RuntimeToolError::SummaryTooLarge { .. }
+        | RuntimeToolError::CallLimitExceeded { .. }
+        | RuntimeToolError::RegistryFull { .. }
+        | RuntimeToolError::DescriptionTooLarge { .. }
+        | RuntimeToolError::SchemaTooLarge { .. }
+        | RuntimeToolError::UndeclaredPlacement { .. } => {
+            host_bound_reason("tool executor returned an out-of-contract error")
+        }
+    }
+}
+
+fn encode_tool_result(
+    tool: &str,
+    args_digest: u64,
+    execution_id: u64,
+    occurred_at_ms: u64,
+    status: &str,
+    result_disposition: &str,
+    reason: &str,
+) -> String {
+    // Hand-rolled S-C result JSON (no `serde`, no new dependency): exactly
+    // the shape `validate_ai_result` enforces for `ai.tool_dispatch`
+    // (`status` outcome axis, `result_disposition` acceptance axis, bounded
+    // `reason`, attribution-only `usage` echo). Richer S2 detail never
+    // crosses: no required-scope strings, no server/task labels, no
+    // placement, no typed causes, no result bytes.
+    let mut out = String::from("{\"status\":");
+    out.push_str(&encode_str(status));
+    out.push_str(",\"result_disposition\":");
+    out.push_str(&encode_str(result_disposition));
+    out.push_str(",\"reason\":");
+    out.push_str(&encode_str(reason));
+    out.push_str(",\"usage\":{\"execution_id\":");
+    out.push_str(&execution_id.to_string());
+    out.push_str(",\"tool\":");
+    out.push_str(&encode_str(tool));
+    out.push_str(",\"args_digest\":");
+    out.push_str(&args_digest.to_string());
+    out.push_str(",\"occurred_at_ms\":");
+    out.push_str(&occurred_at_ms.to_string());
+    out.push_str("}}");
+    out
+}
+
+fn handle_tool_dispatch(
+    scope: Scope,
+    input: &DispatchInput<'_>,
+    view: &mut ToolView<'_>,
+) -> Result<String, IpcError> {
+    const METHOD: &str = "ai.tool_dispatch";
+    let DecodedRequest::ToolDispatch(decoded) = decode_request(METHOD, input.params)? else {
+        return Err(IpcError::Internal {
+            reason: "decoder returned the wrong request shape".into(),
+        });
+    };
+    // POLICY (AI-0302-E1d): out-of-band argument bound first (fail fast):
+    // the view bytes never crossed gate 5 (params bind them by digest
+    // only), so the handler enforces the S2 argument bound before hashing
+    // or dispatching them.
+    if view.arguments.len() > HOST_MAX_TOOL_ARGUMENTS_BYTES {
+        return Err(IpcError::LimitExceeded {
+            field: "args".into(),
+            limit: HOST_MAX_TOOL_ARGUMENTS_BYTES,
+            actual: view.arguments.len(),
+        });
+    }
+    // POLICY (AI-0302-E1d): digest-mismatch-refuses — recompute FNV-1a-64
+    // over the received bytes (same `args_digest` function the S2 usage
+    // ring uses; digest only, never raw args) and compare against the
+    // caller-supplied digest BEFORE any registry, consent, or executor
+    // contact. A mismatch refuses fail-closed (tamper evidence), never
+    // dispatches.
+    let recomputed = HostUsageEvent::args_digest(view.arguments);
+    if recomputed != decoded.args_digest {
+        return Err(decode_invalid(
+            "ai.tool_dispatch params: args digest does not match arguments",
+        ));
+    }
+    // POLICY (AI-0302-E1d): method-necessary-not-sufficient — the six gates
+    // admitted under exactly one scope; assert it is `ai.invoke` (never
+    // re-implemented here) without branching on it past this assertion.
+    // The per-tool triple below must still pass on top.
+    if scope != Scope::AiInvoke {
+        return Err(IpcError::Internal {
+            reason: "tool dispatch admitted outside ai.invoke".into(),
+        });
+    }
+    // POLICY (AI-0302-E1d): S2-owned name grammar (same bytes-only-cross-
+    // then-shape-check rule as the E1a cache_hint ids): over-grammar names
+    // refuse typed here via the real S2 shape check, never pass through
+    // unchecked. Unregistered names refuse `NotFound` (resolution
+    // semantics, the gate-1/E1c identity precedent); the registry lookup
+    // also supplies the consent-triple scope below.
+    validate_host_tool_name(&decoded.tool)
+        .map_err(|_| decode_invalid("ai.tool_dispatch params: tool name has a bad shape"))?;
+    let required_scope = match view.registry.lookup(&decoded.tool) {
+        Some(spec) => spec.required_scope.clone(),
+        None => {
+            return Err(IpcError::NotFound {
+                reason: "unknown tool".into(),
+            });
+        }
+    };
+    // POLICY (AI-0302-E1d): method-necessary-not-sufficient — the tool's
+    // own `(protocol, tool, scope)` triple runs through the host consent
+    // seam at the dispatch `now_ms` (same `now_ms` the executor sees
+    // below; no caching across calls, no wildcard grant shape). A denial
+    // refuses with zero executor contact even with the method granted.
+    //
+    // Residual (accepted, host-side): tier-vs-`read_only`, the authorizer
+    // hook, and the per-turn call cap are NOT enforced here — the host
+    // re-imposes them when dispatch moves host-side (S1 `GATE_ORDER_DOC`).
+    // E1d wires the digest plus per-tool consent on top of the six gates.
+    let query = HostConsentQuery {
+        protocol_id: view.protocol_id,
+        agent_instance: HostAgentInstanceId(decoded.agent_instance_id),
+        tool: &decoded.tool,
+        scope: &required_scope,
+        now_ms: decoded.now_ms,
+    };
+    match view.consent.check(&query) {
+        HostConsentDecision::Allow => {}
+        HostConsentDecision::Deny { reason } => return Err(tool_consent_refusal(&reason)),
+    }
+    // POLICY (AI-0302-E1d): single-tool-per-call — the allow-set narrows
+    // the one named tool (absent constrains nothing; an explicit empty list
+    // narrows everything away). It never fans out into a batch: one tool
+    // per call, one dispatch below. An omitted tool refuses with zero
+    // executor contact.
+    if host_narrowing_omits(decoded.allowed.as_deref(), &decoded.tool) {
+        return Err(tool_narrowing_refusal(&decoded.tool));
+    }
+    // POLICY (AI-0302-E1d): single-attempt — exactly one executor call, no
+    // retry loop, no fallback chain. Admission refusals above had zero
+    // contact (`is_admission_refusal` stays exact: only pre-contact
+    // refusals); everything below is an after-contact outcome keeping its
+    // S2 axis. Usage/ledger hooks stay host-side: this handler records
+    // nothing and settles nothing — attribution crosses in the result
+    // echo for the host to record.
+    let arguments: &[u8] = view.arguments;
+    let outcome = view
+        .executor
+        .execute(&decoded.tool, arguments, decoded.now_ms);
+    match outcome {
+        Ok(success) => {
+            // POLICY (AI-0302-E1d): over-bound payloads keep `success`
+            // (the effect happened) and record `rejected` with the typed
+            // bound cause as the reason — the runtime bus
+            // `result_rejected` precedent, never a silent truncation and
+            // never an empty-bytes substitute.
+            if success.summary.len() > RUNTIME_MAX_SUMMARY_BYTES {
+                let cause = RuntimeToolError::SummaryTooLarge {
+                    limit: RUNTIME_MAX_SUMMARY_BYTES,
+                    actual: success.summary.len(),
+                };
+                return Ok(encode_tool_result(
+                    &decoded.tool,
+                    decoded.args_digest,
+                    view.execution_id,
+                    decoded.now_ms,
+                    "success",
+                    "rejected",
+                    &host_bound_reason(&cause.to_string()),
+                ));
+            }
+            if success.data.len() > HOST_MAX_TOOL_RESULT_BYTES {
+                let cause = RuntimeToolError::ResultTooLarge {
+                    limit: HOST_MAX_TOOL_RESULT_BYTES,
+                    actual: success.data.len(),
+                };
+                return Ok(encode_tool_result(
+                    &decoded.tool,
+                    decoded.args_digest,
+                    view.execution_id,
+                    decoded.now_ms,
+                    "success",
+                    "rejected",
+                    &host_bound_reason(&cause.to_string()),
+                ));
+            }
+            // POLICY (AI-0302-E1d): results cross this transport as UTF-8
+            // text only (the S-C rule, same as E1b inline bytes and E1c
+            // tool arguments); binary payloads refuse typed rather than
+            // crossing smuggled or dropping silent. Result bytes stay
+            // host-side either way — only the digest echo crosses.
+            std::str::from_utf8(&success.data).map_err(|_| {
+                decode_invalid("ai.tool_dispatch result: tool result is not UTF-8 text")
+            })?;
+            Ok(encode_tool_result(
+                &decoded.tool,
+                decoded.args_digest,
+                view.execution_id,
+                decoded.now_ms,
+                "success",
+                "accepted",
+                "",
+            ))
+        }
+        Err(error) => match tool_status_vocab(&error) {
+            Some(status) => Ok(encode_tool_result(
+                &decoded.tool,
+                decoded.args_digest,
+                view.execution_id,
+                decoded.now_ms,
+                status,
+                "accepted",
+                &tool_outcome_reason(&error),
+            )),
+            // Out-of-contract executor error (validation already passed
+            // above): fail closed, never retried, never misclassified.
+            None => Err(IpcError::Internal {
+                reason: "tool executor returned an out-of-contract error".into(),
+            }),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -5904,5 +6481,1199 @@ mod e1c_tests {
         ));
         assert!(matches!(error, IpcError::ScopeDenied { .. }), "{error:?}");
         assert_eq!(provider.complete_calls(), 0);
+    }
+}
+
+#[cfg(test)]
+mod e1d_tests {
+    use super::*;
+    use bitty_ai_host::tool_dispatch::{
+        ConsentDecision as HostConsentDecision, ConsentGrant as HostConsentGrant,
+        ConsentLedger as HostConsentLedger, ConsentQuery as HostConsentQuery,
+        ToolPlacement as HostToolPlacement, ToolRegistry as HostToolRegistry,
+        ToolSpec as HostToolSpec, UsageEvent as HostUsageEvent,
+        consent_grant_expiry as host_consent_grant_expiry,
+    };
+    use bitty_ai_runtime::{
+        FakeProvider, FakeToolExecutor, ModelDescriptor, ToolError as RuntimeToolError,
+    };
+    use bitty_ipc_api::validate_ai_result;
+
+    const CLIENT: &str = "agent-7";
+    const DISPATCH_METHOD: &str = "ai.tool_dispatch";
+    const PROVIDER_ID: &str = "bitty-fake";
+    const PROTOCOL: &str = "owner";
+    const TOOL: &str = "fetch";
+    const TOOL_SCOPE: &str = "tools";
+    const EXECUTION_ID: u64 = 41;
+    const PARAMS_NOW_MS: u64 = 500;
+
+    fn granted_invoke() -> ScopeSet {
+        ScopeSet::single(Scope::AiInvoke)
+    }
+
+    fn ledger_for(scope: Scope) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(CLIENT.to_owned(), scope, 0, 10_000, "user".to_owned())
+            .expect("grant fits in an empty ledger");
+        ledger
+    }
+
+    fn input<'a>(
+        method: &'a str,
+        granted: &'a ScopeSet,
+        ledger: &'a ConsentLedger,
+        now_ms: u64,
+        created_at_ms: u64,
+        timeout_ms: u64,
+        params: &'a [u8],
+    ) -> DispatchInput<'a> {
+        DispatchInput {
+            method,
+            request_id: 7,
+            granted,
+            ledger,
+            client_id: CLIENT,
+            now_ms,
+            created_at_ms,
+            timeout_ms,
+            params,
+        }
+    }
+
+    fn provider_registry_two() -> ProviderRegistry {
+        use bitty_ai_runtime::{ModelCapability as Cap, ModelProvider as _};
+        let provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut registry = ProviderRegistry::new();
+        for descriptor in provider.list_models() {
+            let ModelDescriptor { name, capabilities } = descriptor;
+            registry
+                .register(
+                    bitty_ai_runtime::ModelRegistration::new(
+                        PROVIDER_ID,
+                        name,
+                        capabilities,
+                        4_096,
+                        1,
+                        2,
+                    )
+                    .expect("valid registration"),
+                )
+                .expect("capacity");
+        }
+        registry
+            .register(
+                bitty_ai_runtime::ModelRegistration::new(
+                    "bitty-a",
+                    "vision",
+                    vec![Cap::Text, Cap::ImageInput],
+                    32_768,
+                    3,
+                    4,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        registry
+    }
+
+    fn valid_pin() -> PinEnvelope {
+        use bitty_ai_host::mcp_placement::{InitializeResult, ToolsCapabilityShape};
+        PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        })
+    }
+
+    fn snapshot_empty() -> SnapshotEnvelope {
+        SnapshotEnvelope::new(
+            bitty_ai_host::mcp_placement::ToolListSnapshot::from_imported(&[]),
+            1,
+            false,
+        )
+    }
+
+    /// Host tool registry with the one consented tool under test.
+    fn tool_registry_one() -> HostToolRegistry {
+        let mut registry = HostToolRegistry::new();
+        registry
+            .register(
+                HostToolSpec::new(
+                    TOOL,
+                    "demo fetch",
+                    b"{}".to_vec(),
+                    TOOL_SCOPE,
+                    true,
+                    HostToolPlacement::Mcp,
+                    None,
+                )
+                .expect("valid tool declaration"),
+            )
+            .expect("capacity");
+        registry
+    }
+
+    /// Test consent ledger behind the host seam: allows exactly the held
+    /// grants (exact triple plus exclusive expiry, the S1 `covers` rule).
+    /// Lives under `#[cfg(test)]` only.
+    struct AllowLedger {
+        grants: Vec<HostConsentGrant>,
+    }
+
+    impl HostConsentLedger for AllowLedger {
+        fn check(&self, query: &HostConsentQuery) -> HostConsentDecision {
+            if self.grants.iter().any(|grant| grant.covers(query)) {
+                HostConsentDecision::Allow
+            } else {
+                HostConsentDecision::Deny {
+                    reason: "no grant for this triple".to_owned(),
+                }
+            }
+        }
+    }
+
+    fn allow_ledger(tool: &str, scope: &str, now_ms: u64) -> AllowLedger {
+        AllowLedger {
+            grants: vec![HostConsentGrant {
+                protocol: PROTOCOL.to_owned(),
+                tool: tool.to_owned(),
+                scope: scope.to_owned(),
+                expires_at_ms: host_consent_grant_expiry(now_ms, None),
+            }],
+        }
+    }
+
+    fn deny_ledger() -> AllowLedger {
+        AllowLedger { grants: Vec::new() }
+    }
+
+    fn tool_view<'a, L>(
+        executor: &'a mut FakeToolExecutor,
+        arguments: &'a [u8],
+        registry: &'a HostToolRegistry,
+        consent: &'a L,
+        execution_id: u64,
+    ) -> ToolView<'a>
+    where
+        L: HostConsentLedger,
+    {
+        ToolView {
+            executor,
+            arguments,
+            registry,
+            consent,
+            protocol_id: PROTOCOL,
+            execution_id,
+        }
+    }
+
+    fn dispatch_params(
+        tool: &str,
+        args_digest: u64,
+        allowed: Option<&[&str]>,
+        now_ms: u64,
+    ) -> Vec<u8> {
+        let mut out = format!(
+            "{{\"tool\":\"{tool}\",\"args_digest\":{args_digest},\"caller\":{{\"agent_instance_id\":7,\"session_id\":9,\"level\":\"own\"}}"
+        );
+        if let Some(names) = allowed {
+            out.push_str(",\"allowed\":[");
+            for (index, name) in names.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                out.push_str(name);
+                out.push('"');
+            }
+            out.push(']');
+        }
+        out.push_str(&format!(",\"now_ms\":{now_ms}}}"));
+        out.into_bytes()
+    }
+
+    fn ready_result(outcome: DispatchOutcome) -> String {
+        match outcome {
+            DispatchOutcome::Ready { result, .. } => result,
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    fn refused_error(outcome: DispatchOutcome) -> IpcError {
+        match outcome {
+            DispatchOutcome::Refused(error) => error,
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    /// Full E1d dispatch with per-test executor, args, registries, and
+    /// ledgers. Transport clock 1000 (created 0, timeout 5000: gate 4
+    /// passes); params clock 500 (proves `occurred_at_ms` uses the params
+    /// timestamp, never the transport clock).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_all<'a>(
+        granted: &'a ScopeSet,
+        gate_ledger: &'a ConsentLedger,
+        params: &'a [u8],
+        provider_registry: &'a ProviderRegistry,
+        pin: &'a PinEnvelope,
+        snapshot: &'a SnapshotEnvelope,
+        records: &'a [RuntimeRecord],
+        store: &'a RuntimeArtifactStore,
+        provider: &'a mut FakeProvider,
+        executor: &'a mut FakeToolExecutor,
+        arguments: &'a [u8],
+        tool_registry: &'a HostToolRegistry,
+        consent: &'a AllowLedger,
+        execution_id: u64,
+    ) -> DispatchOutcome {
+        let scoped = input(
+            DISPATCH_METHOD,
+            granted,
+            gate_ledger,
+            1_000,
+            0,
+            5_000,
+            params,
+        );
+        let view = ReadOnlyView {
+            registry: provider_registry,
+            mcp_pin: pin,
+            mcp_snapshot: snapshot,
+        };
+        let ctx = ContextView {
+            records,
+            artifacts: store,
+        };
+        let mut complete = CompleteView {
+            provider,
+            caller_scope: CallerScopeEcho::new("provider/bitty-fake", 500),
+        };
+        let mut tools = tool_view(executor, arguments, tool_registry, consent, execution_id);
+        dispatch_with_tools(&scoped, &view, &ctx, &mut complete, &mut tools)
+    }
+
+    fn lawful_args() -> Vec<u8> {
+        b"{\"url\":\"https://example.test\"}".to_vec()
+    }
+
+    #[test]
+    fn happy_path_success_echoes_attribution() {
+        // POLICY (AI-0302-E1d): end-to-end over the injected
+        // FakeToolExecutor (zero real I/O): decoded params -> digest gate
+        // -> scope assertion -> lookup -> per-tool consent -> narrowing ->
+        // exactly one executor call -> S-C result JSON. The usage echo
+        // carries attribution only (execution id, tool, digest echo,
+        // params timestamp); result bytes stay host-side.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("ok", b"{\"data\":1}".to_vec());
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, Some(&[TOOL]), PARAMS_NOW_MS);
+        let result = ready_result(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        validate_ai_result(DISPATCH_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"status\":\"success\""), "{result}");
+        assert!(
+            result.contains("\"result_disposition\":\"accepted\""),
+            "{result}"
+        );
+        assert!(result.contains("\"reason\":\"\""), "{result}");
+        assert!(result.contains("\"execution_id\":41"), "{result}");
+        assert!(result.contains("\"tool\":\"fetch\""), "{result}");
+        assert!(
+            result.contains(&format!("\"args_digest\":{digest}")),
+            "{result}"
+        );
+        assert!(result.contains("\"occurred_at_ms\":500"), "{result}");
+        assert_eq!(provider.complete_calls(), 0);
+        assert_eq!(executor.calls(), &[(TOOL.to_owned(), args)]);
+    }
+
+    #[test]
+    fn digest_mismatch_refuses_with_zero_executor_contact() {
+        // POLICY (AI-0302-E1d): digest-mismatch-refuses — tampered bytes
+        // (digest over other args) refuse fail-closed before lookup,
+        // consent, narrowing, or dispatch. The poison executor would
+        // succeed if contacted; the empty call log proves it was not.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let wrong = HostUsageEvent::args_digest(b"{\"url\":\"https://evil.test\"}");
+        assert_ne!(wrong, HostUsageEvent::args_digest(&args));
+        let params = dispatch_params(TOOL, wrong, Some(&[TOOL]), PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn method_granted_but_per_tool_unconsented_refuses() {
+        // POLICY (AI-0302-E1d): method-necessary-not-sufficient — gate 3
+        // granted `ai.invoke`, but the tool's own triple has no grant, so
+        // the call refuses `Denied`/`ToolConsent` with zero contact.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = deny_ledger();
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, Some(&[TOOL]), PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(
+                error,
+                IpcError::Denied { ref code, .. } if code == "ToolConsent"
+            ),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_refuses_not_found_with_zero_contact() {
+        // Unregistered names refuse `NotFound` (resolution semantics)
+        // after the digest gate passes, with zero executor contact.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = HostToolRegistry::new();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::NotFound { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn malformed_tool_name_refuses_shape_with_zero_contact() {
+        // Bytes-only names cross gate 5; the S2-owned `^[a-z]...` grammar
+        // refuses them typed at the lookup gate, never passing through.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params("Fetch", digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn multi_tool_params_shape_refuses_at_gate_five() {
+        // A params shape naming a second tool list (`tools` alongside
+        // `tool`) refuses at gate 5 as an unknown field: one tool per call
+        // is structural, never interpreted.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = format!(
+            "{{\"tool\":\"{TOOL}\",\"args_digest\":{digest},\"caller\":{{\"agent_instance_id\":7,\"session_id\":9,\"level\":\"own\"}},\"tools\":[\"{TOOL}\"],\"now_ms\":{PARAMS_NOW_MS}}}"
+        );
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            params.as_bytes(),
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn allow_set_never_fans_out_into_a_batch() {
+        // POLICY (AI-0302-E1d): single-tool-per-call — an allow-set naming
+        // several tools still dispatches exactly the one params tool, once.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("ok", b"{}".to_vec());
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, Some(&[TOOL, "other"]), PARAMS_NOW_MS);
+        let result = ready_result(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        validate_ai_result(DISPATCH_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"status\":\"success\""), "{result}");
+        assert_eq!(executor.calls().len(), 1);
+        assert_eq!(executor.calls(), &[(TOOL.to_owned(), args)]);
+    }
+
+    #[test]
+    fn narrowing_unlisted_tool_refuses_with_zero_contact() {
+        // An allow-set omitting the named tool refuses
+        // `Denied`/`ToolNarrowed` with the S1 wording and zero contact; an
+        // explicit empty list narrows everything away the same way.
+        for allowed in [Some(&["other"][..]), Some(&[][..])] {
+            let granted = granted_invoke();
+            let gate_ledger = ledger_for(Scope::AiInvoke);
+            let provider_registry = provider_registry_two();
+            let pin = valid_pin();
+            let snapshot = snapshot_empty();
+            let store = RuntimeArtifactStore::new();
+            let empty: [RuntimeRecord; 0] = [];
+            let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+            let tool_registry = tool_registry_one();
+            let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+            let mut executor = FakeToolExecutor::new();
+            let args = lawful_args();
+            let digest = HostUsageEvent::args_digest(&args);
+            let params = dispatch_params(TOOL, digest, allowed, PARAMS_NOW_MS);
+            let error = refused_error(dispatch_all(
+                &granted,
+                &gate_ledger,
+                &params,
+                &provider_registry,
+                &pin,
+                &snapshot,
+                &empty,
+                &store,
+                &mut provider,
+                &mut executor,
+                &args,
+                &tool_registry,
+                &consent,
+                EXECUTION_ID,
+            ));
+            assert!(
+                matches!(
+                    error,
+                    IpcError::Denied { ref code, ref reason }
+                    if code == "ToolNarrowed"
+                        && reason == "tool 'fetch' omitted by per-call narrowing"
+                ),
+                "unexpected: {error:?}"
+            );
+            assert!(executor.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn executor_outcome_taxonomy_stays_distinct_with_single_attempt() {
+        // POLICY (AI-0302-E1d): single-attempt plus axis preservation —
+        // executor-after-contact `Denied` vs `Failed` vs `Unknown` cross as
+        // three distinct Ready statuses (never collapsed into admission
+        // refusals), each after exactly one executor call with no retry.
+        let cases: [(&str, RuntimeToolError, &str); 4] = [
+            (
+                "denied",
+                RuntimeToolError::Denied {
+                    name: TOOL.to_owned(),
+                    reason: "host says no".to_owned(),
+                },
+                "host says no",
+            ),
+            (
+                "failed",
+                RuntimeToolError::Failed {
+                    name: TOOL.to_owned(),
+                    reason: "boom".to_owned(),
+                },
+                "boom",
+            ),
+            (
+                "failed",
+                RuntimeToolError::ProtocolRejected {
+                    name: TOOL.to_owned(),
+                    reason: "bad envelope".to_owned(),
+                },
+                "bad envelope",
+            ),
+            (
+                "unknown",
+                RuntimeToolError::EffectUnknown {
+                    name: TOOL.to_owned(),
+                    reason: "ack lost".to_owned(),
+                },
+                "ack lost",
+            ),
+        ];
+        for (status, scripted, reason) in cases {
+            let granted = granted_invoke();
+            let gate_ledger = ledger_for(Scope::AiInvoke);
+            let provider_registry = provider_registry_two();
+            let pin = valid_pin();
+            let snapshot = snapshot_empty();
+            let store = RuntimeArtifactStore::new();
+            let empty: [RuntimeRecord; 0] = [];
+            let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+            let tool_registry = tool_registry_one();
+            let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+            let mut executor = FakeToolExecutor::new();
+            executor.push_error(scripted);
+            let args = lawful_args();
+            let digest = HostUsageEvent::args_digest(&args);
+            let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+            let result = ready_result(dispatch_all(
+                &granted,
+                &gate_ledger,
+                &params,
+                &provider_registry,
+                &pin,
+                &snapshot,
+                &empty,
+                &store,
+                &mut provider,
+                &mut executor,
+                &args,
+                &tool_registry,
+                &consent,
+                EXECUTION_ID,
+            ));
+            validate_ai_result(DISPATCH_METHOD, result.as_bytes()).expect("S-C result shape");
+            assert!(
+                result.contains(&format!("\"status\":\"{status}\"")),
+                "{result}"
+            );
+            assert!(
+                result.contains("\"result_disposition\":\"accepted\""),
+                "{result}"
+            );
+            assert!(
+                result.contains(&format!("\"reason\":\"{reason}\"")),
+                "{result}"
+            );
+            assert!(
+                result.contains(&format!("\"args_digest\":{digest}")),
+                "{result}"
+            );
+            assert_eq!(executor.calls().len(), 1, "single attempt for {status}");
+        }
+        // A pre-effect protocol rejection records `failed` (runtime bus
+        // precedent: the turn stays model-observable) while the reason
+        // keeps its non-executed attribution distinct from executed
+        // failures — pinned by the `bad envelope` row above.
+    }
+
+    #[test]
+    fn non_utf8_tool_result_refuses_typed() {
+        // POLICY (AI-0302-E1d): results cross this transport as UTF-8 text
+        // only (same rule as E1b inline bytes and E1c tool arguments) — a
+        // binary payload refuses typed, never smuggled or lossy-converted.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("ok", vec![0xff, 0xfe]);
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(executor.calls().len(), 1);
+    }
+
+    #[test]
+    fn overbound_tool_result_records_rejected_not_refused() {
+        // An acknowledged effect whose payload exceeds the result bound
+        // keeps `success` and records `rejected` with the typed bound cause
+        // (runtime bus `result_rejected` precedent) — never truncated
+        // silent, never an empty-bytes substitute, never a refusal.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("ok", vec![b'a'; 17 * 1024]);
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let result = ready_result(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        validate_ai_result(DISPATCH_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"status\":\"success\""), "{result}");
+        assert!(
+            result.contains("\"result_disposition\":\"rejected\""),
+            "{result}"
+        );
+        assert!(result.contains("exceeds"), "{result}");
+        assert_eq!(executor.calls().len(), 1);
+    }
+
+    #[test]
+    fn out_of_contract_executor_error_refuses_internal_without_retry() {
+        // Validation already passed above, so an executor-side validation
+        // error disagrees with the lookup (registry changed mid-call):
+        // fail closed `Internal`, never retried, never misclassified onto
+        // an outcome axis.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_error(RuntimeToolError::UnknownTool {
+            name: TOOL.to_owned(),
+        });
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::Internal { .. }),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(executor.calls().len(), 1);
+    }
+
+    #[test]
+    fn oversized_arguments_refuse_bound_with_zero_contact() {
+        // The view bytes never crossed gate 5 (params bind them by digest
+        // only), so the handler enforces the S2 argument bound before
+        // hashing or dispatching: correct digest, still refused.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        let args = vec![b'a'; 17 * 1024];
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(
+                error,
+                IpcError::LimitExceeded { ref field, .. } if field == "args"
+            ),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn admission_gate_order_digest_then_consent_then_narrowing() {
+        // POLICY (AI-0302-E1d): the admission gates run in task order — a
+        // tampered digest beats a missing consent, and a missing consent
+        // beats a narrowing omission. Each row poisons exactly one later
+        // gate while failing an earlier one.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        // Row 1: wrong digest plus denied consent plus omitted narrowing
+        // still reports the digest (InvalidRequest, never Denied).
+        {
+            let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+            let tool_registry = tool_registry_one();
+            let consent = deny_ledger();
+            let mut executor = FakeToolExecutor::new();
+            let params = dispatch_params(
+                TOOL,
+                digest.wrapping_add(1),
+                Some(&["other"]),
+                PARAMS_NOW_MS,
+            );
+            let error = refused_error(dispatch_all(
+                &granted,
+                &gate_ledger,
+                &params,
+                &provider_registry,
+                &pin,
+                &snapshot,
+                &empty,
+                &store,
+                &mut provider,
+                &mut executor,
+                &args,
+                &tool_registry,
+                &consent,
+                EXECUTION_ID,
+            ));
+            assert!(
+                matches!(error, IpcError::InvalidRequest { .. }),
+                "digest must win: {error:?}"
+            );
+            assert!(executor.calls().is_empty());
+        }
+        // Row 2: correct digest plus denied consent plus omitted narrowing
+        // still reports consent (ToolConsent, never ToolNarrowed).
+        {
+            let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+            let tool_registry = tool_registry_one();
+            let consent = deny_ledger();
+            let mut executor = FakeToolExecutor::new();
+            let params = dispatch_params(TOOL, digest, Some(&["other"]), PARAMS_NOW_MS);
+            let error = refused_error(dispatch_all(
+                &granted,
+                &gate_ledger,
+                &params,
+                &provider_registry,
+                &pin,
+                &snapshot,
+                &empty,
+                &store,
+                &mut provider,
+                &mut executor,
+                &args,
+                &tool_registry,
+                &consent,
+                EXECUTION_ID,
+            ));
+            assert!(
+                matches!(
+                    error,
+                    IpcError::Denied { ref code, .. } if code == "ToolConsent"
+                ),
+                "consent must win: {error:?}"
+            );
+            assert!(executor.calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn expired_triple_grant_denies_at_exclusive_boundary() {
+        // The S1 exclusive-expiry rule (`now_ms < expires_at_ms` allows,
+        // equality denies) holds at the endpoint layer: a grant expiring
+        // exactly at the params timestamp denies.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = AllowLedger {
+            grants: vec![HostConsentGrant {
+                protocol: PROTOCOL.to_owned(),
+                tool: TOOL.to_owned(),
+                scope: TOOL_SCOPE.to_owned(),
+                expires_at_ms: PARAMS_NOW_MS,
+            }],
+        };
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &granted,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(
+                error,
+                IpcError::Denied { ref code, .. } if code == "ToolConsent"
+            ),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn scope_assertion_rejects_non_invoke_admission() {
+        // POLICY (AI-0302-E1d): method-necessary — the handler asserts the
+        // admission scope is `ai.invoke` without re-implementing the grant
+        // check. Called directly with a mismatched scope, it refuses
+        // `Internal` fail-closed instead of dispatching.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("ok", b"{}".to_vec());
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let scoped = input(
+            DISPATCH_METHOD,
+            &granted,
+            &gate_ledger,
+            1_000,
+            0,
+            5_000,
+            &params,
+        );
+        let mut tools = tool_view(&mut executor, &args, &tool_registry, &consent, EXECUTION_ID);
+        let error = handle_tool_dispatch(Scope::AiInspect, &scoped, &mut tools).unwrap_err();
+        assert!(
+            matches!(error, IpcError::Internal { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn earlier_entries_keep_tool_dispatch_not_wired() {
+        // POLICY (AI-0302-E1d): parallel extension — the E1d entry wires
+        // only its own method; every earlier entry still returns `NotWired`
+        // for an admitted `ai.tool_dispatch` call.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let scoped = input(
+            DISPATCH_METHOD,
+            &granted,
+            &gate_ledger,
+            1_000,
+            0,
+            5_000,
+            &params,
+        );
+        assert!(
+            matches!(dispatch(&scoped), DispatchOutcome::NotWired { .. }),
+            "E0 entry must keep tool_dispatch NotWired"
+        );
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let view = ReadOnlyView {
+            registry: &provider_registry,
+            mcp_pin: &pin,
+            mcp_snapshot: &snapshot,
+        };
+        assert!(
+            matches!(
+                dispatch_with(&scoped, &view),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "E1a entry must keep tool_dispatch NotWired"
+        );
+        let ctx = ContextView {
+            records: &empty,
+            artifacts: &store,
+        };
+        assert!(
+            matches!(
+                dispatch_with_context(&scoped, &view, &ctx),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "E1b entry must keep tool_dispatch NotWired"
+        );
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut complete = CompleteView {
+            provider: &mut provider,
+            caller_scope: CallerScopeEcho::new("provider/bitty-fake", 500),
+        };
+        assert!(
+            matches!(
+                dispatch_with_complete(&scoped, &view, &ctx, &mut complete),
+                DispatchOutcome::NotWired { .. }
+            ),
+            "E1c entry must keep tool_dispatch NotWired"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+    }
+
+    #[test]
+    fn missing_invoke_grant_refuses_before_handler() {
+        // Without the `ai.invoke` grant, gate 2 refuses `ScopeDenied`
+        // before any handler contact (same six gates, same order).
+        let cli = ScopeSet::cli_default();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = provider_registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let params = dispatch_params(TOOL, digest, None, PARAMS_NOW_MS);
+        let error = refused_error(dispatch_all(
+            &cli,
+            &gate_ledger,
+            &params,
+            &provider_registry,
+            &pin,
+            &snapshot,
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+            EXECUTION_ID,
+        ));
+        assert!(
+            matches!(error, IpcError::ScopeDenied { .. }),
+            "unexpected: {error:?}"
+        );
+        assert!(executor.calls().is_empty());
     }
 }
