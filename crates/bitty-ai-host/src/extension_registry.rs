@@ -57,7 +57,7 @@
 //!   and no parity check against any other seam.
 //! - `Cargo.toml` stays `std`-only.
 //!
-//! S-1/S-2 posture (AIQ-38 still open): this mirror is terminal-side
+//! S-1/S-2 posture (S-1 adopted 2026-10-15, bitty-ai-docs#277): this mirror is terminal-side
 //! declaration metadata only — shapes a host uses to *talk about*
 //! extensions, never a channel carrying them and never a store admitting
 //! them.
