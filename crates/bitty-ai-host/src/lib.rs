@@ -11,11 +11,15 @@
 //! checks — no behavior, no transport — and `#![deny(unsafe_code)]`
 //! (honored via the workspace lints) forbids unsafe blocks crate-wide.
 //!
+//! Decided upstream (recorded here, not chosen here):
+//!
+//! - S-1 registry-split choice (adopted 2026-10-15, bitty-ai-docs#277,
+//!   resident singleton helper; AIQ-38 split facet closed).
+//! - DEC-0004 acceptance (accepted 2026-10-15, bitty-ai-docs#278,
+//!   three lenses).
+//!
 //! Explicitly open (no choice made here or in any module below):
 //!
-//! - S-1 versus S-2 registry-split choice (stays open under AIQ-38).
-//! - DEC-0004 acceptance (still requires architecture, docs-curator, and
-//!   security review).
 //! - `LocalEndpoint` route question (stays with the Phase 2 backlog).
 //! - Per-seam behavior (stays with separately scoped Phase 2 tasks).
 //!

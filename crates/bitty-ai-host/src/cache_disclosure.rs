@@ -31,7 +31,7 @@
 //!   channel stays with the scoped IPC task (S-2), which must also take on
 //!   the IPC review trigger noted in this crate's `Cargo.toml`.
 //!
-//! S-1/S-2 posture (AIQ-38 still open): this mirror is terminal-side
+//! S-1/S-2 posture (S-1 adopted 2026-10-15, bitty-ai-docs#277): this mirror is terminal-side
 //! metadata only — shapes a host uses to *talk about* cached disclosure,
 //! never a channel carrying it. It grants nothing: constructing these values
 //! performs no I/O and bestows no capability. Key equality never authorizes

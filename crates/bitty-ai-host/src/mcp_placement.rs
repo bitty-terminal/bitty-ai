@@ -80,8 +80,8 @@
 //! `relist` / pin revalidation, allowlist lookup, tier/authorizer/consent
 //! gates, bounded dispatch), execute paths (`execute_narrowed` /
 //! `execute_inner`, call-tool mapping), scoped-IPC envelope types (S-2,
-//! parked on the host `Cargo.toml` IPC review plus CTX-0147 Phase 2 and the
-//! AIQ-38 S-1/S-2 decision), placement-policy admission (S-3, parked on
+//! parked on the host `Cargo.toml` IPC review plus CTX-0147 Phase 2
+//! (S-1 adopted 2026-10-15, bitty-ai-docs#277)), placement-policy admission (S-3, parked on
 //! policy design plus security review and AIQ-36 acceptance), SPKI fetch and
 //! peer-key providers (real provider stays slice-gated), credential helpers,
 //! resources/prompts consumers (classifiers stay symmetry-only, no version,
