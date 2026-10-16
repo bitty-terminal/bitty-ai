@@ -998,6 +998,22 @@ fn correlator_of(top: &JVal, method: &str) -> Result<Option<SnapshotVersion>, Ip
     // owns their refusal upstream; the fieldless empty-object rule owns it
     // for fieldless methods at decode), so this allow-list opens no
     // wildcard.
+    // POLICY (AI-0302-E2): duplicates refuse — the contract allows ONE
+    // optional correlator, and `field()` is first-wins, so two members
+    // must not silently resolve to the first (CodeRabbit PR#500 review).
+    // Every decode path funnels through here, so direct parser/handler
+    // paths enforce the same rule as the gate-5 dispatch path.
+    let occurrences = top.as_obj().map_or(0, |fields| {
+        fields
+            .iter()
+            .filter(|(key, _)| key == CORRELATOR_FIELD)
+            .count()
+    });
+    if occurrences > 1 {
+        return Err(decode_invalid(&format!(
+            "{method} params: field '{CORRELATOR_FIELD}' duplicated"
+        )));
+    }
     match top.field(CORRELATOR_FIELD) {
         None => Ok(None),
         Some(value) => value
@@ -8128,6 +8144,21 @@ mod e2_tests {
             assert!(parse_correlator("ai.model_cost", &body).is_ok());
             assert!(decode_request("ai.model_cost", &body).is_ok());
         }
+    }
+
+    #[test]
+    fn duplicate_correlator_refuses_invalid_request() {
+        // POLICY (AI-0302-E2): the contract allows ONE optional
+        // correlator — two members refuse rather than silently resolving
+        // to the first (CodeRabbit PR#500 review). Every decode path
+        // funnels through `correlator_of`, so direct parser/handler paths
+        // enforce the same rule as the gate-5 dispatch path.
+        let body = br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":3,"snapshot_version":4}"#;
+        let error = parse_correlator("ai.model_cost", body).unwrap_err();
+        assert_invalid_request(&error, "duplicate correlator parses");
+        let error = decode_request("ai.model_cost", body).unwrap_err();
+        assert_invalid_request(&error, "duplicate correlator decodes");
+        assert!(handle_cost(body).is_err(), "duplicate correlator handles");
     }
 
     #[test]
