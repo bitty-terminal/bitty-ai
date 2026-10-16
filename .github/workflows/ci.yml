@@ -45,6 +45,16 @@ jobs:
       - name: v0.1 durable-path gate
         run: cargo test --locked -p bitty-ai-slice --test v01_no_durable_path
 
+      # Host-boundary gate v2 (AI-0310): the fail-closed textual gate for the
+      # CTX-0159 classification delta. Same guards as
+      # `just host-boundary-gate-v2` and `just host-boundary-gate-v2-test`
+      # (spelled as bash here so CI keeps zero dependency on `just`).
+      - name: Host-boundary gate v2
+        run: bash scripts/host-boundary-gate-v2.sh
+
+      - name: Host-boundary gate v2 regression tests
+        run: bash scripts/tests/host-boundary-gate-v2-test.sh
+
       - name: Lint GitHub Actions workflows
         run: >-
           docker run --rm
