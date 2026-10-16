@@ -29,6 +29,20 @@ typecheck:
 gate-v01-durable:
     cargo test --locked -p bitty-ai-slice --test v01_no_durable_path
 
+# Host-boundary gate v2 (AI-0310): the fail-closed textual gate enforcing the
+# CTX-0159 classification delta (bitty-ai-docs#282) — endpoint consumption
+# allow-list, host zero-dep tripwire, pin tripwire, no-new-edge, test-only
+# confinement. Part of `check` and CI so a new cross-layer edge cannot land
+# without a classification update.
+host-boundary-gate-v2:
+    bash scripts/host-boundary-gate-v2.sh
+
+# Regression suite for the v2 gate (AI-0310): synthetic fixtures plus the
+# real-tree green assertion. Part of `check` and CI with any change to the
+# gate; update the fixtures before enabling a new check.
+host-boundary-gate-v2-test:
+    bash scripts/tests/host-boundary-gate-v2-test.sh
+
 actionlint:
     actionlint -color
 
@@ -79,7 +93,7 @@ commit-check message:
     @cp commitlint.config.ts target/dev-tools/commitlint.config.ts
     @msg="$(realpath "{{message}}")" && cd target/dev-tools && bunx --bun commitlint --edit "$msg"
 
-check: fmt-check clippy test gate-v01-durable actionlint markdownlint
+check: fmt-check clippy test gate-v01-durable actionlint host-boundary-gate-v2 host-boundary-gate-v2-test markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
