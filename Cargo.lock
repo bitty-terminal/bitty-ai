@@ -161,7 +161,7 @@ source = "git+https://github.com/bitty-terminal/bitty?rev=cfeffa2d8e138702985094
 [[package]]
 name = "bitty-ipc-api"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=d0c4ecd#d0c4ecd8f68ffef0301d10e2fe23f2ad8a3dcb0e"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=f201911#f20191183f6ae9464889c5d0a6cc8606670314ee"
 
 [[package]]
 name = "bitty-lua"

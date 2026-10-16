@@ -74,8 +74,8 @@
 //!   [`check_correlator`], and [`correlator_current`]. TOLERANT mode: stale or
 //!   missing sightings proceed (disposition recorded test-observably, never in
 //!   result JSON); enforcement is S-F (AI-0303), not here. Dispatch-path flow
-//!   of the field pends a `bitty-ipc-api` schema allowance (gate 5 still
-//!   refuses it as unknown there; see the E2 contract).
+//!   of the field rides the `bitty-ipc-api` schema allowance (landed AI-0307,
+//!   rev f201911: gate 5 accepts the optional field there; see the E2 contract).
 //! - E3: loopback admit/deny matrix, reassembler TTL, forged-tier vectors.
 //! - S-F (AI-0303, separate follow-up): correlator enforcement and the full
 //!   host-boundary lint gate re-establishment. No producer emits snapshot
@@ -232,15 +232,16 @@
 //! // fields still refuse (gate 5 upstream on the dispatch path; the empty-
 //! // object rule for fieldless methods at decode).
 
-//! Pending schema allowance: the pinned `bitty-ipc-api` gate-5 schema
-//! (`validate_ai_params`) still refuses `snapshot_version` as an unknown field
-//! on the dispatch path, so correlator-bearing params refuse at gate 5 until
-//! a `bitty-ipc` follow-up allow-lists the optional field there (the S-C
-//! optional-field machinery — absent-means-default — already exists; only the
-//! allow-list entry is missing). The decode extension point is ready now; an
-//! `e2` tripwire test pins the gate-5 refusal so the allowance landing fails
-//! loudly and forces the dispatch-path update. Direct handler/decode calls
-//! (which bypass gate 5) exercise the tolerant path today.
+//! Schema allowance (landed AI-0307, `bitty-ipc-api` rev f201911 follow-up to
+//! `bitty-ipc` #31): the gate-5 schema (`validate_ai_params`) allow-lists the
+//! optional `snapshot_version` field on the dispatch path, so
+//! correlator-bearing params pass gate 5 and reach decode/handler with the
+//! tolerant disposition (the S-C optional-field machinery —
+//! absent-means-default — already existed; only the allow-list entry was
+//! missing). The decode extension point was ready before the allowance; an
+//! `e2` test then pinned the gate-5 refusal so the allowance landing would
+//! fail loudly, and now pins the allowed dispatch path instead. Enforcement
+//! (refusing on stale/missing) is S-F (AI-0303), never here.
 
 //! ## Normative precedence
 //!
@@ -937,12 +938,11 @@ fn parse_params_object(params: &[u8]) -> Result<JVal, IpcError> {
 // The tolerant S-1 correlator field lands here (seam built, AI-0302-E2):
 // every per-method decode funnels through `decode_request`, which accepts
 // ONE optional, bounded correlator field alongside the method fields via
-// the single `correlator_of` allow-list choke below. Gate 5 still refuses
-// the field as unknown on the dispatch path (pending `bitty-ipc-api`
-// schema allowance), so correlator-bearing dispatch params refuse upstream
-// there today; direct decode/handler calls (which bypass gate 5) exercise
-// the tolerant path now. Enforcement (refusing on stale/missing) is S-F
-// (AI-0303), never here.
+// the single `correlator_of` allow-list choke below. Gate 5 accepts the
+// field on the dispatch path since the `bitty-ipc-api` schema allowance
+// (landed AI-0307, rev f201911), so correlator-bearing dispatch params
+// reach decode/handler with the tolerant disposition. Enforcement
+// (refusing on stale/missing) is S-F (AI-0303), never here.
 
 /// Params field name carrying the tolerant S-1 snapshot correlator.
 ///
@@ -4142,13 +4142,14 @@ mod tests {
 
     #[test]
     fn endpoint_ipc_pin_stays_at_owner_decision() {
-        // POLICY (AI-0302-E0): the `bitty-ipc-api` git pin is the owner
-        // decision in PX-1298 (`d0c4ecd`, 7-char per workspace git-pin
-        // policy). A stale-pin bump is a separate follow-up, never silent
-        // drift inside S-E.
+        // POLICY (AI-0302-E0): the `bitty-ipc-api` git pin is an owner
+        // decision (`f201911` per AI-0307, 7-char per workspace git-pin
+        // policy; was `d0c4ecd` per PX-1298 before the schema-allowance
+        // follow-up to `bitty-ipc` #31). A stale-pin bump is a separate
+        // follow-up, never silent drift inside S-E.
         assert!(
-            ENDPOINT_MANIFEST.contains(r#"rev = "d0c4ecd""#),
-            "endpoint manifest must pin bitty-ipc-api at rev d0c4ecd"
+            ENDPOINT_MANIFEST.contains(r#"rev = "f201911""#),
+            "endpoint manifest must pin bitty-ipc-api at rev f201911"
         );
     }
 }
@@ -8194,39 +8195,82 @@ mod e2_tests {
     }
 
     #[test]
-    fn gate5_refuses_correlator_pending_schema_allowance() {
-        // TRIPWIRE (AI-0302-E2, pending `bitty-ipc` follow-up): the pinned
-        // gate-5 schema (`validate_ai_params` at `bitty-ipc-api` rev
-        // d0c4ecd) still refuses `snapshot_version` as an unknown field, so
-        // correlator-bearing DISPATCH params refuse at gate 5 today. When
-        // the schema allow-lists the optional field, THIS TEST FAILS —
-        // update it to expect the tolerant proceed (plus dispatch-path
-        // disposition coverage) instead of deleting it.
+    fn gate5_accepts_correlator_schema_allowance_landed() {
+        // ALLOWANCE LANDED (AI-0307, `bitty-ipc-api` rev f201911 follow-up to
+        // `bitty-ipc` #31): the gate-5 schema (`validate_ai_params`) now
+        // allow-lists the optional `snapshot_version` correlator, so
+        // correlator-bearing DISPATCH params pass gate 5 and reach
+        // decode/handler with the tolerant disposition. This test replaces
+        // the AI-0302-E2 tripwire
+        // (`gate5_refuses_correlator_pending_schema_allowance`), which failed
+        // loudly on the pin bump exactly as designed (refusal assertion vs
+        // new `Ready`). Enforcement stays S-F (AI-0303): stale or missing
+        // sightings still proceed here.
         let granted = granted_inspect();
         let ledger = ledger_for(Scope::AiInspect);
         let registry = ProviderRegistry::new();
         let pin = valid_pin();
         let snapshot = snapshot_three();
-        let scoped = input(
-            "ai.model_select",
-            &granted,
-            &ledger,
-            br#"{"required":["text"],"snapshot_version":7}"#,
+        let view_ref = view(&registry, &pin, &snapshot);
+        // Shaped arm: the correlator rides alongside method fields and the
+        // dispatch reaches the handler (Ready, schema-clean result, no
+        // correlator trace) with the sighting classified tolerantly.
+        let shaped = br#"{"required":["text"],"snapshot_version":7}"#;
+        let result = ready_result(dispatch_with(
+            &input("ai.model_select", &granted, &ledger, shaped),
+            &view_ref,
+        ));
+        validate_ai_result("ai.model_select", result.as_bytes()).expect("S-C result shape");
+        assert!(!result.contains(CORRELATOR_FIELD), "{result}");
+        assert_eq!(
+            parse_correlator("ai.model_select", shaped).expect("valid correlator"),
+            Some(SnapshotVersion::new(7))
         );
-        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
-        assert_invalid_request(&error, "shaped correlator at gate 5");
-        assert!(
-            format!("{error:?}").contains("unknown field refused"),
-            "unexpected: {error:?}"
+        assert_eq!(
+            check_correlator(
+                Some(SnapshotVersion::new(7)),
+                correlator_current("ai.model_select", &view_ref)
+            ),
+            CorrelatorInfo {
+                seen: Some(SnapshotVersion::new(7)),
+                disposition: CorrelatorDisposition::Unchecked,
+            }
         );
-        let scoped = input(
-            "ai.mcp_snapshot",
-            &granted,
-            &ledger,
-            b"{\"snapshot_version\":3}",
+        // Fieldless arm: a body carrying ONLY the correlator dispatches to
+        // Ready (sighted 3 against the envelope current 3).
+        let fieldless = b"{\"snapshot_version\":3}";
+        let result = ready_result(dispatch_with(
+            &input("ai.mcp_snapshot", &granted, &ledger, fieldless),
+            &view_ref,
+        ));
+        validate_ai_result("ai.mcp_snapshot", result.as_bytes()).expect("S-C result shape");
+        assert!(!result.contains(CORRELATOR_FIELD), "{result}");
+        assert_eq!(
+            check_correlator(
+                parse_correlator("ai.mcp_snapshot", fieldless).expect("valid correlator"),
+                correlator_current("ai.mcp_snapshot", &view_ref)
+            ),
+            CorrelatorInfo {
+                seen: Some(SnapshotVersion::new(3)),
+                disposition: CorrelatorDisposition::Current,
+            }
         );
-        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
-        assert_invalid_request(&error, "fieldless correlator at gate 5");
+        // A stale sighting on the dispatch path still proceeds tolerantly
+        // (S-F flips this to a refusal, never here).
+        let stale = b"{\"snapshot_version\":1}";
+        let result = ready_result(dispatch_with(
+            &input("ai.mcp_snapshot", &granted, &ledger, stale),
+            &view_ref,
+        ));
+        validate_ai_result("ai.mcp_snapshot", result.as_bytes()).expect("S-C result shape");
+        assert_eq!(
+            check_correlator(
+                parse_correlator("ai.mcp_snapshot", stale).expect("valid correlator"),
+                correlator_current("ai.mcp_snapshot", &view_ref)
+            )
+            .disposition,
+            CorrelatorDisposition::StaleTolerated
+        );
     }
 
     #[test]
