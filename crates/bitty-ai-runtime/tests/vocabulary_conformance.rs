@@ -6,7 +6,10 @@
 //! the `bitty-ai-runtime` twins. Each mapping asserts CURRENT equivalence;
 //! drift fails loudly with a message naming both sides (file:line at the
 //! pinned rev vs this repo path). Drift is reported, never silently fixed:
-//! no production type in `src/` changes to match, per task scope.
+//! no production type in `src/` changes to match, per task scope — with the
+//! single owner-directed exception of D3 (AI-0316, CONVERGE), where the
+//! runtime tool-name grammar was widened to the agent class and the drift
+//! test became a converge proof.
 //!
 //! Method: `bitty-agent-api` at `a8e4112` exposes only `AgentId` plus
 //! `AgentError` (`crates/bitty-agent-api/src/id.rs`, `error.rs`), so only
@@ -37,8 +40,10 @@
 //!   `read_only`, `placement`, `native`, `schema_json: Vec<u8>` vs agent
 //!   `input_schema: String`); covered by the bound tests, no silent fix.
 //! - Tool name grammar shared core (`tool_name_grammar_shared_core_matches`): M.
-//! - Tool name grammar `-`/`.` (`tool_name_grammar_drift`): D (runtime
-//!   `^[a-z][a-z0-9_]*$` rejects what agent `^[a-z][a-z0-9_.-]*$` accepts).
+//! - Tool name grammar `-`/`.` (`tool_name_grammar_converged`): M
+//!   (AI-0316 CONVERGE: runtime widened to the agent class
+//!   `^[a-z][a-z0-9_.-]*$`; the former drift test is now the converge
+//!   proof and runs un-ignored).
 //! - ToolCall args bound 16 KiB (`tool_args_bound_matches`): M.
 //! - ToolCall id (`toolcall_id_field_drift`): D (runtime `ToolCall` has no
 //!   caller id; agent requires `id`, correlated by `ToolResult.call_id`).
@@ -69,9 +74,10 @@
 //! threads. All messages are static literals (CodeQL lesson from AI-0082:
 //! no dynamic data in assert/panic strings).
 //!
-//! Covered here (and only here): the 18 AI-0257 mappings above (11 match
-//! plus 7 drift-ledger, the drift tests ignored but live, failing under the
-//! ignored-only run).
+//! Covered here (and only here): the 18 AI-0257 mappings above (12 match
+//! plus 6 drift-ledger, the drift tests ignored but live, failing under the
+//! ignored-only run; D3 converged per the AI-0316 owner ruling and runs
+//! un-ignored).
 
 use bitty_agent_api::{AgentId, MAX_AGENT_ID_LEN, MAX_AGENT_ID_SEGMENT_LEN};
 use bitty_ai_runtime::tool::{
@@ -358,6 +364,8 @@ fn executed_tool_outcome_carries_untrusted_flag() {
 
 // DRIFT-LEDGER (ignored but live): runtime tool.rs MAX_TOOL_DESCRIPTION_LEN=512
 // vs bitty-agent@a8e4112 tool.rs MAX_TOOL_DESCRIPTION_LEN=1024.
+// ARCHIVED (owner ruling 2026-10-16): Independent local fail-closed bounds
+// with no shared declaration path.
 #[test]
 #[ignore = "drift ledger: runtime MAX_TOOL_DESCRIPTION_LEN=512 vs agent MAX_TOOL_DESCRIPTION_LEN=1024"]
 fn toolspec_description_bound_drift() {
@@ -372,6 +380,8 @@ fn toolspec_description_bound_drift() {
 
 // DRIFT-LEDGER (ignored but live): runtime tool.rs MAX_TOOL_SCHEMA_BYTES=16KiB
 // vs bitty-agent@a8e4112 tool.rs MAX_TOOL_SCHEMA_BYTES=8KiB.
+// ARCHIVED (owner ruling 2026-10-16): Opposite-direction looseness, neither
+// side normative, alignment without shared wire type is arbitrary churn.
 #[test]
 #[ignore = "drift ledger: runtime MAX_TOOL_SCHEMA_BYTES=16KiB vs agent MAX_TOOL_SCHEMA_BYTES=8KiB"]
 fn toolspec_schema_bound_drift() {
@@ -384,26 +394,39 @@ fn toolspec_schema_bound_drift() {
     );
 }
 
-// DRIFT-LEDGER (ignored but live): runtime tool.rs rejects `-`/`.` names
-// vs bitty-agent@a8e4112 tool.rs accepts them.
+// CONVERGED (owner ruling 2026-10-16, CONVERGE D3): runtime tool.rs now
+// accepts the agent class `^[a-z][a-z0-9_.-]*$` (bitty-agent@a8e4112
+// tool.rs grammar `start with [a-z], then [a-z0-9_.-]`), so the former
+// drift is the converge proof and this test runs un-ignored.
 #[test]
-#[ignore = "drift ledger: runtime tool-name grammar rejects `-`/`.` vs agent accepts them"]
-fn tool_name_grammar_drift() {
-    // DRIFT tool-name grammar: runtime tool.rs:293-305
-    // (^[a-z][a-z0-9_]*$) rejects `-` and `.`, which bitty-agent
-    // tool.rs:1309-1322 (^[a-z][a-z0-9_.-]*$, valid names include
-    // "run-command" and "a.b" per its valid_tool_names test) accepts.
-    // Fails loudly; neither grammar changes here (report-only).
+fn tool_name_grammar_converged() {
+    // Converged tool-name grammar: runtime tool.rs `validate_tool_name`
+    // accepts `-` and `.` exactly like bitty-agent tool.rs
+    // (`valid_tool_names` accepts "run-command" and "a.b").
     for name in ["run-command", "a.b", "my-tool_2"] {
         assert!(
             validate_tool_name(name).is_ok(),
-            "DRIFT tool-name grammar: runtime tool.rs rejects `-`/`.` names that bitty-agent@a8e4112 tool.rs accepts"
+            "converged tool-name grammar: runtime tool.rs rejects `-`/`.` names that bitty-agent@a8e4112 tool.rs accepts"
         );
     }
+    // The widening is exact: the still-rejected classes stay rejected.
+    for name in ["", "1tool", "Tool", "tool with space", "tool\0name"] {
+        assert!(
+            validate_tool_name(name).is_err(),
+            "converged tool-name grammar: runtime tool.rs accepts a name both sides reject"
+        );
+    }
+    let too_long = "a".repeat(AGENT_MAX_TOOL_NAME_LEN + 1);
+    assert!(
+        validate_tool_name(&too_long).is_err(),
+        "converged tool-name grammar: runtime accepts an over-long name"
+    );
 }
 
 // DRIFT-LEDGER (ignored but live): runtime tool.rs ToolCall has no caller id
 // vs bitty-agent@a8e4112 tool.rs ToolCall.id with ToolResult.call_id correlation.
+// ARCHIVED (owner ruling 2026-10-16): Bus-issued ExecutionId (AI-0106) is the
+// deliberate correlation identity.
 #[test]
 #[ignore = "drift ledger: runtime ToolCall has no caller id vs agent ToolCall.id with ToolResult.call_id"]
 fn toolcall_id_field_drift() {
@@ -422,6 +445,8 @@ fn toolcall_id_field_drift() {
 
 // DRIFT-LEDGER (ignored but live): no runtime ToolResult twin (split into
 // ToolSuccess plus ToolExecution) vs bitty-agent@a8e4112 tool.rs ToolResult.
+// ARCHIVED (owner ruling 2026-10-16): Split ToolSuccess/ToolExecution
+// supersedes flat ToolResult by design.
 #[test]
 #[ignore = "drift ledger: no runtime ToolResult twin (ToolSuccess plus ToolExecution) vs agent ToolResult"]
 fn toolresult_shape_drift() {
@@ -441,11 +466,13 @@ fn toolresult_shape_drift() {
 
 // DRIFT-LEDGER (ignored but live): no runtime AgentObservation twin or 8KiB
 // observation cap vs bitty-agent@a8e4112 observation.rs AgentObservation.
+// ARCHIVED (owner ruling 2026-10-16): AgentObservation is terminal-layer
+// vocabulary, untrusted-surface already parity-matched.
 #[test]
 #[ignore = "drift ledger: no runtime AgentObservation twin or 8KiB cap vs agent AgentObservation"]
 fn observation_type_drift() {
     // DRIFT observation vocabulary: runtime has no AgentObservation twin.
-    // The agent enum (bitty-agent observation.rs:33, eleven variants with an
+    // The agent enum (bitty-agent observation.rs:33, ten variants with an
     // 8 KiB payload cap at observation.rs:17 and read-only snapshots plus
     // is_untrusted_surface labeling) has no counterpart enum or 8 KiB
     // observation cap in runtime; only the untrusted flag survives, on
@@ -459,6 +486,8 @@ fn observation_type_drift() {
 
 // DRIFT-LEDGER (ignored but live): runtime session.rs AgentSession has no
 // history caps or side queue vs bitty-agent@a8e4112 session.rs plus message.rs caps.
+// ARCHIVED (owner ruling 2026-10-16): History caps/queue ownership deliberately
+// outside AgentSession.
 #[test]
 #[ignore = "drift ledger: runtime AgentSession has no history caps or side queue vs agent session plus message caps"]
 fn session_bounds_drift() {

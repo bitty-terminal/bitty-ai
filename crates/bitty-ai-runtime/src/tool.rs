@@ -291,7 +291,14 @@ impl ToolError {
 }
 
 /// Validate a tool name (`TB-2`): non-empty, at most 64 bytes,
-/// `^[a-z][a-z0-9_]*$` within the owner namespace.
+/// `^[a-z][a-z0-9_.-]*$` within the owner namespace.
+///
+/// Converged with `bitty-agent` at rev `a8e4112`
+/// (`crates/bitty-agent/src/tool.rs`, grammar comment `start with [a-z],
+/// then [a-z0-9_.-]`, `valid_tool_names` accepting `run-command`, `a.b`,
+/// `my-tool_2`) per the AI-0316 owner ruling (2026-10-16, CONVERGE D3).
+/// Dots and hyphens are accepted; empty, uppercase-start, leading-digit,
+/// whitespace, NUL, non-ASCII, and over-length names are still rejected.
 ///
 /// # Errors
 ///
@@ -300,9 +307,9 @@ pub fn validate_tool_name(name: &str) -> Result<(), ToolError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_TOOL_NAME_LEN
         && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.' || b == b'-'
+        });
     if valid {
         Ok(())
     } else {
@@ -2062,10 +2069,19 @@ mod tests {
 
     #[test]
     fn tool_name_shape() {
+        // AI-0316 convergence: the agent-class grammar
+        // (`^[a-z][a-z0-9_.-]*$`, bitty-agent@a8e4112) accepts dots and
+        // hyphens alongside the shared underscore core.
         assert!(validate_tool_name("workspace_read").is_ok());
+        assert!(validate_tool_name("run-command").is_ok());
+        assert!(validate_tool_name("terminal.read").is_ok());
+        assert!(validate_tool_name("a.b").is_ok());
+        assert!(validate_tool_name("my-tool_2").is_ok());
         assert!(validate_tool_name("").is_err());
         assert!(validate_tool_name("Read").is_err());
-        assert!(validate_tool_name("terminal.read").is_err());
+        assert!(validate_tool_name("1tool").is_err());
+        assert!(validate_tool_name("tool with space").is_err());
+        assert!(validate_tool_name("tool\0name").is_err());
         assert!(validate_tool_name("a".repeat(65).as_str()).is_err());
     }
 
@@ -2189,25 +2205,50 @@ mod tests {
     #[test]
     fn register_revalidates_specs_built_without_new() {
         let mut registry = ToolRegistry::new();
-        // Legacy dotted vocabulary (`terminal.read_zone`) never enters the
-        // registry, even when the spec bypasses `ToolSpec::new`.
+        // AI-0316 convergence: dotted and dashed vocabulary
+        // (`terminal.read_zone`, `run-command`) enters the registry even
+        // when the spec bypasses `ToolSpec::new`, exactly like a
+        // `new`-built spec (registry round-trip below).
         let dotted = ToolSpec {
             name: "terminal.read_zone".to_owned(),
-            description: "legacy dotted name".to_owned(),
+            description: "dotted name".to_owned(),
             schema_json: Vec::new(),
             required_scope: "terminal.inspect".to_owned(),
             read_only: true,
             placement: Some(ToolPlacement::Mcp),
             native: None,
         };
+        registry
+            .register(dotted)
+            .expect("dotted name must register");
+        let dashed = ToolSpec {
+            name: "run-command".to_owned(),
+            description: "dashed name".to_owned(),
+            schema_json: Vec::new(),
+            required_scope: "terminal.inspect".to_owned(),
+            read_only: true,
+            placement: Some(ToolPlacement::Mcp),
+            native: None,
+        };
+        registry
+            .register(dashed)
+            .expect("dashed name must register");
         assert_eq!(
             registry
-                .register(dotted)
-                .expect_err("dotted name must fail"),
-            ToolError::InvalidName {
-                name: "terminal.read_zone".to_owned(),
-            }
+                .lookup("terminal.read_zone")
+                .expect("dotted spec kept")
+                .required_scope,
+            "terminal.inspect"
         );
+        assert_eq!(
+            registry
+                .lookup("run-command")
+                .expect("dashed spec kept")
+                .required_scope,
+            "terminal.inspect"
+        );
+        // Revalidation still applies to the other bounds: an oversized
+        // description is refused even though its name is valid.
         let oversized = ToolSpec {
             name: "workspace_read".to_owned(),
             description: "x".repeat(MAX_TOOL_DESCRIPTION_LEN + 1),
@@ -2221,7 +2262,9 @@ mod tests {
             registry.register(oversized),
             Err(ToolError::DescriptionTooLarge { .. })
         ));
-        assert!(registry.is_empty());
+        // Only the two converged names were admitted; the refusal changed
+        // nothing.
+        assert_eq!(registry.len(), 2);
     }
 
     /// AIQ-33 S3 fixture: owner-approved native reason/backend used by the
@@ -2597,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_dotted_tool_call_fails_as_invalid_name() {
+    fn dotted_tool_call_passes_name_gate_fails_as_unknown_until_registered() {
         struct Allow;
         impl ToolAuthorizer for Allow {
             fn authorize(&self, _ctx: &AuthContext) -> AuthDecision {
@@ -2609,14 +2652,17 @@ mod tests {
             name: "terminal.read_zone".to_owned(),
             arguments: br#"{}"#.to_vec(),
         };
+        // AI-0316 convergence: the dotted name passes the `TB-2` shape
+        // gate, so an unregistered dotted call fails as `UnknownTool`
+        // (lookup miss), never `InvalidName`.
         assert_eq!(
             bus.precheck(
                 std::slice::from_ref(&call),
                 &base(),
                 MAX_TOOL_CALLS_PER_TURN
             )
-            .expect_err("dotted name must fail"),
-            ToolError::InvalidName {
+            .expect_err("unregistered dotted name must fail"),
+            ToolError::UnknownTool {
                 name: "terminal.read_zone".to_owned(),
             }
         );
