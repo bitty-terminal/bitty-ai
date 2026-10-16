@@ -22,4 +22,4 @@ workspace = true
 # clocks, or threads on this path.
 bitty-ai-runtime = { path = "../bitty-ai-runtime" }
 bitty-ai-host = { path = "../bitty-ai-host" }
-bitty-ipc-api = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "d0c4ecd" }
+bitty-ipc-api = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "f201911" }
