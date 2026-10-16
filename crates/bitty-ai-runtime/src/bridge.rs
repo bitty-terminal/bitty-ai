@@ -1306,14 +1306,20 @@ mod tests {
                 .grant("local.assistant", "workspace_read", "", 9)
                 .is_err()
         );
-        // Runtime TB-2 tool shape still applies at the seam: dotted legacy
-        // vocabulary never enters the fake table.
+        // Runtime TB-2 tool shape still applies at the seam: AI-0316
+        // convergence accepts dotted/dashed names, so the dotted grant
+        // lands, while a still-malformed tool name is refused.
         assert!(
             ledger
                 .grant("local.assistant", "terminal.read_zone", "s", 9)
+                .is_ok()
+        );
+        assert!(
+            ledger
+                .grant("local.assistant", "Bad Tool!", "workspace.read", 9)
                 .is_err()
         );
-        assert!(ledger.is_empty());
+        assert_eq!(ledger.len(), 1);
     }
 
     #[test]

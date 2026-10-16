@@ -870,10 +870,11 @@ fn l1_assembly_prunes_and_externalizes_inside_turn() {
 }
 
 #[test]
-fn legacy_dotted_tool_name_from_model_fails_as_invalid() {
-    // The model is untrusted: a legacy dotted name (`terminal.read_zone`,
-    // pre-AI-0012 slice vocabulary) must surface as `InvalidName` (`TB-2`),
-    // never as a dispatch or a silent unknown-tool substitute.
+fn dotted_tool_name_from_model_fails_as_unknown_until_registered() {
+    // The model is untrusted: a dotted name (`terminal.read_zone`,
+    // pre-AI-0012 slice vocabulary) passes the converged `TB-2` shape gate
+    // (AI-0316) but names no registered spec here, so it must surface as
+    // `UnknownTool`, never as a dispatch or a silent substitute.
     let mut provider = FakeProvider::new("bitty-fake").expect("valid id");
     provider.push_turn(ProviderTurn {
         text: "calling legacy".to_owned(),
@@ -894,7 +895,7 @@ fn legacy_dotted_tool_name_from_model_fails_as_invalid() {
         matches!(
             &outcome,
             ExecOutcome::Failed {
-                error: AgentError::Tool(ToolError::InvalidName { .. })
+                error: AgentError::Tool(ToolError::UnknownTool { .. })
             }
         ),
         "unexpected outcome: {outcome:?}"

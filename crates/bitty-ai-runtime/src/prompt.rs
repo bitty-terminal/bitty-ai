@@ -142,7 +142,7 @@ pub const SUPPORTED_SKILL_VERSIONS: &[&str] = &[SKILL_REGISTRY_VERSION_1];
 /// existing `PromptNotAllowed` variant requires a `tool` field. This sentinel
 /// reuses that variant per S-13 without adding a new error variant: it
 /// contains `<`, space, and `>` so it can never collide with a `TB-2` tool
-/// name (`^[a-z][a-z0-9_]*$`), making the assembly-time origin unambiguous.
+/// name (`^[a-z][a-z0-9_.-]*$`), making the assembly-time origin unambiguous.
 pub const EMPTY_ALLOW_SET_SENTINEL: &str = "<empty allow-set>";
 
 /// Prompt layer from most stable (Core) to most dynamic (Runtime/Turn).
@@ -963,7 +963,8 @@ pub fn validate_pinned_layer_trust(layer: PromptLayer, text: &str) -> Result<(),
 }
 
 /// Validate a prompt tool entry against the `TB-2` name shape
-/// (`^[a-z][a-z0-9_]*$`, bounded).
+/// (`^[a-z][a-z0-9_.-]*$`, bounded; converged with `bitty-agent` per
+/// AI-0316).
 ///
 /// # Errors
 ///
@@ -981,9 +982,10 @@ pub fn validate_prompt_tool_name(name: &str) -> Result<(), PromptError> {
 /// [`MAX_SKILL_NAME_LEN`] bytes, `^[a-z][a-z0-9_-]*$`.
 ///
 /// Independent of the tool namespace ([`validate_prompt_tool_name`] / `TB-2`,
-/// which forbids `-`): skill names allow hyphen so conventional names like
-/// `my-skill` are accepted without widening the tool charset. Dots stay
-/// rejected in both namespaces. Invalid names reuse
+/// `^[a-z][a-z0-9_.-]*$` since the AI-0316 convergence): the skill charset
+/// is now a strict subset of the tool charset — hyphenated names like
+/// `my-skill` validate in both namespaces, while dots are accepted for
+/// tools but stay rejected for skills. Invalid names reuse
 /// [`PromptError::InvalidToolName`] to avoid a new variant for the same shape
 /// failure; the charset difference lives in the validator, not the error
 /// type.
@@ -2119,8 +2121,8 @@ impl LayerInput {
 /// One parsed skill/profile registry entry.
 #[derive(Debug, Clone)]
 struct SkillEntry {
-    /// Entry name (`^[a-z][a-z0-9_-]*$`, bounded; hyphen allowed independent
-    /// of the tool namespace).
+    /// Entry name (`^[a-z][a-z0-9_-]*$`, bounded; hyphen shared with the
+    /// converged tool namespace, dots rejected unlike tool names).
     name: String,
     /// Literal fragment lines after `text:` (joined with `\n`).
     fragment: String,
@@ -2185,8 +2187,9 @@ fn parse_skill_chunk(chunk: &[(usize, &str)]) -> Result<Option<SkillEntry>, Prom
             if value.len() > MAX_SKILL_NAME_LEN {
                 return Err(malformed(*lineno, "skill name exceeds length bound"));
             }
-            // Skill namespace is independent of the tool namespace: hyphens
-            // accepted here, still rejected by `validate_prompt_tool_name`.
+            // Skill namespace is independent of the tool namespace: the
+            // skill charset stays dot-free even though converged tool
+            // names (`TB-2`) accept dots alongside hyphens.
             validate_skill_name(value)?;
             match &name {
                 None => name = Some(value.to_owned()),
@@ -3914,14 +3917,16 @@ mod tests {
     }
 
     #[test]
-    fn hyphenated_skill_name_accepted_independent_of_tool_namespace() {
-        // P2-4: skill names allow `-` independent of the tool namespace
-        // (`TB-2` forbids it), so `my-skill` assembles while the tool
-        // validator still rejects it.
+    fn hyphenated_skill_name_accepted_alongside_converged_tool_namespace() {
+        // P2-4 (rewritten AI-0316): skill names allow `-` and the converged
+        // tool namespace (`TB-2`) accepts `-` too, so `my-skill` assembles
+        // in both validators; dots stay skill-rejected while tools accept
+        // them.
         assert!(validate_skill_name("my-skill").is_ok());
-        assert!(validate_prompt_tool_name("my-skill").is_err());
-        // Dots stay rejected in both namespaces; bad shapes still reuse
-        // `InvalidToolName` with no new variant.
+        assert!(validate_prompt_tool_name("my-skill").is_ok());
+        assert!(validate_prompt_tool_name("a.b").is_ok());
+        // Dots stay rejected in the skill namespace only; bad shapes still
+        // reuse `InvalidToolName` with no new variant.
         assert!(validate_skill_name("bad.name").is_err());
         assert!(matches!(
             validate_skill_name("Bad!"),
