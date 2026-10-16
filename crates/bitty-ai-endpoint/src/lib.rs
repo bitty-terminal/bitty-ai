@@ -8328,7 +8328,7 @@ mod e3_tests {
     // poisoned-later-gate order probes, the reassembler TTL handoff, forged
     // top-level keys, and one lawful `Ready` control per entry point. No
     // production code changes; no new bounds (the TTL row reuses
-    // `REASSEMBLY_TTL_MS`; the grep guard below pins that).
+    // `REASSEMBLY_TTL_MS` from `bitty-ipc-api`).
     use super::*;
     use bitty_ai_host::tool_dispatch::{
         ConsentDecision as HostConsentDecision, ConsentGrant as HostConsentGrant,
