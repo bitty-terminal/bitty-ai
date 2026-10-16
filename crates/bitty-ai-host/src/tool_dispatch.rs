@@ -26,7 +26,7 @@
 //!   `UndeclaredPlacement` as a registration refusal (same family as
 //!   `DuplicateTool` and `RegistryFull`): never `Denied`, which is
 //!   dispatch-time only.
-//! - `validate_tool_name` (`TB-2` shape `^[a-z][a-z0-9_]*$`, non-empty, at
+//! - `validate_tool_name` (`TB-2` shape `^[a-z][a-z0-9_.-]*$`, non-empty, at
 //!   most 64 bytes), `ToolPlacement::parse`/`as_str` over the closed
 //!   `mcp`/`native` vocabulary (fail-closed), `validate_placement` (`None`
 //!   refuses, `Mcp` carrying native detail refuses as contradictory, `Native`
@@ -368,7 +368,15 @@ impl ToolError {
 }
 
 /// Validate a tool name (`TB-2`): non-empty, at most 64 bytes,
-/// `^[a-z][a-z0-9_]*$` within the owner namespace.
+/// `^[a-z][a-z0-9_.-]*$` within the owner namespace.
+///
+/// Converged with `bitty-agent` at rev `a8e4112`
+/// (`crates/bitty-agent/src/tool.rs`, grammar comment `start with [a-z],
+/// then [a-z0-9_.-]`, `valid_tool_names` accepting `run-command`, `a.b`,
+/// `my-tool_2`) per the AI-0316 owner ruling (2026-10-16, CONVERGE D3,
+/// mirrors `tool.rs`). Dots and hyphens are accepted; empty,
+/// uppercase-start, leading-digit, whitespace, NUL, non-ASCII, and
+/// over-length names are still rejected.
 ///
 /// # Errors
 ///
@@ -377,9 +385,9 @@ pub fn validate_tool_name(name: &str) -> Result<(), ToolError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_TOOL_NAME_LEN
         && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.' || b == b'-'
+        });
     if valid {
         Ok(())
     } else {
@@ -1380,7 +1388,7 @@ impl ExecutionContext {
 /// is read). No version field, no transport.
 ///
 /// Byte bounds (S1 values, fail-closed in [`DispatchRequest::new`]): `tool`
-/// satisfies [`validate_tool_name`] (non-empty, `^[a-z][a-z0-9_]*$`, at most
+/// satisfies [`validate_tool_name`] (non-empty, `^[a-z][a-z0-9_.-]*$`, at most
 /// [`MAX_TOOL_NAME_LEN`] bytes); `allowed` holds at most
 /// [`MAX_TOOLS_PER_SESSION`] entries with each entry satisfying
 /// [`validate_tool_name`], mirroring the registry population the echo
@@ -1705,14 +1713,22 @@ mod tests {
 
     #[test]
     fn tool_name_shape_mirror() {
+        // AI-0317 convergence (mirrors the runtime `tool_name_shape` test):
+        // the agent-class grammar (`^[a-z][a-z0-9_.-]*$`,
+        // bitty-agent@a8e4112) accepts dots and hyphens alongside the
+        // shared underscore core.
         assert!(validate_tool_name("workspace_read").is_ok());
+        assert!(validate_tool_name("run-command").is_ok());
+        assert!(validate_tool_name("terminal.read").is_ok());
+        assert!(validate_tool_name("a.b").is_ok());
+        assert!(validate_tool_name("my-tool_2").is_ok());
         assert!(validate_tool_name("a").is_ok());
         assert!(validate_tool_name("tool_1").is_ok());
         assert!(validate_tool_name("").is_err());
         assert!(validate_tool_name("Read").is_err());
         assert!(validate_tool_name("9start").is_err());
-        assert!(validate_tool_name("terminal.read").is_err());
-        assert!(validate_tool_name("tool-name").is_err());
+        assert!(validate_tool_name("tool with space").is_err());
+        assert!(validate_tool_name("tool\0name").is_err());
         assert!(validate_tool_name(&"a".repeat(65)).is_err());
         assert!(validate_tool_name(&"a".repeat(64)).is_ok());
     }

@@ -22,7 +22,7 @@
 //!   within [`MAX_NATIVE_PLACEMENT_BYTES`] bytes each), [`PlacementError`]
 //!   as the registration-refusal subset (`UndeclaredPlacement` is never a
 //!   dispatch denial), [`validate_tool_name`] (`TB-2` shape
-//!   `^[a-z][a-z0-9_]*$`, non-empty, at most [`MAX_TOOL_NAME_LEN`] bytes),
+//!   `^[a-z][a-z0-9_.-]*$`, non-empty, at most [`MAX_TOOL_NAME_LEN`] bytes),
 //!   and the FNV-1a-64 precedent (`offset basis`, `prime`, byte-wise
 //!   `schema_digest`).
 //! - `tools.rs` import provenance plus snapshot/diff: [`MAX_TOOL_PAGES`] (5,
@@ -198,7 +198,12 @@ pub fn bound_error_name(value: &str) -> String {
 }
 
 /// Validate a tool name (`TB-2`, mirrors `tool.rs`): non-empty, at most 64
-/// bytes, `^[a-z][a-z0-9_]*$` within the owner namespace.
+/// bytes, `^[a-z][a-z0-9_.-]*$` within the owner namespace.
+///
+/// Converged with `bitty-agent` at rev `a8e4112` per the AI-0316 owner
+/// ruling (2026-10-16, CONVERGE D3): dots and hyphens are accepted; empty,
+/// uppercase-start, leading-digit, whitespace, NUL, non-ASCII, and
+/// over-length names are still rejected.
 ///
 /// # Errors
 ///
@@ -207,9 +212,9 @@ pub fn validate_tool_name(name: &str) -> Result<(), PlacementError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_TOOL_NAME_LEN
         && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.' || b == b'-'
+        });
     if valid {
         Ok(())
     } else {
@@ -1584,6 +1589,26 @@ mod tests {
         // separation via IdentityMismatch, never via this comparison).
         let swapped = pin();
         assert!(listed.matches_pin(&swapped));
+    }
+
+    #[test]
+    fn tool_name_shape_mirror() {
+        // AI-0317 convergence (mirrors the runtime `tool_name_shape` test):
+        // the agent-class grammar (`^[a-z][a-z0-9_.-]*$`,
+        // bitty-agent@a8e4112) accepts dots and hyphens alongside the
+        // shared underscore core.
+        assert!(validate_tool_name("workspace_read").is_ok());
+        assert!(validate_tool_name("run-command").is_ok());
+        assert!(validate_tool_name("terminal.read").is_ok());
+        assert!(validate_tool_name("a.b").is_ok());
+        assert!(validate_tool_name("my-tool_2").is_ok());
+        assert!(validate_tool_name("").is_err());
+        assert!(validate_tool_name("Read").is_err());
+        assert!(validate_tool_name("9start").is_err());
+        assert!(validate_tool_name("tool with space").is_err());
+        assert!(validate_tool_name("tool\0name").is_err());
+        assert!(validate_tool_name(&"a".repeat(65)).is_err());
+        assert!(validate_tool_name(&"a".repeat(64)).is_ok());
     }
 
     #[test]
