@@ -69,11 +69,15 @@
 //!   earlier entries are unchanged; only the new entry wires
 //!   `ai.tool_dispatch` (single tool per call, single executor attempt;
 //!   executor-after-contact outcomes cross as Ready status vocabulary).
-//! - E2: params-schema plug-in plus the tolerant S-1 correlator field
-//!   (pending; the per-method decode table below names the extension seam,
-//!   which stays unbuilt until gate 5 accepts the field).
+//! - E2: params-schema plug-in plus the tolerant S-1 correlator field — DONE
+//!   via the per-method decode extension point below plus [`parse_correlator`],
+//!   [`check_correlator`], and [`correlator_current`]. TOLERANT mode: stale or
+//!   missing sightings proceed (disposition recorded test-observably, never in
+//!   result JSON); enforcement is S-F (AI-0303), not here. Dispatch-path flow
+//!   of the field pends a `bitty-ipc-api` schema allowance (gate 5 still
+//!   refuses it as unknown there; see the E2 contract).
 //! - E3: loopback admit/deny matrix, reassembler TTL, forged-tier vectors.
-//! - S-F (separate follow-up, deferred): correlator enforcement and the full
+//! - S-F (AI-0303, separate follow-up): correlator enforcement and the full
 //!   host-boundary lint gate re-establishment. No producer emits snapshot
 //!   versions yet, so enforcing now would deny everything.
 //!
@@ -191,6 +195,52 @@
 //! // POLICY (AI-0302-E1d): single-attempt — exactly one executor call, no
 //! // retry loop. Effect-uncertain (`Unknown`) outcomes report reconcile
 //! // semantics in the result; the caller drives any retry as a fresh call.
+
+//! ## E2 handler contract
+//!
+//! The per-method decode layer accepts ONE optional, bounded correlator field
+//! (`snapshot_version`, `u64`) alongside each method's fields, parsed into
+//! `Option<SnapshotVersion>` (absent maps to `None`, the S-2-compatible
+//! fallback). [`check_correlator`] classifies the sighting against the
+//! caller-supplied current version through the real host
+//! [`check_snapshot_version`](bitty_ai_host::snapshot::check_snapshot_version)
+//! taxonomy, but TOLERANT mode never refuses: stale or missing sightings
+//! proceed with the disposition recorded test-observably in [`CorrelatorInfo`]
+//! (returned alongside, never in the result JSON — `validate_ai_result`
+//! refuses unknown result fields under the same S-C `check_known` rule as
+//! params, so the disposition stays out of results). Enforcement (refusing on
+//! stale/missing) is S-F (AI-0303), never here: an `e2` test locks that stale
+//! proceeds.
+//!
+//! // POLICY (AI-0302-E2): tolerant-not-enforcing — `StaleVersion` and
+//! // `MissingVersion` outcomes map to `StaleTolerated`/`MissingTolerated`
+//! // data, never to refusals. Flipping either to a refusal is the S-F
+//! // (AI-0303) change; doing it here would deny everything since no producer
+//! // emits snapshot versions yet.
+//!
+//! // POLICY (AI-0302-E2): disposition-observable-not-result — the correlator
+//! // disposition travels in [`CorrelatorInfo`] (test-observable return
+//! // value), never in the S-C result JSON. Result shapes stay exactly what
+//! // `validate_ai_result` enforces; every Ready result is re-validated in
+//! // tests to prove nothing extra crossed.
+//!
+//! // POLICY (AI-0302-E2): field-name-and-shape — the correlator field is
+//! // named exactly `snapshot_version` and carries a `u64` (total over the
+//! // full range, same representational discipline as `SnapshotVersion::new`;
+//! // negatives, fractions, exponents, and over-`u64` magnitudes refuse as
+//! // `InvalidRequest`). It is allow-listed, not a wildcard: unknown OTHER
+//! // fields still refuse (gate 5 upstream on the dispatch path; the empty-
+//! // object rule for fieldless methods at decode).
+
+//! Pending schema allowance: the pinned `bitty-ipc-api` gate-5 schema
+//! (`validate_ai_params`) still refuses `snapshot_version` as an unknown field
+//! on the dispatch path, so correlator-bearing params refuse at gate 5 until
+//! a `bitty-ipc` follow-up allow-lists the optional field there (the S-C
+//! optional-field machinery — absent-means-default — already exists; only the
+//! allow-list entry is missing). The decode extension point is ready now; an
+//! `e2` tripwire test pins the gate-5 refusal so the allowance landing fails
+//! loudly and forces the dispatch-path update. Direct handler/decode calls
+//! (which bypass gate 5) exercise the tolerant path today.
 
 //! ## Normative precedence
 //!
@@ -418,6 +468,7 @@ use bitty_ai_host::provider_registry::{
     ProviderError as HostProviderError, validate_model_name as validate_host_model_name,
     validate_provider_id as validate_host_provider_id,
 };
+use bitty_ai_host::snapshot::{SnapshotRefusal, SnapshotVersion, check_snapshot_version};
 use bitty_ai_runtime::{
     ModelCapability as RuntimeCapability, ProviderRegistry, SelectRequest as RuntimeSelectRequest,
     SelectionError as RuntimeSelectionError,
@@ -881,12 +932,173 @@ fn parse_params_object(params: &[u8]) -> Result<JVal, IpcError> {
 // the rules it relies on (same bounds, same closed vocabularies as the
 // schema validators) and maps any deviation to `InvalidRequest`.
 //
-// E2 EXTENSION SEAM (noted, not built; POLICY (AI-0302-E1a)): the tolerant S-1 correlator field
-// lands here — each decoder takes the top-level object and would accept one
-// optional, bounded correlator field alongside its method fields once gate
-// 5 stops refusing it as unknown. No correlator is accepted today: an
-// extra field still refuses upstream at gate 5, and these decoders must
-// not pre-accept it.
+// ── E2 tolerant S-1 correlator extension point ────────────────────────────────
+//
+// The tolerant S-1 correlator field lands here (seam built, AI-0302-E2):
+// every per-method decode funnels through `decode_request`, which accepts
+// ONE optional, bounded correlator field alongside the method fields via
+// the single `correlator_of` allow-list choke below. Gate 5 still refuses
+// the field as unknown on the dispatch path (pending `bitty-ipc-api`
+// schema allowance), so correlator-bearing dispatch params refuse upstream
+// there today; direct decode/handler calls (which bypass gate 5) exercise
+// the tolerant path now. Enforcement (refusing on stale/missing) is S-F
+// (AI-0303), never here.
+
+/// Params field name carrying the tolerant S-1 snapshot correlator.
+///
+/// // POLICY (AI-0302-E2): field-name-and-shape — exactly one spelling,
+/// shared by every decode site (table arms, fieldless arms, and
+/// [`parse_correlator`]) so the allow-list cannot drift per method.
+pub const CORRELATOR_FIELD: &str = "snapshot_version";
+
+/// Tolerant S-1 correlator disposition (AI-0302-E2; enforcement is S-F).
+///
+/// Records what [`check_correlator`] found, as data. Stale or missing
+/// sightings proceed (tolerant); S-F (AI-0303) flips those two arms to
+/// refusals. An `e2` test locks that stale proceeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelatorDisposition {
+    /// The sighting is current (equal or ahead): accepted.
+    Current,
+    /// The sighting is behind current: PROCEEDS tolerantly (S-F flips to refuse).
+    StaleTolerated,
+    /// No sighting, current known: PROCEEDS tolerantly (S-F flips to refuse).
+    MissingTolerated,
+    /// No current version is available for this method: the check is
+    /// skipped and the call proceeds (S-2-compatible fallback).
+    Unchecked,
+}
+
+/// A parsed correlator sighting plus its tolerant disposition.
+///
+/// Test-observable return value of the E2 extension point: travels
+/// alongside decode results, never in the S-C result JSON (see the
+/// disposition-observable-not-result policy in the E2 handler contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorrelatorInfo {
+    /// The cited version (`None` = field absent, S-2 fallback).
+    pub seen: Option<SnapshotVersion>,
+    /// What the tolerant check found.
+    pub disposition: CorrelatorDisposition,
+}
+
+/// Read the optional correlator field off a top-level params object.
+///
+/// The single allow-list choke: absent maps to `None`; a present value
+/// must be a plain `u64` integer (total over the full range, same
+/// representational discipline as [`SnapshotVersion::new`]) or the body
+/// refuses `InvalidRequest` naming the field. Negatives, fractions,
+/// exponents, and over-`u64` magnitudes all refuse here — `as_u64` admits
+/// ASCII digits only. Depth/bound discipline is inherited: the field is a
+/// top-level scalar under the depth-capped params parse, so no extra bound
+/// applies beyond the `u64` range itself.
+fn correlator_of(top: &JVal, method: &str) -> Result<Option<SnapshotVersion>, IpcError> {
+    // POLICY (AI-0302-E2): field-name-and-shape — the ONLY extra field
+    // decode acknowledges. Unknown OTHER fields are not read here (gate 5
+    // owns their refusal upstream; the fieldless empty-object rule owns it
+    // for fieldless methods at decode), so this allow-list opens no
+    // wildcard.
+    // POLICY (AI-0302-E2): duplicates refuse — the contract allows ONE
+    // optional correlator, and `field()` is first-wins, so two members
+    // must not silently resolve to the first (CodeRabbit PR#500 review).
+    // Every decode path funnels through here, so direct parser/handler
+    // paths enforce the same rule as the gate-5 dispatch path.
+    let occurrences = top.as_obj().map_or(0, |fields| {
+        fields
+            .iter()
+            .filter(|(key, _)| key == CORRELATOR_FIELD)
+            .count()
+    });
+    if occurrences > 1 {
+        return Err(decode_invalid(&format!(
+            "{method} params: field '{CORRELATOR_FIELD}' duplicated"
+        )));
+    }
+    match top.field(CORRELATOR_FIELD) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(SnapshotVersion::new)
+            .map(Some)
+            .ok_or_else(|| {
+                decode_invalid(&format!(
+                    "{method} params: field '{CORRELATOR_FIELD}' must be an integer"
+                ))
+            }),
+    }
+}
+
+/// Parse the optional correlator off raw params bytes.
+///
+/// Bytes-level twin of [`correlator_of`] for callers without a parsed
+/// object: empty bodies (the fieldless empty-body rule) map to `None`,
+/// non-object bodies refuse exactly like [`parse_params_object`], and the
+/// field rule is [`correlator_of`] itself, so the two paths cannot drift.
+pub fn parse_correlator(method: &str, params: &[u8]) -> Result<Option<SnapshotVersion>, IpcError> {
+    if params.is_empty() {
+        return Ok(None);
+    }
+    let top = parse_params_object(params)?;
+    correlator_of(&top, method)
+}
+
+/// Classify a correlator sighting against a caller-supplied current version.
+///
+/// Runs the real host
+/// [`check_snapshot_version`](bitty_ai_host::snapshot::check_snapshot_version)
+/// taxonomy and records — never refuses. `current = None` (no current
+/// version is available for the method) skips the check as [`CorrelatorDisposition::Unchecked`];
+/// otherwise `Ok` maps to [`CorrelatorDisposition::Current`], `StaleVersion`
+/// to [`CorrelatorDisposition::StaleTolerated`], and `MissingVersion` to
+/// [`CorrelatorDisposition::MissingTolerated`].
+pub fn check_correlator(
+    seen: Option<SnapshotVersion>,
+    current: Option<SnapshotVersion>,
+) -> CorrelatorInfo {
+    let Some(current) = current else {
+        // POLICY (AI-0302-E2): no-current-skips-check — without a
+        // caller-supplied current there is nothing to compare against, so
+        // the check is skipped (tolerant) and the sighting rides along
+        // unclassified for S-F to consume.
+        return CorrelatorInfo {
+            seen,
+            disposition: CorrelatorDisposition::Unchecked,
+        };
+    };
+    // POLICY (AI-0302-E2): tolerant-not-enforcing — both refusal arms of
+    // the host taxonomy record as tolerated data and proceed. Flipping
+    // either arm to a refusal is the S-F (AI-0303) change, never here.
+    let disposition = match check_snapshot_version(seen, current) {
+        Ok(()) => CorrelatorDisposition::Current,
+        Err(SnapshotRefusal::StaleVersion { .. }) => CorrelatorDisposition::StaleTolerated,
+        Err(SnapshotRefusal::MissingVersion { .. }) => CorrelatorDisposition::MissingTolerated,
+    };
+    CorrelatorInfo { seen, disposition }
+}
+
+/// Caller-supplied current snapshot version for `method`, if any view
+/// envelope carries one.
+///
+/// The ONLY current-version source: caller-supplied view data (no store
+/// reads beyond the existing `&` refs, no clock). Today only
+/// `ai.mcp_snapshot` has one — the echoed [`SnapshotEnvelope::list_version`](bitty_ai_host::mcp_placement::SnapshotEnvelope::list_version)
+/// (monotonic MCP list data, cited here as the check input; staleness
+/// stays reported-not-enforced per the envelope contract). Every other
+/// method maps to `None` (check skipped, tolerant):
+/// `ai.mcp_pin` carries no numeric version (protocol version is a string),
+/// context generations keep exact-equality fence semantics and must NOT
+/// migrate to ordered comparison (see `bitty_ai_host::snapshot` S2-echo
+/// positioning), and the complete/tools views carry no versions.
+pub fn correlator_current(method: &str, view: &ReadOnlyView<'_>) -> Option<SnapshotVersion> {
+    // POLICY (AI-0302-E2): view-data-only current — the check input comes
+    // from the caller-supplied envelopes, never a fresh read. Methods
+    // without a versioned envelope skip the check (tolerant) instead of
+    // inventing a current.
+    match method {
+        "ai.mcp_snapshot" => Some(SnapshotVersion::new(view.mcp_snapshot.list_version())),
+        _ => None,
+    }
+}
 
 // Closed capability vocabulary (IPC-side canonical spellings, same set the
 // schema validator enforces).
@@ -1383,6 +1595,12 @@ fn decode_request(method: &str, params: &[u8]) -> Result<DecodedRequest, IpcErro
         }
     }
     let top = parse_params_object(params)?;
+    // POLICY (AI-0302-E2): single allow-list choke — the tolerant S-1
+    // correlator is the only extra field decode acknowledges, on every
+    // shaped arm (validated here, tolerated downstream; enforcement is
+    // S-F). A body wrong in both the correlator and a method field reports
+    // the correlator deterministically, before the method arm runs.
+    correlator_of(&top, method)?;
     match method {
         "ai.provider_list" | "ai.mcp_pin" | "ai.mcp_snapshot" => match &top {
             JVal::Obj(fields) if fields.is_empty() => match method {
@@ -1390,6 +1608,18 @@ fn decode_request(method: &str, params: &[u8]) -> Result<DecodedRequest, IpcErro
                 "ai.mcp_pin" => Ok(DecodedRequest::Pin),
                 _ => Ok(DecodedRequest::Snapshot),
             },
+            // POLICY (AI-0302-E2): allow-listed, not a wildcard — a
+            // fieldless body carrying ONLY the validated correlator
+            // decodes (tolerated downstream); any other extra field still
+            // refuses here via the empty-object rule (gate 5 owns it
+            // upstream on the dispatch path).
+            JVal::Obj(fields) if fields.len() == 1 && fields[0].0.as_str() == CORRELATOR_FIELD => {
+                match method {
+                    "ai.provider_list" => Ok(DecodedRequest::List),
+                    "ai.mcp_pin" => Ok(DecodedRequest::Pin),
+                    _ => Ok(DecodedRequest::Snapshot),
+                }
+            }
             _ => Err(decode_invalid("params must be an empty object")),
         },
         _ => DECODE_TABLE
@@ -7675,5 +7905,416 @@ mod e1d_tests {
             "unexpected: {error:?}"
         );
         assert!(executor.calls().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod e2_tests {
+    use super::*;
+    use bitty_ai_host::mcp_placement::{InitializeResult, ToolListSnapshot};
+    use bitty_ipc_api::validate_ai_result;
+
+    const CLIENT: &str = "agent-7";
+
+    const COST_BODY: &[u8] =
+        br#"{"input_tokens":10,"output_tokens":5,"input_weight":1,"output_weight":2}"#;
+
+    fn granted_inspect() -> ScopeSet {
+        ScopeSet::single(Scope::AiInspect)
+    }
+
+    fn ledger_for(scope: Scope) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(CLIENT.to_owned(), scope, 0, 10_000, "user".to_owned())
+            .expect("grant fits in an empty ledger");
+        ledger
+    }
+
+    fn input<'a>(
+        method: &'a str,
+        granted: &'a ScopeSet,
+        ledger: &'a ConsentLedger,
+        params: &'a [u8],
+    ) -> DispatchInput<'a> {
+        DispatchInput {
+            method,
+            request_id: 7,
+            granted,
+            ledger,
+            client_id: CLIENT,
+            now_ms: 1_000,
+            created_at_ms: 0,
+            timeout_ms: 5_000,
+            params,
+        }
+    }
+
+    fn valid_pin() -> PinEnvelope {
+        PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        })
+    }
+
+    /// Snapshot envelope echoing an empty tool list at version 3.
+    fn snapshot_three() -> SnapshotEnvelope {
+        SnapshotEnvelope::new(ToolListSnapshot::from_imported(&[]), 3, false)
+    }
+
+    fn view<'a>(
+        registry: &'a ProviderRegistry,
+        pin: &'a PinEnvelope,
+        snapshot: &'a SnapshotEnvelope,
+    ) -> ReadOnlyView<'a> {
+        ReadOnlyView {
+            registry,
+            mcp_pin: pin,
+            mcp_snapshot: snapshot,
+        }
+    }
+
+    fn ready_result(outcome: DispatchOutcome) -> String {
+        match outcome {
+            DispatchOutcome::Ready { result, .. } => result,
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    fn refused_error(outcome: DispatchOutcome) -> IpcError {
+        match outcome {
+            DispatchOutcome::Refused(error) => error,
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_request(error: &IpcError, label: &str) {
+        assert!(
+            matches!(error, IpcError::InvalidRequest { .. }),
+            "{label}: expected InvalidRequest, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn absent_field_falls_back_s2_compatible() {
+        // POLICY (AI-0302-E2): absent correlator is the S-2-compatible
+        // fallback — envelope-id-only correlation stays valid. Missing maps
+        // to `None` at parse and to `MissingTolerated` only when a current
+        // is known (tolerant proceed), `Unchecked` otherwise.
+        assert_eq!(
+            parse_correlator("ai.model_cost", COST_BODY).expect("valid body"),
+            None
+        );
+        assert_eq!(
+            parse_correlator("ai.provider_list", b"").expect("empty body"),
+            None
+        );
+        assert_eq!(
+            parse_correlator("ai.provider_list", b"{}").expect("empty object"),
+            None
+        );
+        assert_eq!(
+            check_correlator(None, None),
+            CorrelatorInfo {
+                seen: None,
+                disposition: CorrelatorDisposition::Unchecked,
+            }
+        );
+        let current = SnapshotVersion::new(3);
+        assert_eq!(
+            check_correlator(None, Some(current)),
+            CorrelatorInfo {
+                seen: None,
+                disposition: CorrelatorDisposition::MissingTolerated,
+            }
+        );
+        // The dispatch path works unchanged without the field.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let scoped = input("ai.provider_list", &granted, &ledger, b"{}");
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result("ai.provider_list", result.as_bytes()).expect("S-C result shape");
+    }
+
+    #[test]
+    fn present_current_accepted() {
+        // A sighted version at/above current classifies `Current` and the
+        // call proceeds: decode, direct handler, and schema-clean result.
+        let params = br#"{"required":["text"],"snapshot_version":7}"#;
+        assert_eq!(
+            parse_correlator("ai.model_select", params).expect("valid correlator"),
+            Some(SnapshotVersion::new(7))
+        );
+        assert!(decode_request("ai.model_select", params).is_ok());
+        let current = SnapshotVersion::new(7);
+        assert_eq!(
+            check_correlator(Some(SnapshotVersion::new(7)), Some(current)),
+            CorrelatorInfo {
+                seen: Some(SnapshotVersion::new(7)),
+                disposition: CorrelatorDisposition::Current,
+            }
+        );
+        // Ahead sightings are current too (monotonic producer data: an
+        // ahead sighting means the caller-side current is itself behind).
+        assert_eq!(
+            check_correlator(Some(SnapshotVersion::new(9)), Some(current)).disposition,
+            CorrelatorDisposition::Current
+        );
+        let cost_params =
+            br#"{"input_tokens":10,"output_tokens":5,"input_weight":1,"output_weight":2,"snapshot_version":7}"#;
+        let result = handle_cost(cost_params).expect("current correlator proceeds");
+        validate_ai_result("ai.model_cost", result.as_bytes()).expect("S-C result shape");
+        assert!(!result.contains(CORRELATOR_FIELD), "{result}");
+    }
+
+    #[test]
+    fn stale_proceeds_tolerantly_locks_tolerant_mode() {
+        // POLICY (AI-0302-E2): tolerant-not-enforcing — a behind sighting
+        // records `StaleTolerated` and PROCEEDS. This test locks tolerant
+        // mode until S-F (AI-0303): flipping stale to a refusal must update
+        // this test, never slip in silently.
+        let seen = SnapshotVersion::new(1);
+        let current = SnapshotVersion::new(5);
+        assert_eq!(
+            check_correlator(Some(seen), Some(current)),
+            CorrelatorInfo {
+                seen: Some(seen),
+                disposition: CorrelatorDisposition::StaleTolerated,
+            }
+        );
+        // Decode accepts the stale body (direct call, bypassing gate 5).
+        let cost_params =
+            br#"{"input_tokens":10,"output_tokens":5,"input_weight":1,"output_weight":2,"snapshot_version":1}"#;
+        assert!(decode_request("ai.model_cost", cost_params).is_ok());
+        // The handler proceeds (NOT refused) with a schema-clean result.
+        let result = handle_cost(cost_params).expect("stale correlator still proceeds");
+        validate_ai_result("ai.model_cost", result.as_bytes()).expect("S-C result shape");
+        // Same for the view-backed snapshot arm: sighted 1 against the
+        // envelope current 3 proceeds and echoes the envelope, stale flag
+        // and all (staleness reported, never enforced here).
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        assert_eq!(
+            correlator_current("ai.mcp_snapshot", &view(&registry, &pin, &snapshot)),
+            Some(SnapshotVersion::new(3))
+        );
+        let result = handle_snapshot(
+            &view(&registry, &pin, &snapshot),
+            b"{\"snapshot_version\":1}",
+        )
+        .expect("stale snapshot sighting still proceeds");
+        validate_ai_result("ai.mcp_snapshot", result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"list_version\":3"), "{result}");
+        assert!(!result.contains(CORRELATOR_FIELD), "{result}");
+    }
+
+    #[test]
+    fn malformed_correlator_refuses_invalid_request() {
+        // POLICY (AI-0302-E2): field-name-and-shape — wrong types and
+        // over-bound magnitudes refuse `InvalidRequest` naming the field,
+        // never a silent drop or a wrap.
+        let bodies: &[&[u8]] = &[
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":"3"}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":-1}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":3.5}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":18446744073709551616}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":true}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":null}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":[3]}"#,
+            br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":{"v":3}}"#,
+        ];
+        for (index, body) in bodies.iter().enumerate() {
+            let error = parse_correlator("ai.model_cost", body).unwrap_err();
+            assert_invalid_request(&error, &format!("parse body {index}"));
+            let error = decode_request("ai.model_cost", body).unwrap_err();
+            assert_invalid_request(&error, &format!("decode body {index}"));
+            assert!(handle_cost(body).is_err(), "handler body {index}");
+        }
+        // The full `u64` range stays representational (no silent
+        // truncation): zero and `u64::MAX` parse and proceed.
+        for raw in [b"0".as_slice(), b"18446744073709551615".as_slice()] {
+            let mut body = br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":"#.to_vec();
+            body.extend_from_slice(raw);
+            body.extend_from_slice(b"}");
+            assert!(parse_correlator("ai.model_cost", &body).is_ok());
+            assert!(decode_request("ai.model_cost", &body).is_ok());
+        }
+    }
+
+    #[test]
+    fn duplicate_correlator_refuses_invalid_request() {
+        // POLICY (AI-0302-E2): the contract allows ONE optional
+        // correlator — two members refuse rather than silently resolving
+        // to the first (CodeRabbit PR#500 review). Every decode path
+        // funnels through `correlator_of`, so direct parser/handler paths
+        // enforce the same rule as the gate-5 dispatch path.
+        let body = br#"{"input_tokens":1,"output_tokens":1,"input_weight":1,"output_weight":1,"snapshot_version":3,"snapshot_version":4}"#;
+        let error = parse_correlator("ai.model_cost", body).unwrap_err();
+        assert_invalid_request(&error, "duplicate correlator parses");
+        let error = decode_request("ai.model_cost", body).unwrap_err();
+        assert_invalid_request(&error, "duplicate correlator decodes");
+        assert!(handle_cost(body).is_err(), "duplicate correlator handles");
+    }
+
+    #[test]
+    fn unknown_other_field_still_refuses() {
+        // POLICY (AI-0302-E2): allow-listed, not a wildcard — the S-C
+        // unknown-field rule stays intact. On the dispatch path gate 5
+        // refuses unknown fields (shaped and fieldless arms alike).
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let scoped = input("ai.provider_list", &granted, &ledger, br#"{"nope":1}"#);
+        assert_invalid_request(
+            &refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot))),
+            "fieldless unknown field",
+        );
+        let scoped = input(
+            "ai.model_select",
+            &granted,
+            &ledger,
+            br#"{"required":["text"],"nope":1}"#,
+        );
+        assert_invalid_request(
+            &refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot))),
+            "shaped unknown field",
+        );
+        // At decode, the fieldless empty-object rule refuses anything past
+        // the allow-listed correlator (the correlator plus one stranger is
+        // not the correlator alone).
+        assert!(decode_request("ai.mcp_snapshot", b"{\"snapshot_version\":3,\"nope\":1}").is_err());
+        assert!(decode_request("ai.provider_list", br#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn gate5_refuses_correlator_pending_schema_allowance() {
+        // TRIPWIRE (AI-0302-E2, pending `bitty-ipc` follow-up): the pinned
+        // gate-5 schema (`validate_ai_params` at `bitty-ipc-api` rev
+        // d0c4ecd) still refuses `snapshot_version` as an unknown field, so
+        // correlator-bearing DISPATCH params refuse at gate 5 today. When
+        // the schema allow-lists the optional field, THIS TEST FAILS —
+        // update it to expect the tolerant proceed (plus dispatch-path
+        // disposition coverage) instead of deleting it.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let scoped = input(
+            "ai.model_select",
+            &granted,
+            &ledger,
+            br#"{"required":["text"],"snapshot_version":7}"#,
+        );
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert_invalid_request(&error, "shaped correlator at gate 5");
+        assert!(
+            format!("{error:?}").contains("unknown field refused"),
+            "unexpected: {error:?}"
+        );
+        let scoped = input(
+            "ai.mcp_snapshot",
+            &granted,
+            &ledger,
+            b"{\"snapshot_version\":3}",
+        );
+        let error = refused_error(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        assert_invalid_request(&error, "fieldless correlator at gate 5");
+    }
+
+    #[test]
+    fn correlator_current_source_map() {
+        // POLICY (AI-0302-E2): view-data-only current — exactly one method
+        // has a versioned envelope today (`ai.mcp_snapshot`, via the echoed
+        // list version). Everything else skips the check (tolerant):
+        // `ai.mcp_pin` carries no numeric version, context generations keep
+        // exact-equality fence semantics (never ordered comparison), and the
+        // complete/tools views carry no versions.
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let view_ref = view(&registry, &pin, &snapshot);
+        assert_eq!(
+            correlator_current("ai.mcp_snapshot", &view_ref),
+            Some(SnapshotVersion::new(3))
+        );
+        for method in [
+            "ai.model_select",
+            "ai.model_fallback",
+            "ai.model_cost",
+            "ai.provider_list",
+            "ai.cache_hint",
+            "ai.mcp_pin",
+            "ai.extension_manifest",
+            "ai.extension_contribute",
+            "ai.extension_activate",
+            "ai.context_read",
+            "ai.provider_complete",
+            "ai.tool_dispatch",
+        ] {
+            assert_eq!(correlator_current(method, &view_ref), None, "{method}");
+            assert_eq!(
+                check_correlator(Some(SnapshotVersion::new(1)), None).disposition,
+                CorrelatorDisposition::Unchecked,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn fieldless_correlator_body_decodes() {
+        // A fieldless body carrying ONLY the validated correlator decodes
+        // (tolerated downstream); duplicates and strangers still refuse.
+        for method in ["ai.provider_list", "ai.mcp_pin", "ai.mcp_snapshot"] {
+            assert!(
+                decode_request(method, b"{\"snapshot_version\":3}").is_ok(),
+                "{method}"
+            );
+            assert!(decode_request(method, b"").is_ok(), "{method}");
+            assert!(decode_request(method, b"{}").is_ok(), "{method}");
+            assert!(
+                decode_request(method, b"{\"snapshot_version\":3,\"snapshot_version\":4}").is_err(),
+                "{method}"
+            );
+        }
+        assert!(decode_request("ai.provider_list", b"{\"snapshot_version\":\"3\"}").is_err());
+    }
+
+    #[test]
+    fn ready_results_stay_schema_clean() {
+        // POLICY (AI-0302-E2): disposition-observable-not-result — Ready
+        // results from correlator-bearing calls carry no correlator trace:
+        // they re-validate under `validate_ai_result` and name no
+        // correlator field.
+        let cost_params =
+            br#"{"input_tokens":10,"output_tokens":5,"input_weight":1,"output_weight":2,"snapshot_version":2}"#;
+        let result = handle_cost(cost_params).expect("tolerant proceed");
+        validate_ai_result("ai.model_cost", result.as_bytes()).expect("S-C result shape");
+        assert!(!result.contains(CORRELATOR_FIELD), "{result}");
+        assert!(!result.contains("correlator"), "{result}");
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let result = handle_snapshot(
+            &view(&registry, &pin, &snapshot),
+            b"{\"snapshot_version\":9}",
+        )
+        .expect("ahead sighting proceeds");
+        validate_ai_result("ai.mcp_snapshot", result.as_bytes()).expect("S-C result shape");
+        assert!(!result.contains(CORRELATOR_FIELD), "{result}");
+        // Full-range sightings stay representational end to end.
+        let info = check_correlator(
+            parse_correlator("ai.model_cost", cost_params).expect("valid correlator"),
+            Some(SnapshotVersion::new(u64::MAX)),
+        );
+        assert_eq!(info.disposition, CorrelatorDisposition::StaleTolerated);
+        assert_eq!(info.seen, Some(SnapshotVersion::new(2)));
     }
 }
