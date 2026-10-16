@@ -49,6 +49,12 @@ jobs:
       # CTX-0159 classification delta. Same guards as
       # `just host-boundary-gate-v2` and `just host-boundary-gate-v2-test`
       # (spelled as bash here so CI keeps zero dependency on `just`).
+      # The gate hard-requires `rg` (fail-closed when absent), which the
+      # GitHub-hosted ubuntu image does not ship, so install it first; if
+      # the install fails the job fails loudly, which is correct.
+      - name: Install ripgrep (host-boundary gate v2)
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Host-boundary gate v2
         run: bash scripts/host-boundary-gate-v2.sh
 
