@@ -8318,3 +8318,1190 @@ mod e2_tests {
         assert_eq!(info.seen, Some(SnapshotVersion::new(2)));
     }
 }
+
+#[cfg(test)]
+mod e3_tests {
+    // POLICY (AI-0306): admit/deny loopback matrix over the endpoint
+    // (slice E3, tests only). Every row is a real dispatch through the
+    // endpoint with caller-supplied `now_ms`: unknown-method `NotFound`,
+    // invoke/inspect isolation both ways, revoked/expired consent,
+    // poisoned-later-gate order probes, the reassembler TTL handoff, forged
+    // top-level keys, and one lawful `Ready` control per entry point. No
+    // production code changes; no new bounds (the TTL row reuses
+    // `REASSEMBLY_TTL_MS` from `bitty-ipc-api`).
+    use super::*;
+    use bitty_ai_host::tool_dispatch::{
+        ConsentDecision as HostConsentDecision, ConsentGrant as HostConsentGrant,
+        ConsentLedger as HostConsentLedger, ConsentQuery as HostConsentQuery,
+        ToolPlacement as HostToolPlacement, ToolRegistry as HostToolRegistry,
+        ToolSpec as HostToolSpec, consent_grant_expiry as host_consent_grant_expiry,
+    };
+    use bitty_ai_runtime::{
+        FakeProvider, FakeToolExecutor, ModelDescriptor, ProviderTurn, ProviderUsage, ToolSuccess,
+    };
+    use bitty_ipc_api::{ChunkReassembler, FeedOutcome, REASSEMBLY_TTL_MS, validate_ai_result};
+
+    const CLIENT: &str = "agent-7";
+    const UNKNOWN_METHOD: &str = "ai.evil";
+    const INSPECT_METHOD: &str = "ai.model_select";
+    const LIST_METHOD: &str = "ai.provider_list";
+    const READ_METHOD: &str = "ai.context_read";
+    const COMPLETE_METHOD: &str = "ai.provider_complete";
+    const DISPATCH_METHOD: &str = "ai.tool_dispatch";
+    const PROVIDER_ID: &str = "bitty-fake";
+    const PROTOCOL: &str = "owner";
+    const TOOL: &str = "fetch";
+    const TOOL_SCOPE: &str = "tools";
+    const EXECUTION_ID: u64 = 41;
+    const PARAMS_NOW_MS: u64 = 500;
+    const MALFORMED_PARAMS: &[u8] = br#"{"scope":"ai.invoke"}"#;
+
+    const INSPECT_METHODS: &[&str] = &[
+        "ai.provider_list",
+        "ai.model_select",
+        "ai.model_fallback",
+        "ai.model_cost",
+        "ai.context_read",
+        "ai.extension_manifest",
+        "ai.extension_contribute",
+        "ai.extension_activate",
+        "ai.cache_hint",
+        "ai.mcp_pin",
+        "ai.mcp_snapshot",
+    ];
+    const INVOKE_METHODS: &[&str] = &["ai.provider_complete", "ai.tool_dispatch"];
+
+    fn granted_inspect() -> ScopeSet {
+        ScopeSet::single(Scope::AiInspect)
+    }
+
+    fn granted_invoke() -> ScopeSet {
+        ScopeSet::single(Scope::AiInvoke)
+    }
+
+    fn ledger_for(scope: Scope) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(CLIENT.to_owned(), scope, 0, 10_000, "user".to_owned())
+            .expect("grant fits in an empty ledger");
+        ledger
+    }
+
+    fn ledger_revoked(scope: Scope) -> ConsentLedger {
+        let mut ledger = ledger_for(scope);
+        assert!(ledger.revoke(CLIENT, scope));
+        ledger
+    }
+
+    fn ledger_expired(scope: Scope) -> ConsentLedger {
+        let mut ledger = ConsentLedger::new();
+        ledger
+            .grant(CLIENT.to_owned(), scope, 0, 100, "user".to_owned())
+            .expect("grant fits in an empty ledger");
+        ledger
+    }
+
+    fn input_full<'a>(
+        method: &'a str,
+        granted: &'a ScopeSet,
+        ledger: &'a ConsentLedger,
+        now_ms: u64,
+        created_at_ms: u64,
+        timeout_ms: u64,
+        params: &'a [u8],
+    ) -> DispatchInput<'a> {
+        DispatchInput {
+            method,
+            request_id: 7,
+            granted,
+            ledger,
+            client_id: CLIENT,
+            now_ms,
+            created_at_ms,
+            timeout_ms,
+            params,
+        }
+    }
+
+    /// Registry with two text models plus one vision model and an alias,
+    /// bridged from `FakeProvider` descriptors exactly like the e1a fixture.
+    fn registry_two() -> ProviderRegistry {
+        use bitty_ai_runtime::{ModelCapability as Cap, ModelProvider as _};
+        let provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut registry = ProviderRegistry::new();
+        for descriptor in provider.list_models() {
+            let ModelDescriptor { name, capabilities } = descriptor;
+            registry
+                .register(
+                    bitty_ai_runtime::ModelRegistration::new(
+                        PROVIDER_ID,
+                        name,
+                        capabilities,
+                        4_096,
+                        1,
+                        2,
+                    )
+                    .expect("valid registration"),
+                )
+                .expect("capacity");
+        }
+        registry
+            .register(
+                bitty_ai_runtime::ModelRegistration::new(
+                    "bitty-a",
+                    "vision",
+                    vec![Cap::Text, Cap::ImageInput],
+                    32_768,
+                    3,
+                    4,
+                )
+                .expect("valid registration"),
+            )
+            .expect("capacity");
+        registry
+            .register_alias(
+                "chat",
+                vec![bitty_ai_runtime::ModelRef::new(PROVIDER_ID, "fake-chat").expect("valid ref")],
+            )
+            .expect("capacity");
+        registry
+    }
+
+    fn valid_pin() -> PinEnvelope {
+        use bitty_ai_host::mcp_placement::{InitializeResult, ToolsCapabilityShape};
+        PinEnvelope::new(InitializeResult {
+            protocol_version: bitty_ai_host::mcp_placement::PROTOCOL_VERSION.to_owned(),
+            tools_supported: true,
+            tools_shape: ToolsCapabilityShape::BoolTrue,
+        })
+    }
+
+    fn snapshot_empty() -> SnapshotEnvelope {
+        SnapshotEnvelope::new(
+            bitty_ai_host::mcp_placement::ToolListSnapshot::from_imported(&[]),
+            1,
+            false,
+        )
+    }
+
+    fn view<'a>(
+        registry: &'a ProviderRegistry,
+        pin: &'a PinEnvelope,
+        snapshot: &'a SnapshotEnvelope,
+    ) -> ReadOnlyView<'a> {
+        ReadOnlyView {
+            registry,
+            mcp_pin: pin,
+            mcp_snapshot: snapshot,
+        }
+    }
+
+    fn ctx_view<'a>(
+        records: &'a [RuntimeRecord],
+        store: &'a RuntimeArtifactStore,
+    ) -> ContextView<'a> {
+        ContextView {
+            records,
+            artifacts: store,
+        }
+    }
+
+    /// Host tool registry holding the one consented tool under test,
+    /// declared exactly like the e1d fixture.
+    fn tool_registry_one() -> HostToolRegistry {
+        let mut registry = HostToolRegistry::new();
+        registry
+            .register(
+                HostToolSpec::new(
+                    TOOL,
+                    "demo fetch",
+                    b"{}".to_vec(),
+                    TOOL_SCOPE,
+                    true,
+                    HostToolPlacement::Mcp,
+                    None,
+                )
+                .expect("valid tool declaration"),
+            )
+            .expect("capacity");
+        registry
+    }
+
+    /// Test consent ledger behind the host seam, mirroring the e1d
+    /// fixture: allows exactly the held grants, denies everything else.
+    struct AllowLedger {
+        grants: Vec<HostConsentGrant>,
+    }
+
+    impl HostConsentLedger for AllowLedger {
+        fn check(&self, query: &HostConsentQuery) -> HostConsentDecision {
+            if self.grants.iter().any(|grant| grant.covers(query)) {
+                HostConsentDecision::Allow
+            } else {
+                HostConsentDecision::Deny {
+                    reason: "no grant for this triple".to_owned(),
+                }
+            }
+        }
+    }
+
+    fn allow_ledger(tool: &str, scope: &str, now_ms: u64) -> AllowLedger {
+        AllowLedger {
+            grants: vec![HostConsentGrant {
+                protocol: PROTOCOL.to_owned(),
+                tool: tool.to_owned(),
+                scope: scope.to_owned(),
+                expires_at_ms: host_consent_grant_expiry(now_ms, None),
+            }],
+        }
+    }
+
+    /// Provider that panics on contact: passing tests prove the gates (or
+    /// the dispatch arm) never reached it. Test-only.
+    struct PanicProvider;
+
+    impl ModelProvider for PanicProvider {
+        fn provider_id(&self) -> &str {
+            PROVIDER_ID
+        }
+
+        fn list_models(&self) -> Vec<ModelDescriptor> {
+            Vec::new()
+        }
+
+        fn complete(
+            &mut self,
+            _request: &RuntimeTurnRequest,
+        ) -> Result<ProviderTurn, RuntimeProviderError> {
+            panic!("provider contacted before admission");
+        }
+
+        fn scripted_turns_remaining(&self) -> usize {
+            0
+        }
+
+        fn complete_calls(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Executor that panics on contact: passing tests prove the gates
+    /// refused before any handler contact. Test-only.
+    struct PanicExecutor;
+
+    impl RuntimeToolExecutor for PanicExecutor {
+        fn execute(
+            &mut self,
+            _tool: &str,
+            _arguments: &[u8],
+            _now_ms: u64,
+        ) -> Result<ToolSuccess, RuntimeToolError> {
+            panic!("executor contacted before admission");
+        }
+    }
+
+    /// Deepest entry with per-test doubles: the six gates run first, and
+    /// any handler contact would hit the caller-supplied doubles.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_tools<'a>(
+        method: &'a str,
+        granted: &'a ScopeSet,
+        gate_ledger: &'a ConsentLedger,
+        params: &'a [u8],
+        now_ms: u64,
+        created_at_ms: u64,
+        timeout_ms: u64,
+        read_view: &ReadOnlyView<'a>,
+        records: &'a [RuntimeRecord],
+        store: &'a RuntimeArtifactStore,
+        provider: &'a mut dyn ModelProvider,
+        executor: &'a mut dyn RuntimeToolExecutor,
+        arguments: &'a [u8],
+        tool_registry: &'a HostToolRegistry,
+        consent: &'a dyn HostConsentLedger,
+    ) -> DispatchOutcome {
+        let scoped = input_full(
+            method,
+            granted,
+            gate_ledger,
+            now_ms,
+            created_at_ms,
+            timeout_ms,
+            params,
+        );
+        let ctx = ContextView {
+            records,
+            artifacts: store,
+        };
+        let mut complete = CompleteView {
+            provider,
+            caller_scope: CallerScopeEcho::new("provider/bitty-fake", PARAMS_NOW_MS),
+        };
+        let mut tools = ToolView {
+            executor,
+            arguments,
+            registry: tool_registry,
+            consent,
+            protocol_id: PROTOCOL,
+            execution_id: EXECUTION_ID,
+        };
+        dispatch_with_tools(&scoped, read_view, &ctx, &mut complete, &mut tools)
+    }
+
+    fn tool_params(tool: &str, args_digest: u64, allowed: Option<&[&str]>, now_ms: u64) -> Vec<u8> {
+        let mut out = format!(
+            "{{\"tool\":\"{tool}\",\"args_digest\":{args_digest},\"caller\":{{\"agent_instance_id\":7,\"session_id\":9,\"level\":\"own\"}}"
+        );
+        if let Some(names) = allowed {
+            out.push_str(",\"allowed\":[");
+            for (index, name) in names.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                out.push_str(name);
+                out.push('"');
+            }
+            out.push(']');
+        }
+        out.push_str(&format!(",\"now_ms\":{now_ms}}}"));
+        out.into_bytes()
+    }
+
+    fn lawful_args() -> Vec<u8> {
+        b"{\"url\":\"https://example.test\"}".to_vec()
+    }
+
+    fn lawful_tool_params() -> Vec<u8> {
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        tool_params(TOOL, digest, Some(&[TOOL]), PARAMS_NOW_MS)
+    }
+
+    /// Minimal lawful complete params, mirroring the e1c fixture: one
+    /// 2-byte user message, budget 64, timeout 1000 from caller time 500.
+    fn lawful_complete_params() -> Vec<u8> {
+        br#"{"model":{"provider_id":"bitty-fake","model":"fake-chat"},"messages":[{"role":"user","content":"hi"}],"budget_bytes":64,"timeout_ms":1000,"now_ms":500}"#.to_vec()
+    }
+
+    fn scripted_turn(text: &str) -> ProviderTurn {
+        ProviderTurn {
+            text: text.to_owned(),
+            tool_calls: Vec::new(),
+            latency_ms: 10,
+            usage: ProviderUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                cached_tokens: 3,
+                cache_write_tokens: 4,
+            },
+        }
+    }
+
+    fn inline_record(id: &str, owner_name: &str, body: &[u8], generation: u64) -> RuntimeRecord {
+        RuntimeRecord {
+            id: id.to_owned(),
+            provider: "project".to_owned(),
+            owner: bitty_ai_runtime::StableId::new(owner_name).expect("valid test owner"),
+            generation,
+            collected_at_ms: 1_700_000_000_000,
+            priority: bitty_ai_runtime::ContextPriority::High,
+            summary: "repo outline".to_owned(),
+            body: RuntimeBody::Inline(body.to_vec()),
+            supersedes: None,
+            is_untrusted_surface: true,
+        }
+    }
+
+    fn lawful_read_params() -> Vec<u8> {
+        br#"{"scopes":["window-1"],"request":{"current_generation":7}}"#.to_vec()
+    }
+
+    fn ready_result(outcome: DispatchOutcome) -> String {
+        match outcome {
+            DispatchOutcome::Ready { result, .. } => result,
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    fn refused_error(outcome: DispatchOutcome) -> IpcError {
+        match outcome {
+            DispatchOutcome::Refused(error) => error,
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    // ── row 1: unknown method ─────────────────────────────────────────────
+
+    #[test]
+    fn unknown_method_under_all_scopes_denies_not_found() {
+        // POLICY (AI-0306): mirrors the S-A `ai_unregistered_name_denies_
+        // notfound` contract at the endpoint level. Grammar-valid but
+        // unregistered: resolution refuses `NotFound` before any scope or
+        // consent state is consulted, even with every scope granted, a live
+        // ledger, an expired deadline, and malformed params poisoning every
+        // later stage. The untouched call logs prove zero handler contact.
+        let granted = ScopeSet::all();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            UNKNOWN_METHOD,
+            &granted,
+            &ledger,
+            MALFORMED_PARAMS,
+            6_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(&error, IpcError::NotFound { .. }),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(error.error_class(), bitty_ipc_api::ErrorClass::NotFound);
+        assert_eq!(provider.complete_calls(), 0);
+        assert!(executor.calls().is_empty());
+        // Probe-level order proof: no gate past resolution ran.
+        let probe = GateProbe::default();
+        let scoped = input_full(UNKNOWN_METHOD, &granted, &ledger, 6_000, 0, 5_000, b"{}");
+        let gated = run_gates(&scoped, &probe).unwrap_err();
+        assert!(
+            matches!(&gated, IpcError::NotFound { .. }),
+            "unexpected: {gated:?}"
+        );
+        assert!(!probe.consent_consulted.get());
+        assert!(!probe.deadline_checked.get());
+        assert!(!probe.json_validated.get());
+        assert!(!probe.admit_reached.get());
+    }
+
+    // ── row 2: invoke/inspect isolation, both directions ──────────────────
+
+    #[test]
+    fn invoke_method_with_inspect_only_grant_denies() {
+        // POLICY (AI-0306): endpoint mirror of the S-A
+        // `ai_inspect_does_not_imply_invoke` contract, invoke direction.
+        // An inspect-only grant plus a live inspect ledger still denies an
+        // invoke-scoped method: no hierarchy bleed upward.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut executor = FakeToolExecutor::new();
+        let params = lawful_tool_params();
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            &params,
+            1_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(
+                &error,
+                IpcError::ScopeDenied { scope, action }
+                if scope == "ai.invoke" && action == DISPATCH_METHOD
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(error.error_class(), bitty_ipc_api::ErrorClass::Scope);
+        assert_eq!(provider.complete_calls(), 0);
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn inspect_method_with_invoke_only_grant_denies() {
+        // POLICY (AI-0306): endpoint mirror of the S-A
+        // `ai_inspect_does_not_imply_invoke` contract, inspect direction.
+        // An invoke-only grant plus a live invoke ledger still denies an
+        // inspect-scoped method: no hierarchy bleed downward either.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut executor = FakeToolExecutor::new();
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            INSPECT_METHOD,
+            &granted,
+            &ledger,
+            br#"{"required":["text"]}"#,
+            1_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(
+                &error,
+                IpcError::ScopeDenied { scope, action }
+                if scope == "ai.inspect" && action == INSPECT_METHOD
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(error.error_class(), bitty_ipc_api::ErrorClass::Scope);
+        assert_eq!(provider.complete_calls(), 0);
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn scope_isolation_holds_across_all_methods_both_directions() {
+        // POLICY (AI-0306): exhaustive endpoint sweep — every inspect
+        // method denies under an invoke-only grant and every invoke method
+        // denies under an inspect-only grant, all as `ScopeDenied` (known
+        // method, missing grant), never `NotFound`. Params stay `{}`: gate
+        // 2 fires before gate 5 can observe them.
+        let invoke_only = granted_invoke();
+        let invoke_ledger = ledger_for(Scope::AiInvoke);
+        for method in INSPECT_METHODS {
+            let scoped = input_full(method, &invoke_only, &invoke_ledger, 1_000, 0, 5_000, b"{}");
+            let error = refused_error(dispatch(&scoped));
+            assert!(
+                matches!(
+                    &error,
+                    IpcError::ScopeDenied { scope, .. } if scope == "ai.inspect"
+                ),
+                "{method}: unexpected {error:?}"
+            );
+        }
+        let inspect_only = granted_inspect();
+        let inspect_ledger = ledger_for(Scope::AiInspect);
+        for method in INVOKE_METHODS {
+            let scoped = input_full(
+                method,
+                &inspect_only,
+                &inspect_ledger,
+                1_000,
+                0,
+                5_000,
+                b"{}",
+            );
+            let error = refused_error(dispatch(&scoped));
+            assert!(
+                matches!(
+                    &error,
+                    IpcError::ScopeDenied { scope, .. } if scope == "ai.invoke"
+                ),
+                "{method}: unexpected {error:?}"
+            );
+        }
+    }
+
+    // ── row 3: revoked and expired consent ────────────────────────────────
+
+    #[test]
+    fn revoked_consent_refuses_otherwise_lawful_call() {
+        // POLICY (AI-0306): a grant-then-revoke ledger denies at gate 3 on
+        // an otherwise lawful call (live deadline, schema-valid params,
+        // consenting downstream fixtures). The untouched call logs prove
+        // the refusal precedes every handler contact.
+        let granted = granted_invoke();
+        let ledger = ledger_revoked(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut executor = FakeToolExecutor::new();
+        let params = lawful_tool_params();
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            &params,
+            1_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(
+                &error,
+                IpcError::ScopeDenied { scope, .. } if scope == "ai.invoke"
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+        assert!(executor.calls().is_empty());
+    }
+
+    #[test]
+    fn expired_consent_refuses_otherwise_lawful_call() {
+        // POLICY (AI-0306): a grant whose window closed before caller
+        // `now_ms` denies at gate 3 on an otherwise lawful call, same
+        // shape as the revoked row above.
+        let granted = granted_invoke();
+        let ledger = ledger_expired(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let mut executor = FakeToolExecutor::new();
+        let params = lawful_tool_params();
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            &params,
+            1_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(
+                &error,
+                IpcError::ScopeDenied { scope, .. } if scope == "ai.invoke"
+            ),
+            "unexpected: {error:?}"
+        );
+        assert_eq!(provider.complete_calls(), 0);
+        assert!(executor.calls().is_empty());
+    }
+
+    // ── row 4: poisoned-later-gate order probes ───────────────────────────
+
+    #[test]
+    fn consent_gate_refuses_before_poisoned_later_stages() {
+        // POLICY (AI-0306): gate-3 order probe. A never-granted ledger
+        // refuses while every later stage is poisoned: an expired deadline,
+        // malformed params, and doubles that panic on contact. The
+        // `ScopeDenied` refusal plus the probe flags plus the unfired
+        // panics prove consent precedes deadline, JSON, and handlers.
+        let granted = granted_invoke();
+        let ledger = ConsentLedger::new();
+        let probe = GateProbe::default();
+        let scoped = input_full(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            6_000,
+            0,
+            5_000,
+            MALFORMED_PARAMS,
+        );
+        let gated = run_gates(&scoped, &probe).unwrap_err();
+        assert!(
+            matches!(
+                &gated,
+                IpcError::ScopeDenied { scope, .. } if scope == "ai.invoke"
+            ),
+            "unexpected: {gated:?}"
+        );
+        assert!(probe.consent_consulted.get());
+        assert!(!probe.deadline_checked.get());
+        assert!(!probe.json_validated.get());
+        assert!(!probe.admit_reached.get());
+        // Same call through the deep entry: the panics never fire.
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = PanicProvider;
+        let mut executor = PanicExecutor;
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            MALFORMED_PARAMS,
+            6_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(
+                &error,
+                IpcError::ScopeDenied { scope, .. } if scope == "ai.invoke"
+            ),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn deadline_gate_refuses_before_poisoned_later_stages() {
+        // POLICY (AI-0306): gate-4 order probe. Caller `now_ms` at the
+        // absolute deadline refuses `Timeout` while the params are
+        // malformed and the doubles panic on contact: the deadline owns
+        // this refusal, never JSON and never a handler.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let probe = GateProbe::default();
+        let scoped = input_full(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            5_000,
+            0,
+            5_000,
+            MALFORMED_PARAMS,
+        );
+        let gated = run_gates(&scoped, &probe).unwrap_err();
+        assert!(
+            matches!(
+                &gated,
+                IpcError::Timeout {
+                    request_id: 7,
+                    timeout_ms: 5_000
+                }
+            ),
+            "unexpected: {gated:?}"
+        );
+        assert_eq!(gated.error_class(), bitty_ipc_api::ErrorClass::Timeout);
+        assert!(probe.consent_consulted.get());
+        assert!(probe.deadline_checked.get());
+        assert!(!probe.json_validated.get());
+        assert!(!probe.admit_reached.get());
+        // Same call through the deep entry: the panics never fire.
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = PanicProvider;
+        let mut executor = PanicExecutor;
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            MALFORMED_PARAMS,
+            5_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(
+                &error,
+                IpcError::Timeout {
+                    request_id: 7,
+                    timeout_ms: 5_000
+                }
+            ),
+            "unexpected: {error:?}"
+        );
+    }
+
+    #[test]
+    fn json_gate_refuses_before_handler_contact() {
+        // POLICY (AI-0306): gate-5 order probe. Live consent and a live
+        // deadline throughout, so the malformed params own the refusal and
+        // the panicking doubles prove no handler contact follows it.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let probe = GateProbe::default();
+        let scoped = input_full(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            1_000,
+            0,
+            5_000,
+            MALFORMED_PARAMS,
+        );
+        let gated = run_gates(&scoped, &probe).unwrap_err();
+        assert!(
+            matches!(&gated, IpcError::InvalidRequest { .. }),
+            "unexpected: {gated:?}"
+        );
+        assert_eq!(gated.error_class(), bitty_ipc_api::ErrorClass::Validation);
+        assert!(probe.consent_consulted.get());
+        assert!(probe.deadline_checked.get());
+        assert!(probe.json_validated.get());
+        assert!(!probe.admit_reached.get());
+        // Same call through the deep entry: the panics never fire.
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = PanicProvider;
+        let mut executor = PanicExecutor;
+        let args = lawful_args();
+        let outcome = dispatch_tools(
+            DISPATCH_METHOD,
+            &granted,
+            &ledger,
+            MALFORMED_PARAMS,
+            1_000,
+            0,
+            5_000,
+            &view(&registry, &pin, &snapshot),
+            &empty,
+            &store,
+            &mut provider,
+            &mut executor,
+            &args,
+            &tool_registry,
+            &consent,
+        );
+        let error = refused_error(outcome);
+        assert!(
+            matches!(&error, IpcError::InvalidRequest { .. }),
+            "unexpected: {error:?}"
+        );
+    }
+
+    // ── row 5: reassembler TTL handoff ────────────────────────────────────
+
+    #[test]
+    fn reassembler_ttl_expiry_refuses_stale_feed() {
+        // POLICY (AI-0306): transport-to-endpoint handoff. The endpoint
+        // consumes reassembled payloads, so a stale assembly must die at
+        // the transport layer on caller `now_ms`, never reach dispatch.
+        // First chunk at `t=0`, second past `REASSEMBLY_TTL_MS`: the feed
+        // refuses `ReassemblyExpired` and discards the offending assembly
+        // only. No new bound: the TTL comes from `bitty-ipc-api`.
+        let mut reassembler = ChunkReassembler::new();
+        assert_eq!(
+            reassembler.feed("matrix-handoff", 0, 2, b"{\"part\":", 0),
+            Ok(FeedOutcome::Pending)
+        );
+        assert!(reassembler.is_open("matrix-handoff"));
+        let error = reassembler
+            .feed("matrix-handoff", 1, 2, b"\"go\"}", REASSEMBLY_TTL_MS + 1)
+            .unwrap_err();
+        assert!(
+            matches!(&error, IpcError::Denied { code, .. } if code == "ReassemblyExpired"),
+            "unexpected: {error:?}"
+        );
+        assert!(!reassembler.is_open("matrix-handoff"));
+        assert_eq!(reassembler.open_count(), 0);
+    }
+
+    #[test]
+    fn reassembler_expire_stale_sweeps_on_caller_clock() {
+        // POLICY (AI-0306): the caller-clock sweep companion. An assembly
+        // open at exactly the TTL is retained (`elapsed <= TTL`); past it,
+        // `expire_stale` discards it and reports the count. The
+        // within-TTL control completes and concatenates in sequence order.
+        let mut reassembler = ChunkReassembler::new();
+        assert_eq!(
+            reassembler.feed("sweep-me", 0, 2, b"ab", 0),
+            Ok(FeedOutcome::Pending)
+        );
+        assert_eq!(reassembler.expire_stale(REASSEMBLY_TTL_MS), 0);
+        assert!(reassembler.is_open("sweep-me"));
+        assert_eq!(reassembler.expire_stale(REASSEMBLY_TTL_MS + 1), 1);
+        assert!(reassembler.is_empty());
+        assert_eq!(
+            reassembler.feed("quick", 0, 2, b"ab", 0),
+            Ok(FeedOutcome::Pending)
+        );
+        assert_eq!(
+            reassembler.feed("quick", 1, 2, b"cd", 7),
+            Ok(FeedOutcome::Complete(b"abcd".to_vec()))
+        );
+        assert!(reassembler.is_empty());
+    }
+
+    // ── row 6: forged top-level keys ──────────────────────────────────────
+
+    #[test]
+    fn forged_top_level_keys_refuse_at_json_layer() {
+        // POLICY (AI-0306): endpoint mirror of the S-A
+        // `forged_level_echo_cannot_escalate` contract. Forged `auth`,
+        // `scope`, and `role` top-level keys on otherwise-lawful tool
+        // params refuse at the JSON/canonical layer (gate 5) before any
+        // gate or handler can consult them as authority. The empty call
+        // logs prove zero handler contact for every key.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let args = lawful_args();
+        let digest = HostUsageEvent::args_digest(&args);
+        let base = format!(
+            "{{\"tool\":\"{TOOL}\",\"args_digest\":{digest},\"caller\":{{\"agent_instance_id\":7,\"session_id\":9,\"level\":\"own\"}},\"allowed\":[\"{TOOL}\"],\"now_ms\":{PARAMS_NOW_MS}"
+        );
+        let cases: [(&str, &str); 3] = [
+            ("auth", "\"auth\":{\"level\":\"All\"}"),
+            ("scope", "\"scope\":\"ai.invoke\""),
+            ("role", "\"role\":\"admin\""),
+        ];
+        for (label, forged) in cases {
+            let body = format!("{base},{forged}}}");
+            let registry = registry_two();
+            let pin = valid_pin();
+            let snapshot = snapshot_empty();
+            let store = RuntimeArtifactStore::new();
+            let tool_registry = tool_registry_one();
+            let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+            let empty: [RuntimeRecord; 0] = [];
+            let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+            let mut executor = FakeToolExecutor::new();
+            let outcome = dispatch_tools(
+                DISPATCH_METHOD,
+                &granted,
+                &ledger,
+                body.as_bytes(),
+                1_000,
+                0,
+                5_000,
+                &view(&registry, &pin, &snapshot),
+                &empty,
+                &store,
+                &mut provider,
+                &mut executor,
+                &args,
+                &tool_registry,
+                &consent,
+            );
+            let error = refused_error(outcome);
+            assert!(
+                matches!(&error, IpcError::InvalidRequest { .. }),
+                "{label}: unexpected {error:?}"
+            );
+            assert_eq!(
+                error.error_class(),
+                bitty_ipc_api::ErrorClass::Validation,
+                "{label}"
+            );
+            assert_eq!(provider.complete_calls(), 0, "{label}");
+            assert!(executor.calls().is_empty(), "{label}");
+        }
+    }
+
+    // ── row 7: lawful controls ────────────────────────────────────────────
+
+    #[test]
+    fn lawful_dispatch_admits_without_wiring() {
+        // POLICY (AI-0306): the E0 entry still admits lawful traffic and
+        // refuses as not-wired: the matrix denies precisely, not broadly.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let scoped = input_full(LIST_METHOD, &granted, &ledger, 1_000, 0, 5_000, b"{}");
+        assert_eq!(
+            dispatch(&scoped),
+            DispatchOutcome::NotWired {
+                method: LIST_METHOD.to_string(),
+                scope: Scope::AiInspect,
+            }
+        );
+    }
+
+    #[test]
+    fn lawful_read_only_call_returns_ready() {
+        // POLICY (AI-0306): `dispatch_with` control — a fully lawful
+        // read-only call answers `Ready` with schema-clean result JSON.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let scoped = input_full(LIST_METHOD, &granted, &ledger, 1_000, 0, 5_000, b"{}");
+        let result = ready_result(dispatch_with(&scoped, &view(&registry, &pin, &snapshot)));
+        validate_ai_result(LIST_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"fake-chat\""), "{result}");
+        assert!(result.contains("\"vision\""), "{result}");
+    }
+
+    #[test]
+    fn lawful_context_read_returns_ready() {
+        // POLICY (AI-0306): `dispatch_with_context` control — a fully
+        // lawful context read answers `Ready` with labeled spans.
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let records = [
+            inline_record("snap-1", "window-1", b"outline bytes", 7),
+            inline_record("delta-0", "window-1", b"delta bytes", 7),
+        ];
+        let params = lawful_read_params();
+        let scoped = input_full(READ_METHOD, &granted, &ledger, 1_000, 0, 5_000, &params);
+        let result = ready_result(dispatch_with_context(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&records, &store),
+        ));
+        validate_ai_result(READ_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"current_generation\":7"), "{result}");
+        assert!(result.contains("\"id\":\"snap-1\""), "{result}");
+    }
+
+    #[test]
+    fn lawful_provider_complete_returns_ready() {
+        // POLICY (AI-0306): `dispatch_with_complete` control — a fully
+        // lawful completion answers `Ready` over the injected fake with
+        // exactly one provider call and schema-clean result JSON.
+        let granted = granted_invoke();
+        let ledger = ledger_for(Scope::AiInvoke);
+        let registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        provider.push_turn(scripted_turn("hello"));
+        let params = lawful_complete_params();
+        let scoped = input_full(COMPLETE_METHOD, &granted, &ledger, 1_000, 0, 5_000, &params);
+        let result = ready_result(dispatch_with_complete(
+            &scoped,
+            &view(&registry, &pin, &snapshot),
+            &ctx_view(&empty, &store),
+            &mut CompleteView {
+                provider: &mut provider,
+                caller_scope: CallerScopeEcho::new("provider/bitty-fake", PARAMS_NOW_MS),
+            },
+        ));
+        validate_ai_result(COMPLETE_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"text\":\"hello\""), "{result}");
+        assert_eq!(provider.complete_calls(), 1);
+    }
+
+    #[test]
+    fn lawful_tool_dispatch_returns_ready() {
+        // POLICY (AI-0306): `dispatch_with_tools` control — a fully lawful
+        // tool dispatch answers `Ready` over the injected fakes with
+        // exactly one executor call and schema-clean result JSON.
+        let granted = granted_invoke();
+        let gate_ledger = ledger_for(Scope::AiInvoke);
+        let provider_registry = registry_two();
+        let pin = valid_pin();
+        let snapshot = snapshot_empty();
+        let store = RuntimeArtifactStore::new();
+        let empty: [RuntimeRecord; 0] = [];
+        let mut provider = FakeProvider::new(PROVIDER_ID).expect("valid provider id");
+        let tool_registry = tool_registry_one();
+        let consent = allow_ledger(TOOL, TOOL_SCOPE, PARAMS_NOW_MS);
+        let mut executor = FakeToolExecutor::new();
+        executor.push_success("ok", b"{\"data\":1}".to_vec());
+        let args = lawful_args();
+        let params = lawful_tool_params();
+        let scoped = input_full(
+            DISPATCH_METHOD,
+            &granted,
+            &gate_ledger,
+            1_000,
+            0,
+            5_000,
+            &params,
+        );
+        let read_view = view(&provider_registry, &pin, &snapshot);
+        let ctx = ctx_view(&empty, &store);
+        let mut complete = CompleteView {
+            provider: &mut provider,
+            caller_scope: CallerScopeEcho::new("provider/bitty-fake", PARAMS_NOW_MS),
+        };
+        let mut tools = ToolView {
+            executor: &mut executor,
+            arguments: &args,
+            registry: &tool_registry,
+            consent: &consent,
+            protocol_id: PROTOCOL,
+            execution_id: EXECUTION_ID,
+        };
+        let result = ready_result(dispatch_with_tools(
+            &scoped,
+            &read_view,
+            &ctx,
+            &mut complete,
+            &mut tools,
+        ));
+        validate_ai_result(DISPATCH_METHOD, result.as_bytes()).expect("S-C result shape");
+        assert!(result.contains("\"status\":\"success\""), "{result}");
+        assert!(result.contains("\"execution_id\":41"), "{result}");
+        assert_eq!(provider.complete_calls(), 0);
+        assert_eq!(executor.calls(), &[(TOOL.to_owned(), args)]);
+    }
+}
