@@ -46,6 +46,7 @@ pub struct ProviderRoutingPublicationAck {
     domain: String,
     snapshot_version: u64,
     digest: String,
+    canonical_bytes: Vec<u8>,
 }
 
 impl ProviderRoutingPublicationAck {
@@ -67,6 +68,18 @@ impl ProviderRoutingPublicationAck {
     #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    #[must_use]
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.publication_id == other.publication_id
+            && self.domain == other.domain
+            && self.snapshot_version == other.snapshot_version
+            && self.digest == other.digest
     }
 }
 
@@ -96,6 +109,7 @@ pub struct ProviderRoutingBinding {
     domain: String,
     snapshot_version: u64,
     digest: String,
+    canonical_bytes: Vec<u8>,
     registry_revision: u64,
     publication_epoch: u64,
 }
@@ -103,7 +117,6 @@ pub struct ProviderRoutingBinding {
 impl ProviderRoutingBinding {
     pub(crate) fn new(
         ack: &ProviderRoutingPublicationAck,
-        projection: ProviderRoutingProjection,
         publication_epoch: u64,
         registry_revision: u64,
     ) -> Self {
@@ -111,7 +124,8 @@ impl ProviderRoutingBinding {
             publication_id: ack.publication_id.clone(),
             domain: ack.domain.clone(),
             snapshot_version: ack.snapshot_version,
-            digest: projection.digest,
+            digest: ack.digest.clone(),
+            canonical_bytes: ack.canonical_bytes.clone(),
             registry_revision,
             publication_epoch,
         }
@@ -135,6 +149,10 @@ impl ProviderRoutingBinding {
     }
     pub(crate) fn digest(&self) -> &str {
         &self.digest
+    }
+
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
     }
 }
 
@@ -322,6 +340,7 @@ pub(crate) fn parse_provider_routing_publication(
             domain: domain.to_owned(),
             snapshot_version: version,
             digest,
+            canonical_bytes: projection.canonical_bytes().to_vec(),
         },
         projection,
     ))
@@ -358,6 +377,7 @@ pub(crate) fn parse_provider_routing_ack(
         domain,
         snapshot_version: snapshot_version_field(&top)?,
         digest,
+        canonical_bytes: Vec::new(),
     })
 }
 
@@ -691,6 +711,72 @@ mod tests {
     }
 
     #[test]
+    fn same_revision_different_registry_projection_refuses_binding() {
+        let published_registry =
+            one_model_registry("alpha", "model-a", ModelCapability::Text, 4096, 1, 1);
+        let current_registry =
+            one_model_registry("beta", "model-a", ModelCapability::Text, 4096, 1, 1);
+        assert_eq!(published_registry.revision(), current_registry.revision());
+        assert_ne!(
+            project_registry(&published_registry)
+                .unwrap()
+                .canonical_bytes(),
+            project_registry(&current_registry)
+                .unwrap()
+                .canonical_bytes()
+        );
+
+        let projection = project_registry(&published_registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "same-revision-different-projection",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut state = PublicationState::default();
+        let ack = state.publish_provider_routing(&frame).unwrap();
+        let ack = state
+            .acknowledge_provider_routing(&acknowledgement_frame(&ack))
+            .unwrap();
+
+        assert_eq!(
+            state.bind_provider_routing(&ack, &current_registry),
+            Err(ProviderRoutingError::ProjectionMismatch)
+        );
+    }
+
+    #[test]
+    fn identical_projection_in_distinct_registry_values_is_accepted() {
+        let published_registry =
+            one_model_registry("alpha", "model-a", ModelCapability::Text, 4096, 1, 1);
+        let current_registry =
+            one_model_registry("alpha", "model-a", ModelCapability::Text, 4096, 1, 1);
+        assert_eq!(published_registry.revision(), current_registry.revision());
+        assert_eq!(
+            project_registry(&published_registry).unwrap(),
+            project_registry(&current_registry).unwrap()
+        );
+
+        let projection = project_registry(&published_registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "identical-distinct-registry",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut state = PublicationState::default();
+        let ack = state.publish_provider_routing(&frame).unwrap();
+        let ack = state
+            .acknowledge_provider_routing(&acknowledgement_frame(&ack))
+            .unwrap();
+
+        assert!(
+            state.bind_provider_routing(&ack, &current_registry).is_ok(),
+            "binding is projection-based, not an instance-identity claim"
+        );
+    }
+
+    #[test]
     fn aliases_are_excluded_but_alias_mutation_changes_revision() {
         let mut registry = registry();
         let before = project_registry(&registry).unwrap();
@@ -768,6 +854,57 @@ mod tests {
         assert!(state.provider_routing_binding_is_current(&binding, &registry));
         assert_eq!(acknowledged.domain(), PROVIDER_ROUTING_DOMAIN);
         assert_eq!(acknowledged.digest(), projection.digest());
+        assert_eq!(acknowledged.canonical_bytes(), projection.canonical_bytes());
+        assert_eq!(binding.canonical_bytes(), projection.canonical_bytes());
+    }
+
+    #[test]
+    fn caller_ack_clone_bytes_cannot_replace_retained_publication_bytes() {
+        let registry = registry();
+        let projection = project_registry(&registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "provider-pub-caller-clone",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut state = PublicationState::default();
+        let published = state.publish_provider_routing(&frame).unwrap();
+        let acknowledged = state
+            .acknowledge_provider_routing(&acknowledgement_frame(&published))
+            .unwrap();
+        let mut caller_clone = acknowledged.clone();
+        caller_clone.canonical_bytes = b"caller-owned-bytes".to_vec();
+
+        let binding = state
+            .bind_provider_routing(&caller_clone, &registry)
+            .expect("identity-only caller clone selects retained helper record");
+        assert_eq!(binding.canonical_bytes(), projection.canonical_bytes());
+        assert!(state.provider_routing_binding_is_current(&binding, &registry));
+    }
+
+    #[test]
+    fn binding_rejects_changed_retained_bytes_even_with_same_digest_and_revision() {
+        let registry = registry();
+        let projection = project_registry(&registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "provider-pub-bytes",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut state = PublicationState::default();
+        let ack = state.publish_provider_routing(&frame).unwrap();
+        let acknowledged = state
+            .acknowledge_provider_routing(&acknowledgement_frame(&ack))
+            .unwrap();
+        let mut binding = state
+            .bind_provider_routing(&acknowledged, &registry)
+            .unwrap();
+
+        binding.canonical_bytes = b"same-digest-different-bytes".to_vec();
+
+        assert!(!state.provider_routing_binding_is_current(&binding, &registry));
     }
 
     #[test]
