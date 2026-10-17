@@ -95,6 +95,11 @@ pub struct PublicationState {
     provider_epoch: u64,
 }
 
+// The offline helper seam guarantees replay and supersession only for the
+// lifetime of this state value. Reconstructing a fresh state does not provide
+// cross-reset identity or authenticated channel isolation; AI-0330 tracks
+// that durable helper-lifetime boundary before any strict success in AI-0329.
+
 impl PublicationState {
     pub fn publish(&mut self, frame: &[u8]) -> Result<PublicationAck, PublicationError> {
         if frame.len() > MAX_PUBLICATION_FRAME_BYTES {
@@ -239,12 +244,13 @@ impl PublicationState {
         let Some(pending) = &self.provider_pending else {
             return Err(provider_binding::ProviderRoutingError::NoPublication);
         };
-        if &ack != pending {
+        if !pending.same_identity(&ack) {
             return Err(provider_binding::ProviderRoutingError::Superseded);
         }
+        let acknowledged = pending.clone();
         self.provider_pending = None;
-        self.provider_acknowledged = Some(ack.clone());
-        Ok(ack)
+        self.provider_acknowledged = Some(acknowledged.clone());
+        Ok(acknowledged)
     }
 
     /// Prove equality between an exact acknowledged publication and the
@@ -259,19 +265,21 @@ impl PublicationState {
         let Some(acknowledged) = &self.provider_acknowledged else {
             return Err(provider_binding::ProviderRoutingError::NoAcknowledgement);
         };
-        if acknowledged != ack {
+        if !acknowledged.same_identity(ack) {
             return Err(provider_binding::ProviderRoutingError::Superseded);
         }
+        let acknowledged = acknowledged.clone();
         let projection = provider_binding::project_registry(registry)?;
-        if projection.digest() != ack.digest() {
+        if projection.digest() != acknowledged.digest()
+            || projection.canonical_bytes() != acknowledged.canonical_bytes()
+        {
             self.provider_acknowledged = None;
             return Err(provider_binding::ProviderRoutingError::ProjectionMismatch);
         }
-        self.provider_bound = Some(ack.clone());
+        self.provider_bound = Some(acknowledged.clone());
         self.provider_acknowledged = None;
         Ok(provider_binding::ProviderRoutingBinding::new(
-            ack,
-            projection,
+            &acknowledged,
             self.provider_epoch,
             registry.revision(),
         ))
@@ -291,10 +299,13 @@ impl PublicationState {
             && ack.domain() == binding.domain()
             && ack.snapshot_version() == binding.snapshot_version()
             && ack.digest() == binding.digest()
+            && ack.canonical_bytes() == binding.canonical_bytes()
             && binding.publication_epoch() == self.provider_epoch
             && binding.registry_revision() == registry.revision()
-            && provider_binding::project_registry(registry)
-                .is_ok_and(|projection| projection.digest() == binding.digest())
+            && provider_binding::project_registry(registry).is_ok_and(|projection| {
+                projection.digest() == binding.digest()
+                    && projection.canonical_bytes() == binding.canonical_bytes()
+            })
     }
 }
 
@@ -546,6 +557,40 @@ pub(crate) fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitty_ai_runtime::{ModelCapability, ModelRegistration, ProviderRegistry};
+
+    fn provider_registry() -> ProviderRegistry {
+        let mut registry = ProviderRegistry::new();
+        registry
+            .register(
+                ModelRegistration::new("alpha", "model-a", vec![ModelCapability::Text], 4096, 1, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        registry
+    }
+
+    fn provider_frame(version: u64, id: &str, payload: &[u8]) -> Vec<u8> {
+        let digest = sha256_hex(payload);
+        let payload = String::from_utf8(payload.to_vec()).unwrap();
+        let metadata_json = payload.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"{{"publication_id":"{id}","snapshot_version":{version},"domain":"{}","digest":"{digest}","metadata_json":"{metadata_json}"}}"#,
+            provider_binding::PROVIDER_ROUTING_DOMAIN
+        )
+        .into_bytes()
+    }
+
+    fn provider_ack_frame(ack: &provider_binding::ProviderRoutingPublicationAck) -> Vec<u8> {
+        format!(
+            r#"{{"publication_id":"{}","snapshot_version":{},"domain":"{}","digest":"{}"}}"#,
+            ack.publication_id(),
+            ack.snapshot_version(),
+            ack.domain(),
+            ack.digest()
+        )
+        .into_bytes()
+    }
     fn metadata() -> &'static str {
         r#"{"providers":[{"id":"local","name":"Local","models":[{"name":"model-a","capabilities":["text"]}]}],"routing_facts":["local-only"]}"#
     }
@@ -801,6 +846,68 @@ mod tests {
                 .expect("bounded provider identifier is accepted")
                 .publication_id,
             "pub-3"
+        );
+    }
+
+    #[test]
+    fn bind_rejects_ack_tuple_without_retained_publication_bytes() {
+        let registry = provider_registry();
+        let projection = provider_binding::project_registry(&registry).unwrap();
+        let publication =
+            provider_frame(1, "provider-pub-bind-bytes", projection.canonical_bytes());
+        let mut state = PublicationState::default();
+        let published = state.publish_provider_routing(&publication).unwrap();
+        let acknowledged = state
+            .acknowledge_provider_routing(&provider_ack_frame(&published))
+            .unwrap();
+
+        // The protocol acknowledgement has the exact same tuple but no
+        // retained publication bytes. It must not replace helper state.
+        state.provider_acknowledged = Some(
+            provider_binding::parse_provider_routing_ack(&provider_ack_frame(&published)).unwrap(),
+        );
+
+        assert_eq!(
+            state.bind_provider_routing(&acknowledged, &registry),
+            Err(provider_binding::ProviderRoutingError::ProjectionMismatch)
+        );
+        assert_eq!(
+            state.bind_provider_routing(&acknowledged, &registry),
+            Err(provider_binding::ProviderRoutingError::NoAcknowledgement)
+        );
+    }
+
+    #[test]
+    fn reconstructed_state_can_reaccept_tuple_within_offline_seam_scope() {
+        let registry = provider_registry();
+        let projection = provider_binding::project_registry(&registry).unwrap();
+        let publication = provider_frame(
+            1,
+            "provider-pub-reconstructed",
+            projection.canonical_bytes(),
+        );
+
+        let mut first = PublicationState::default();
+        let first_published = first.publish_provider_routing(&publication).unwrap();
+        let first_ack = first
+            .acknowledge_provider_routing(&provider_ack_frame(&first_published))
+            .unwrap();
+        let first_binding = first.bind_provider_routing(&first_ack, &registry).unwrap();
+
+        let mut reconstructed = PublicationState::default();
+        let reconstructed_published = reconstructed
+            .publish_provider_routing(&publication)
+            .unwrap();
+        let reconstructed_ack = reconstructed
+            .acknowledge_provider_routing(&provider_ack_frame(&reconstructed_published))
+            .unwrap();
+        let reconstructed_binding = reconstructed
+            .bind_provider_routing(&reconstructed_ack, &registry)
+            .unwrap();
+
+        assert!(reconstructed.provider_routing_binding_is_current(&first_binding, &registry));
+        assert!(
+            reconstructed.provider_routing_binding_is_current(&reconstructed_binding, &registry)
         );
     }
 }
