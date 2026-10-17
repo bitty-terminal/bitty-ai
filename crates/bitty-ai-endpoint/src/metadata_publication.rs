@@ -1,6 +1,9 @@
 //! In-memory S-1 metadata publication handshake. It adds no transport and does
 //! not select providers, access credentials, or perform model I/O. Normal
-//! `ai.*` correlators remain optional/tolerant until Core supplies versions.
+//! `ai.*` correlators remain optional/tolerant. The acknowledgement capability
+//! is retained by the helper-side strict seam, but no strict method is enabled
+//! until a current snapshot in this same provider/routing metadata domain is
+//! bound to it.
 
 use super::{JVal, parse_params_object};
 use std::collections::BTreeSet;
@@ -27,6 +30,40 @@ pub struct PublicationAck {
     pub publication_id: String,
     pub snapshot_version: u64,
     pub digest: String,
+}
+
+/// Opaque proof that one exact publication acknowledgement was accepted.
+///
+/// The fields are intentionally private: endpoint strict mode can only be
+/// entered with a value issued by [`PublicationState::acknowledge_for_endpoint`]
+/// after the state has validated and consumed the matching pending ack. This
+/// is an in-memory capability, not a transport credential or a caller-supplied
+/// version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcknowledgedPublication {
+    publication_id: String,
+    snapshot_version: u64,
+    digest: String,
+}
+
+impl AcknowledgedPublication {
+    /// The validated publication identity, safe for bounded diagnostics.
+    #[must_use]
+    pub fn publication_id(&self) -> &str {
+        &self.publication_id
+    }
+
+    /// The validated snapshot version carried by the publication.
+    #[must_use]
+    pub fn snapshot_version(&self) -> u64 {
+        self.snapshot_version
+    }
+
+    /// The validated lowercase SHA-256 digest of the metadata payload.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +163,25 @@ impl PublicationState {
         }
         self.pending = None;
         Ok(ack)
+    }
+
+    /// Consume the exact pending acknowledgement and issue an opaque endpoint
+    /// capability. Strict dispatch remains `Unbound` until a same-domain
+    /// current snapshot is supplied by an accepted contract.
+    ///
+    /// This is deliberately separate from [`Self::acknowledge`], whose public
+    /// tuple is retained for protocol tests and callers that only need the
+    /// handshake result. The capability cannot be constructed from that tuple.
+    pub fn acknowledge_for_endpoint(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<AcknowledgedPublication, PublicationError> {
+        let ack = self.acknowledge(frame)?;
+        Ok(AcknowledgedPublication {
+            publication_id: ack.publication_id,
+            snapshot_version: ack.snapshot_version,
+            digest: ack.digest,
+        })
     }
 }
 
@@ -430,6 +486,58 @@ mod tests {
         assert_eq!(
             s.acknowledge(bytes.as_bytes()),
             Err(PublicationError::NoPublication)
+        );
+    }
+
+    #[test]
+    fn endpoint_capability_requires_exact_single_ack() {
+        let mut state = PublicationState::default();
+        let publication = frame(1, "pub-1", metadata());
+        let ack = state.publish(&publication).unwrap();
+        let ack_frame = format!(
+            r#"{{"publication_id":"{}","snapshot_version":{},"digest":"{}"}}"#,
+            ack.publication_id, ack.snapshot_version, ack.digest
+        );
+        let capability = state
+            .acknowledge_for_endpoint(ack_frame.as_bytes())
+            .expect("exact acknowledgement issues endpoint capability");
+        assert_eq!(capability.publication_id(), "pub-1");
+        assert_eq!(capability.snapshot_version(), 1);
+        assert_eq!(capability.digest(), ack.digest);
+        assert_eq!(
+            state.acknowledge_for_endpoint(ack_frame.as_bytes()),
+            Err(PublicationError::NoPublication)
+        );
+        // A replayed publication is rejected by the same bounded state even
+        // after the endpoint capability has been issued.
+        assert_eq!(
+            state.publish(&publication),
+            Err(PublicationError::StaleOrReplay)
+        );
+    }
+
+    #[test]
+    fn superseded_ack_cannot_issue_endpoint_capability() {
+        let mut state = PublicationState::default();
+        let first = state.publish(&frame(1, "pub-1", metadata())).unwrap();
+        let second = state.publish(&frame(2, "pub-2", metadata())).unwrap();
+        let first_ack = format!(
+            r#"{{"publication_id":"{}","snapshot_version":{},"digest":"{}"}}"#,
+            first.publication_id, first.snapshot_version, first.digest
+        );
+
+        assert_eq!(
+            state.acknowledge_for_endpoint(first_ack.as_bytes()),
+            Err(PublicationError::Superseded)
+        );
+        let second_ack = format!(
+            r#"{{"publication_id":"{}","snapshot_version":{},"digest":"{}"}}"#,
+            second.publication_id, second.snapshot_version, second.digest
+        );
+        assert!(
+            state
+                .acknowledge_for_endpoint(second_ack.as_bytes())
+                .is_ok()
         );
     }
     #[test]
