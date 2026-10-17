@@ -23,5 +23,19 @@ acknowledgements fail closed.
 This module defines vocabulary and state validation only. It adds no transport;
 Core must wire publish/ack through the resident helper IPC and establish the
 producer-side metadata source before any `snapshot_version` is sent on normal
-`ai.*` requests. Until that integration exists, the optional E2 correlator
-remains tolerant and AI-0303 stale/missing enforcement remains disabled.
+`ai.*` requests. Existing endpoint entries remain tolerant for standalone use.
+
+`StrictEndpoint` can retain an opaque capability made from an exact
+`PublicationState` acknowledgement, but strict dispatch is currently
+fail-closed as `Unbound`. The acknowledgement describes the provider/routing
+metadata validated by `validate_metadata`; the current `ReadOnlyView` exposes
+runtime registry data and MCP pin/tool-list envelopes. No same-domain helper
+snapshot binding is present, and the MCP `SnapshotEnvelope::list_version` is
+not treated as equivalent to the publication's `snapshot_version`. Therefore
+`dispatch_with_strict` refuses before handlers for every method in this
+revision. No caller-supplied publication ID, digest, or version is authority,
+and `StrictReadOnlyView` intentionally has no such fields.
+
+This is only a partial, helper-side seam. Core/Lua/IPC caller wiring, a
+same-domain current binding, and production release remain out of scope; this
+API makes no claim that publication metadata equals MCP tool-list metadata.

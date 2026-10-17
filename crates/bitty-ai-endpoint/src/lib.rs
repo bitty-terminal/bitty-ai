@@ -73,13 +73,18 @@
 //!   via the per-method decode extension point below plus [`parse_correlator`],
 //!   [`check_correlator`], and [`correlator_current`]. TOLERANT mode: stale or
 //!   missing sightings proceed (disposition recorded test-observably, never in
-//!   result JSON); enforcement is S-F (AI-0303), not here. Dispatch-path flow
+//!   result JSON); the explicit acknowledged entry below is currently
+//!   fail-closed as `Unbound` because no same-domain current binding exists.
+//!   Dispatch-path flow
 //!   of the field rides the `bitty-ipc-api` schema allowance (landed AI-0307,
 //!   rev f201911: gate 5 accepts the optional field there; see the E2 contract).
 //! - E3: loopback admit/deny matrix, reassembler TTL, forged-tier vectors.
-//! - S-F (AI-0303, separate follow-up): correlator enforcement and the full
-//!   host-boundary lint gate re-establishment. No producer emits snapshot
-//!   versions yet, so enforcing now would deny everything.
+//! - S-F (AI-0303): the acknowledged helper-side publication handshake is
+//!   present, but strict correlator enforcement is fail-closed as `Unbound`.
+//!   The provider/routing publication has no proven same-domain current
+//!   snapshot in these dispatch views; the MCP tool-list version is unrelated.
+//!   Existing entries stay tolerant. Core/Lua/IPC caller wiring remains out of
+//!   scope.
 //!
 //! ## E1a handler contract
 //!
@@ -208,15 +213,14 @@
 //! proceed with the disposition recorded test-observably in [`CorrelatorInfo`]
 //! (returned alongside, never in the result JSON — `validate_ai_result`
 //! refuses unknown result fields under the same S-C `check_known` rule as
-//! params, so the disposition stays out of results). Enforcement (refusing on
-//! stale/missing) is S-F (AI-0303), never here: an `e2` test locks that stale
-//! proceeds.
+//! params, so the disposition stays out of results). A same-domain strict
+//! binding does not exist in this revision; the strict entry refuses
+//! `Unbound`. An `e2` test locks stale proceeding through the default path.
 //!
 //! // POLICY (AI-0302-E2): tolerant-not-enforcing — `StaleVersion` and
 //! // `MissingVersion` outcomes map to `StaleTolerated`/`MissingTolerated`
-//! // data, never to refusals. Flipping either to a refusal is the S-F
-//! // (AI-0303) change; doing it here would deny everything since no producer
-//! // emits snapshot versions yet.
+//! // data, never to refusals. Strict dispatch currently refuses `Unbound`
+//! // before handlers; default dispatch remains tolerant.
 //!
 //! // POLICY (AI-0302-E2): disposition-observable-not-result — the correlator
 //! // disposition travels in [`CorrelatorInfo`] (test-observable return
@@ -241,7 +245,8 @@
 //! missing). The decode extension point was ready before the allowance; an
 //! `e2` test then pinned the gate-5 refusal so the allowance landing would
 //! fail loudly, and now pins the allowed dispatch path instead. Enforcement
-//! (refusing on stale/missing) is S-F (AI-0303), never here.
+//! (refusing on stale/missing) is deferred until a same-domain binding exists;
+//! strict dispatch currently refuses `Unbound`, never by this classifier.
 
 //! ## Normative precedence
 //!
@@ -258,6 +263,59 @@ use bitty_ipc_api::{
     ConsentLedger, IpcError, Scope, ScopeSet, authorize_method, domain_deadline_ms,
     validate_ai_params, validate_domain_timeout,
 };
+
+/// Explicit endpoint entry state for acknowledged publication enforcement.
+///
+/// The endpoint retains the opaque acknowledgement, but this endpoint revision
+/// has no helper-side current snapshot in the same provider/routing metadata
+/// domain. Consequently strict dispatch is fail-closed as
+/// [`StrictCorrelatorRefusal::Unbound`]; the
+/// acknowledgement cannot be used to authorize the unrelated MCP tool-list
+/// snapshot.
+///
+/// It cannot be fabricated by callers because [`Self::from_ack`] accepts only
+/// the private capability emitted by
+/// [`PublicationState::acknowledge_for_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictEndpoint {
+    _acknowledged_publication: metadata_publication::AcknowledgedPublication,
+}
+
+impl StrictEndpoint {
+    /// Retain a real, exact publication acknowledgement for a future
+    /// same-domain binding.
+    #[must_use]
+    pub fn from_ack(ack: metadata_publication::AcknowledgedPublication) -> Self {
+        Self {
+            _acknowledged_publication: ack,
+        }
+    }
+
+    fn enforce(&self) -> Result<(), StrictCorrelatorRefusal> {
+        // `AcknowledgedPublication` describes provider/routing metadata. The
+        // current ReadOnlyView contains no typed snapshot in that domain:
+        // `SnapshotEnvelope::list_version` is MCP tool-list metadata and must
+        // not be treated as equivalent merely because it is also numeric.
+        Err(StrictCorrelatorRefusal::Unbound)
+    }
+}
+
+/// Typed fail-closed outcomes for the acknowledged strict correlator seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictCorrelatorRefusal {
+    /// The method has no current version binding in this endpoint revision.
+    Unbound,
+}
+
+fn strict_refusal_error(refusal: StrictCorrelatorRefusal) -> IpcError {
+    let reason = match refusal {
+        StrictCorrelatorRefusal::Unbound => "strict correlator has no binding",
+    };
+    IpcError::Denied {
+        code: "SnapshotCorrelator".to_string(),
+        reason: reason.to_string(),
+    }
+}
 
 // ── inputs ──────────────────────────────────────────────────────────────────
 
@@ -501,6 +559,19 @@ pub struct ReadOnlyView<'a> {
     pub mcp_snapshot: &'a SnapshotEnvelope,
 }
 
+/// Strict-call view over the existing read-only handler tables.
+///
+/// This wrapper deliberately carries no caller-supplied publication identity,
+/// digest, or version. The current view is not a provider/routing metadata
+/// snapshot, so [`dispatch_with_strict`] refuses it as
+/// [`StrictCorrelatorRefusal::Unbound`] until a same-domain helper binding is
+/// added by an accepted contract.
+#[derive(Debug)]
+pub struct StrictReadOnlyView<'a> {
+    /// Existing read-only handler tables.
+    pub view: &'a ReadOnlyView<'a>,
+}
+
 /// E1a dispatch entry: admit exactly like [`dispatch`], then wire the ten
 /// read-only methods end to end.
 ///
@@ -520,6 +591,68 @@ pub fn dispatch_with(input: &DispatchInput<'_>, view: &ReadOnlyView<'_>) -> Disp
     // POLICY (AI-0302-E1a): explicit per-method wiring table. E1b/c/d arms
     // stay NotWired; any future method added upstream without an E-phase
     // arm lands on the fallback NotWired, never on a guessed handler.
+    let result = match input.method {
+        "ai.model_select" => handle_select(view, input.params),
+        "ai.model_fallback" => handle_fallback(input.params),
+        "ai.model_cost" => handle_cost(input.params),
+        "ai.provider_list" => handle_list(view, input.params),
+        "ai.cache_hint" => handle_cache_hint(input.params),
+        "ai.mcp_pin" => handle_pin(view, input.params),
+        "ai.mcp_snapshot" => handle_snapshot(view, input.params),
+        "ai.extension_manifest" => handle_manifest(input.params),
+        "ai.extension_contribute" => handle_contribute(input.params),
+        "ai.extension_activate" => handle_activate(input.params),
+        "ai.context_read" | "ai.provider_complete" | "ai.tool_dispatch" => {
+            return DispatchOutcome::NotWired {
+                method: input.method.to_string(),
+                scope,
+            };
+        }
+        _ => {
+            return DispatchOutcome::NotWired {
+                method: input.method.to_string(),
+                scope,
+            };
+        }
+    };
+    match result {
+        Ok(result) => DispatchOutcome::Ready {
+            method: input.method.to_string(),
+            scope,
+            result,
+        },
+        Err(error) => DispatchOutcome::Refused(error),
+    }
+}
+
+/// Strict read-only dispatch entry backed by an acknowledged publication.
+///
+/// This entry preserves the six-gate order, then parses and enforces the
+/// correlator before any E1a handler can run. In this revision, the check is
+/// fail-closed as `Unbound` for every method because the acknowledged
+/// provider/routing publication is not bound to any current view snapshot.
+/// It is intentionally separate from [`dispatch_with`], whose standalone
+/// callers remain tolerant. No transport, socket, clock, or filesystem is
+/// introduced here.
+pub fn dispatch_with_strict(
+    input: &DispatchInput<'_>,
+    strict_view: &StrictReadOnlyView<'_>,
+    endpoint: &StrictEndpoint,
+) -> DispatchOutcome {
+    let view = strict_view.view;
+    let probe = GateProbe::default();
+    let scope = match run_gates(input, &probe) {
+        Ok(scope) => scope,
+        Err(error) => return DispatchOutcome::Refused(error),
+    };
+    match parse_correlator(input.method, input.params) {
+        Ok(_) => {}
+        Err(error) => return DispatchOutcome::Refused(error),
+    }
+    if let Err(refusal) = endpoint.enforce() {
+        return DispatchOutcome::Refused(strict_refusal_error(refusal));
+    }
+    // Keep the E1a method table identical after the strict pre-handler check.
     let result = match input.method {
         "ai.model_select" => handle_select(view, input.params),
         "ai.model_fallback" => handle_fallback(input.params),
@@ -959,8 +1092,8 @@ fn parse_params_object(params: &[u8]) -> Result<JVal, IpcError> {
 // the single `correlator_of` allow-list choke below. Gate 5 accepts the
 // field on the dispatch path since the `bitty-ipc-api` schema allowance
 // (landed AI-0307, rev f201911), so correlator-bearing dispatch params
-// reach decode/handler with the tolerant disposition. Enforcement
-// (refusing on stale/missing) is S-F (AI-0303), never here.
+// reach decode/handler with the tolerant disposition. Strict enforcement is
+// performed only by the explicit acknowledged endpoint entry point.
 
 /// Params field name carrying the tolerant S-1 snapshot correlator.
 ///
@@ -969,18 +1102,19 @@ fn parse_params_object(params: &[u8]) -> Result<JVal, IpcError> {
 /// [`parse_correlator`]) so the allow-list cannot drift per method.
 pub const CORRELATOR_FIELD: &str = "snapshot_version";
 
-/// Tolerant S-1 correlator disposition (AI-0302-E2; enforcement is S-F).
+/// Tolerant S-1 correlator disposition (AI-0302-E2).
 ///
 /// Records what [`check_correlator`] found, as data. Stale or missing
-/// sightings proceed (tolerant); S-F (AI-0303) flips those two arms to
-/// refusals. An `e2` test locks that stale proceeds.
+/// sightings proceed (tolerant). [`dispatch_with_strict`] currently refuses
+/// valid correlator shapes as `Unbound` because no same-domain publication
+/// binding exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrelatorDisposition {
     /// The sighting is current (equal or ahead): accepted.
     Current,
-    /// The sighting is behind current: PROCEEDS tolerantly (S-F flips to refuse).
+    /// The sighting is behind current and proceeds in tolerant mode.
     StaleTolerated,
-    /// No sighting, current known: PROCEEDS tolerantly (S-F flips to refuse).
+    /// No sighting, current known, and proceeds in tolerant mode.
     MissingTolerated,
     /// No current version is available for this method: the check is
     /// skipped and the call proceeds (S-2-compatible fallback).
@@ -1077,7 +1211,8 @@ pub fn check_correlator(
         // POLICY (AI-0302-E2): no-current-skips-check — without a
         // caller-supplied current there is nothing to compare against, so
         // the check is skipped (tolerant) and the sighting rides along
-        // unclassified for S-F to consume.
+        // unclassified; strict dispatch separately refuses because there is
+        // no same-domain current binding.
         return CorrelatorInfo {
             seen,
             disposition: CorrelatorDisposition::Unchecked,
@@ -1085,7 +1220,8 @@ pub fn check_correlator(
     };
     // POLICY (AI-0302-E2): tolerant-not-enforcing — both refusal arms of
     // the host taxonomy record as tolerated data and proceed. Flipping
-    // either arm to a refusal is the S-F (AI-0303) change, never here.
+    // strict dispatch separately refuses because no same-domain binding
+    // exists.
     let disposition = match check_snapshot_version(seen, current) {
         Ok(()) => CorrelatorDisposition::Current,
         Err(SnapshotRefusal::StaleVersion { .. }) => CorrelatorDisposition::StaleTolerated,
@@ -1100,8 +1236,8 @@ pub fn check_correlator(
 /// The ONLY current-version source: caller-supplied view data (no store
 /// reads beyond the existing `&` refs, no clock). Today only
 /// `ai.mcp_snapshot` has one — the echoed [`SnapshotEnvelope::list_version`](bitty_ai_host::mcp_placement::SnapshotEnvelope::list_version)
-/// (monotonic MCP list data, cited here as the check input; staleness
-/// stays reported-not-enforced per the envelope contract). Every other
+/// (monotonic MCP list data, cited here only for tolerant classification;
+/// it is not a strict publication binding). Every other
 /// method maps to `None` (check skipped, tolerant):
 /// `ai.mcp_pin` carries no numeric version (protocol version is a string),
 /// context generations keep exact-equality fence semantics and must NOT
@@ -7997,6 +8133,29 @@ mod e2_tests {
         SnapshotEnvelope::new(ToolListSnapshot::from_imported(&[]), 3, false)
     }
 
+    fn acknowledged_endpoint(version: u64) -> StrictEndpoint {
+        let metadata_json = "\"{\\\"providers\\\":[],\\\"routing_facts\\\":[]}\"";
+        // SHA-256 of the bounded metadata fixture. Keeping this fixture local
+        // avoids adding a test-only helper outside the publication test module.
+        let digest = "c5bf79494b59a31888b1a6396f3b7745b0d3ff0b9ff2a60dff7f2e6417e2a2fe";
+        let publication = format!(
+            r#"{{"publication_id":"strict-{version}","snapshot_version":{version},"digest":"{digest}","metadata_json":{}}}"#,
+            metadata_json
+        );
+        let ack = format!(
+            r#"{{"publication_id":"strict-{version}","snapshot_version":{version},"digest":"{digest}"}}"#
+        );
+        let mut state = metadata_publication::PublicationState::default();
+        state
+            .publish(publication.as_bytes())
+            .expect("valid publication");
+        StrictEndpoint::from_ack(
+            state
+                .acknowledge_for_endpoint(ack.as_bytes())
+                .expect("exact publication acknowledgement"),
+        )
+    }
+
     fn view<'a>(
         registry: &'a ProviderRegistry,
         pin: &'a PinEnvelope,
@@ -8007,6 +8166,10 @@ mod e2_tests {
             mcp_pin: pin,
             mcp_snapshot: snapshot,
         }
+    }
+
+    fn strict_view<'a>(view: &'a ReadOnlyView<'a>) -> StrictReadOnlyView<'a> {
+        StrictReadOnlyView { view }
     }
 
     fn ready_result(outcome: DispatchOutcome) -> String {
@@ -8289,7 +8452,9 @@ mod e2_tests {
             }
         );
         // A stale sighting on the dispatch path still proceeds tolerantly
-        // (S-F flips this to a refusal, never here).
+        // Strict dispatch is currently unbound because the publication and
+        // MCP list metadata domains have not been proven equivalent; this
+        // default entry remains tolerant.
         let stale = b"{\"snapshot_version\":1}";
         let result = ready_result(dispatch_with(
             &input("ai.mcp_snapshot", &granted, &ledger, stale),
@@ -8304,6 +8469,76 @@ mod e2_tests {
             .disposition,
             CorrelatorDisposition::StaleTolerated
         );
+    }
+
+    #[test]
+    fn forged_same_version_mcp_view_is_still_strictly_unbound() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let view_ref = view(&registry, &pin, &snapshot);
+        let endpoint = acknowledged_endpoint(3);
+        let strict_ref = strict_view(&view_ref);
+
+        // The acknowledged publication is provider/routing metadata. The
+        // MCP tool-list version in this view is a different domain, so even a
+        // numerically equal correlator is refused before the handler runs.
+        for (method, params) in [
+            ("ai.mcp_snapshot", br#"{"snapshot_version":3}"#.as_slice()),
+            ("ai.provider_list", br#"{}"#.as_slice()),
+        ] {
+            let refused = refused_error(dispatch_with_strict(
+                &input(method, &granted, &ledger, params),
+                &strict_ref,
+                &endpoint,
+            ));
+            assert!(
+                matches!(
+                    refused,
+                    IpcError::Denied { ref code, ref reason }
+                        if code == "SnapshotCorrelator"
+                            && reason == "strict correlator has no binding"
+                ),
+                "strict unbound refusal: {refused:?}"
+            );
+        }
+
+        // Existing default dispatch remains tolerant for the same missing and
+        // stale requests, proving strict mode is opt-in.
+        for params in [br#"{}"#.as_slice(), br#"{"snapshot_version":1}"#.as_slice()] {
+            assert!(matches!(
+                dispatch_with(
+                    &input("ai.mcp_snapshot", &granted, &ledger, params),
+                    &view_ref,
+                ),
+                DispatchOutcome::Ready { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn strict_dispatch_refuses_methods_without_current_binding() {
+        let granted = granted_inspect();
+        let ledger = ledger_for(Scope::AiInspect);
+        let registry = ProviderRegistry::new();
+        let pin = valid_pin();
+        let snapshot = snapshot_three();
+        let endpoint = acknowledged_endpoint(3);
+        let view_ref = view(&registry, &pin, &snapshot);
+        let strict_ref = strict_view(&view_ref);
+        let result = dispatch_with_strict(
+            &input("ai.provider_list", &granted, &ledger, br#"{}"#),
+            &strict_ref,
+            &endpoint,
+        );
+        let error = refused_error(result);
+        assert!(matches!(
+            error,
+            IpcError::Denied { code, reason }
+                if code == "SnapshotCorrelator" && reason == "strict correlator has no binding"
+        ));
     }
 
     #[test]
