@@ -252,6 +252,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod metadata_publication;
+
 use bitty_ipc_api::{
     ConsentLedger, IpcError, Scope, ScopeSet, authorize_method, domain_deadline_ms,
     validate_ai_params, validate_domain_timeout,
@@ -699,13 +701,28 @@ impl JsonParser<'_> {
         if self.peek() == Some(b'-') {
             self.pos += 1;
         }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(decode_invalid("params must be well-formed JSON"));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(decode_invalid("params must be well-formed JSON")),
         }
         if self.peek() == Some(b'.') {
             self.pos += 1;
+            let fraction_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
+            }
+            if self.pos == fraction_start {
+                return Err(decode_invalid("params must be well-formed JSON"));
             }
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
@@ -713,12 +730,13 @@ impl JsonParser<'_> {
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
+            let exponent_start = self.pos;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.pos += 1;
             }
-        }
-        if self.pos == start {
-            return Err(decode_invalid("params must be well-formed JSON"));
+            if self.pos == exponent_start {
+                return Err(decode_invalid("params must be well-formed JSON"));
+            }
         }
         let raw = self
             .bytes
@@ -4829,6 +4847,21 @@ mod e1a_tests {
         let wrapped = format!("{{\"value\":{encoded}}}");
         let parsed = parse_params_object(wrapped.as_bytes()).expect("encodes valid JSON");
         assert_eq!(parsed.field("value").and_then(JVal::as_str), Some(tricky));
+    }
+
+    #[test]
+    fn json_numbers_follow_rfc8259_grammar() {
+        for number in [
+            "0", "-0", "12", "-12", "1.0", "-0.5", "1e2", "1E+2", "-1e-2",
+        ] {
+            let params = format!(r#"{{"value":{number}}}"#);
+            assert!(parse_params_object(params.as_bytes()).is_ok(), "{number}");
+        }
+
+        for number in ["01", "-01", "1.", "1e", "1e+", "1e-"] {
+            let params = format!(r#"{{"value":{number}}}"#);
+            assert!(parse_params_object(params.as_bytes()).is_err(), "{number}");
+        }
     }
 }
 
