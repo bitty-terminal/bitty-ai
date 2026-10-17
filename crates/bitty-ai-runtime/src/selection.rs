@@ -375,6 +375,11 @@ pub struct ModelAlias {
 pub struct ProviderRegistry {
     models: Vec<RegisteredModel>,
     aliases: Vec<ModelAlias>,
+    /// Monotonic local mutation generation used by helper-side snapshot
+    /// bindings. It is not a publication version and never crosses IPC.
+    // POLICY (AI-0324): every accepted model or alias mutation invalidates
+    // helper-side proofs through this local generation.
+    revision: u64,
 }
 
 impl ProviderRegistry {
@@ -442,6 +447,7 @@ impl ProviderRegistry {
             input_cost_weight: registration.input_cost_weight,
             output_cost_weight: registration.output_cost_weight,
         });
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -493,6 +499,7 @@ impl ProviderRegistry {
             return Err(SelectionError::AliasesFull { limit: MAX_ALIASES });
         }
         self.aliases.push(ModelAlias { alias, candidates });
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -506,6 +513,16 @@ impl ProviderRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.models.is_empty()
+    }
+
+    /// Local mutation generation for same-process snapshot invalidation.
+    ///
+    /// This value is deliberately distinct from a publication version. It is
+    /// only usable together with a registry reference and a canonical digest;
+    /// callers cannot use it as a publication correlator.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Registered alias count.

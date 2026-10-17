@@ -258,6 +258,7 @@
 #![deny(unsafe_code)]
 
 pub mod metadata_publication;
+pub mod provider_binding;
 
 use bitty_ipc_api::{
     ConsentLedger, IpcError, Scope, ScopeSet, authorize_method, domain_deadline_ms,
@@ -700,7 +701,7 @@ pub fn dispatch_with_strict(
 /// (defense in depth for direct callers; the canonical layer already
 /// confirmed it).
 #[derive(Debug, Clone, PartialEq)]
-enum JVal {
+pub(crate) enum JVal {
     Null,
     Bool(bool),
     Num(JsonNum),
@@ -716,7 +717,7 @@ enum JVal {
 struct JsonNum(String);
 
 impl JVal {
-    fn as_u64(&self) -> Option<u64> {
+    pub(crate) fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Num(raw) => {
                 if raw.0.is_empty() || !raw.0.bytes().all(|b| b.is_ascii_digit()) {
@@ -728,25 +729,25 @@ impl JVal {
         }
     }
 
-    fn as_u32(&self) -> Option<u32> {
+    pub(crate) fn as_u32(&self) -> Option<u32> {
         self.as_u64().and_then(|v| u32::try_from(v).ok())
     }
 
-    fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
             _ => None,
         }
     }
 
-    fn as_arr(&self) -> Option<&[JVal]> {
+    pub(crate) fn as_arr(&self) -> Option<&[JVal]> {
         match self {
             Self::Arr(items) => Some(items),
             _ => None,
         }
     }
 
-    fn as_obj(&self) -> Option<&[(String, JVal)]> {
+    pub(crate) fn as_obj(&self) -> Option<&[(String, JVal)]> {
         match self {
             Self::Obj(fields) => Some(fields),
             _ => None,
@@ -759,7 +760,7 @@ impl JVal {
     /// // POLICY (AI-0302-E1a): first-wins (never last-wins): a duplicated
     /// // field that ever reached decode must resolve to the caller's
     /// // original value, not an overriding shadow.
-    fn field(&self, name: &str) -> Option<&JVal> {
+    pub(crate) fn field(&self, name: &str) -> Option<&JVal> {
         self.as_obj()?
             .iter()
             .find(|(key, _)| key == name)

@@ -6,6 +6,7 @@
 //! bound to it.
 
 use super::{JVal, parse_params_object};
+use crate::provider_binding;
 use std::collections::BTreeSet;
 
 pub const MAX_PUBLICATION_FRAME_BYTES: usize = 256 * 1024;
@@ -86,6 +87,12 @@ pub struct PublicationState {
     latest_version: Option<u64>,
     pending: Option<PublicationAck>,
     accepted_publication_ids: BTreeSet<String>,
+    provider_latest_version: Option<u64>,
+    provider_pending: Option<provider_binding::ProviderRoutingPublicationAck>,
+    provider_acknowledged: Option<provider_binding::ProviderRoutingPublicationAck>,
+    provider_bound: Option<provider_binding::ProviderRoutingPublicationAck>,
+    provider_accepted_publication_ids: BTreeSet<String>,
+    provider_epoch: u64,
 }
 
 impl PublicationState {
@@ -183,13 +190,119 @@ impl PublicationState {
             digest: ack.digest,
         })
     }
+
+    /// Publish one domain-tagged provider/routing projection. This lifecycle is
+    /// separate from the generic metadata publication above: provider display
+    /// names and routing facts are not the `ai.provider_list` projection.
+    pub fn publish_provider_routing(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<
+        provider_binding::ProviderRoutingPublicationAck,
+        provider_binding::ProviderRoutingError,
+    > {
+        let (ack, _) = provider_binding::parse_provider_routing_publication(frame)?;
+        if self
+            .provider_latest_version
+            .is_some_and(|last| ack.snapshot_version() <= last)
+        {
+            return Err(provider_binding::ProviderRoutingError::StaleOrReplay);
+        }
+        if self
+            .provider_accepted_publication_ids
+            .contains(ack.publication_id())
+        {
+            return Err(provider_binding::ProviderRoutingError::PublicationIdReused);
+        }
+        if self.provider_accepted_publication_ids.len() >= MAX_ACCEPTED_PUBLICATION_IDS {
+            return Err(provider_binding::ProviderRoutingError::PublicationLimit);
+        }
+        self.provider_accepted_publication_ids
+            .insert(ack.publication_id().to_owned());
+        self.provider_latest_version = Some(ack.snapshot_version());
+        self.provider_pending = Some(ack.clone());
+        self.provider_acknowledged = None;
+        self.provider_bound = None;
+        self.provider_epoch = self.provider_epoch.saturating_add(1);
+        Ok(ack)
+    }
+
+    /// Consume the exact pending provider/routing acknowledgement.
+    pub fn acknowledge_provider_routing(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<
+        provider_binding::ProviderRoutingPublicationAck,
+        provider_binding::ProviderRoutingError,
+    > {
+        let ack = provider_binding::parse_provider_routing_ack(frame)?;
+        let Some(pending) = &self.provider_pending else {
+            return Err(provider_binding::ProviderRoutingError::NoPublication);
+        };
+        if &ack != pending {
+            return Err(provider_binding::ProviderRoutingError::Superseded);
+        }
+        self.provider_pending = None;
+        self.provider_acknowledged = Some(ack.clone());
+        Ok(ack)
+    }
+
+    /// Prove equality between an exact acknowledged publication and the
+    /// current helper registry. The proof is opaque and carries no mutation
+    /// authority. A failed comparison never enables strict dispatch.
+    pub fn bind_provider_routing(
+        &mut self,
+        ack: &provider_binding::ProviderRoutingPublicationAck,
+        registry: &bitty_ai_runtime::ProviderRegistry,
+    ) -> Result<provider_binding::ProviderRoutingBinding, provider_binding::ProviderRoutingError>
+    {
+        let Some(acknowledged) = &self.provider_acknowledged else {
+            return Err(provider_binding::ProviderRoutingError::NoAcknowledgement);
+        };
+        if acknowledged != ack {
+            return Err(provider_binding::ProviderRoutingError::Superseded);
+        }
+        let projection = provider_binding::project_registry(registry)?;
+        if projection.digest() != ack.digest() {
+            self.provider_acknowledged = None;
+            return Err(provider_binding::ProviderRoutingError::ProjectionMismatch);
+        }
+        self.provider_bound = Some(ack.clone());
+        self.provider_acknowledged = None;
+        Ok(provider_binding::ProviderRoutingBinding::new(
+            ack,
+            projection,
+            self.provider_epoch,
+            registry.revision(),
+        ))
+    }
+
+    /// Check a proof against the publication lifecycle and current registry.
+    #[must_use]
+    pub fn provider_routing_binding_is_current(
+        &self,
+        binding: &provider_binding::ProviderRoutingBinding,
+        registry: &bitty_ai_runtime::ProviderRegistry,
+    ) -> bool {
+        let Some(ack) = &self.provider_bound else {
+            return false;
+        };
+        ack.publication_id() == binding.publication_id()
+            && ack.domain() == binding.domain()
+            && ack.snapshot_version() == binding.snapshot_version()
+            && ack.digest() == binding.digest()
+            && binding.publication_epoch() == self.provider_epoch
+            && binding.registry_revision() == registry.revision()
+            && provider_binding::project_registry(registry)
+                .is_ok_and(|projection| projection.digest() == binding.digest())
+    }
 }
 
-fn parse_object(bytes: &[u8]) -> Result<JVal, PublicationError> {
+pub(crate) fn parse_object(bytes: &[u8]) -> Result<JVal, PublicationError> {
     parse_params_object(bytes).map_err(|_| PublicationError::InvalidJson)
 }
 
-fn reject_duplicate_keys(value: &JVal) -> Result<(), PublicationError> {
+pub(crate) fn reject_duplicate_keys(value: &JVal) -> Result<(), PublicationError> {
     match value {
         JVal::Obj(fields) => {
             let mut keys = BTreeSet::new();
@@ -236,7 +349,7 @@ fn integer_field(value: &JVal, name: &str) -> Result<u64, PublicationError> {
         .ok_or(PublicationError::InvalidJson)
 }
 
-fn valid_identity(value: &str) -> bool {
+pub(crate) fn valid_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_METADATA_FIELD_BYTES
         && value
@@ -361,7 +474,7 @@ fn credential_like_identity(value: &str) -> bool {
 }
 
 // SHA-256 per FIPS 180-4. Fixed-size state and bounded caller input only.
-fn sha256_hex(input: &[u8]) -> String {
+pub(crate) fn sha256_hex(input: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
