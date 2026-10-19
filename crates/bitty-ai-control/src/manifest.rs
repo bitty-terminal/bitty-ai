@@ -420,9 +420,10 @@ pub(crate) fn validated_helper_key(
     provider: &CryptoProvider,
 ) -> Result<CertifiedKey, ManifestError> {
     let certificate = CertificateDer::from(manifest.key_material.helper_certificate_der.clone());
-    let mut key_bytes = manifest.key_material.helper_private_key_pkcs8_der.to_vec();
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::mem::take(&mut key_bytes)));
-    zeroize::Zeroize::zeroize(&mut key_bytes);
+    let key_bytes = manifest.key_material.helper_private_key_pkcs8_der.to_vec();
+    // `PrivatePkcs8KeyDer::from(Vec<u8>)` takes ownership; rustls' provider
+    // wraps the consumed DER in `Zeroizing`, so no separate wipe is needed here.
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes));
 
     let certified =
         CertifiedKey::from_der(vec![certificate], key, provider).map_err(|error| match error {

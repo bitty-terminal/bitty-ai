@@ -27,9 +27,10 @@ use crate::{CONTROL_ALPN, TLS_PREAUTH_STEPS_MAX, TLS_PREAUTH_WIRE_MAX_BYTES};
 /// Helper-side control server configuration.
 ///
 /// Construction consumes the [`LaunchManifest`] so the owned private-key
-/// buffer is dropped (and zeroized) as soon as rustls has loaded the key. The
-/// value is reusable for successive handshake attempts within one launch, but
-/// older launch material must never authenticate a replacement launch.
+/// buffer is dropped (and zeroized) as soon as rustls has loaded the key.
+/// The value is one-shot: [`Self::handshake`] and [`Self::accept`] consume it,
+/// so one server serves exactly one handshake. Older launch material must
+/// never authenticate a replacement launch.
 pub struct ControlServer {
     config: Arc<ServerConfig>,
     peer_certificate_pin: CertificatePin,

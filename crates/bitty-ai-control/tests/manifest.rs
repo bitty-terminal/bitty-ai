@@ -383,8 +383,11 @@ fn debug_and_errors_do_not_expose_private_key() {
         format!("{}", manifest.core_certificate_pin()),
         format!("{:?}", manifest.core_certificate_pin()),
     ] {
-        assert!(!rendered.contains(&key_hex), "key leaked: {rendered}");
-        assert!(!rendered.to_lowercase().contains(&key_hex));
+        let leaked = rendered.contains(&key_hex) || rendered.to_lowercase().contains(&key_hex);
+        assert!(
+            !leaked,
+            "key material leaked in a rendered Debug/Display value"
+        );
     }
 
     assert!(format!("{manifest:?}").contains("<redacted>"));
