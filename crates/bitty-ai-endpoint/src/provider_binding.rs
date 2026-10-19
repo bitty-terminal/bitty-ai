@@ -291,7 +291,7 @@ fn append_json_string(out: &mut Vec<u8>, value: &str) {
     out.push(b'"');
     for character in value.chars() {
         match character {
-            '"' => out.extend_from_slice(br#"\"#),
+            '"' => out.extend_from_slice(br#"\""#),
             '\\' => out.extend_from_slice(br#"\\"#),
             '\u{0008}' => out.extend_from_slice(br#"\b"#),
             '\u{000c}' => out.extend_from_slice(br#"\f"#),
@@ -636,6 +636,102 @@ mod tests {
                 .digest()
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+
+    // Regression (AI-0335): a quote must be encoded as the two bytes `\"`.
+    // The pre-fix encoder emitted a lone backslash, which is not a valid JSON
+    // escape, so any quote-bearing identity produced unparseable canonical
+    // bytes and a digest that the bitty-ipc contract module would not match.
+    const QUOTED_PROJECTION: &[u8] = br#"{"domain":"provider-routing","providers":[{"id":"alpha\"quote","models":[{"name":"model\"a","capabilities":["text"],"context_window_tokens":4096,"input_cost_weight":1,"output_cost_weight":1}]}]}"#;
+    const QUOTED_PROJECTION_DIGEST: &str =
+        "7143461b65f6ad9676eedd2fc5ca6fa2b5ba8cbb193d0709e20b47b5e6243aee";
+
+    #[test]
+    fn quote_bearing_projection_matches_ipc_canonical_bytes_and_digest() {
+        let parsed = crate::metadata_publication::parse_object(QUOTED_PROJECTION).unwrap();
+        let projection = project_payload(&parsed).unwrap();
+
+        assert_eq!(projection.canonical_bytes(), QUOTED_PROJECTION);
+        assert_eq!(projection.digest(), QUOTED_PROJECTION_DIGEST);
+        assert!(
+            projection
+                .canonical_bytes()
+                .windows(b"alpha\\\"quote".len())
+                .any(|window| window == b"alpha\\\"quote"),
+            "provider id keeps the backslash+quote spelling"
+        );
+        assert!(
+            projection
+                .canonical_bytes()
+                .windows(b"model\\\"a".len())
+                .any(|window| window == b"model\\\"a"),
+            "model name keeps the backslash+quote spelling"
+        );
+
+        // The old spelling emitted `\` followed by the character, which is an
+        // invalid JSON escape and must never reappear.
+        assert!(
+            !projection
+                .canonical_bytes()
+                .windows(b"alpha\\quote".len())
+                .any(|window| window == b"alpha\\quote"),
+            "provider id must not use the old single-backslash spelling"
+        );
+        assert!(
+            !projection
+                .canonical_bytes()
+                .windows(b"model\\a".len())
+                .any(|window| window == b"model\\a"),
+            "model name must not use the old single-backslash spelling"
+        );
+    }
+
+    #[test]
+    fn json_string_keeps_every_non_quote_escape_spelling() {
+        let mut out = Vec::new();
+        append_json_string(&mut out, "\"\\\u{0008}\u{000c}\n\r\t\u{0001}");
+        assert_eq!(out, br#""\"\\\b\f\n\r\t\u0001""#);
+    }
+
+    #[test]
+    fn quote_bearing_publication_retains_exact_canonical_bytes() {
+        let mut state = PublicationState::default();
+        let frame = publication_frame(
+            1,
+            "provider-pub-quoted",
+            PROVIDER_ROUTING_DOMAIN,
+            QUOTED_PROJECTION,
+        );
+        let ack = state.publish_provider_routing(&frame).unwrap();
+        let acknowledged = state
+            .acknowledge_provider_routing(&acknowledgement_frame(&ack))
+            .unwrap();
+
+        assert_eq!(acknowledged.canonical_bytes(), QUOTED_PROJECTION);
+        assert_eq!(acknowledged.digest(), QUOTED_PROJECTION_DIGEST);
+        assert_eq!(acknowledged.domain(), PROVIDER_ROUTING_DOMAIN);
+
+        // ProviderRegistry rejects quotes in provider ids and model names, so a
+        // quote-bearing projection can never equal a local registry projection.
+        // Bind must refuse it rather than silently accepting corrupted bytes.
+        let mut quoted_registry = ProviderRegistry::new();
+        assert!(
+            quoted_registry
+                .register(ModelRegistration {
+                    provider_id: "alpha\"quote".into(),
+                    name: "model\"a".into(),
+                    capabilities: vec![ModelCapability::Text],
+                    context_window_tokens: 4096,
+                    input_cost_weight: 1,
+                    output_cost_weight: 1,
+                })
+                .is_err(),
+            "registry shape rejects quotes, so quoted bind equality is unreachable"
+        );
+        assert_eq!(
+            state.bind_provider_routing(&acknowledged, &registry()),
+            Err(ProviderRoutingError::ProjectionMismatch)
         );
     }
 
