@@ -16,6 +16,10 @@ members = [
   # Helper-side ai.* handler endpoint skeleton, S-E per AI-0302 (E0: six-gate
   # dispatcher shell, no per-method wiring; edges to runtime, host, ipc-api).
   "crates/bitty-ai-endpoint",
+  # Helper-side launch-scoped mutual-certificate control transport (AI-0333
+  # slice 1: bounded launch manifest plus TLS 1.3 server). Separate TLS/bootstrap
+  # composition boundary; the endpoint purity policy is unchanged.
+  "crates/bitty-ai-control",
   # Future crates:
   # - crates/bitty-ai-model-provider
   # - crates/bitty-ai-context-provider
