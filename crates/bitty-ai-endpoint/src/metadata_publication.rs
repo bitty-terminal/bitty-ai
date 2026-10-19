@@ -8,6 +8,11 @@
 use super::{JVal, parse_params_object};
 use crate::provider_binding;
 use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 pub const MAX_PUBLICATION_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_ACCEPTED_PUBLICATION_IDS: usize = 256;
@@ -82,8 +87,83 @@ pub enum PublicationError {
     NoPublication,
 }
 
-#[derive(Debug, Default)]
+/// Opaque helper-side lifetime token carried by provider binding proofs.
+///
+/// POLICY (AI-0330): the token is minted from a process-local monotonic
+/// sequence, held only in private in-memory fields, never serialized, never
+/// accepted from frames/acks/callers, and never exposed through an accessor or
+/// `Debug`. It is helper-side replay isolation, not Core authority and not an
+/// authentication statement about the producer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicationLifetimeToken(u64);
+
+impl fmt::Debug for PublicationLifetimeToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PublicationLifetimeToken(..)")
+    }
+}
+
+/// Process-local source of distinct helper lifetime tokens.
+///
+/// POLICY (AI-0330): this counter only makes two in-memory helper lifetimes
+/// distinguishable. It does not authenticate Core, is never sent or accepted
+/// as a payload value, and cannot authorize anything by itself. A caller cannot
+/// choose a sequence value, and a reconstructed or replaced state always mints
+/// a value the old proof does not carry. This is deliberately not a
+/// process-global "Core epoch"; authenticated Core ingress remains the separate
+/// bitty#2199 gate.
+static NEXT_PUBLICATION_LIFETIME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const EXHAUSTED_LIFETIME_SEQUENCE: u64 = 0;
+
+/// One shared helper-state lifetime. Clones share this cell through `Arc`; the
+/// revoked flag can only move from false to true.
+pub(crate) struct PublicationStateLifetime {
+    sequence: u64,
+    revoked: AtomicBool,
+}
+
+impl fmt::Debug for PublicationStateLifetime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicationStateLifetime")
+            .field("revoked", &self.is_revoked())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublicationStateLifetime {
+    fn mint() -> Arc<Self> {
+        let sequence = NEXT_PUBLICATION_LIFETIME_SEQUENCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .unwrap_or(EXHAUSTED_LIFETIME_SEQUENCE);
+        // Exhaustion fails closed: the sentinel lifetime starts revoked, so no
+        // proof minted under it can ever be current.
+        let revoked = sequence == EXHAUSTED_LIFETIME_SEQUENCE;
+        Arc::new(Self {
+            sequence,
+            revoked: AtomicBool::new(revoked),
+        })
+    }
+
+    pub(crate) fn token(&self) -> PublicationLifetimeToken {
+        PublicationLifetimeToken(self.sequence)
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::SeqCst)
+    }
+
+    fn revoke(&self) {
+        self.revoked.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Helper publication lifecycle with a private in-memory lifetime.
+#[derive(Debug)]
 pub struct PublicationState {
+    lifetime: Arc<PublicationStateLifetime>,
     latest_version: Option<u64>,
     pending: Option<PublicationAck>,
     accepted_publication_ids: BTreeSet<String>,
@@ -95,12 +175,81 @@ pub struct PublicationState {
     provider_epoch: u64,
 }
 
-// The offline helper seam guarantees replay and supersession only for the
-// lifetime of this state value. Reconstructing a fresh state does not provide
-// cross-reset identity or authenticated channel isolation; AI-0330 tracks
-// that durable helper-lifetime boundary before any strict success in AI-0329.
+impl Default for PublicationState {
+    fn default() -> Self {
+        Self {
+            lifetime: PublicationStateLifetime::mint(),
+            latest_version: None,
+            pending: None,
+            accepted_publication_ids: BTreeSet::new(),
+            provider_latest_version: None,
+            provider_pending: None,
+            provider_acknowledged: None,
+            provider_bound: None,
+            provider_accepted_publication_ids: BTreeSet::new(),
+            provider_epoch: 0,
+        }
+    }
+}
+
+impl Clone for PublicationState {
+    /// POLICY (AI-0330): a clone is an alias of the same live helper lifetime.
+    /// It shares the lifetime cell, including the irreversible revoked flag, so
+    /// a reset through any alias invalidates proofs held by every alias.
+    fn clone(&self) -> Self {
+        Self {
+            lifetime: Arc::clone(&self.lifetime),
+            latest_version: self.latest_version,
+            pending: self.pending.clone(),
+            accepted_publication_ids: self.accepted_publication_ids.clone(),
+            provider_latest_version: self.provider_latest_version,
+            provider_pending: self.provider_pending.clone(),
+            provider_acknowledged: self.provider_acknowledged.clone(),
+            provider_bound: self.provider_bound.clone(),
+            provider_accepted_publication_ids: self.provider_accepted_publication_ids.clone(),
+            provider_epoch: self.provider_epoch,
+        }
+    }
+}
 
 impl PublicationState {
+    /// Irreversibly revoke this state's helper lifetime and clear all
+    /// publication state.
+    ///
+    /// POLICY (AI-0330): the revoked cell is shared with every clone, so old
+    /// provider proofs fail with
+    /// [`provider_binding::ProviderRoutingError::PublicationLifetimeRevoked`]
+    /// in those aliases. The reset value mints a new lifetime and can recover
+    /// only through a fresh publish/ack/bind cycle. An old proof can never
+    /// become current again, even when the publication tuple, canonical bytes,
+    /// epoch, and registry revision repeat byte-for-byte.
+    pub fn reset(&mut self) {
+        self.lifetime.revoke();
+        *self = Self::default();
+    }
+
+    fn active_lifetime_token(
+        &self,
+    ) -> Result<PublicationLifetimeToken, provider_binding::ProviderRoutingError> {
+        if self.lifetime.is_revoked() {
+            return Err(provider_binding::ProviderRoutingError::PublicationLifetimeRevoked);
+        }
+        Ok(self.lifetime.token())
+    }
+
+    fn check_lifetime_token(
+        &self,
+        token: PublicationLifetimeToken,
+    ) -> Result<(), provider_binding::ProviderRoutingError> {
+        if self.lifetime.is_revoked() {
+            return Err(provider_binding::ProviderRoutingError::PublicationLifetimeRevoked);
+        }
+        if token != self.lifetime.token() {
+            return Err(provider_binding::ProviderRoutingError::PublicationLifetimeMismatch);
+        }
+        Ok(())
+    }
+
     pub fn publish(&mut self, frame: &[u8]) -> Result<PublicationAck, PublicationError> {
         if frame.len() > MAX_PUBLICATION_FRAME_BYTES {
             return Err(PublicationError::FrameTooLarge);
@@ -206,6 +355,7 @@ impl PublicationState {
         provider_binding::ProviderRoutingPublicationAck,
         provider_binding::ProviderRoutingError,
     > {
+        self.active_lifetime_token()?;
         let (ack, _) = provider_binding::parse_provider_routing_publication(frame)?;
         if self
             .provider_latest_version
@@ -240,6 +390,7 @@ impl PublicationState {
         provider_binding::ProviderRoutingPublicationAck,
         provider_binding::ProviderRoutingError,
     > {
+        self.active_lifetime_token()?;
         let ack = provider_binding::parse_provider_routing_ack(frame)?;
         let Some(pending) = &self.provider_pending else {
             return Err(provider_binding::ProviderRoutingError::NoPublication);
@@ -254,14 +405,16 @@ impl PublicationState {
     }
 
     /// Prove equality between an exact acknowledged publication and the
-    /// current helper registry. The proof is opaque and carries no mutation
-    /// authority. A failed comparison never enables strict dispatch.
+    /// current helper registry. The proof is opaque, carries this state's
+    /// private lifetime token, and carries no mutation authority. A failed
+    /// comparison never enables strict dispatch.
     pub fn bind_provider_routing(
         &mut self,
         ack: &provider_binding::ProviderRoutingPublicationAck,
         registry: &bitty_ai_runtime::ProviderRegistry,
     ) -> Result<provider_binding::ProviderRoutingBinding, provider_binding::ProviderRoutingError>
     {
+        let lifetime_token = self.active_lifetime_token()?;
         let Some(acknowledged) = &self.provider_acknowledged else {
             return Err(provider_binding::ProviderRoutingError::NoAcknowledgement);
         };
@@ -282,7 +435,45 @@ impl PublicationState {
             &acknowledged,
             self.provider_epoch,
             registry.revision(),
+            lifetime_token,
         ))
+    }
+
+    /// Check a proof against the publication lifecycle and current registry,
+    /// returning the typed refusal instead of collapsing it to a boolean.
+    ///
+    /// POLICY (AI-0330): lifetime revocation and lifetime mismatch are checked
+    /// before any reproducible publication tuple, byte, epoch, or revision
+    /// comparison, so a proof from another/reset helper state cannot be
+    /// mistaken for a current proof merely because those values are identical.
+    pub fn verify_provider_routing_binding(
+        &self,
+        binding: &provider_binding::ProviderRoutingBinding,
+        registry: &bitty_ai_runtime::ProviderRegistry,
+    ) -> Result<(), provider_binding::ProviderRoutingError> {
+        self.check_lifetime_token(binding.lifetime_token())?;
+        let Some(ack) = &self.provider_bound else {
+            return Err(provider_binding::ProviderRoutingError::NoAcknowledgement);
+        };
+        if ack.publication_id() != binding.publication_id()
+            || ack.domain() != binding.domain()
+            || ack.snapshot_version() != binding.snapshot_version()
+            || ack.digest() != binding.digest()
+            || ack.canonical_bytes() != binding.canonical_bytes()
+            || binding.publication_epoch() != self.provider_epoch
+        {
+            return Err(provider_binding::ProviderRoutingError::Superseded);
+        }
+        if binding.registry_revision() != registry.revision() {
+            return Err(provider_binding::ProviderRoutingError::StaleOrReplay);
+        }
+        let projection = provider_binding::project_registry(registry)?;
+        if projection.digest() != binding.digest()
+            || projection.canonical_bytes() != binding.canonical_bytes()
+        {
+            return Err(provider_binding::ProviderRoutingError::ProjectionMismatch);
+        }
+        Ok(())
     }
 
     /// Check a proof against the publication lifecycle and current registry.
@@ -292,20 +483,8 @@ impl PublicationState {
         binding: &provider_binding::ProviderRoutingBinding,
         registry: &bitty_ai_runtime::ProviderRegistry,
     ) -> bool {
-        let Some(ack) = &self.provider_bound else {
-            return false;
-        };
-        ack.publication_id() == binding.publication_id()
-            && ack.domain() == binding.domain()
-            && ack.snapshot_version() == binding.snapshot_version()
-            && ack.digest() == binding.digest()
-            && ack.canonical_bytes() == binding.canonical_bytes()
-            && binding.publication_epoch() == self.provider_epoch
-            && binding.registry_revision() == registry.revision()
-            && provider_binding::project_registry(registry).is_ok_and(|projection| {
-                projection.digest() == binding.digest()
-                    && projection.canonical_bytes() == binding.canonical_bytes()
-            })
+        self.verify_provider_routing_binding(binding, registry)
+            .is_ok()
     }
 }
 
@@ -878,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstructed_state_can_reaccept_tuple_within_offline_seam_scope() {
+    fn reconstructed_state_refuses_old_proof_and_accepts_its_own() {
         let registry = provider_registry();
         let projection = provider_binding::project_registry(&registry).unwrap();
         let publication = provider_frame(
@@ -905,7 +1084,25 @@ mod tests {
             .bind_provider_routing(&reconstructed_ack, &registry)
             .unwrap();
 
-        assert!(reconstructed.provider_routing_binding_is_current(&first_binding, &registry));
+        // The replay inputs really are identical; only the helper lifetime is
+        // different. The old proof must not become current in the new state.
+        assert_eq!(
+            first_binding.publication_epoch(),
+            reconstructed_binding.publication_epoch()
+        );
+        assert_eq!(
+            first_binding.registry_revision(),
+            reconstructed_binding.registry_revision()
+        );
+        assert_eq!(
+            first_binding.canonical_bytes(),
+            reconstructed_binding.canonical_bytes()
+        );
+        assert_eq!(
+            reconstructed.verify_provider_routing_binding(&first_binding, &registry),
+            Err(provider_binding::ProviderRoutingError::PublicationLifetimeMismatch)
+        );
+        assert!(!reconstructed.provider_routing_binding_is_current(&first_binding, &registry));
         assert!(
             reconstructed.provider_routing_binding_is_current(&reconstructed_binding, &registry)
         );

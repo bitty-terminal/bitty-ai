@@ -121,6 +121,26 @@ endpoint_lib() {
 root="$(new_fixture clean)"
 pass_case "clean classified tree passes" "$root"
 
+root="$(new_fixture lifetime-atomics)"
+cat >>"$(endpoint_lib "$root")" <<'EOF'
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+pub struct LifetimeCell {
+    sequence: AtomicU64,
+    revoked: AtomicBool,
+}
+
+pub fn share(cell: &Arc<LifetimeCell>) -> bool {
+    let _ = Ordering::SeqCst;
+    !cell.revoked.load(Ordering::SeqCst) && cell.sequence.load(Ordering::Relaxed) > 0
+}
+EOF
+pass_case "AI-0330 lifetime Arc/atomics pass" "$root"
+
 root="$(new_fixture lawful-alias-construction)"
 cat >>"$(endpoint_lib "$root")" <<'EOF'
 
@@ -156,6 +176,10 @@ fail_case "smuggled filesystem read fails" "$root"
 root="$(new_fixture smuggled-thread-spawn)"
 printf '\npub fn bg() { let _ = std::thread::spawn(|| {}); }\n' >>"$(endpoint_lib "$root")"
 fail_case "smuggled thread spawn fails" "$root"
+
+root="$(new_fixture smuggled-sync-mutex)"
+printf '\nuse std::sync::Mutex;\npub fn guard(m: &Mutex<u8>) -> u8 { *m.lock().unwrap() }\n' >>"$(endpoint_lib "$root")"
+fail_case "smuggled std::sync::Mutex fails" "$root"
 
 root="$(new_fixture smuggled-extern-crate-rename)"
 printf '\nextern crate std as s;\npub fn exfil(p: &str) { let _ = s::fs::read(p); }\n' >>"$(endpoint_lib "$root")"

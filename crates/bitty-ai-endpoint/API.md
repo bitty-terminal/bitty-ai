@@ -40,7 +40,11 @@ closed. Binding retains the bounded exact canonical publication bytes through
 pending, acknowledged, and bound lifecycle state. It compares those bytes
 byte-for-byte with a fresh `ProviderRegistry` projection in addition to the
 SHA-256 digest, exact identity/domain/version, publication epoch, and registry
-revision. This is not live Core/helper wiring or full S-F behavior.
+revision. The proof is also bound to the issuing `PublicationState`'s private
+helper lifetime. `reset` revokes that lifetime irreversibly for every clone;
+a reconstructed or replaced state has a different lifetime and refuses the old
+proof, but does not revoke the old lifetime held by surviving aliases.
+This is not live Core/helper wiring or full S-F behavior.
 
 The MCP `SnapshotEnvelope::list_version` is not treated as equivalent to the
 provider publication's `snapshot_version`. `dispatch_with_strict` remains
@@ -76,13 +80,30 @@ identity and version lifecycle, canonical projection, digest, exact retained
 bytes, and current registry revision/epoch. MCP remains a separate version
 domain, and the default tolerant dispatch path is preserved.
 
-Replay and supersession guarantees are scoped to one `PublicationState`
-instance lifetime. Reconstructing a fresh state does not provide cross-reset
-identity or authenticated channel isolation; an identical publication can be
-accepted again and an otherwise matching old proof can be current in that
-reconstructed state. This offline limitation is explicit and is not a claim of
-Core-origin authentication. Durable helper/channel lifetime isolation is tracked
-by AI-0330 and blocks AI-0329 strict success.
+Replay and supersession guarantees are scoped to one helper-state lifetime.
+Each `PublicationState` mints a private, in-memory lifetime when constructed;
+every `ProviderRoutingBinding` proof carries that state's opaque lifetime token.
+`PublicationState` clones are aliases of the same lifetime cell, so they share
+the irreversible revoked flag. `PublicationState::reset` revokes the current
+lifetime irreversibly, clears all publication state, and mints a new lifetime
+for recovery; a reconstructed or replaced state also has a different lifetime.
+Consequently a proof minted before reset/reconstruction/replacement is refused
+even when the publication tuple, canonical bytes, epoch, and registry revision
+are byte-identical: `verify_provider_routing_binding` returns
+`ProviderRoutingError::PublicationLifetimeRevoked` for a revoked shared cell or
+`ProviderRoutingError::PublicationLifetimeMismatch` for a different lifetime,
+and `provider_routing_binding_is_current` remains fail-closed (`false`). A fresh
+publish/ack/bind cycle in the new lifetime succeeds.
+
+The lifetime token is never serialized, never accepted from publication, ack,
+bind, or caller input, and never exposed through an accessor or `Debug`. Its
+process-local monotonic sequence only ensures distinct helper-side in-memory
+lifetimes; it is not a process-global Core epoch, establishes no Core origin,
+and is not authenticated channel isolation. The separate
+`AcknowledgedPublication` capability retained by `StrictEndpoint` remains
+inert because strict dispatch is `Unbound`; binding either capability to
+authenticated Core delivery is part of the same bitty#2199 / AI-0329 gate.
+This offline helper seam alone does not authorize strict dispatch.
 
 This is only a partial, helper-side seam. The accepted contract is documented
 in the [`bitty-ai-docs` execution-ownership R1 draft](https://github.com/bitty-terminal/bitty-ai-docs/blob/main/architecture/execution-ownership-r1.md#providerrouting-snapshot-binding-contract-accepted-2026-10-17);

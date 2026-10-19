@@ -167,7 +167,14 @@ HOST_MODULES=(
 # `s::fs::read`) recompiles the banned subtrees under an alias the `std::`
 # patterns cannot see (both spellings proven compilable), so the rename is
 # refused outright rather than chased through alias resolution.
-AMBIENT_PATTERN='std::(net|process|thread|fs|time|os|env|sync)\b|\btokio::|\bmio::|\bsocket2::|\b(UnixStream|TcpStream|TcpListener|UdpSocket|SocketAddr)\b|\bthread::spawn\b|\bSystemTime\b|\bToolBus\b|::precheck\b|extern\s+crate\s+std\b|use\s+std\s+as\b'
+#
+# POLICY (AI-0330): `std::sync::Arc`, `std::sync::atomic::AtomicBool`,
+# `std::sync::atomic::AtomicU64`, and `std::sync::atomic::Ordering` are the
+# helper's private in-memory lifetime discriminator (shared clone cell and
+# monotonic sequence). They are not ambient I/O or a transport. Every other
+# `std::sync` item (Mutex, RwLock, mpsc, Condvar, Once, ...) and all
+# clock/fs/net/thread paths stay banned.
+AMBIENT_PATTERN='std::(net|process|thread|fs|time|os|env)\b|std::sync(?!::(?:Arc\b|atomic::(?:Atomic(?:Bool|U64)\b|Ordering\b)))\b|\btokio::|\bmio::|\bsocket2::|\b(UnixStream|TcpStream|TcpListener|UdpSocket|SocketAddr)\b|\bthread::spawn\b|\bSystemTime\b|\bToolBus\b|::precheck\b|extern\s+crate\s+std\b|use\s+std\s+as\b'
 
 fail() {
 	printf 'host-boundary-gate-v2: FAIL: %s\n' "$*" >&2
