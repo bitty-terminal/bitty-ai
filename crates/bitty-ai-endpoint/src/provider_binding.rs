@@ -3,6 +3,11 @@
 //! This is a pure, in-memory seam for the first `ai.provider_list` candidate.
 //! It does not wire strict dispatch, transport, provider implementations, or
 //! credentials. The generic metadata publication handshake remains separate.
+//!
+//! POLICY (AI-0330): proofs are bound to one private helper-state lifetime.
+//! That prevents replay into a reconstructed/reset state with identical
+//! publication inputs. It is not authenticated Core origin; live Core ingress
+//! and delivery remain the separate bitty#2199 gate.
 
 use bitty_ai_runtime::{ModelCapability, ProviderRegistry};
 
@@ -10,7 +15,7 @@ use crate::JVal;
 
 use super::metadata_publication::{
     MAX_CAPABILITIES_PER_MODEL, MAX_METADATA_FIELD_BYTES, MAX_MODELS_PER_PROVIDER, MAX_PROVIDERS,
-    MAX_PUBLICATION_FRAME_BYTES,
+    MAX_PUBLICATION_FRAME_BYTES, PublicationLifetimeToken,
 };
 
 /// Domain tag for the provider/routing projection.
@@ -37,6 +42,10 @@ pub enum ProviderRoutingError {
     NoPublication,
     NoAcknowledgement,
     ProjectionMismatch,
+    /// The helper-state lifetime is revoked and can never be reactivated.
+    PublicationLifetimeRevoked,
+    /// The proof belongs to a different helper-state lifetime.
+    PublicationLifetimeMismatch,
 }
 
 /// Exact domain-tagged publication identity accepted by the helper.
@@ -103,6 +112,12 @@ impl ProviderRoutingProjection {
 }
 
 /// Opaque same-domain equality proof. It contains no registry mutation path.
+///
+/// POLICY (AI-0330): the proof additionally carries the private lifetime token
+/// of the `PublicationState` that issued it. The token is never serialized or
+/// accepted from caller input, so a proof from a reconstructed, replaced, reset,
+/// or revoked helper lifetime is refused before tuple/byte/epoch/revision
+/// equality is considered, even when those values repeat byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRoutingBinding {
     publication_id: String,
@@ -112,6 +127,7 @@ pub struct ProviderRoutingBinding {
     canonical_bytes: Vec<u8>,
     registry_revision: u64,
     publication_epoch: u64,
+    lifetime_token: PublicationLifetimeToken,
 }
 
 impl ProviderRoutingBinding {
@@ -119,6 +135,7 @@ impl ProviderRoutingBinding {
         ack: &ProviderRoutingPublicationAck,
         publication_epoch: u64,
         registry_revision: u64,
+        lifetime_token: PublicationLifetimeToken,
     ) -> Self {
         Self {
             publication_id: ack.publication_id.clone(),
@@ -128,7 +145,12 @@ impl ProviderRoutingBinding {
             canonical_bytes: ack.canonical_bytes.clone(),
             registry_revision,
             publication_epoch,
+            lifetime_token,
         }
+    }
+
+    pub(crate) fn lifetime_token(&self) -> PublicationLifetimeToken {
+        self.lifetime_token
     }
 
     pub(crate) fn registry_revision(&self) -> u64 {
@@ -833,6 +855,18 @@ mod tests {
         .into_bytes()
     }
 
+    fn bind_frame_in_state(
+        state: &mut PublicationState,
+        frame: &[u8],
+        registry: &ProviderRegistry,
+    ) -> ProviderRoutingBinding {
+        let ack = state.publish_provider_routing(frame).unwrap();
+        let ack = state
+            .acknowledge_provider_routing(&acknowledgement_frame(&ack))
+            .unwrap();
+        state.bind_provider_routing(&ack, registry).unwrap()
+    }
+
     #[test]
     fn exact_publish_ack_and_binding_prove_registry_equality() {
         let registry = registry();
@@ -856,6 +890,159 @@ mod tests {
         assert_eq!(acknowledged.digest(), projection.digest());
         assert_eq!(acknowledged.canonical_bytes(), projection.canonical_bytes());
         assert_eq!(binding.canonical_bytes(), projection.canonical_bytes());
+    }
+
+    #[test]
+    fn reconstructed_state_refuses_old_proof_with_typed_lifetime_error() {
+        let registry = registry();
+        let projection = project_registry(&registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "provider-pub-lifetime-replay",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+
+        let mut first = PublicationState::default();
+        let old_proof = bind_frame_in_state(&mut first, &frame, &registry);
+        assert!(first.provider_routing_binding_is_current(&old_proof, &registry));
+
+        let mut reconstructed = PublicationState::default();
+        let fresh_proof = bind_frame_in_state(&mut reconstructed, &frame, &registry);
+
+        // Non-vacuous replay: the reconstructed state repeats the publication
+        // identity, exact bytes, epoch, and registry revision.
+        assert_eq!(
+            old_proof.publication_epoch(),
+            fresh_proof.publication_epoch()
+        );
+        assert_eq!(
+            old_proof.registry_revision(),
+            fresh_proof.registry_revision()
+        );
+        assert_eq!(old_proof.canonical_bytes(), fresh_proof.canonical_bytes());
+        assert_eq!(old_proof.digest(), fresh_proof.digest());
+        assert!(
+            reconstructed.provider_routing_binding_is_current(&fresh_proof, &registry),
+            "the reconstructed state must issue a current proof for its own bind"
+        );
+
+        assert_eq!(
+            reconstructed.verify_provider_routing_binding(&old_proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeMismatch)
+        );
+        assert!(!reconstructed.provider_routing_binding_is_current(&old_proof, &registry));
+    }
+
+    #[test]
+    fn clones_share_lifetime_and_revocation_propagates() {
+        let registry = registry();
+        let projection = project_registry(&registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "provider-pub-clone-lifetime",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut state = PublicationState::default();
+        let proof = bind_frame_in_state(&mut state, &frame, &registry);
+
+        let mut alias = state.clone();
+        assert_eq!(
+            alias.verify_provider_routing_binding(&proof, &registry),
+            Ok(())
+        );
+        assert!(alias.provider_routing_binding_is_current(&proof, &registry));
+
+        alias.reset();
+
+        assert_eq!(
+            state.verify_provider_routing_binding(&proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeRevoked)
+        );
+        assert_eq!(
+            alias.verify_provider_routing_binding(&proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeMismatch)
+        );
+        assert_eq!(
+            state.publish_provider_routing(&frame),
+            Err(ProviderRoutingError::PublicationLifetimeRevoked),
+            "a revoked alias must not start a new provider publication"
+        );
+    }
+
+    #[test]
+    fn lifetime_revocation_is_irreversible() {
+        let registry = registry();
+        let projection = project_registry(&registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "provider-pub-irreversible",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut original = PublicationState::default();
+        let old_proof = bind_frame_in_state(&mut original, &frame, &registry);
+
+        let mut alias = original.clone();
+        alias.reset();
+
+        // Recovery: the reset value mints a new lifetime and accepts a fresh
+        // publish/ack/bind cycle for the byte-identical publication.
+        let fresh_proof = bind_frame_in_state(&mut alias, &frame, &registry);
+        assert!(alias.provider_routing_binding_is_current(&fresh_proof, &registry));
+
+        // The old proof never becomes current again, neither in the revoked
+        // original alias nor in the recovered lifetime.
+        assert_eq!(
+            original.verify_provider_routing_binding(&old_proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeRevoked)
+        );
+        assert_eq!(
+            alias.verify_provider_routing_binding(&old_proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeMismatch)
+        );
+
+        // A second reset cannot resurrect the old token or the previous
+        // recovered token.
+        alias.reset();
+        let second_proof = bind_frame_in_state(&mut alias, &frame, &registry);
+        assert!(alias.provider_routing_binding_is_current(&second_proof, &registry));
+        assert_eq!(
+            alias.verify_provider_routing_binding(&old_proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeMismatch)
+        );
+        assert_eq!(
+            alias.verify_provider_routing_binding(&fresh_proof, &registry),
+            Err(ProviderRoutingError::PublicationLifetimeMismatch)
+        );
+    }
+
+    #[test]
+    fn fresh_state_publish_ack_bind_is_current() {
+        let registry = registry();
+        let projection = project_registry(&registry).unwrap();
+        let frame = publication_frame(
+            1,
+            "provider-pub-fresh-lifetime",
+            PROVIDER_ROUTING_DOMAIN,
+            projection.canonical_bytes(),
+        );
+        let mut state = PublicationState::default();
+        let proof = bind_frame_in_state(&mut state, &frame, &registry);
+        assert_eq!(
+            state.verify_provider_routing_binding(&proof, &registry),
+            Ok(())
+        );
+        assert!(state.provider_routing_binding_is_current(&proof, &registry));
+        assert!(
+            format!("{proof:?}").contains("PublicationLifetimeToken(..)"),
+            "the private lifetime sequence must stay out of proof Debug output"
+        );
+        assert!(
+            !format!("{state:?}").contains("sequence:"),
+            "the private lifetime sequence must stay out of state Debug output"
+        );
     }
 
     #[test]
