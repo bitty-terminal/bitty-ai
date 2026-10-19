@@ -63,8 +63,9 @@ HOST_MANIFEST="$HOST_DIR/Cargo.toml"
 
 # POLICY (AI-0310): classified crate inventory per the delta. The endpoint is
 # the privileged consumer; the host is the std-only vocabulary crate; the
-# remaining four are classified non-binding members. A new `crates/*`
-# directory fails check 4 until the classification names it here.
+# remaining five are classified non-binding members. `bitty-ai-control` is its
+# own TLS/bootstrap composition boundary (AI-0333), not an endpoint edge. A new
+# `crates/*` directory fails check 4 until the classification names it here.
 CLASSIFIED_CRATES=(
 	"crates/bitty-ai-endpoint"
 	"crates/bitty-ai-host"
@@ -72,6 +73,7 @@ CLASSIFIED_CRATES=(
 	"crates/bitty-ai-slice"
 	"crates/bitty-ai-session"
 	"crates/bitty-ai-mcp"
+	"crates/bitty-ai-control"
 )
 
 # POLICY (AI-0310): classified dependency edges per the delta. The endpoint

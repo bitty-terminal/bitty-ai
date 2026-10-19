@@ -58,7 +58,7 @@ fail_case() {
 	fi
 }
 
-# Builds a minimal classified tree: six classified crates, an endpoint with
+# Builds a minimal classified tree: seven classified crates, an endpoint with
 # the day-one-red import plus lawful host consumption, and a host with no
 # dependencies. Prints the fixture root.
 new_fixture() {
@@ -66,8 +66,8 @@ new_fixture() {
 	local root="$TEST_ROOT/$name"
 	local crate
 	mkdir -p "$root/crates/bitty-ai-endpoint/src" "$root/crates/bitty-ai-host/src"
-	printf '[workspace]\nmembers = [\n  "crates/bitty-ai-slice",\n  "crates/bitty-ai-runtime",\n  "crates/bitty-ai-session",\n  "crates/bitty-ai-mcp",\n  "crates/bitty-ai-host",\n  "crates/bitty-ai-endpoint",\n]\nresolver = "3"\n' >"$root/Cargo.toml"
-	for crate in bitty-ai-runtime bitty-ai-slice bitty-ai-session bitty-ai-mcp; do
+	printf '[workspace]\nmembers = [\n  "crates/bitty-ai-slice",\n  "crates/bitty-ai-runtime",\n  "crates/bitty-ai-session",\n  "crates/bitty-ai-mcp",\n  "crates/bitty-ai-control",\n  "crates/bitty-ai-host",\n  "crates/bitty-ai-endpoint",\n]\nresolver = "3"\n' >"$root/Cargo.toml"
+	for crate in bitty-ai-runtime bitty-ai-slice bitty-ai-session bitty-ai-mcp bitty-ai-control; do
 		mkdir -p "$root/crates/$crate/src"
 		printf '[package]\nname = "%s"\nversion = "0.0.1"\nedition = "2024"\n' "$crate" >"$root/crates/$crate/Cargo.toml"
 		printf '// stub\n' >"$root/crates/$crate/src/lib.rs"
