@@ -41,7 +41,9 @@ pending, acknowledged, and bound lifecycle state. It compares those bytes
 byte-for-byte with a fresh `ProviderRegistry` projection in addition to the
 SHA-256 digest, exact identity/domain/version, publication epoch, and registry
 revision. The proof is also bound to the issuing `PublicationState`'s private
-helper lifetime, which reset/reconstruction/replacement revokes irreversibly.
+helper lifetime. `reset` revokes that lifetime irreversibly for every clone;
+a reconstructed or replaced state has a different lifetime and refuses the old
+proof, but does not revoke the old lifetime held by surviving aliases.
 This is not live Core/helper wiring or full S-F behavior.
 
 The MCP `SnapshotEnvelope::list_version` is not treated as equivalent to the
