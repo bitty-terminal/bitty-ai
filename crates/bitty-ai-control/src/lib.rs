@@ -1,13 +1,15 @@
 //! Helper-side launch-scoped mutual-certificate control transport and
 //! provider-publication state machine.
 //!
-//! **Status: AI-0333 transport plus AI-0337 application state machine,
-//! pre-review implementation.** This crate implements the helper side of the
-//! selected launch-scoped mutual-certificate profile in `bitty-ai-docs`
-//! (`architecture/authenticated-provider-publication.md`): bounded
-//! launch-manifest ingestion, a mutual-certificate TLS 1.3 server, bounded
-//! control-record framing, establishment validation, registry projection,
-//! `Publish -> Ack -> Bind -> Bound`, and lifetime invalidation/rotation.
+//! **Status: AI-0333 transport, AI-0337 state machine, and AI-0338 launch
+//! entrypoint, pre-review implementation.** This crate implements the helper
+//! side of the selected launch-scoped mutual-certificate profile in
+//! `bitty-ai-docs` (`architecture/authenticated-provider-publication.md`):
+//! bounded launch-manifest ingestion, a mutual-certificate TLS 1.3 server,
+//! bounded control-record framing, establishment validation, registry
+//! projection, `Publish -> Ack -> Bind -> Bound`, lifetime
+//! invalidation/rotation, and a testable process entrypoint that adopts the
+//! Core launch channels.
 //!
 //! It does **not** implement data-channel `Admit`/`Admitted` reservation, an
 //! `ai.provider_list` handler, provider or credential contact, the Core
@@ -20,9 +22,11 @@
 //! This is a separately owned composition boundary. The endpoint crate keeps
 //! its three-edge purity policy (runtime, host, ipc-api); this crate is the
 //! only place where launch material, rustls configuration, and the inherited
-//! control byte stream meet. It opens no listener, socket, thread, or clock:
-//! the caller injects a `Read + Write` stream and owns every deadline. The
-//! design's five-second establishment/transaction deadlines and 60-second
+//! control byte stream meet. The library opens no listener, socket, thread, or
+//! clock: the caller injects a `Read + Write` stream and owns every deadline.
+//! The `bitty-ai-helper` binary owns one narrow, audited adoption of inherited
+//! descriptors `3` and `4`; descriptor `5` (the data channel) is never used.
+//! The design's five-second establishment/transaction deadlines and 60-second
 //! authority age are caller policy bounds, not implemented here.
 //!
 //! The crate accepts only these inputs:
@@ -177,11 +181,18 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod control_registry;
+pub mod entrypoint;
 pub mod framing;
 pub mod manifest;
 pub mod server;
 pub mod state;
 
+pub use control_registry::{CONTROL_ONLY_FEED_REVISION, ControlOnlyRegistry};
+pub use entrypoint::{
+    CHILD_BOOTSTRAP_DESCRIPTOR, CHILD_CONTROL_DESCRIPTOR, HelperExit, run_helper,
+    run_helper_on_platform,
+};
 pub use framing::{FrameError, FrameReader, FrameWriter};
 pub use manifest::{
     CertificatePin, EstablishmentExpectations, LaunchKeyMaterial, LaunchManifest, ManifestError,
