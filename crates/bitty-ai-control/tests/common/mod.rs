@@ -15,6 +15,7 @@ use bitty_ai_control::{
     CertificatePin, ControlError, ControlServerHandshake, EstablishedPeer, LaunchKeyMaterial,
     LaunchManifest,
 };
+use bitty_ipc_api::provider_publication::{Digest, EstablishmentEcho, Nonce, SessionId};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -92,6 +93,29 @@ pub fn valid_manifest(fixtures: &Fixtures) -> LaunchManifest {
 /// Reference-encoded valid manifest bytes.
 pub fn valid_manifest_bytes(fixtures: &Fixtures) -> Zeroizing<Vec<u8>> {
     valid_manifest(fixtures).encode()
+}
+
+/// Exact non-secret `Establish` echo for a manifest.
+pub fn establishment_echo(manifest: &LaunchManifest) -> EstablishmentEcho {
+    EstablishmentEcho {
+        bootstrap_format_version: 1,
+        control_protocol_version: 1,
+        core_instance_nonce: Nonce::new(manifest.core_instance_nonce),
+        launch_nonce: SessionId::new(manifest.launch_nonce),
+        component_name: manifest.component_name.clone(),
+        descriptor_version: manifest.descriptor_version.clone(),
+        executable_name: manifest.executable_name.clone(),
+        executable_sha256: Digest::new(manifest.executable_sha256),
+        component_protocol_version: manifest.component_protocol_version,
+        control_channel_nonce: Nonce::new(manifest.control_channel_nonce),
+        data_channel_nonce: Nonce::new(manifest.data_channel_nonce),
+        delegation_purpose: manifest.delegation_purpose.clone(),
+        control_profile: manifest.control_profile.clone(),
+        key_material_profile: manifest.key_material.profile,
+        key_type: manifest.key_material.key_type,
+        core_leaf_digest: Digest::of(&manifest.key_material.core_certificate_der),
+        helper_leaf_digest: Digest::of(&manifest.key_material.helper_certificate_der),
+    }
 }
 
 /// Build a test client that pins the helper leaf and presents the Core leaf.
