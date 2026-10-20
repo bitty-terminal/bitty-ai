@@ -1279,6 +1279,42 @@ fn core_invalidation_rotates_same_revision_and_keeps_one_predecessor() {
 }
 
 #[test]
+fn core_reset_and_supersession_rotate_at_the_same_feed_revision() {
+    for reason in [Reason::Reset, Reason::Supersession] {
+        let projection = projection(&["alpha"]);
+        let mut harness = Harness::new(1, projection.clone());
+        harness.establish();
+        let first = harness.control.lifetime_id().expect("first lifetime");
+        let _ = harness.drain();
+
+        harness.send_invalidate(first, 1, reason);
+        let step = harness.control.step().expect("core rotation");
+        let second = harness.control.lifetime_id().expect("second lifetime");
+        assert_ne!(first, second);
+        assert_eq!(
+            step,
+            Step::LifetimeRotated {
+                previous: first,
+                current: second,
+                feed_revision: 1,
+                reason,
+            }
+        );
+        assert_eq!(harness.control.feed_revision(), Some(1));
+        let records = harness.drain();
+        assert_eq!(records.len(), 2);
+        assert!(
+            matches!(records[0].body, RecordBody::Lifetime(LifetimeBody {
+            lifetime_id,
+            feed_revision: 1,
+        }) if lifetime_id == second)
+        );
+        assert!(matches!(records[1].body, RecordBody::Projection(ref body)
+            if body.lifetime_id == second && body.feed_revision == 1));
+    }
+}
+
+#[test]
 fn core_grant_loss_and_shutdown_close_without_a_new_lifetime() {
     for reason in [Reason::GrantLoss, Reason::Shutdown] {
         let mut harness = Harness::new(1, empty_projection());

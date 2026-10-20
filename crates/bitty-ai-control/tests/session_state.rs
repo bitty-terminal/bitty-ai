@@ -267,6 +267,22 @@ fn handshake_preserves_launch_expectations() {
 }
 
 #[test]
+fn into_parts_with_expectations_preserves_the_launch_nonce() {
+    let fixtures = fixtures();
+    let manifest = valid_manifest(&fixtures);
+    let session_id = SessionId::new(manifest.launch_nonce);
+    let server = ControlServer::new(manifest).expect("server");
+    let link = Link::new(client_connection(client_config(
+        &fixtures,
+        CONTROL_ALPN,
+        false,
+    )));
+    let session = server.accept(link).expect("accept");
+    let (_connection, _stream, _peer, expectations) = session.into_parts_with_expectations();
+    assert_eq!(expectations.launch_nonce(), session_id);
+}
+
+#[test]
 fn from_session_establishes_over_a_real_tls_session() {
     let fixtures = fixtures();
     let manifest = valid_manifest(&fixtures);
