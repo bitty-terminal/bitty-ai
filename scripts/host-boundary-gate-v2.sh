@@ -87,9 +87,11 @@ ENDPOINT_ALLOWED_DEPS=(
 )
 
 # POLICY (AI-0310): the `bitty-ipc-api` git pin is an owner decision
-# (`f201911` per AI-0307). A bump is a separately scoped owner decision,
-# never silent drift; the gate and the E0 seed test change together.
-EXPECTED_IPC_PIN="f201911"
+# (`e6a2c0c` per the owner authorization recorded in AI-0336 on 2026-10-20,
+# provider-publication contract merge bitty-ipc #35; was `f201911` per
+# AI-0307). A bump is a separately scoped owner decision, never silent drift;
+# the gate and the E0 seed test change together.
+EXPECTED_IPC_PIN="e6a2c0c"
 
 # POLICY (AI-0310): endpoint-allowed `bitty_ai_runtime` items — the declared
 # consumption set, i.e. the 10 lawful seams as surveyed at main 7879757:

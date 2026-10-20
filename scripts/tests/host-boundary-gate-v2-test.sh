@@ -77,9 +77,9 @@ new_fixture() {
 	# host docs are exempt from the endpoint-scoped allow-list.
 	printf '//! host stub\n#![deny(unsafe_code)]\n/// See [`ExecutionContext`](bitty_ai_runtime::tool::ExecutionContext).\npub mod snapshot;\n' >"$root/crates/bitty-ai-host/src/lib.rs"
 	printf '//! snapshot vocabulary\npub struct SnapshotVersion(u32);\npub struct SnapshotRefusal;\npub fn check_snapshot_version(a: u32, b: u32) -> bool { a == b }\n' >"$root/crates/bitty-ai-host/src/snapshot.rs"
-	printf '[package]\nname = "bitty-ai-endpoint"\nversion = "0.0.1"\nedition = "2024"\n\n[dependencies]\nbitty-ai-runtime = { path = "../bitty-ai-runtime" }\nbitty-ai-host = { path = "../bitty-ai-host" }\nbitty-ipc-api = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "f201911" }\n' >"$root/crates/bitty-ai-endpoint/Cargo.toml"
+	printf '[package]\nname = "bitty-ai-endpoint"\nversion = "0.0.1"\nedition = "2024"\n\n[dependencies]\nbitty-ai-runtime = { path = "../bitty-ai-runtime" }\nbitty-ai-host = { path = "../bitty-ai-host" }\nbitty-ipc-api = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c" }\n' >"$root/crates/bitty-ai-endpoint/Cargo.toml"
 	# POLICY (AI-0310): fixture pins mirror the owner decisions under test
-	# (pin f201911); the pin-drift case below mutates the rev to prove the
+	# (pin e6a2c0c); the pin-drift case below mutates the rev to prove the
 	# tripwire fails closed.
 	cat >"$root/crates/bitty-ai-endpoint/src/lib.rs" <<'EOF'
 #![deny(unsafe_code)]
@@ -218,7 +218,7 @@ printf 'serde = "1"\n' >>"$root/crates/bitty-ai-host/Cargo.toml"
 fail_case "host dependency fails the zero-dep tripwire" "$root"
 
 root="$(new_fixture pin-drift)"
-sed -i 's/rev = "f201911"/rev = "aaaaaaa"/' "$root/crates/bitty-ai-endpoint/Cargo.toml"
+sed -i 's/rev = "e6a2c0c"/rev = "aaaaaaa"/' "$root/crates/bitty-ai-endpoint/Cargo.toml"
 fail_case "pin drift fails the pin tripwire" "$root"
 
 root="$(new_fixture unlisted-crate)"

@@ -4298,13 +4298,14 @@ mod tests {
     #[test]
     fn endpoint_ipc_pin_stays_at_owner_decision() {
         // POLICY (AI-0302-E0): the `bitty-ipc-api` git pin is an owner
-        // decision (`f201911` per AI-0307, 7-char per workspace git-pin
-        // policy; was `d0c4ecd` per PX-1298 before the schema-allowance
-        // follow-up to `bitty-ipc` #31). A stale-pin bump is a separate
-        // follow-up, never silent drift inside S-E.
+        // decision (`e6a2c0c` per AI-0336, the provider-publication control
+        // contract merge in `bitty-ipc` #35; was `f201911` per AI-0307 and
+        // `d0c4ecd` per PX-1298 before the schema-allowance follow-up to
+        // `bitty-ipc` #31). A stale-pin bump is a separate follow-up, never
+        // silent drift inside S-E.
         assert!(
-            ENDPOINT_MANIFEST.contains(r#"rev = "f201911""#),
-            "endpoint manifest must pin bitty-ipc-api at rev f201911"
+            ENDPOINT_MANIFEST.contains(r#"rev = "e6a2c0c""#),
+            "endpoint manifest must pin bitty-ipc-api at rev e6a2c0c"
         );
     }
 }
