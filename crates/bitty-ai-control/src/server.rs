@@ -21,7 +21,9 @@ use rustls::{
     ProtocolVersion, ServerConfig, ServerConnection, SignatureScheme,
 };
 
-use crate::manifest::{CertificatePin, LaunchManifest, ManifestError, validated_helper_key};
+use crate::manifest::{
+    CertificatePin, EstablishmentExpectations, LaunchManifest, ManifestError, validated_helper_key,
+};
 use crate::{CONTROL_ALPN, TLS_PREAUTH_STEPS_MAX, TLS_PREAUTH_WIRE_MAX_BYTES};
 
 /// Helper-side control server configuration.
@@ -34,6 +36,7 @@ use crate::{CONTROL_ALPN, TLS_PREAUTH_STEPS_MAX, TLS_PREAUTH_WIRE_MAX_BYTES};
 pub struct ControlServer {
     config: Arc<ServerConfig>,
     peer_certificate_pin: CertificatePin,
+    establishment_expectations: EstablishmentExpectations,
 }
 
 impl ControlServer {
@@ -58,6 +61,7 @@ impl ControlServer {
         let certified_key =
             validated_helper_key(&manifest, &provider).map_err(ControlError::Manifest)?;
         let peer_certificate_pin = manifest.core_certificate_pin();
+        let establishment_expectations = EstablishmentExpectations::from_manifest(&manifest);
 
         let verifier = Arc::new(PinnedClientCertVerifier {
             pin: peer_certificate_pin,
@@ -86,6 +90,7 @@ impl ControlServer {
         Ok(Self {
             config: Arc::new(config),
             peer_certificate_pin,
+            establishment_expectations,
         })
     }
 
@@ -107,7 +112,12 @@ impl ControlServer {
     /// Returns [`ControlError::Rustls`] if rustls cannot instantiate the
     /// connection (for example, an invalid configured bound).
     pub fn handshake(self) -> Result<ControlServerHandshake, ControlError> {
-        ControlServerHandshake::new(&self)
+        let Self {
+            config,
+            peer_certificate_pin,
+            ..
+        } = self;
+        ControlServerHandshake::new(&config, peer_certificate_pin)
     }
 
     /// Accept one mutual TLS session over an injected duplex stream.
@@ -124,7 +134,12 @@ impl ControlServer {
     /// rejection, ALPN mismatch, missing/unexpected peer certificate, or an
     /// exhausted wire/step budget.
     pub fn accept<S: Read + Write>(self, mut stream: S) -> Result<ControlSession<S>, ControlError> {
-        let mut handshake = self.handshake()?;
+        let Self {
+            config,
+            peer_certificate_pin,
+            establishment_expectations,
+        } = self;
+        let mut handshake = ControlServerHandshake::new(&config, peer_certificate_pin)?;
         let mut received_wire = 0_usize;
         let mut sent_wire = 0_usize;
 
@@ -182,6 +197,7 @@ impl ControlServer {
                     connection: handshake.into_connection(),
                     stream,
                     peer,
+                    establishment_expectations,
                 });
             }
         }
@@ -210,11 +226,13 @@ pub struct ControlServerHandshake {
 }
 
 impl ControlServerHandshake {
-    fn new(server: &ControlServer) -> Result<Self, ControlError> {
+    fn new(
+        config: &Arc<ServerConfig>,
+        expected_peer_pin: CertificatePin,
+    ) -> Result<Self, ControlError> {
         Ok(Self {
-            connection: ServerConnection::new(server.config.clone())
-                .map_err(ControlError::Rustls)?,
-            expected_peer_pin: server.peer_certificate_pin,
+            connection: ServerConnection::new(config.clone()).map_err(ControlError::Rustls)?,
+            expected_peer_pin,
         })
     }
 
@@ -372,12 +390,15 @@ impl fmt::Debug for EstablishedPeer {
 
 /// One established control session over the injected stream.
 ///
-/// Application records are slice 2; this type exposes the pin-checked peer
-/// and the rustls connection plus stream for the later record layer.
+/// This type exposes the pin-checked peer, the non-secret launch
+/// expectations captured when the server was built, and the rustls
+/// connection plus stream. [`crate::HelperControl`] consumes it for the
+/// application record layer.
 pub struct ControlSession<S> {
     connection: ServerConnection,
     stream: S,
     peer: EstablishedPeer,
+    establishment_expectations: EstablishmentExpectations,
 }
 
 impl<S> ControlSession<S> {
@@ -385,6 +406,16 @@ impl<S> ControlSession<S> {
     #[must_use]
     pub fn peer(&self) -> &EstablishedPeer {
         &self.peer
+    }
+
+    /// Non-secret establishment expectations derived from the launch manifest
+    /// that authenticated this session.
+    ///
+    /// The later application state machine compares the Core `Establish` echo
+    /// against these values; no private key or certificate bytes are exposed.
+    #[must_use]
+    pub fn establishment_expectations(&self) -> &EstablishmentExpectations {
+        &self.establishment_expectations
     }
 
     /// Borrow the rustls server connection.

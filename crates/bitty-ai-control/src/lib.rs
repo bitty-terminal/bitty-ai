@@ -1,13 +1,19 @@
-//! Helper-side launch-scoped mutual-certificate control transport (slice 1).
+//! Helper-side launch-scoped mutual-certificate control transport and
+//! provider-publication state machine.
 //!
-//! **Status: AI-0333 slice 1, pre-review implementation.** This crate
-//! implements only the helper side of the selected launch-scoped
-//! mutual-certificate profile in `bitty-ai-docs`
+//! **Status: AI-0333 transport plus AI-0337 application state machine,
+//! pre-review implementation.** This crate implements the helper side of the
+//! selected launch-scoped mutual-certificate profile in `bitty-ai-docs`
 //! (`architecture/authenticated-provider-publication.md`): bounded
-//! launch-manifest ingestion and a mutual-certificate TLS 1.3 server.
-//! It does not implement control records, the application establishment
-//! exchange, lifetime/publication state, the Core supervisor side, or
-//! authenticated publication itself. Those remain later slices and gates.
+//! launch-manifest ingestion, a mutual-certificate TLS 1.3 server, bounded
+//! control-record framing, establishment validation, registry projection,
+//! `Publish -> Ack -> Bind -> Bound`, and lifetime invalidation/rotation.
+//!
+//! It does **not** implement data-channel `Admit`/`Admitted` reservation, an
+//! `ai.provider_list` handler, provider or credential contact, the Core
+//! supervisor side, or authenticated publication itself. Strict provider
+//! publication remains disabled; an incoming `Admit` revokes. Those remain
+//! later slices and gates.
 //!
 //! ## Scope and boundaries
 //!
@@ -16,13 +22,40 @@
 //! only place where launch material, rustls configuration, and the inherited
 //! control byte stream meet. It opens no listener, socket, thread, or clock:
 //! the caller injects a `Read + Write` stream and owns every deadline. The
-//! design's five-second establishment deadline is a caller policy bound, not
-//! implemented here.
+//! design's five-second establishment/transaction deadlines and 60-second
+//! authority age are caller policy bounds, not implemented here.
 //!
 //! The crate accepts only these inputs:
 //!
 //! - one bounded launch-manifest record (exactly one record, then EOF);
-//! - one injected duplex stream carrying TLS from its first byte.
+//! - one injected duplex stream carrying TLS from its first byte;
+//! - an injected [`RegistryView`] snapshot/read-gate seam.
+//!
+//! ## Control record I/O and state machine
+//!
+//! [`FrameReader`] reads exactly one four-byte big-endian length prefix plus
+//! that many record bytes, validates the length against the shared
+//! `CONTROL_FRAME_MAX_BYTES` and the small-record bound, and allocates only
+//! after the length is accepted. [`FrameWriter`] bounds its outbound queue by
+//! `CONTROL_QUEUE_MAX_RECORDS` and `CONTROL_INFLIGHT_MAX_BYTES` and clears the
+//! queue on the first write failure. The wire header, bodies, closed enums,
+//! canonical payload, and codec are the pure `bitty-ipc-api`
+//! `provider_publication` contract; this crate adds no second wire format.
+//!
+//! [`HelperControl`] consumes exactly one `Establish`, verifies every
+//! non-secret field against the launch manifest, sends `Established` and one
+//! initial `Projection`, then drives one pending publication at a time. The
+//! helper is the sole lifetime creator. A Core-origin invalidation rotates
+//! the current lifetime with the same feed revision; a registry mutation
+//! emits the predecessor invalidation before the caller's mutation and
+//! advances the feed revision with checked arithmetic. One immediately
+//! retired predecessor is retained for a crossed invalidation; a duplicate,
+//! older predecessor, or outrun rotation window closes control and keeps
+//! strict disabled.
+//!
+//! Every protocol, resource, registry, random, or write failure is terminal:
+//! the current lifetime, predecessor window, pending publication, and receipt
+//! are cleared, and no old record is retried on a replacement stream.
 //!
 //! ## Concrete launch-manifest encoding
 //!
@@ -144,14 +177,22 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod framing;
 pub mod manifest;
 pub mod server;
+pub mod state;
 
+pub use framing::{FrameError, FrameReader, FrameWriter};
 pub use manifest::{
-    CertificatePin, LaunchKeyMaterial, LaunchManifest, ManifestError, ManifestReadError,
+    CertificatePin, EstablishmentExpectations, LaunchKeyMaterial, LaunchManifest, ManifestError,
+    ManifestReadError,
 };
 pub use server::{
     ControlError, ControlServer, ControlServerHandshake, ControlSession, EstablishedPeer,
+};
+pub use state::{
+    HelperControl, HelperControlError, ProofState, RegistryError, RegistrySnapshot, RegistryView,
+    RevocationReason, Step,
 };
 
 /// Bootstrap/control protocol version accepted by this slice.
@@ -209,3 +250,35 @@ pub const TLS_PREAUTH_WIRE_MAX_BYTES: usize = 128 * 1024;
 
 /// Pre-authentication bounded processing steps used by the blocking helper.
 pub const TLS_PREAUTH_STEPS_MAX: usize = 256;
+
+// The transport constants above predate the shared pure control contract.
+// These assertions make any drift a compile error rather than two wire
+// definitions that disagree at runtime.
+const _: () = assert!(
+    BOOTSTRAP_FORMAT_VERSION == bitty_ipc_api::provider_publication::BOOTSTRAP_FORMAT_VERSION
+);
+const _: () = assert!(
+    CONTROL_PROTOCOL_VERSION == bitty_ipc_api::provider_publication::CONTROL_PROTOCOL_VERSION
+);
+const _: () = assert!(CORE_ROLE == bitty_ipc_api::provider_publication::ROLE_CORE);
+const _: () = assert!(HELPER_ROLE == bitty_ipc_api::provider_publication::ROLE_HELPER);
+const _: () = assert!(
+    KEY_MATERIAL_PROFILE_MUTUAL_CERTIFICATES
+        == bitty_ipc_api::provider_publication::KEY_MATERIAL_PROFILE
+);
+const _: () =
+    assert!(KEY_TYPE_ECDSA_P256 == bitty_ipc_api::provider_publication::KEY_TYPE_ECDSA_P256);
+const _: () = assert!(
+    CONTROL_BOOTSTRAP_MAX_BYTES == bitty_ipc_api::provider_publication::CONTROL_BOOTSTRAP_MAX_BYTES
+);
+const _: () = assert!(
+    CONTROL_HANDSHAKE_MAX_BYTES == bitty_ipc_api::provider_publication::CONTROL_HANDSHAKE_MAX_BYTES
+);
+const _: () =
+    assert!(LAUNCH_CERT_MAX_BYTES == bitty_ipc_api::provider_publication::LAUNCH_CERT_MAX_BYTES);
+const _: () =
+    assert!(LAUNCH_KEY_MAX_BYTES == bitty_ipc_api::provider_publication::LAUNCH_KEY_MAX_BYTES);
+const _: () = assert!(
+    CONTROL_STRING_MAX_BYTES == bitty_ipc_api::provider_publication::CONTROL_STRING_MAX_BYTES
+);
+const _: () = assert!(RANDOM_ID_BYTES == bitty_ipc_api::provider_publication::RANDOM_ID_BYTES);

@@ -8,12 +8,13 @@
 use std::fmt;
 use std::io::{self, Read};
 
+use bitty_ipc_api::provider_publication::{Digest, EstablishmentEcho, Nonce, SessionId};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use rustls::{Error as RustlsError, InconsistentKeys, SignatureScheme};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -407,6 +408,142 @@ impl LaunchManifest {
             &self.key_material.helper_private_key_pkcs8_der,
             LAUNCH_KEY_MAX_BYTES,
         )?;
+        Ok(())
+    }
+}
+
+/// Non-secret establishment values expected from the authenticated Core.
+///
+/// This is the private bootstrap expectation the helper compares against the
+/// `Establish` echo. It contains exactly the non-secret manifest fields plus
+/// both leaf digests; it never contains a private key, certificate bytes, or
+/// any other launch secret.
+///
+/// The only production source is a validated [`LaunchManifest`]. The TLS
+/// server derives one before consuming the manifest, and
+/// [`crate::HelperControl`] can re-derive and compare it so a session cannot
+/// be paired with a different launch expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstablishmentExpectations {
+    bootstrap_format_version: u16,
+    control_protocol_version: u16,
+    core_instance_nonce: Nonce,
+    launch_nonce: SessionId,
+    component_name: String,
+    descriptor_version: String,
+    executable_name: String,
+    executable_sha256: Digest,
+    component_protocol_version: u16,
+    control_channel_nonce: Nonce,
+    data_channel_nonce: Nonce,
+    delegation_purpose: String,
+    control_profile: String,
+    key_material_profile: u8,
+    key_type: u8,
+    core_leaf_digest: Digest,
+    helper_leaf_digest: Digest,
+}
+
+impl EstablishmentExpectations {
+    /// Derive the exact non-secret establishment expectations.
+    ///
+    /// The caller must pass a manifest that already passed
+    /// [`LaunchManifest::parse`] or [`LaunchManifest::validate`]; this method
+    /// copies non-secret fields and computes the two leaf digests, but does
+    /// not re-validate the key material.
+    #[must_use]
+    pub fn from_manifest(manifest: &LaunchManifest) -> Self {
+        Self {
+            bootstrap_format_version: BOOTSTRAP_FORMAT_VERSION,
+            control_protocol_version: CONTROL_PROTOCOL_VERSION,
+            core_instance_nonce: Nonce::new(manifest.core_instance_nonce),
+            launch_nonce: SessionId::new(manifest.launch_nonce),
+            component_name: manifest.component_name.clone(),
+            descriptor_version: manifest.descriptor_version.clone(),
+            executable_name: manifest.executable_name.clone(),
+            executable_sha256: Digest::new(manifest.executable_sha256),
+            component_protocol_version: manifest.component_protocol_version,
+            control_channel_nonce: Nonce::new(manifest.control_channel_nonce),
+            data_channel_nonce: Nonce::new(manifest.data_channel_nonce),
+            delegation_purpose: manifest.delegation_purpose.clone(),
+            control_profile: manifest.control_profile.clone(),
+            key_material_profile: manifest.key_material.profile,
+            key_type: manifest.key_material.key_type,
+            core_leaf_digest: Digest::new(
+                *CertificatePin::of_der(&manifest.key_material.core_certificate_der).as_bytes(),
+            ),
+            helper_leaf_digest: Digest::new(
+                *CertificatePin::of_der(&manifest.key_material.helper_certificate_der).as_bytes(),
+            ),
+        }
+    }
+
+    /// Launch nonce that also names the control session.
+    #[must_use]
+    pub fn launch_nonce(&self) -> SessionId {
+        self.launch_nonce
+    }
+
+    /// Compare every non-secret `Establish` field with these expectations.
+    ///
+    /// The returned field name is a fixed local label. It never contains a
+    /// received value, identifier, path, or payload byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first mismatching field name.
+    pub fn verify(&self, echo: &EstablishmentEcho) -> Result<(), &'static str> {
+        if echo.bootstrap_format_version != self.bootstrap_format_version {
+            return Err("bootstrap_format_version");
+        }
+        if echo.control_protocol_version != self.control_protocol_version {
+            return Err("control_protocol_version");
+        }
+        if echo.core_instance_nonce != self.core_instance_nonce {
+            return Err("core_instance_nonce");
+        }
+        if echo.launch_nonce != self.launch_nonce {
+            return Err("launch_nonce");
+        }
+        if echo.component_name != self.component_name {
+            return Err("component_name");
+        }
+        if echo.descriptor_version != self.descriptor_version {
+            return Err("descriptor_version");
+        }
+        if echo.executable_name != self.executable_name {
+            return Err("executable_name");
+        }
+        if echo.executable_sha256 != self.executable_sha256 {
+            return Err("executable_sha256");
+        }
+        if echo.component_protocol_version != self.component_protocol_version {
+            return Err("component_protocol_version");
+        }
+        if echo.control_channel_nonce != self.control_channel_nonce {
+            return Err("control_channel_nonce");
+        }
+        if echo.data_channel_nonce != self.data_channel_nonce {
+            return Err("data_channel_nonce");
+        }
+        if echo.delegation_purpose != self.delegation_purpose {
+            return Err("delegation_purpose");
+        }
+        if echo.control_profile != self.control_profile {
+            return Err("control_profile");
+        }
+        if echo.key_material_profile != self.key_material_profile {
+            return Err("key_material_profile");
+        }
+        if echo.key_type != self.key_type {
+            return Err("key_type");
+        }
+        if echo.core_leaf_digest != self.core_leaf_digest {
+            return Err("core_leaf_digest");
+        }
+        if echo.helper_leaf_digest != self.helper_leaf_digest {
+            return Err("helper_leaf_digest");
+        }
         Ok(())
     }
 }

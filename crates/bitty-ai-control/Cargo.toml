@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Helper-side launch-scoped mutual-certificate control transport (AI-0333 slice 1)"
+description = "Helper-side launch-scoped mutual-certificate control transport and provider-publication state machine"
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -14,10 +14,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-# POLICY (AI-0333): this is the separately owned TLS/bootstrap composition
-# boundary, deliberately outside the endpoint purity policy. Exactly three
-# edges, all already resolved in this workspace through the bitty-network
-# family (same provider, no second TLS family):
+# POLICY (AI-0333/AI-0337): this is the separately owned TLS/bootstrap and
+# control-state composition boundary, deliberately outside the endpoint
+# purity policy. Exactly four edges: the pure IPC contract plus the TLS
+# family already resolved in this workspace (same provider, no second TLS
+# family):
 #
 # - rustls: TLS 1.3 server with a custom pinned `ClientCertVerifier`. Default
 #   features are off so the shipped build has no TLS 1.2 (`tls12` is a
@@ -31,12 +32,18 @@ workspace = true
 #   only owned accessible storage, exactly as the design's cooperative-cleanup
 #   framing allows; provider/library copies are out of scope.
 #
+# - bitty-ipc-api: the pure provider-publication record contract (AI-0336
+#   pin, same revision as the endpoint edge). The control record header,
+#   typed bodies, closed enums, canonical payload, constants, and codec are
+#   owned there; this crate reuses them and adds no second wire format.
+#
 # `rustls-pki-types` is not a direct edge: its `CertificateDer`,
 # `PrivateKeyDer`, and `DistinguishedName` types are used through rustls's
 # re-export. No rcgen, no X.509 parser, no clock/socket/thread dependency.
 rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
 sha2 = { version = "=0.11.0" }
 zeroize = { version = "=1.9.0" }
+bitty-ipc-api = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "e6a2c0c" }
 
 [dev-dependencies]
 # TEST-ONLY: enables rustls's TLS 1.2 code so the refusal test can construct a
