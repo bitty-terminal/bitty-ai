@@ -36,10 +36,12 @@ use crate::state::{HelperControl, RegistryView, Step};
 
 /// Fixed child descriptor number of the one-shot launch bootstrap read end.
 ///
-/// This mirrors the Core launch seam's `CHILD_BOOTSTRAP_DESCRIPTOR` launch
-/// contract (`bitty-runtime` `ai_publication_launch`). `bitty-ai-control` has
-/// no dependency edge on the Core crate, so the value is restated here with
-/// the contract named instead of imported.
+/// This mirrors the planned Core provider-publication launch contract
+/// (`bitty-runtime` `ai_publication_launch::CHILD_BOOTSTRAP_DESCRIPTOR`). That
+/// module is not present in the Core checkout at `aceb327e`; it lands with the
+/// separately scoped Core adapter. `bitty-ai-control` has no dependency edge
+/// on the Core crate, so the value is restated here with the planned contract
+/// named instead of imported.
 pub const CHILD_BOOTSTRAP_DESCRIPTOR: u32 = 3;
 
 /// Fixed child descriptor number of the dedicated duplex control stream.

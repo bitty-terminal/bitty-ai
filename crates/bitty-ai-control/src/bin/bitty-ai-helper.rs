@@ -73,11 +73,14 @@ fn run() -> HelperExit {
 /// launch seam, so descriptors `3` and `4` are open, inherited, and owned
 /// exclusively by this process for the lifetime of the adopted values.
 /// Adopting a descriptor transfers ownership to the returned values, which
-/// close it on drop. Running this binary by hand does not satisfy the
-/// contract; adoption then yields closed/foreign descriptors and the protocol
-/// fails closed as an I/O error. `OwnedFd`/`UnixStream` construction is
-/// otherwise safe: no memory is reinterpreted and no allocation or I/O occurs
-/// here.
+/// close it on drop. Manual execution is unsupported: the binary is defined
+/// only for the Core launch contract above. If descriptors `3`/`4` are closed,
+/// foreign, or not the expected channel types, behavior is outside this safety
+/// contract and is not guaranteed to map to a specific [`HelperExit`]; callers
+/// must not rely on a defined failure for unsupported invocations. Supported
+/// launches only ever pass open descriptors of the documented types.
+/// `OwnedFd`/`UnixStream` construction is otherwise safe: no memory is
+/// reinterpreted and no allocation or I/O occurs here.
 #[cfg(unix)]
 #[allow(unsafe_code)] // Justification: one narrow, audited descriptor adoption.
 fn adopt_inherited_channels() -> (std::fs::File, std::os::unix::net::UnixStream) {

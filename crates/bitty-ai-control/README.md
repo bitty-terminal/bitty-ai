@@ -27,10 +27,12 @@ appear on the control stream, and control records never appear on the bootstrap
 channel. Descriptor `5` is never adopted; `Admit`/`Admitted`, provider routing,
 and credential contact are not implemented.
 
-The constants above mirror the Core launch seam
-(`bitty-runtime` `ai_publication_launch::CHILD_BOOTSTRAP_DESCRIPTOR` and
-`CHILD_CONTROL_DESCRIPTOR`). `bitty-ai-control` has no dependency edge on the
-Core crate, so the values are named and documented here rather than imported.
+The constants above mirror the planned Core provider-publication launch
+contract (`bitty-runtime` `ai_publication_launch::CHILD_BOOTSTRAP_DESCRIPTOR`
+and `CHILD_CONTROL_DESCRIPTOR`). That module is not present in the Core
+checkout at `aceb327e`; it lands with the separately scoped Core adapter. The
+values are therefore named and documented here rather than imported, and this
+repository does not claim the Core side is implemented or integrated.
 
 ## `bitty-ai-helper`
 
@@ -51,8 +53,9 @@ repository or this slice.
 Core's launch manifest `executable_sha256` must identify the exact
 `bitty-ai-helper` executable produced from the launch's verified build. The
 digest binding belongs to Core's trusted descriptor and launch path, which
-already verifies the component before spawn; the helper does not read its own
-image, compute a digest, or compare `executable_sha256` locally. There is no
+must verify the component before spawn; that Core integration is pending and
+is not claimed here. The helper does not read its own image, compute a digest,
+or compare `executable_sha256` locally. There is no
 trusted descriptor source in this crate, and the manifest field is only echoed
 back in the establishment exchange. Launching an untracked or stale helper is a
 Core launch defect, not something this binary can detect.
