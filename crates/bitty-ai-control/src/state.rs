@@ -292,6 +292,13 @@ pub enum HelperControlError {
         /// Received record kind.
         kind: Kind,
     },
+    /// The record sender is not the authenticated Core role.
+    UnexpectedSender {
+        /// Received sender role.
+        sender: Sender,
+    },
+    /// The Core sent a registry mutation, which only the helper owns.
+    CoreRegistryMutation,
     /// The lifetime or feed revision is not current.
     StaleAuthority,
     /// A publication is already pending acknowledgement.
@@ -353,6 +360,12 @@ impl fmt::Display for HelperControlError {
             Self::UnexpectedRecord { .. } => {
                 formatter.write_str("control record is not valid in the current state")
             }
+            Self::UnexpectedSender { .. } => {
+                formatter.write_str("control record sender is not the authenticated Core")
+            }
+            Self::CoreRegistryMutation => {
+                formatter.write_str("Core may not mutate the helper registry")
+            }
             Self::StaleAuthority => {
                 formatter.write_str("control lifetime or feed revision is not current")
             }
@@ -403,6 +416,8 @@ impl std::error::Error for HelperControlError {
             | Self::SessionMismatch
             | Self::SequenceMismatch
             | Self::UnexpectedRecord { .. }
+            | Self::UnexpectedSender { .. }
+            | Self::CoreRegistryMutation
             | Self::StaleAuthority
             | Self::PublicationAlreadyPending
             | Self::PublicationIdentityMismatch
@@ -532,6 +547,37 @@ impl Fault {
     }
 }
 
+/// Last retired public identifiers retained for RNG-collision checks.
+///
+/// The predecessor window is a wire/correlation concept and is cleared after
+/// one crossed invalidation. Collision checking must keep the last retired
+/// lifetime and receipt independently so a repeated random value is never
+/// accepted just because correlation consumed the predecessor.
+#[derive(Debug, Default)]
+struct RetiredIdentifiers {
+    lifetime: Option<LifetimeId>,
+    receipt: Option<ReceiptId>,
+}
+
+impl RetiredIdentifiers {
+    fn note_lifetime(&mut self, lifetime: LifetimeId) {
+        self.lifetime = Some(lifetime);
+    }
+
+    fn note_receipt(&mut self, receipt: ReceiptId) {
+        self.receipt = Some(receipt);
+    }
+
+    fn lifetime_conflicts(&self, candidate: LifetimeId) -> bool {
+        self.lifetime == Some(candidate)
+    }
+
+    fn receipt_bytes_conflict(&self, candidate: &[u8; RANDOM_ID_BYTES]) -> bool {
+        self.receipt
+            .is_some_and(|receipt| receipt.as_bytes() == candidate)
+    }
+}
+
 /// Helper-side provider-publication state machine.
 ///
 /// `T` is the authenticated control stream and `R` is the injected registry
@@ -553,6 +599,7 @@ pub struct HelperControl<T, R> {
     out_sequence: u64,
     lifetime: Option<Lifetime>,
     predecessor: Option<RetiredLifetime>,
+    retired: RetiredIdentifiers,
     pending: Option<PendingPublication>,
     receipt: Option<ActiveReceipt>,
     last_core_publication_version: u64,
@@ -602,14 +649,18 @@ impl<S: Read + Write, R: RegistryView> HelperControl<ControlSession<S>, R> {
 impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
     /// Build the state machine over an already-authenticated stream.
     ///
-    /// This form is for a future transport adapter and for deterministic
-    /// tests. It performs no authentication itself: the caller is responsible
-    /// for pairing it with the authenticated session and its manifest.
+    /// **Test/adapter-only.** This constructor performs no authentication
+    /// itself. Production callers must use [`HelperControl::from_session`] or
+    /// [`HelperControl::new`], which require a pin-checked
+    /// [`ControlSession`]. This form exists for deterministic tests and for a
+    /// future transport adapter that has already authenticated and pinned the
+    /// stream.
     ///
     /// # Errors
     ///
     /// Returns [`HelperControlError::Manifest`] when the manifest is
     /// structurally invalid.
+    #[doc(hidden)]
     pub fn from_stream(
         manifest: LaunchManifest,
         stream: T,
@@ -636,6 +687,7 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
             out_sequence: 0,
             lifetime: None,
             predecessor: None,
+            retired: RetiredIdentifiers::default(),
             pending: None,
             receipt: None,
             last_core_publication_version: 0,
@@ -768,7 +820,7 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
         }
 
         self.pending = None;
-        self.receipt = None;
+        self.clear_receipt();
         self.emit(RecordBody::Invalidate(InvalidateBody {
             lifetime_id: previous,
             feed_revision,
@@ -825,7 +877,7 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
         let (previous, feed_revision) = self.current_identity()?;
 
         self.pending = None;
-        self.receipt = None;
+        self.clear_receipt();
         self.emit(RecordBody::Invalidate(InvalidateBody {
             lifetime_id: previous,
             feed_revision,
@@ -866,8 +918,13 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
     ///
     /// A caller uses this for its own deadline, shutdown, or replacement
     /// policy. Revocation is terminal and clears the current lifetime,
-    /// predecessor window, pending publication, and receipt. No old record is
-    /// retried on a replacement stream.
+    /// predecessor window, retired identifier checks, pending publication, and
+    /// receipt. No old record is retried on a replacement stream.
+    ///
+    /// This method does not write an `Invalidate`, TLS `close_notify`, or EOF.
+    /// The caller owns the transport: dropping this value (and its
+    /// [`ControlSession`]) closes the injected stream. A wire-visible
+    /// shutdown record, if required, belongs to the caller's shutdown policy.
     pub fn close(&mut self) {
         if self.phase == Phase::Revoked {
             return;
@@ -965,6 +1022,7 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
                 if self
                     .receipt
                     .is_some_and(|receipt| receipt.receipt.as_bytes() == ack_id.as_bytes())
+                    || self.retired.receipt_bytes_conflict(ack_id.as_bytes())
                 {
                     return Err(self.fail(Fault::random_for(HelperControlError::RandomUnavailable)));
                 }
@@ -975,7 +1033,7 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
 
         // One current tuple: accepting a new publication revokes any prior
         // receipt before the new proof exists.
-        self.receipt = None;
+        self.clear_receipt();
         self.pending = Some(PendingPublication {
             lifetime_id,
             feed_revision,
@@ -1019,7 +1077,9 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
         let receipt = match random_id::<RANDOM_ID_BYTES>() {
             Ok(bytes) => {
                 let receipt = ReceiptId::new(bytes);
-                if receipt.as_bytes() == pending.ack_id.as_bytes() {
+                if receipt.as_bytes() == pending.ack_id.as_bytes()
+                    || self.retired.receipt_bytes_conflict(receipt.as_bytes())
+                {
                     return Err(self.fail(Fault::random_for(HelperControlError::RandomUnavailable)));
                 }
                 receipt
@@ -1043,14 +1103,24 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
         })
     }
 
+    /// Handle a Core-origin invalidation.
+    ///
+    /// Accepted reasons: `SourceMutation`, `Reset`, and `Supersession` rotate
+    /// the current lifetime with the same feed revision; `GrantLoss` and
+    /// `Shutdown` close authority without a replacement lifetime.
+    /// `RegistryMutation` is refused because only the helper owns the registry
+    /// and emits that reason on its own mutation path.
     fn handle_invalidate(&mut self, body: InvalidateBody) -> Result<Step, HelperControlError> {
+        if body.reason == Reason::RegistryMutation {
+            return Err(self.fail(Fault::protocol(HelperControlError::CoreRegistryMutation)));
+        }
         let current = self
             .lifetime
             .as_ref()
             .map(|lifetime| (lifetime.id, lifetime.feed_revision));
         if current == Some((body.lifetime_id, body.feed_revision)) {
             self.pending = None;
-            self.receipt = None;
+            self.clear_receipt();
             if matches!(body.reason, Reason::GrantLoss | Reason::Shutdown) {
                 self.phase = Phase::Revoked;
                 self.revocation = Some(RevocationReason::PeerWithdrewAuthority);
@@ -1155,6 +1225,13 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
     }
 
     fn validate_envelope(&mut self, record: &ControlRecord) -> Result<(), HelperControlError> {
+        if record.sender != Sender::Core {
+            return Err(
+                self.fail(Fault::protocol(HelperControlError::UnexpectedSender {
+                    sender: record.sender,
+                })),
+            );
+        }
         if validate_session(self.session_id, record.session_id).is_err() {
             return Err(self.fail(Fault::protocol(HelperControlError::SessionMismatch)));
         }
@@ -1195,6 +1272,7 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
             || self
                 .predecessor
                 .is_some_and(|predecessor| predecessor.id == id)
+            || self.retired.lifetime_conflicts(id)
         {
             // A repeated fresh identifier is a terminal RNG failure. Never
             // retry with a timestamp, counter, fixed seed, or guessed value.
@@ -1209,10 +1287,17 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
 
     fn retire_current(&mut self) {
         if let Some(previous) = self.lifetime.take() {
+            self.retired.note_lifetime(previous.id);
             self.predecessor = Some(RetiredLifetime {
                 id: previous.id,
                 feed_revision: previous.feed_revision,
             });
+        }
+    }
+
+    fn clear_receipt(&mut self) {
+        if let Some(receipt) = self.receipt.take() {
+            self.retired.note_receipt(receipt.receipt);
         }
     }
 
@@ -1253,16 +1338,20 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
         }
         self.phase = Phase::Revoked;
         self.revocation = Some(reason);
+        // Local revocation is not conditional on delivering a diagnostic.
+        // Clear the lifetime, pending publication, receipt, retired IDs, and
+        // outbound queue first; only then make one best-effort Error attempt.
+        self.clear_authority();
         if let Some(code) = code {
             self.send_error_best_effort(code);
         }
-        self.clear_authority();
         error
     }
 
     fn clear_authority(&mut self) {
         self.lifetime = None;
         self.predecessor = None;
+        self.retired = RetiredIdentifiers::default();
         self.pending = None;
         self.receipt = None;
         self.writer.clear();
@@ -1271,16 +1360,15 @@ impl<T: Read + Write, R: RegistryView> HelperControl<T, R> {
 
 impl<T: Read + Write, R: RegistryView> fmt::Debug for HelperControl<T, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Safe-diagnostics rule: never print session, lifetime, ack, or
+        // receipt identifiers from the state owner.
         formatter
             .debug_struct("HelperControl")
-            .field("session_id", &self.session_id)
             .field("phase", &self.phase)
-            .field(
-                "lifetime_id",
-                &self.lifetime.as_ref().map(|lifetime| lifetime.id),
-            )
-            .field("feed_revision", &self.feed_revision())
-            .field("proof_state", &self.proof_state())
+            .field("established", &self.lifetime.is_some())
+            .field("pending_publication", &self.pending.is_some())
+            .field("active_receipt", &self.receipt.is_some())
+            .field("closed", &self.is_closed())
             .field("revocation", &self.revocation)
             .finish_non_exhaustive()
     }
@@ -1333,4 +1421,37 @@ fn random_id<const N: usize>() -> Result<[u8; N], HelperControlError> {
         .fill(&mut bytes)
         .map_err(|_| HelperControlError::RandomUnavailable)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LifetimeId, ReceiptId, RetiredIdentifiers};
+
+    #[test]
+    fn retired_lifetime_is_checked_until_the_next_rotation() {
+        let first = LifetimeId::new([0x11; 32]);
+        let second = LifetimeId::new([0x22; 32]);
+        let third = LifetimeId::new([0x33; 32]);
+        let mut retired = RetiredIdentifiers::default();
+        retired.note_lifetime(first);
+        // Crossing an invalidation clears the wire predecessor window, but
+        // not this collision set.
+        assert!(retired.lifetime_conflicts(first));
+        retired.note_lifetime(second);
+        assert!(!retired.lifetime_conflicts(first));
+        assert!(retired.lifetime_conflicts(second));
+        assert!(!retired.lifetime_conflicts(third));
+    }
+
+    #[test]
+    fn retired_receipt_is_checked_after_replacement() {
+        let first = ReceiptId::new([0x44; 32]);
+        let second = ReceiptId::new([0x55; 32]);
+        let mut retired = RetiredIdentifiers::default();
+        retired.note_receipt(first);
+        assert!(retired.receipt_bytes_conflict(first.as_bytes()));
+        retired.note_receipt(second);
+        assert!(!retired.receipt_bytes_conflict(first.as_bytes()));
+        assert!(retired.receipt_bytes_conflict(second.as_bytes()));
+    }
 }

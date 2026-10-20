@@ -115,9 +115,9 @@ impl ControlServer {
         let Self {
             config,
             peer_certificate_pin,
-            ..
+            establishment_expectations,
         } = self;
-        ControlServerHandshake::new(&config, peer_certificate_pin)
+        ControlServerHandshake::new(&config, peer_certificate_pin, establishment_expectations)
     }
 
     /// Accept one mutual TLS session over an injected duplex stream.
@@ -139,7 +139,8 @@ impl ControlServer {
             peer_certificate_pin,
             establishment_expectations,
         } = self;
-        let mut handshake = ControlServerHandshake::new(&config, peer_certificate_pin)?;
+        let mut handshake =
+            ControlServerHandshake::new(&config, peer_certificate_pin, establishment_expectations)?;
         let mut received_wire = 0_usize;
         let mut sent_wire = 0_usize;
 
@@ -193,12 +194,7 @@ impl ControlServer {
             }
 
             if let Some(peer) = handshake.established_peer()? {
-                return Ok(ControlSession {
-                    connection: handshake.into_connection(),
-                    stream,
-                    peer,
-                    establishment_expectations,
-                });
+                return Ok(handshake.into_control_session(stream, peer));
             }
         }
 
@@ -223,16 +219,19 @@ impl fmt::Debug for ControlServer {
 pub struct ControlServerHandshake {
     connection: ServerConnection,
     expected_peer_pin: CertificatePin,
+    establishment_expectations: EstablishmentExpectations,
 }
 
 impl ControlServerHandshake {
     fn new(
         config: &Arc<ServerConfig>,
         expected_peer_pin: CertificatePin,
+        establishment_expectations: EstablishmentExpectations,
     ) -> Result<Self, ControlError> {
         Ok(Self {
             connection: ServerConnection::new(config.clone()).map_err(ControlError::Rustls)?,
             expected_peer_pin,
+            establishment_expectations,
         })
     }
 
@@ -343,6 +342,32 @@ impl ControlServerHandshake {
         }))
     }
 
+    /// Non-secret establishment expectations captured by the server.
+    ///
+    /// A caller that drives the handshake manually can retain these values
+    /// across [`Self::into_connection`] and build the application state
+    /// machine without re-parsing the launch manifest.
+    #[must_use]
+    pub fn establishment_expectations(&self) -> &EstablishmentExpectations {
+        &self.establishment_expectations
+    }
+
+    /// Consume a completed handshake into one control session.
+    ///
+    /// The caller must already have obtained the completed [`EstablishedPeer`]
+    /// from [`Self::established_peer`]. This does not re-check completion; it
+    /// only preserves the launch expectations that the blocking
+    /// [`ControlServer::accept`] path would otherwise carry.
+    #[must_use]
+    pub fn into_control_session<S>(self, stream: S, peer: EstablishedPeer) -> ControlSession<S> {
+        ControlSession {
+            connection: self.connection,
+            stream,
+            peer,
+            establishment_expectations: self.establishment_expectations,
+        }
+    }
+
     /// Consume the handshake and return the underlying rustls connection.
     #[must_use]
     pub fn into_connection(self) -> ServerConnection {
@@ -441,9 +466,32 @@ impl<S> ControlSession<S> {
     }
 
     /// Consume the session into the rustls connection, stream, and peer.
+    ///
+    /// The launch expectations are dropped. Use
+    /// [`Self::into_parts_with_expectations`] when the parts must be rebuilt
+    /// into an application state machine.
     #[must_use]
     pub fn into_parts(self) -> (ServerConnection, S, EstablishedPeer) {
         (self.connection, self.stream, self.peer)
+    }
+
+    /// Consume the session into the rustls connection, stream, peer, and
+    /// non-secret launch expectations.
+    #[must_use]
+    pub fn into_parts_with_expectations(
+        self,
+    ) -> (
+        ServerConnection,
+        S,
+        EstablishedPeer,
+        EstablishmentExpectations,
+    ) {
+        (
+            self.connection,
+            self.stream,
+            self.peer,
+            self.establishment_expectations,
+        )
     }
 }
 

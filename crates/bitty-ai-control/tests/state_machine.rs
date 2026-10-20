@@ -1657,6 +1657,79 @@ fn wrong_direction_and_unknown_wire_values_revoke() {
 }
 
 #[test]
+fn helper_sender_inbound_invalidate_and_error_are_refused() {
+    let mut harness = Harness::new(1, empty_projection());
+    harness.establish();
+    let _ = harness.drain();
+    let lifetime = harness.control.lifetime_id().expect("lifetime");
+    harness.stream.send_record(&ControlRecord {
+        sender: Sender::Helper,
+        sequence: 2,
+        session_id: harness.session,
+        body: RecordBody::Invalidate(InvalidateBody {
+            lifetime_id: lifetime,
+            feed_revision: 1,
+            reason: Reason::SourceMutation,
+        }),
+    });
+    let error = harness
+        .control
+        .step()
+        .expect_err("helper sender invalidate");
+    assert!(matches!(
+        error,
+        HelperControlError::UnexpectedSender {
+            sender: Sender::Helper
+        }
+    ));
+    harness.assert_closed(RevocationReason::ProtocolViolation);
+
+    let mut harness = Harness::new(1, empty_projection());
+    harness.establish();
+    let _ = harness.drain();
+    harness.stream.send_record(&ControlRecord {
+        sender: Sender::Helper,
+        sequence: 2,
+        session_id: harness.session,
+        body: RecordBody::Error(ErrorCode::InvalidControl),
+    });
+    let error = harness.control.step().expect_err("helper sender error");
+    assert!(matches!(
+        error,
+        HelperControlError::UnexpectedSender {
+            sender: Sender::Helper
+        }
+    ));
+    harness.assert_closed(RevocationReason::ProtocolViolation);
+}
+
+#[test]
+fn core_registry_mutation_invalidation_is_refused() {
+    let mut harness = Harness::new(1, empty_projection());
+    harness.establish();
+    let _ = harness.drain();
+    let lifetime = harness.control.lifetime_id().expect("lifetime");
+    harness.send_invalidate(lifetime, 1, Reason::RegistryMutation);
+    let error = harness.control.step().expect_err("core registry mutation");
+    assert!(matches!(error, HelperControlError::CoreRegistryMutation));
+    harness.assert_closed(RevocationReason::ProtocolViolation);
+}
+
+#[test]
+fn failed_error_write_does_not_delay_authority_clearing() {
+    let mut harness = Harness::new(1, empty_projection());
+    harness.establish();
+    let _ = harness.drain();
+    let lifetime = harness.control.lifetime_id().expect("lifetime");
+    harness.stream.fail_writes_after(Some(0));
+    harness.send_invalidate(lifetime, 1, Reason::RegistryMutation);
+    let error = harness.control.step().expect_err("core registry mutation");
+    assert!(matches!(error, HelperControlError::CoreRegistryMutation));
+    harness.assert_closed(RevocationReason::ProtocolViolation);
+    assert!(harness.stream.output_is_empty());
+}
+
+#[test]
 fn peer_error_is_terminal_without_an_error_reply() {
     let mut harness = Harness::new(1, empty_projection());
     harness.establish();
@@ -1830,5 +1903,9 @@ fn diagnostics_never_echo_payload_or_identifiers() {
     assert!(!text.contains(&harness.session.to_hex()));
     assert!(!text.contains('/'));
     assert!(text.contains("bind"));
+    let debug = format!("{:?}", harness.control);
+    assert!(!debug.contains(&lifetime.to_hex()));
+    assert!(!debug.contains(&harness.session.to_hex()));
+    assert!(!debug.contains(&tuple.publication_id.to_hex()));
     harness.assert_closed(RevocationReason::ProtocolViolation);
 }
