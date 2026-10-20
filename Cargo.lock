@@ -89,6 +89,7 @@ source = "git+https://github.com/bitty-terminal/bitty-agent?rev=a8e4112#a8e41121
 name = "bitty-ai-control"
 version = "0.0.1"
 dependencies = [
+ "bitty-ipc-api",
  "rustls",
  "sha2",
  "zeroize",
