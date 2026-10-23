@@ -4,6 +4,9 @@ name: Snapshot source
 # current with respect to main. In-repo publication retired the separate
 # *-workflow mirror: the commander's merge closeout runs `just workflow-publish`
 # (native `carryctx export --publication` + `git push` of the snapshot branch).
+# The publisher refreshes origin/main first and refuses a checkout whose HEAD is
+# neither origin/main nor an ancestor of it, so the trailer this gate reads
+# records a revision main actually contains.
 #
 # The gate tolerates the two legitimate cases that are not "stale": no snapshot
 # branch exists yet, and the snapshot was republished from a newer main than the
