@@ -15,13 +15,14 @@
 #   - the named remote must resolve to exactly one URL for both fetch and
 #     push. An explicit pushurl identical to the fetch URL publishes; an empty
 #     `remote.<name>.url` or `remote.<name>.pushurl` record (which
-#     `git remote get-url` can hide next to a valid URL), a split pushurl
-#     (reachable or not), a pushurl that differs from the fetch URL only by
-#     trailing newline bytes, a `pushInsteadOf` rewrite, more than one push
-#     URL, and an unresolvable `--remote` (a URL or path, which would skip the
-#     comparison) are refused before the export with a static,
-#     credential-free diagnostic, and `--allow-non-main` cannot bypass that
-#     refusal;
+#     `git remote get-url` can hide next to a valid URL), an oversized or
+#     over-count raw URL record set, an unreadable config (bounded incremental
+#     inspection), a split pushurl (reachable or not), a pushurl
+#     that differs from the fetch URL only by trailing newline bytes, a
+#     `pushInsteadOf` rewrite, more than one push URL, and an unresolvable
+#     `--remote` (a URL or path, which would skip the comparison) are refused
+#     before the export with a static, credential-free diagnostic, and
+#     `--allow-non-main` cannot bypass that refusal;
 #   - the manifest guard parses JSON and requires the TOP-LEVEL `redacted`
 #     boolean. A nested `redacted: true`, a string, a number, a boolean false,
 #     or a truncated document must not authorize a push, and diagnostics must
@@ -147,6 +148,22 @@ exec "${REAL_GIT:?REAL_GIT is required}" "$@"
 WRAPPER
 chmod +x "$TOCTOU_BIN/git"
 
+# ── git wrapper for an unreadable config ───────────────────────────────────
+# Makes every `git config` read fail with a status other than "key not found"
+# (exit 1). The bounded raw-record inspection must treat that as unreadable
+# input instead of an empty record set, and refuse before the export.
+FAIL_CONFIG_BIN="$TEST_ROOT/bin-fail-config"
+mkdir -p -- "$FAIL_CONFIG_BIN"
+cat >"$FAIL_CONFIG_BIN/git" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-C" && "${3:-}" == "config" ]]; then
+	exit 128
+fi
+exec "${REAL_GIT:?REAL_GIT is required}" "$@"
+WRAPPER
+chmod +x "$FAIL_CONFIG_BIN/git"
+
 # ── fixtures and helpers ────────────────────────────────────────────────────
 new_fixture() {
 	local name="$1"
@@ -195,6 +212,14 @@ run_publish() {
 	STUB_MANIFEST="$manifest" STUB_CALL_LOG="$root/carryctx-calls.log" \
 		PATH="$STUB_BIN:$PATH" \
 		bash "$SCRIPT" --project "$(checkout_of "$root")" "$@"
+}
+
+# Same run, but `git config` fails with a non-"key not found" status.
+run_publish_unreadable_config() {
+	local root="$1" manifest="$2"
+	REAL_GIT="$REAL_GIT" STUB_MANIFEST="$manifest" STUB_CALL_LOG="$root/carryctx-calls.log" \
+		PATH="$FAIL_CONFIG_BIN:$STUB_BIN:$PATH" \
+		bash "$SCRIPT" --project "$(checkout_of "$root")"
 }
 
 # Same run, but with the TOCTOU probe on PATH: the wrapper moves the local
@@ -432,6 +457,45 @@ expect_ok "empty push URL record reports the empty record" output_has "$RUN_OUTP
 expect_not "empty push URL record does not echo URL values" output_has "$RUN_OUTPUT" "$root"
 expect_not "empty push URL record never exports" export_recorded "$root"
 expect_not "empty push URL record never pushes" remote_has_snapshot "$root"
+
+# Raw record inspection is bounded. A config whose URL record set exceeds the
+# byte or record bound is refused before resolution instead of being buffered
+# whole, and neither branch prints the value.
+root="$(new_fixture oversized-url-record)"
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+oversized_value="$fetch_url/SENTINEL-OVERSIZE-$(printf '%*s' 70000 '' | tr ' ' 'a')"
+git -C "$(checkout_of "$root")" config --add remote.origin.url "$oversized_value"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "oversized raw URL record is refused before export" 1
+expect_ok "oversized record reports the byte bound" output_has "$RUN_OUTPUT" "65536-byte bound"
+expect_not "oversized record does not echo the value" output_has "$RUN_OUTPUT" "SENTINEL-OVERSIZE"
+expect_not "oversized record never exports" export_recorded "$root"
+expect_not "oversized record never pushes" remote_has_snapshot "$root"
+
+# The fixture already has one URL record; 64 more cross the 64-record bound.
+root="$(new_fixture too-many-url-records)"
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+for ((i = 0; i < 64; i++)); do
+	git -C "$(checkout_of "$root")" config --add remote.origin.url "$fetch_url"
+done
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "excess raw URL records are refused before export" 1
+expect_ok "excess records report the record bound" output_has "$RUN_OUTPUT" "64-record bound"
+expect_not "excess records do not echo URL values" output_has "$RUN_OUTPUT" "$root"
+expect_not "excess records never export" export_recorded "$root"
+expect_not "excess records never push" remote_has_snapshot "$root"
+
+# A config read that fails for any reason other than "key not found" is not an
+# empty record set: fail closed before the export and the push.
+root="$(new_fixture unreadable-url-config)"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish_unreadable_config "$root" "$manifest"
+expect_status "unreadable URL config fails closed before export" 1
+expect_ok "unreadable URL config reports the inspection failure" output_has "$RUN_OUTPUT" "cannot inspect"
+expect_not "unreadable URL config never exports" export_recorded "$root"
+expect_not "unreadable URL config never pushes" remote_has_snapshot "$root"
 
 # An explicit pushurl identical to the fetch URL is still one destination.
 root="$(new_fixture identical-pushurl)"

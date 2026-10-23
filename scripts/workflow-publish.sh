@@ -22,8 +22,9 @@
 # unconditionally: `--allow-non-main` does not bypass it. The comparison is
 # byte-exact, so a push URL that differs from the fetch URL only by trailing
 # newline bytes is still a split destination. The raw `remote.<name>.url` and
-# `remote.<name>.pushurl` records are inspected before resolution: an empty
-# record is refused even when `git remote get-url` hides it. This publisher
+# `remote.<name>.pushurl` records are inspected before resolution under explicit
+# byte and record bounds: an empty, oversized, or truncated record set is
+# refused even when `git remote get-url` hides it. This publisher
 # refreshes `$REMOTE/main` from the fetch URL while `git push "$REMOTE"` writes
 # to the push URL(s), so a split would validate one repository's main and
 # publish the snapshot into another — the one place the `snapshot-source` gate
@@ -90,6 +91,13 @@ GIT_TIMEOUT="${GIT_TIMEOUT:-120}"
 DRY_RUN=0
 ALLOW_NON_MAIN=0
 ALLOW_NAME_MISMATCH=0
+# Bounds for the raw remote URL record inspection below. One configured URL is
+# one record and publication requires exactly one, so anything approaching
+# these limits is an anomaly. Bounding the read keeps a corrupted or hostile
+# config from making the publisher buffer an unbounded stream; exceeding either
+# bound fails closed.
+URL_RECORD_SET_MAX_BYTES=65536
+URL_RECORD_SET_MAX_RECORDS=64
 
 usage() {
 	sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d'
@@ -192,27 +200,87 @@ PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
 # name), so the count/equality guard can pass while fetch or push resolves the
 # partial configuration. Records are read NUL-separated: a URL value that
 # embeds newline bytes stays one record instead of splitting into a bogus empty
-# one (the byte-exact comparison below still refuses it separately). python3 is
-# already required by this script, reads the bytes from a pipe, and prints only
-# a status token, never a value. Bash 3.2 is preserved: no NUL-safe variables,
-# `mapfile`, or namerefs.
+# one (the byte-exact comparison below still refuses it separately).
+#
+# The record set is read incrementally under URL_RECORD_SET_MAX_BYTES and
+# URL_RECORD_SET_MAX_RECORDS. python3 is already required by this script, reads
+# the bytes from a pipe without buffering the whole stream, and prints only a
+# status token, never a value. A git config read error is not mistaken for a
+# missing key (exit 1, a normal pushurl case): any other failure, a truncated
+# record set (no final NUL), and either over-limit status fail closed. Bash 3.2
+# is preserved: no NUL-safe variables, `mapfile`, or namerefs.
 require_no_empty_url_records() {
-	local key="$1" side="$2" status
+	local key="$1" side="$2" status pipeline_status git_status=0
 	status="$({
-		timeout "$GIT_TIMEOUT" git -C "$PROJECT" config --null --get-all "$key" 2>/dev/null || true
+		timeout "$GIT_TIMEOUT" git -C "$PROJECT" config --null --get-all "$key" 2>/dev/null || git_status=$?
+		[[ "$git_status" -eq 0 || "$git_status" -eq 1 ]]
 	} | python3 -c '
 import sys
 
-records = sys.stdin.buffer.read().split(b"\0")[:-1]
-sys.stdout.write("empty" if any(record == b"" for record in records) else "ok")
-' 2>/dev/null)" || status="read-failure"
+max_bytes = int(sys.argv[1])
+max_records = int(sys.argv[2])
+chunk_size = 4096
+
+total = 0
+records = 0
+has_empty = False
+pending = bytearray()
+
+try:
+    while True:
+        chunk = sys.stdin.buffer.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            sys.stdout.write("too-large")
+            sys.exit(0)
+        start = 0
+        while True:
+            index = chunk.find(b"\0", start)
+            if index < 0:
+                pending.extend(chunk[start:])
+                break
+            pending.extend(chunk[start:index])
+            records += 1
+            if records > max_records:
+                sys.stdout.write("too-many")
+                sys.exit(0)
+            if not pending:
+                has_empty = True
+            pending.clear()
+            start = index + 1
+except OSError:
+    sys.stdout.write("read-failure")
+    sys.exit(0)
+
+if pending:
+    sys.stdout.write("truncated")
+else:
+    sys.stdout.write("empty" if has_empty else "ok")
+' "$URL_RECORD_SET_MAX_BYTES" "$URL_RECORD_SET_MAX_RECORDS" 2>/dev/null)" && pipeline_status=0 || pipeline_status=$?
+	case "$status" in
+	ok | empty)
+		# A valid token only counts when git itself completed: a config read
+		# error must not be read as a missing or empty record set.
+		[[ "$pipeline_status" -eq 0 ]] || status="read-failure"
+		;;
+	too-large | too-many | truncated | read-failure) ;;
+	*) status="read-failure" ;;
+	esac
 	case "$status" in
 	ok) ;;
 	empty)
 		fail "remote '$REMOTE' has an empty $side URL record ($key); 'git remote get-url' can hide an empty record, so the shared-URL comparison cannot prove which repository receives the snapshot. Remove the empty '$key' entry and re-run. URL values are never printed because they can embed credentials."
 		;;
+	too-large)
+		fail "remote '$REMOTE' has raw $side URL records exceeding the $URL_RECORD_SET_MAX_BYTES-byte bound; refusing to publish. Remove the oversized entry and re-run. URL values are never printed because they can embed credentials."
+		;;
+	too-many)
+		fail "remote '$REMOTE' has raw $side URL records exceeding the $URL_RECORD_SET_MAX_RECORDS-record bound; refusing to publish. Remove the extra entries and re-run. URL values are never printed because they can embed credentials."
+		;;
 	*)
-		fail "cannot inspect the raw $side URL records for remote '$REMOTE'; refusing to publish. URL values are never printed because they can embed credentials."
+		fail "cannot inspect the raw $side URL records for remote '$REMOTE' (read failed or input was incomplete); refusing to publish. URL values are never printed because they can embed credentials."
 		;;
 	esac
 }
