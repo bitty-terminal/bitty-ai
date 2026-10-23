@@ -27,9 +27,12 @@
 #   3. Refuses to push unless the committed `manifest.json` parses as a JSON
 #      object whose TOP-LEVEL `redacted` field is the boolean `true`. A nested
 #      `redacted: true` does not satisfy the guard, and the check never
-#      degrades to a text match.
-#   4. Pushes `refs/heads/carryctx-snapshots` to the remote only when the local
-#      ref changed; otherwise prints a no-op message.
+#      degrades to a text match. Failures report the field's JSON type, never
+#      its contents.
+#   4. Pins the validated commit (`$PUB_REF^{commit}`) and pushes that exact
+#      object, so a concurrent ref move between validation and push cannot
+#      publish an unvalidated commit. Pushes only when the local ref changed;
+#      otherwise prints a no-op message.
 #
 # Dependencies: git, carryctx, timeout, python3. python3 is required for the
 # manifest JSON check and is verified up front; the script fails when it is
@@ -211,7 +214,7 @@ if [[ "$DRY_RUN" == 0 ]] &&
 	fi
 fi
 
-BEFORE="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" rev-parse -q --verify "$PUB_REF" 2>/dev/null || true)"
+BEFORE="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" rev-parse -q --verify "$PUB_REF^{commit}" 2>/dev/null || true)"
 
 EXPORT_ARGS=(export --pack-format dir -o "$TMP_ROOT/pack" --publication --project "$PROJECT")
 if [[ "$DRY_RUN" == 1 ]]; then
@@ -229,12 +232,16 @@ if [[ "$DRY_RUN" == 1 ]]; then
 	exit 0
 fi
 
-AFTER="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" rev-parse "$PUB_REF" 2>/dev/null)" ||
+# Pin the commit under validation. Every later read and the push itself use
+# this exact object, never the mutable ref name: a concurrent update of
+# `$PUB_REF` between the manifest check and the push can no longer substitute an
+# unvalidated commit.
+AFTER="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" rev-parse "$PUB_REF^{commit}" 2>/dev/null)" ||
 	fail "publication ref $PUB_REF was not created by carryctx export --publication"
 
 MANIFEST_FILE="$TMP_ROOT/manifest.json"
-if ! timeout "$GIT_TIMEOUT" git -C "$PROJECT" show "$PUB_REF:manifest.json" >"$MANIFEST_FILE" 2>/dev/null; then
-	fail "cannot read $PUB_REF:manifest.json"
+if ! timeout "$GIT_TIMEOUT" git -C "$PROJECT" show "$AFTER:manifest.json" >"$MANIFEST_FILE" 2>/dev/null; then
+	fail "cannot read manifest.json from publication commit $AFTER"
 fi
 # Parse, do not grep: the top-level `redacted` field must be the JSON boolean
 # true. A nested `redacted: true`, a string "true", or a number must not
@@ -243,6 +250,23 @@ MANIFEST_ERROR="$(
 	python3 - "$MANIFEST_FILE" 2>&1 <<'PY'
 import json
 import sys
+
+
+def json_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
 
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
@@ -253,11 +277,16 @@ except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
 if not isinstance(manifest, dict):
     sys.exit("manifest.json top level is not a JSON object")
 
-redacted = manifest.get("redacted")
+# Report only the JSON type of the rejected field: its contents may hold
+# values the publication is supposed to redact, and diagnostics must not leak
+# them.
+if "redacted" not in manifest:
+    sys.exit("manifest.json has no top-level 'redacted' field")
+redacted = manifest["redacted"]
 if redacted is not True:
     sys.exit(
         "manifest.json top-level 'redacted' must be the JSON boolean true "
-        f"(found {json.dumps(redacted)})"
+        f"(found {json_type(redacted)})"
     )
 PY
 )" || fail "publication $PUB_REF is not stamped redacted: true at the top level; refusing to push ($MANIFEST_ERROR)"
@@ -268,7 +297,7 @@ if [[ -n "$BEFORE" && "$BEFORE" == "$AFTER" ]]; then
 fi
 
 log "pushing $PUB_REF (${BEFORE:0:12} -> ${AFTER:0:12}) to $REMOTE"
-if ! timeout "$GIT_TIMEOUT" git -C "$PROJECT" push "$REMOTE" "refs/heads/carryctx-snapshots:refs/heads/carryctx-snapshots"; then
+if ! timeout "$GIT_TIMEOUT" git -C "$PROJECT" push "$REMOTE" "$AFTER:refs/heads/carryctx-snapshots"; then
 	fail "git push failed (network/auth/permissions?); the local publication commit is preserved"
 fi
 log "published $PUB_REF at ${AFTER:0:12}"

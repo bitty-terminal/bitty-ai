@@ -64,9 +64,11 @@ jobs:
       # Snapshot publisher guards (AI-0344): divergent local main and feature
       # branches are rejected before export (origin/main is refreshed first),
       # detached/behind checkouts stay valid, --allow-non-main bypasses with a
-      # warning, and the manifest guard requires a parsed top-level
-      # `redacted: true`. Same suite as `just workflow-publish-test`; it uses
-      # local bare remotes and a carryctx stub, so it needs no network.
+      # warning, the manifest guard requires a parsed top-level
+      # `redacted: true` and reports only its JSON type, and a ref-move probe
+      # proves the pinned validated commit is the pushed source. Same suite as
+      # `just workflow-publish-test`; it uses local bare remotes and a carryctx
+      # stub, so it needs no network.
       - name: workflow-publish regression tests
         run: bash scripts/tests/workflow-publish-test.sh
 

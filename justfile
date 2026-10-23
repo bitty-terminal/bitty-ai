@@ -45,11 +45,13 @@ host-boundary-gate-v2-test:
 
 # Regression suite for the snapshot publisher (AI-0344): divergent local main
 # and feature branches are rejected before export, detached/behind checkouts
-# stay valid, `--allow-non-main` bypasses with a warning, and the manifest
-# guard requires a parsed top-level `redacted: true` (nested/string/number/
-# malformed documents fail closed). Runs against local bare remotes and a
-# `carryctx` stub: no network, no real remote. Part of `check` and CI so the
-# guards cannot silently regress.
+# stay valid, `--allow-non-main` bypasses with a warning, the manifest guard
+# requires a parsed top-level `redacted: true` (nested/string/number/boolean/
+# malformed documents fail closed) and reports only the rejected JSON type, and
+# a probe moves the publication ref before push to prove the pinned validated
+# commit is what gets published. Dry runs write no ref and push nothing. Runs
+# against local bare remotes and a `carryctx` stub: no network, no real remote.
+# Part of `check` and CI so the guards cannot silently regress.
 workflow-publish-test:
     bash scripts/tests/workflow-publish-test.sh
 
@@ -114,8 +116,10 @@ check: fmt-check clippy test gate-v01-durable actionlint host-boundary-gate-v2 h
 # `redacted: true`, and commits one snapshot to the fixed ref
 # `refs/heads/carryctx-snapshots`; the target pushes that branch only when the
 # local ref advanced. The manifest guard parses JSON with python3 (checked up
-# front) and rejects nested, string, number, or malformed stamps. Canonical
-# closeout runs from the primary checkout on branch main
+# front), rejects nested, string, number, boolean, or malformed stamps without
+# echoing field contents, and the push sends the pinned validated commit rather
+# than the ref name, so a concurrent ref move cannot publish unvalidated data.
+# Canonical closeout runs from the primary checkout on branch main
 # (`cd "$BITTY_WORKSPACE/bitty-ai" && just workflow-publish`); a detached or
 # behind checkout at an ancestor of origin/main publishes with a warning. Dry
 # run validates the source revision and the export and writes neither the ref
