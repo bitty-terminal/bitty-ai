@@ -14,9 +14,10 @@
 #     `--allow-non-main` remains the explicit bypass;
 #   - the named remote must resolve to exactly one URL for both fetch and
 #     push. An explicit pushurl identical to the fetch URL publishes; a split
-#     pushurl (reachable or not), a `pushInsteadOf` rewrite, more than one push
-#     URL, and an unresolvable `--remote` (a URL or path, which would skip the
-#     comparison) are refused before the export with a static,
+#     pushurl (reachable or not), a pushurl that differs from the fetch URL
+#     only by trailing newline bytes, a `pushInsteadOf` rewrite, more than one
+#     push URL, and an unresolvable `--remote` (a URL or path, which would skip
+#     the comparison) are refused before the export with a static,
 #     credential-free diagnostic, and `--allow-non-main` cannot bypass that
 #     refusal;
 #   - the manifest guard parses JSON and requires the TOP-LEVEL `redacted`
@@ -410,6 +411,33 @@ manifest="$(write_manifest "$root" '{"redacted": true}')"
 capture run_publish "$root" "$manifest"
 expect_status "pushurl identical to the fetch URL publishes" 0
 expect_ok "identical pushurl reaches the remote" remote_has_snapshot "$root"
+
+# A configured pushurl whose value ends in newline bytes is a different
+# destination: `git push` resolves the raw value, so the newline is part of the
+# path. Command substitution used to strip that byte, making the push record
+# compare equal to the fetch URL even though the destinations differ. Capture
+# must stay byte-exact and refuse this split before the export.
+root="$(new_fixture newline-suffixed-pushurl)"
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+set_pushurls "$root" "$fetch_url"$'\n'
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "newline-suffixed pushurl is refused before export" 1
+expect_ok "newline-suffixed pushurl reports the shared-URL requirement" output_has "$RUN_OUTPUT" "exactly one shared URL"
+expect_not "newline-suffixed pushurl is not echoed" output_has "$RUN_OUTPUT" "$root"
+expect_not "newline-suffixed pushurl never exports" export_recorded "$root"
+expect_not "newline-suffixed pushurl never pushes to the fetch remote" remote_has_snapshot "$root"
+
+# Control for the case above: the same fixture with the exact URL still
+# publishes. The refusal comes from the extra newline byte, not from declaring
+# an explicit pushurl at all.
+root="$(new_fixture exact-pushurl-control)"
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+set_pushurls "$root" "$fetch_url"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "exact pushurl still publishes under byte-exact capture" 0
+expect_ok "exact pushurl still pushes the snapshot" remote_has_snapshot "$root"
 
 # A reachable second repository as pushurl: even with an identical main, the
 # fetch-side main is not the destination's verified main, so refuse.

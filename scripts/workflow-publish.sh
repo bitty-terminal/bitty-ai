@@ -19,7 +19,9 @@
 # The named remote must resolve to exactly one URL for both fetch and push. A
 # split configuration (`remote.<name>.pushurl`, `url.<base>.pushInsteadOf`, or
 # more than one URL on either side) is refused before the fetch,
-# unconditionally: `--allow-non-main` does not bypass it. This publisher
+# unconditionally: `--allow-non-main` does not bypass it. The comparison is
+# byte-exact, so a push URL that differs from the fetch URL only by trailing
+# newline bytes is still a split destination. This publisher
 # refreshes `$REMOTE/main` from the fetch URL while `git push "$REMOTE"` writes
 # to the push URL(s), so a split would validate one repository's main and
 # publish the snapshot into another — the one place the `snapshot-source` gate
@@ -179,8 +181,23 @@ PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
 # while `pushInsteadOf` could still redirect the push. No branch prints URL
 # values (they can embed credentials), and the unresolvable branch does not echo
 # the argument because it may itself be a credential-bearing URL.
-FETCH_URLS="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url --all "$REMOTE" 2>/dev/null || true)"
-PUSH_URLS="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url --push --all "$REMOTE" 2>/dev/null || true)"
+#
+# Capture the URL records byte-exactly. Command substitution strips every
+# trailing newline, so a configured URL that itself ends in newline bytes would
+# collapse onto the fetch URL in the comparison while `git push` still resolves
+# the destination to the raw, newline-suffixed value. Append a sentinel inside
+# the substitution and remove only that byte afterwards, keeping every byte git
+# printed (including the record terminator).
+FETCH_URLS="$(
+	timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url --all "$REMOTE" 2>/dev/null || true
+	printf x
+)"
+FETCH_URLS="${FETCH_URLS%x}"
+PUSH_URLS="$(
+	timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url --push --all "$REMOTE" 2>/dev/null || true
+	printf x
+)"
+PUSH_URLS="${PUSH_URLS%x}"
 if [[ -z "$FETCH_URLS" || -z "$PUSH_URLS" ]]; then
 	fail "the requested remote is not a configured git remote (or its push URL cannot be resolved); this publisher requires a named remote (--remote NAME, default origin) so it can prove the fetch and push destinations are one shared URL. Add it with 'git remote add NAME URL' and pass NAME. The argument is not echoed here because it may be a URL with embedded credentials."
 fi
