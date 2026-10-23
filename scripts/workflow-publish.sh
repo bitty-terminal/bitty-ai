@@ -21,7 +21,9 @@
 # more than one URL on either side) is refused before the fetch,
 # unconditionally: `--allow-non-main` does not bypass it. The comparison is
 # byte-exact, so a push URL that differs from the fetch URL only by trailing
-# newline bytes is still a split destination. This publisher
+# newline bytes is still a split destination. The raw `remote.<name>.url` and
+# `remote.<name>.pushurl` records are inspected before resolution: an empty
+# record is refused even when `git remote get-url` hides it. This publisher
 # refreshes `$REMOTE/main` from the fetch URL while `git push "$REMOTE"` writes
 # to the push URL(s), so a split would validate one repository's main and
 # publish the snapshot into another — the one place the `snapshot-source` gate
@@ -52,8 +54,9 @@
 #      otherwise prints a no-op message.
 #
 # Dependencies: git, carryctx, timeout, python3. python3 is required for the
-# manifest JSON check and is verified up front; the script fails when it is
-# missing instead of skipping redaction verification.
+# raw remote-URL record check and the manifest JSON check, and is verified up
+# front; the script fails when it is missing instead of skipping either
+# verification.
 #
 # The local CarryCtx DB is never modified. `--dry-run` validates the source
 # revision and the export and writes neither the ref nor the remote.
@@ -166,10 +169,11 @@ url_count() {
 have git || fail "git not on PATH"
 have carryctx || fail "carryctx not on PATH"
 have timeout || fail "timeout not on PATH"
-# The redaction guard below parses JSON. python3 is present on every closeout
-# host and CI image; jq and bun are not guaranteed. Fail statically instead of
-# falling back to a text match that a nested field could satisfy.
-have python3 || fail "python3 not on PATH; it is required to parse $PUB_REF:manifest.json (jq/bun are not assumed)"
+# This script parses the raw remote URL records below and the redaction manifest
+# later. python3 is present on every closeout host and CI image; jq and bun are
+# not guaranteed. Fail statically instead of falling back to a comparison or
+# text match that could hide an empty record or a nested field.
+have python3 || fail "python3 not on PATH; it is required to inspect raw remote URL records and to parse $PUB_REF:manifest.json (jq/bun are not assumed)"
 
 PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
 
@@ -182,6 +186,39 @@ PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
 # values (they can embed credentials), and the unresolvable branch does not echo
 # the argument because it may itself be a credential-bearing URL.
 #
+# Inspect the raw `remote.<name>.url` / `remote.<name>.pushurl` records before
+# resolving them. Git accepts a valid URL alongside an empty record, and
+# `git remote get-url` may then print only the non-empty line (or the remote
+# name), so the count/equality guard can pass while fetch or push resolves the
+# partial configuration. Records are read NUL-separated: a URL value that
+# embeds newline bytes stays one record instead of splitting into a bogus empty
+# one (the byte-exact comparison below still refuses it separately). python3 is
+# already required by this script, reads the bytes from a pipe, and prints only
+# a status token, never a value. Bash 3.2 is preserved: no NUL-safe variables,
+# `mapfile`, or namerefs.
+require_no_empty_url_records() {
+	local key="$1" side="$2" status
+	status="$({
+		timeout "$GIT_TIMEOUT" git -C "$PROJECT" config --null --get-all "$key" 2>/dev/null || true
+	} | python3 -c '
+import sys
+
+records = sys.stdin.buffer.read().split(b"\0")[:-1]
+sys.stdout.write("empty" if any(record == b"" for record in records) else "ok")
+' 2>/dev/null)" || status="read-failure"
+	case "$status" in
+	ok) ;;
+	empty)
+		fail "remote '$REMOTE' has an empty $side URL record ($key); 'git remote get-url' can hide an empty record, so the shared-URL comparison cannot prove which repository receives the snapshot. Remove the empty '$key' entry and re-run. URL values are never printed because they can embed credentials."
+		;;
+	*)
+		fail "cannot inspect the raw $side URL records for remote '$REMOTE'; refusing to publish. URL values are never printed because they can embed credentials."
+		;;
+	esac
+}
+require_no_empty_url_records "remote.$REMOTE.url" fetch
+require_no_empty_url_records "remote.$REMOTE.pushurl" push
+
 # Capture the URL records byte-exactly. Command substitution strips every
 # trailing newline, so a configured URL that itself ends in newline bytes would
 # collapse onto the fetch URL in the comparison while `git push` still resolves

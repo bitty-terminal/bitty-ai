@@ -13,11 +13,13 @@
 #     the export, while detached/behind checkouts stay valid and
 #     `--allow-non-main` remains the explicit bypass;
 #   - the named remote must resolve to exactly one URL for both fetch and
-#     push. An explicit pushurl identical to the fetch URL publishes; a split
-#     pushurl (reachable or not), a pushurl that differs from the fetch URL
-#     only by trailing newline bytes, a `pushInsteadOf` rewrite, more than one
-#     push URL, and an unresolvable `--remote` (a URL or path, which would skip
-#     the comparison) are refused before the export with a static,
+#     push. An explicit pushurl identical to the fetch URL publishes; an empty
+#     `remote.<name>.url` or `remote.<name>.pushurl` record (which
+#     `git remote get-url` can hide next to a valid URL), a split pushurl
+#     (reachable or not), a pushurl that differs from the fetch URL only by
+#     trailing newline bytes, a `pushInsteadOf` rewrite, more than one push
+#     URL, and an unresolvable `--remote` (a URL or path, which would skip the
+#     comparison) are refused before the export with a static,
 #     credential-free diagnostic, and `--allow-non-main` cannot bypass that
 #     refusal;
 #   - the manifest guard parses JSON and requires the TOP-LEVEL `redacted`
@@ -403,6 +405,33 @@ expect_ok "bypassed publication pushes despite unverifiable main" remote_has_sna
 # its push URL(s). A split destination is refused before the export: publishing
 # into a repository whose main was never verified misattributes provenance, and
 # the snapshot-source gate runs in the repository that receives the snapshot.
+
+# Git accepts a valid URL plus an empty `remote.<name>.url` record. On some
+# versions `git remote get-url --all` hides the empty record, so the resolved
+# count/equality guard would pass while fetch resolves the partial
+# configuration. The raw record must be refused before resolution.
+root="$(new_fixture empty-fetch-url-record)"
+git -C "$(checkout_of "$root")" config --add remote.origin.url ""
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "empty fetch URL record is refused before export" 1
+expect_ok "empty fetch URL record reports the empty record" output_has "$RUN_OUTPUT" "empty fetch URL record"
+expect_not "empty fetch URL record does not echo URL values" output_has "$RUN_OUTPUT" "$root"
+expect_not "empty fetch URL record never exports" export_recorded "$root"
+expect_not "empty fetch URL record never pushes" remote_has_snapshot "$root"
+
+# Same shape on the push side: a valid pushurl plus an empty record can resolve
+# to only the valid line, while push still reads the partial configuration.
+root="$(new_fixture empty-push-url-record)"
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+set_pushurls "$root" "$fetch_url" ""
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "empty push URL record is refused before export" 1
+expect_ok "empty push URL record reports the empty record" output_has "$RUN_OUTPUT" "empty push URL record"
+expect_not "empty push URL record does not echo URL values" output_has "$RUN_OUTPUT" "$root"
+expect_not "empty push URL record never exports" export_recorded "$root"
+expect_not "empty push URL record never pushes" remote_has_snapshot "$root"
 
 # An explicit pushurl identical to the fetch URL is still one destination.
 root="$(new_fixture identical-pushurl)"
