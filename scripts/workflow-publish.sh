@@ -16,6 +16,21 @@
 # The companion CI gate (`snapshot-source`) verifies the pushed snapshot's
 # `CarryCtx-Source` trailer matches main HEAD.
 #
+# The named remote must resolve to exactly one URL for both fetch and push. A
+# split configuration (`remote.<name>.pushurl`, `url.<base>.pushInsteadOf`, or
+# more than one URL on either side) is refused before the fetch,
+# unconditionally: `--allow-non-main` does not bypass it. This publisher
+# refreshes `$REMOTE/main` from the fetch URL while `git push "$REMOTE"` writes
+# to the push URL(s), so a split would validate one repository's main and
+# publish the snapshot into another — the one place the `snapshot-source` gate
+# actually runs. It would also seed the publication from the fetch side's
+# snapshot branch without knowing the push side's tip. A `--remote` that is not
+# a configured remote (a URL or a path) is refused for the same reason:
+# `pushInsteadOf` could still rewrite that destination without the comparison
+# ever running. The diagnostic is static and bounded: it prints the remote name
+# and URL counts only for a resolved remote, never URL values, which can embed
+# credentials.
+#
 # What it does:
 #   1. Refreshes `$REMOTE/main` (bounded by --git-timeout) for every checkout,
 #      including branch `main`, then requires HEAD to be that commit or an
@@ -48,8 +63,9 @@
 #   --dry-run          validate the source revision and the export; no ref
 #                      write, no push.
 #   --project DIR      repository to publish (default: this checkout root).
-#   --remote NAME      git remote to fetch main from and push to
-#                      (default: origin).
+#   --remote NAME      git remote to fetch main from and push to; it must be a
+#                      configured remote name resolving to exactly one shared
+#                      URL (default: origin). URLs and paths are refused.
 #   --git-timeout SECS timeout for every carryctx/git op (default: 120).
 #   --allow-non-main   publish even when HEAD is neither $REMOTE/main nor an
 #                      ancestor of it, or when $REMOTE/main cannot be
@@ -134,6 +150,17 @@ log() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Counts non-empty lines in a `git remote get-url --all` result without
+# `mapfile`, which macOS's bash 3.2 lacks (this script is re-vendored into
+# repositories whose CI runs macOS).
+url_count() {
+	local text="$1" count=0 line
+	while IFS= read -r line; do
+		[[ -n "$line" ]] && count=$((count + 1))
+	done <<<"$text"
+	printf '%s\n' "$count"
+}
+
 have git || fail "git not on PATH"
 have carryctx || fail "carryctx not on PATH"
 have timeout || fail "timeout not on PATH"
@@ -143,6 +170,25 @@ have timeout || fail "timeout not on PATH"
 have python3 || fail "python3 not on PATH; it is required to parse $PUB_REF:manifest.json (jq/bun are not assumed)"
 
 PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
+
+# Refuse anything but one shared fetch/push URL before any network fetch,
+# export, or ref write. `git remote get-url --push` resolves exactly what
+# `git push $REMOTE` would use, including `remote.<name>.pushurl`,
+# `url.<base>.pushInsteadOf`, and several URLs on either side. A name that does
+# not resolve is refused too: a URL or path argument would skip the comparison
+# while `pushInsteadOf` could still redirect the push. No branch prints URL
+# values (they can embed credentials), and the unresolvable branch does not echo
+# the argument because it may itself be a credential-bearing URL.
+FETCH_URLS="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url --all "$REMOTE" 2>/dev/null || true)"
+PUSH_URLS="$(timeout "$GIT_TIMEOUT" git -C "$PROJECT" remote get-url --push --all "$REMOTE" 2>/dev/null || true)"
+if [[ -z "$FETCH_URLS" || -z "$PUSH_URLS" ]]; then
+	fail "the requested remote is not a configured git remote (or its push URL cannot be resolved); this publisher requires a named remote (--remote NAME, default origin) so it can prove the fetch and push destinations are one shared URL. Add it with 'git remote add NAME URL' and pass NAME. The argument is not echoed here because it may be a URL with embedded credentials."
+fi
+FETCH_URL_COUNT="$(url_count "$FETCH_URLS")"
+PUSH_URL_COUNT="$(url_count "$PUSH_URLS")"
+if [[ "$FETCH_URL_COUNT" != 1 || "$PUSH_URL_COUNT" != 1 || "$FETCH_URLS" != "$PUSH_URLS" ]]; then
+	fail "remote '$REMOTE' resolves to $FETCH_URL_COUNT fetch URL(s) and $PUSH_URL_COUNT push URL(s); this publisher requires exactly one shared URL so the source guard validates the repository that receives the snapshot. Remove the extra 'remote.$REMOTE.url' / 'remote.$REMOTE.pushurl' entries or pushInsteadOf split (or align them) and re-run. URL values are never printed because they can embed credentials."
+fi
 
 # CarryCtx records the checkout directory basename as the project token in the
 # `CarryCtx-Source` trailer, so a worktree or recovery clone with a different

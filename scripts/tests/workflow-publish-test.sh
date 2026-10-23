@@ -12,6 +12,13 @@
 #     ahead of or diverged from a freshly fetched origin/main must fail before
 #     the export, while detached/behind checkouts stay valid and
 #     `--allow-non-main` remains the explicit bypass;
+#   - the named remote must resolve to exactly one URL for both fetch and
+#     push. An explicit pushurl identical to the fetch URL publishes; a split
+#     pushurl (reachable or not), a `pushInsteadOf` rewrite, more than one push
+#     URL, and an unresolvable `--remote` (a URL or path, which would skip the
+#     comparison) are refused before the export with a static,
+#     credential-free diagnostic, and `--allow-non-main` cannot bypass that
+#     refusal;
 #   - the manifest guard parses JSON and requires the TOP-LEVEL `redacted`
 #     boolean. A nested `redacted: true`, a string, a number, a boolean false,
 #     or a truncated document must not authorize a push, and diagnostics must
@@ -154,6 +161,23 @@ new_fixture() {
 
 checkout_of() { printf '%s/remote\n' "$1"; }
 bare_of() { printf '%s/remote.git\n' "$1"; }
+
+# Replaces `remote.origin.pushurl` with exactly the given URLs; no arguments
+# removes the pushurl and restores the fetch URL as the push destination.
+set_pushurls() {
+	local root="$1"
+	shift
+	local checkout url
+	checkout="$(checkout_of "$root")"
+	git -C "$checkout" config --unset-all remote.origin.pushurl >/dev/null 2>&1 || true
+	for url in "$@"; do
+		git -C "$checkout" config --add remote.origin.pushurl "$url"
+	done
+}
+
+path_has_snapshot() {
+	git -C "$1" rev-parse -q --verify refs/heads/carryctx-snapshots >/dev/null 2>&1
+}
 
 # Writes the manifest the stub will commit and prints its path.
 write_manifest() {
@@ -372,6 +396,103 @@ capture run_publish "$root" "$manifest" --allow-non-main
 expect_status "--allow-non-main bypasses an unverifiable origin/main" 0
 expect_ok "bypass reports skipped source verification" output_has "$RUN_OUTPUT" "skipping source verification"
 expect_ok "bypassed publication pushes despite unverifiable main" remote_has_snapshot "$root"
+
+# ── fetch/push destination guard ────────────────────────────────────────────
+# The script fetches main from the remote's fetch URL but `git push` writes to
+# its push URL(s). A split destination is refused before the export: publishing
+# into a repository whose main was never verified misattributes provenance, and
+# the snapshot-source gate runs in the repository that receives the snapshot.
+
+# An explicit pushurl identical to the fetch URL is still one destination.
+root="$(new_fixture identical-pushurl)"
+set_pushurls "$root" "$(git -C "$(checkout_of "$root")" remote get-url origin)"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "pushurl identical to the fetch URL publishes" 0
+expect_ok "identical pushurl reaches the remote" remote_has_snapshot "$root"
+
+# A reachable second repository as pushurl: even with an identical main, the
+# fetch-side main is not the destination's verified main, so refuse.
+root="$(new_fixture split-pushurl)"
+split_dest="$root/push-destination.git"
+git init --quiet --bare --initial-branch=main "$split_dest"
+git -C "$TEST_ROOT/split-pushurl-seed" push --quiet "$split_dest" main
+set_pushurls "$root" "$split_dest"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "split pushurl is refused before export" 1
+expect_ok "split refusal names the shared-URL requirement" output_has "$RUN_OUTPUT" "exactly one shared URL"
+expect_not "split refusal does not echo the push URL" output_has "$RUN_OUTPUT" "$split_dest"
+expect_not "split configuration never exports" export_recorded "$root"
+expect_not "split configuration never pushes to the fetch remote" remote_has_snapshot "$root"
+expect_not "split configuration never pushes to the push destination" path_has_snapshot "$split_dest"
+
+# An unreachable push destination is the same gap: the fetch works, but the
+# snapshot could not be verified there. Refuse early, not after the export.
+root="$(new_fixture unreachable-pushurl)"
+unreachable="$root/missing-push-destination.git"
+set_pushurls "$root" "$unreachable"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "unreachable push destination is refused before export" 1
+expect_ok "unreachable destination reports the split" output_has "$RUN_OUTPUT" "exactly one shared URL"
+expect_not "unreachable destination path is not echoed" output_has "$RUN_OUTPUT" "missing-push-destination"
+expect_not "unreachable destination never exports" export_recorded "$root"
+expect_not "unreachable destination never pushes" remote_has_snapshot "$root"
+
+# Multiple push URLs push to several repositories at once; one main check
+# cannot cover them, so the destination is ambiguous.
+root="$(new_fixture multiple-pushurls)"
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+set_pushurls "$root" "$fetch_url" "$fetch_url"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "multiple push URLs are refused" 1
+expect_ok "multiple push URLs report the destination counts" output_has "$RUN_OUTPUT" "2 push URL(s)"
+expect_not "multiple push URLs never export" export_recorded "$root"
+expect_not "multiple push URLs never push" remote_has_snapshot "$root"
+
+# `url.<base>.pushInsteadOf` rewrites the push URL without touching
+# `remote.origin.pushurl`; `git remote get-url --push` applies the same rewrite
+# git push does, so the guard sees the split destination.
+root="$(new_fixture pushinsteadof-split)"
+instead_dest="$root/push-destination.git"
+git init --quiet --bare --initial-branch=main "$instead_dest"
+git -C "$TEST_ROOT/pushinsteadof-split-seed" push --quiet "$instead_dest" main
+fetch_url="$(git -C "$(checkout_of "$root")" remote get-url origin)"
+git -C "$(checkout_of "$root")" config "url.$instead_dest.pushInsteadOf" "$fetch_url"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest"
+expect_status "pushInsteadOf split is refused before export" 1
+expect_ok "pushInsteadOf split reports the shared-URL requirement" output_has "$RUN_OUTPUT" "exactly one shared URL"
+expect_not "pushInsteadOf split does not echo the rewritten URL" output_has "$RUN_OUTPUT" "$instead_dest"
+expect_not "pushInsteadOf split never exports" export_recorded "$root"
+expect_not "pushInsteadOf split never pushes to the fetch remote" remote_has_snapshot "$root"
+expect_not "pushInsteadOf split never pushes to the rewritten destination" path_has_snapshot "$instead_dest"
+
+# A URL or path as --remote is not a configured remote, so the fetch/push
+# comparison cannot run; `pushInsteadOf` could still redirect the push. Refuse,
+# and never echo the argument (a URL can carry credentials).
+root="$(new_fixture unresolvable-remote)"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest" --remote "https://user:SENTINEL-TOKEN@example.invalid/org/repo.git"
+expect_status "unresolvable --remote is refused before export" 1
+expect_ok "unresolvable remote reports the named-remote requirement" output_has "$RUN_OUTPUT" "named remote"
+expect_not "unresolvable remote is not echoed" output_has "$RUN_OUTPUT" "SENTINEL-TOKEN"
+expect_not "unresolvable remote never exports" export_recorded "$root"
+expect_not "unresolvable remote never pushes" remote_has_snapshot "$root"
+
+# --allow-non-main bypasses source provenance, not a split destination: the
+# snapshot would still land in a repository whose main was never checked.
+root="$(new_fixture split-pushurl-bypass)"
+bypass_dest="$root/push-destination.git"
+git init --quiet --bare --initial-branch=main "$bypass_dest"
+set_pushurls "$root" "$bypass_dest"
+manifest="$(write_manifest "$root" '{"redacted": true}')"
+capture run_publish "$root" "$manifest" --allow-non-main
+expect_status "--allow-non-main cannot bypass a split pushurl" 1
+expect_not "--allow-non-main split refusal never exports" export_recorded "$root"
+expect_not "--allow-non-main split refusal never pushes" path_has_snapshot "$bypass_dest"
 
 # ── manifest redaction rejections ───────────────────────────────────────────
 root="$(new_fixture nested-redacted)"
