@@ -49,9 +49,14 @@ host-boundary-gate-v2-test:
 # requires a parsed top-level `redacted: true` (nested/string/number/boolean/
 # malformed documents fail closed) and reports only the rejected JSON type, and
 # a probe moves the publication ref before push to prove the pinned validated
-# commit is what gets published. Dry runs write no ref and push nothing. Runs
-# against local bare remotes and a `carryctx` stub: no network, no real remote.
-# Part of `check` and CI so the guards cannot silently regress.
+# commit is what gets published. The named remote must resolve to exactly one
+# URL for fetch and push: an identical pushurl publishes, while a split
+# pushurl (reachable or not), a `pushInsteadOf` rewrite, multiple push URLs,
+# an unresolvable `--remote`, and `--allow-non-main` over a split all fail
+# before export with a credential-free diagnostic (AI-0348). Dry runs write no
+# ref and push nothing. Runs against local bare remotes and a `carryctx` stub:
+# no network, no real remote. Part of `check` and CI so the guards cannot
+# silently regress.
 workflow-publish-test:
     bash scripts/tests/workflow-publish-test.sh
 
@@ -108,22 +113,25 @@ commit-check message:
 check: fmt-check clippy test gate-v01-durable actionlint host-boundary-gate-v2 host-boundary-gate-v2-test workflow-publish-test markdownlint
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
-# closeout only; never a git hook). The script first refreshes `origin/main`
-# for every checkout and requires HEAD to be that commit or an ancestor of it,
-# so a divergent or unpushed local `main` fails before anything is exported;
-# `--allow-non-main` is the explicit provenance bypass. `carryctx export
-# --publication` then redacts the bundle, stamps the top-level manifest
-# `redacted: true`, and commits one snapshot to the fixed ref
-# `refs/heads/carryctx-snapshots`; the target pushes that branch only when the
-# local ref advanced. The manifest guard parses JSON with python3 (checked up
-# front), rejects nested, string, number, boolean, or malformed stamps without
-# echoing field contents, and the push sends the pinned validated commit rather
-# than the ref name, so a concurrent ref move cannot publish unvalidated data.
-# Canonical closeout runs from the primary checkout on branch main
-# (`cd "$BITTY_WORKSPACE/bitty-ai" && just workflow-publish`); a detached or
-# behind checkout at an ancestor of origin/main publishes with a warning. Dry
-# run validates the source revision and the export and writes neither the ref
-# nor the remote.
+# closeout only; never a git hook). The script first refuses a split fetch/push
+# destination (`remote.<name>.pushurl`, pushInsteadOf, or several URLs) and any
+# `--remote` that is not a configured remote name, before anything
+# remote-facing; it then refreshes `origin/main` for every checkout and
+# requires HEAD to be that commit or an ancestor of it, so a divergent or
+# unpushed local `main` fails before anything is exported; `--allow-non-main`
+# is the explicit provenance bypass (it does not bypass the split-remote
+# refusal). `carryctx export --publication` then redacts the bundle, stamps the
+# top-level manifest `redacted: true`, and commits one snapshot to the fixed
+# ref `refs/heads/carryctx-snapshots`; the target pushes that branch only when
+# the local ref advanced. The manifest guard parses JSON with python3 (checked
+# up front), rejects nested, string, number, boolean, or malformed stamps
+# without echoing field contents, and the push sends the pinned validated
+# commit rather than the ref name, so a concurrent ref move cannot publish
+# unvalidated data. Canonical closeout runs from the primary checkout on branch
+# main (`cd "$BITTY_WORKSPACE/bitty-ai" && just workflow-publish`); a detached
+# or behind checkout at an ancestor of origin/main publishes with a warning.
+# Dry run validates the source revision and the export and writes neither the
+# ref nor the remote.
 workflow-publish *args:
     bash scripts/workflow-publish.sh {{args}}
 
