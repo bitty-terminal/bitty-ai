@@ -66,10 +66,10 @@ fn value_offset(line: &str, key: &str) -> Option<usize> {
                     while val_start < bytes.len() && bytes[val_start].is_ascii_whitespace() {
                         val_start += 1;
                     }
-                    if let Some((parsed_key, _)) = parse_json_string(line, index)
-                        && parsed_key == key
-                    {
-                        return (val_start <= bytes.len()).then_some(val_start);
+                    if let Some((parsed_key, _)) = parse_json_string(line, index) {
+                        if parsed_key == key {
+                            return (val_start <= bytes.len()).then_some(val_start);
+                        }
                     }
                     index = val_start;
                 } else {
