@@ -201,6 +201,19 @@ fn invalid_retry_integer_fails_closed() {
         }
         other => panic!("expected InvalidRetry, got {other:?}"),
     }
+    // Subsequent feed/finish stay latched until reset().
+    assert_eq!(
+        parser.feed(b"\n"),
+        Err(SseError::InvalidRetry("not-a-number".to_owned()))
+    );
+    assert_eq!(
+        parser.finish(),
+        Err(SseError::InvalidRetry("not-a-number".to_owned()))
+    );
+    parser.reset();
+    let events = parser.feed(b"data: recovered\n\n").expect("after reset");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data, "recovered");
 }
 
 #[test]
