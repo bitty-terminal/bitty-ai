@@ -109,6 +109,7 @@ pub struct SseParser {
     current_retry: Option<u64>,
     last_event_id: Option<String>,
     has_event_fields: bool,
+    failed_line_len: Option<usize>,
 }
 
 impl SseParser {
@@ -127,11 +128,16 @@ impl SseParser {
     /// Reset internal state, clearing buffered bytes and partial events.
     pub fn reset(&mut self) {
         self.buffer.clear();
+        self.clear_current_event();
+        self.last_event_id = None;
+        self.failed_line_len = None;
+    }
+
+    fn clear_current_event(&mut self) {
         self.current_event = None;
         self.current_data.clear();
         self.current_id = None;
         self.current_retry = None;
-        self.last_event_id = None;
         self.has_event_fields = false;
     }
 
@@ -139,6 +145,12 @@ impl SseParser {
     ///
     /// Returns all complete [`SseEvent`]s dispatched by this chunk.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseError> {
+        if let Some(actual) = self.failed_line_len {
+            return Err(SseError::LineTooLong {
+                max: MAX_SSE_LINE_BYTES,
+                actual,
+            });
+        }
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
@@ -147,6 +159,9 @@ impl SseParser {
             let next_line = match find_line_break(&self.buffer) {
                 Some((line_end, advance)) => {
                     if line_end > MAX_SSE_LINE_BYTES {
+                        self.buffer.clear();
+                        self.clear_current_event();
+                        self.failed_line_len = Some(line_end);
                         return Err(SseError::LineTooLong {
                             max: MAX_SSE_LINE_BYTES,
                             actual: line_end,
@@ -157,11 +172,20 @@ impl SseParser {
                     Some(line_bytes)
                 }
                 None => {
-                    // Check if trailing incomplete line exceeds ceiling
-                    if self.buffer.len() > MAX_SSE_LINE_BYTES {
+                    // A trailing `\r` at the end of the buffer is waiting to see
+                    // if the next chunk starts with `\n`, so exclude it from the
+                    // incomplete payload length check.
+                    let effective_len = self
+                        .buffer
+                        .strip_suffix(b"\r")
+                        .map_or(self.buffer.len(), <[u8]>::len);
+                    if effective_len > MAX_SSE_LINE_BYTES {
+                        self.buffer.clear();
+                        self.clear_current_event();
+                        self.failed_line_len = Some(effective_len);
                         return Err(SseError::LineTooLong {
                             max: MAX_SSE_LINE_BYTES,
-                            actual: self.buffer.len(),
+                            actual: effective_len,
                         });
                     }
                     None
@@ -190,8 +214,26 @@ impl SseParser {
 
     /// Finalize parsing at end of stream, flushing any pending unterminated event.
     pub fn finish(&mut self) -> Result<Option<SseEvent>, SseError> {
+        if let Some(actual) = self.failed_line_len {
+            return Err(SseError::LineTooLong {
+                max: MAX_SSE_LINE_BYTES,
+                actual,
+            });
+        }
         if !self.buffer.is_empty() {
-            let line_bytes = std::mem::take(&mut self.buffer);
+            let mut line_bytes = std::mem::take(&mut self.buffer);
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+            if line_bytes.len() > MAX_SSE_LINE_BYTES {
+                let actual = line_bytes.len();
+                self.clear_current_event();
+                self.failed_line_len = Some(actual);
+                return Err(SseError::LineTooLong {
+                    max: MAX_SSE_LINE_BYTES,
+                    actual,
+                });
+            }
             let line_str = std::str::from_utf8(&line_bytes).map_err(|_| SseError::InvalidUtf8)?;
             if !line_str.starts_with(':') && !line_str.is_empty() {
                 self.process_line(line_str)?;

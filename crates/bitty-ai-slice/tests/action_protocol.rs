@@ -301,3 +301,24 @@ fn facade_process_action_outcome_with_content_store() {
         .expect("blob must exist in store");
     assert_eq!(retrieved_blob, large_output.as_bytes());
 }
+
+#[test]
+fn generate_preview_counts_trimmed_boundary_whitespace_in_skipped_bytes() {
+    let head_part = "HEAD_TOKEN          ";
+    let middle_part = "MIDDLE_PAYLOAD_".repeat(10);
+    let tail_part = "          TAIL_TOKEN";
+    let raw = format!("{head_part}{middle_part}{tail_part}");
+    let preview = ActionEngine::generate_preview(&raw, 80);
+
+    let marker_start = preview.find("\n[... skipped ").expect("marker start");
+    let marker_end = preview.find(" bytes ...]\n").expect("marker end");
+    let skipped_reported: usize = preview[marker_start + "\n[... skipped ".len()..marker_end]
+        .parse()
+        .expect("parse skipped count");
+    let kept_head = &preview[..marker_start];
+    let kept_tail = &preview[marker_end + " bytes ...]\n".len()..];
+    assert_eq!(
+        kept_head.len() + skipped_reported + kept_tail.len(),
+        raw.len()
+    );
+}

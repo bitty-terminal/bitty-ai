@@ -808,13 +808,18 @@ impl ActionEngine {
         let half = (max_bytes - marker_budget) / 2;
         let head = Self::truncate_head_utf8(raw, half);
         let tail = Self::truncate_tail_utf8(raw, half);
+        let head_trimmed = head.trim_end();
+        let tail_trimmed = tail.trim_start();
 
-        let skipped = raw.len().saturating_sub(head.len() + tail.len());
+        let skipped = raw
+            .len()
+            .saturating_sub(head_trimmed.len() + tail_trimmed.len());
 
-        let mut out = String::with_capacity(head.len() + tail.len() + marker_budget);
-        out.push_str(head.trim_end());
+        let mut out =
+            String::with_capacity(head_trimmed.len() + tail_trimmed.len() + marker_budget);
+        out.push_str(head_trimmed);
         out.push_str(&format!("\n[... skipped {skipped} bytes ...]\n"));
-        out.push_str(tail.trim_start());
+        out.push_str(tail_trimmed);
         out
     }
 
