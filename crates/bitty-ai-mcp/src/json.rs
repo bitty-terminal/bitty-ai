@@ -57,7 +57,7 @@ fn value_offset(line: &str, key: &str) -> Option<usize> {
                 index += 1;
             }
             b'"' if depth == 1 => {
-                let (parsed_key, mut after) = parse_json_string(line, index)?;
+                let mut after = skip_json_string(bytes, index)?;
                 while after < bytes.len() && bytes[after].is_ascii_whitespace() {
                     after += 1;
                 }
@@ -66,7 +66,9 @@ fn value_offset(line: &str, key: &str) -> Option<usize> {
                     while val_start < bytes.len() && bytes[val_start].is_ascii_whitespace() {
                         val_start += 1;
                     }
-                    if parsed_key == key {
+                    if let Some((parsed_key, _)) = parse_json_string(line, index)
+                        && parsed_key == key
+                    {
                         return (val_start <= bytes.len()).then_some(val_start);
                     }
                     index = val_start;
@@ -359,5 +361,12 @@ mod tests {
 
         let lone_low = r#"{"text":"\uDE00abc"}"#;
         assert_eq!(find_string_field(lone_low, "text"), None);
+
+        // Unrelated string values containing lone surrogates do not abort lookup of later fields.
+        let unrelated_lone = r#"{"note":"\uD800","text":"kept"}"#;
+        assert_eq!(
+            find_string_field(unrelated_lone, "text"),
+            Some("kept".to_owned())
+        );
     }
 }

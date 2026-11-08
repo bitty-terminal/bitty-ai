@@ -232,7 +232,10 @@ fn collect_text_parts(result: &str) -> CollectedText {
         return CollectedText { text, len };
     };
     let bytes = array.as_bytes();
-    let mut index = 0_usize;
+    if bytes.first() != Some(&b'[') {
+        return CollectedText { text, len };
+    }
+    let mut index = 1_usize;
     while index < bytes.len() {
         match bytes[index] {
             b'{' => {
@@ -241,22 +244,25 @@ fn collect_text_parts(result: &str) -> CollectedText {
                 };
                 let part_obj = &array[index..=end];
                 index = end + 1;
-                if find_string_field(part_obj, "type")
-                    .as_deref()
-                    .unwrap_or("text")
-                    != "text"
-                {
+                let is_text = match find_raw_field(part_obj, "type") {
+                    None => true,
+                    Some(_) => find_string_field(part_obj, "type").as_deref() == Some("text"),
+                };
+                if !is_text {
                     continue;
                 }
                 if let Some(part) = find_string_field(part_obj, "text") {
-                    len += part.len();
+                    len = len.saturating_add(part.len());
                     if len <= MAX_CALL_RESULT_BYTES + 1 {
                         text.push_str(&part);
                     }
-                    if len > MAX_CALL_RESULT_BYTES + 1 {
-                        break;
-                    }
                 }
+            }
+            b'[' => {
+                let Some(end) = crate::json::balanced_end(array, index, b'[', b']') else {
+                    break;
+                };
+                index = end + 1;
             }
             b'"' => {
                 index += 1;
@@ -594,7 +600,9 @@ mod tests {
         let big_text = "r".repeat(MAX_CALL_RESULT_BYTES + 10);
         let line = answer(
             1,
-            &format!("{{\"content\":[{{\"type\":\"text\",\"text\":\"{big_text}\"}}]}}"),
+            &format!(
+                "{{\"content\":[{{\"type\":\"text\",\"text\":\"{big_text}\"}},{{\"type\":\"text\",\"text\":\"extra\"}}]}}"
+            ),
         );
         let mut transport = FakeTransport {
             inbound: vec![line].into_iter().collect(),
@@ -611,7 +619,30 @@ mod tests {
             &mut Vec::new(),
         )
         .expect_err("oversize result");
-        assert!(matches!(error, McpCallError::ResultRejected { .. }));
+        match error {
+            McpCallError::ResultRejected { actual, .. } => {
+                assert_eq!(actual, MAX_CALL_RESULT_BYTES + 15);
+            }
+            other => panic!("expected ResultRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_text_parts_requires_top_level_array_and_valid_type() {
+        let non_array = answer(1, r#"{"content":{"type":"text","text":"nope"}}"#);
+        assert_eq!(
+            parse_call_result(&non_array, "mcp_demo_echo").expect("non-array"),
+            (String::new(), 0)
+        );
+
+        let nested_and_null_type = answer(
+            1,
+            r#"{"content":[[{"type":"text","text":"nested"}],{"type":null,"text":"nulltype"},{"type":"text","text":"kept"}]}"#,
+        );
+        assert_eq!(
+            parse_call_result(&nested_and_null_type, "mcp_demo_echo").expect("filtered"),
+            ("kept".to_owned(), 4)
+        );
     }
 
     #[test]

@@ -134,9 +134,13 @@ fn finish_flushes_unterminated_event() {
 #[test]
 fn oversized_line_fails_closed() {
     let mut parser = SseParser::new();
+    parser
+        .feed(b"event: partial\ndata: before-oversized\n")
+        .expect("initial fields");
     let mut oversized = Vec::with_capacity(MAX_SSE_LINE_BYTES + 10);
     oversized.extend_from_slice(b"data: ");
     oversized.resize(MAX_SSE_LINE_BYTES + 10, b'a');
+    oversized.extend_from_slice(b"\n\n");
 
     let err = parser.feed(&oversized).unwrap_err();
     match err {
@@ -146,6 +150,18 @@ fn oversized_line_fails_closed() {
         }
         other => panic!("expected LineTooLong, got {other:?}"),
     }
+
+    // Subsequent feed/finish calls stay failed until reset() so partial events cannot be emitted.
+    assert!(matches!(
+        parser.feed(b"data: after\n\n"),
+        Err(SseError::LineTooLong { .. })
+    ));
+    assert!(matches!(parser.finish(), Err(SseError::LineTooLong { .. })));
+
+    parser.reset();
+    let events = parser.feed(b"data: recovered\n\n").expect("after reset");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data, "recovered");
 }
 
 #[test]
