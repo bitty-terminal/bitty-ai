@@ -297,7 +297,11 @@ impl LaunchManifest {
         let mut chunk = Zeroizing::new([0_u8; 512]);
 
         loop {
-            let read = reader.read(&mut chunk[..]).map_err(ManifestReadError::Io)?;
+            let read = match reader.read(&mut chunk[..]) {
+                Ok(n) => n,
+                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(ManifestReadError::Io(err)),
+            };
             if read == 0 {
                 break;
             }
@@ -863,7 +867,34 @@ impl fmt::Debug for HexSlice<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::CertificatePin;
+    use std::io::{self, Read};
+
+    use super::{CertificatePin, LaunchManifest, ManifestError, ManifestReadError};
+
+    struct InterruptedReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        interrupted_once: bool,
+    }
+
+    impl Read for InterruptedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted_once {
+                self.interrupted_once = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "simulated EINTR",
+                ));
+            }
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let len = buf.len().min(self.data.len() - self.pos);
+            buf[..len].copy_from_slice(&self.data[self.pos..self.pos + len]);
+            self.pos += len;
+            Ok(len)
+        }
+    }
 
     #[test]
     fn pin_is_sha256_of_certificate_der() {
@@ -873,5 +904,19 @@ mod tests {
             CertificatePin::of_der(b"").to_hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn read_from_retries_interrupted_reads_to_eof() {
+        let mut reader = InterruptedReader {
+            data: &[0, 1],
+            pos: 0,
+            interrupted_once: false,
+        };
+        let err = LaunchManifest::read_from(&mut reader).expect_err("truncated after EINTR retry");
+        assert!(matches!(
+            err,
+            ManifestReadError::Manifest(ManifestError::Truncated(_))
+        ));
     }
 }

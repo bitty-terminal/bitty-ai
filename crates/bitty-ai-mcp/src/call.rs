@@ -204,6 +204,12 @@ pub fn parse_call_result(line: &str, tool: &str) -> Result<(String, usize), McpC
         });
     }
     let collected = collect_text_parts(result);
+    if collected.malformed_text {
+        return Err(McpCallError::Failed {
+            tool: tool.to_owned(),
+            reason: "call answer carries malformed text part".to_owned(),
+        });
+    }
     // Always report the observed length, even when the retained text is
     // empty (the probe stops retaining past cap-plus-one while still
     // counting): the caller enforces the result bound from the length.
@@ -220,6 +226,7 @@ pub fn parse_call_result(line: &str, tool: &str) -> Result<(String, usize), McpC
 struct CollectedText {
     text: String,
     len: usize,
+    malformed_text: bool,
 }
 
 /// Concatenate every `{"type":"text","text":"..."}` part of a result
@@ -228,12 +235,21 @@ struct CollectedText {
 fn collect_text_parts(result: &str) -> CollectedText {
     let mut text = String::new();
     let mut len = 0_usize;
+    let mut malformed_text = false;
     let Some(array) = find_raw_field(result, "content") else {
-        return CollectedText { text, len };
+        return CollectedText {
+            text,
+            len,
+            malformed_text,
+        };
     };
     let bytes = array.as_bytes();
     if bytes.first() != Some(&b'[') {
-        return CollectedText { text, len };
+        return CollectedText {
+            text,
+            len,
+            malformed_text,
+        };
     }
     let mut index = 1_usize;
     while index < bytes.len() {
@@ -256,6 +272,8 @@ fn collect_text_parts(result: &str) -> CollectedText {
                     if len <= MAX_CALL_RESULT_BYTES + 1 {
                         text.push_str(&part);
                     }
+                } else if find_raw_field(part_obj, "text").is_some() {
+                    malformed_text = true;
                 }
             }
             b'[' => {
@@ -280,7 +298,11 @@ fn collect_text_parts(result: &str) -> CollectedText {
             _ => index += 1,
         }
     }
-    CollectedText { text, len }
+    CollectedText {
+        text,
+        len,
+        malformed_text,
+    }
 }
 
 /// Dispatch one tool call with a whole-call deadline.
@@ -643,6 +665,15 @@ mod tests {
             parse_call_result(&nested_and_null_type, "mcp_demo_echo").expect("filtered"),
             ("kept".to_owned(), 4)
         );
+
+        let malformed_text = answer(
+            1,
+            r#"{"content":[{"type":"text","text":"bad\uD800surrogate"}]}"#,
+        );
+        assert!(matches!(
+            parse_call_result(&malformed_text, "mcp_demo_echo"),
+            Err(McpCallError::Failed { .. })
+        ));
     }
 
     #[test]

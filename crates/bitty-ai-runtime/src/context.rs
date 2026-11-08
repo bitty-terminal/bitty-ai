@@ -356,10 +356,11 @@ impl ContextRequest {
     pub fn effective_budget_bytes(&self) -> usize {
         let mut budget = self
             .max_bytes
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .unwrap_or(DEFAULT_CONTEXT_BUDGET_BYTES);
+            .map_or(DEFAULT_CONTEXT_BUDGET_BYTES, |bytes| {
+                usize::try_from(bytes).unwrap_or(usize::MAX)
+            });
         if let Some(tokens) = self.max_tokens {
-            budget = budget.min(tokens as usize * BYTES_PER_TOKEN_ESTIMATE);
+            budget = budget.min((tokens as usize).saturating_mul(BYTES_PER_TOKEN_ESTIMATE));
         }
         budget
     }
