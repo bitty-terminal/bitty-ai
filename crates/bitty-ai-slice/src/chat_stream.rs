@@ -264,15 +264,20 @@ impl ChatCompletionStreamParser {
         seq: &mut u32,
     ) -> Result<(), ChatStreamError> {
         if let ChatStreamDelta::Content(text) = delta {
+            let next_seq = seq.checked_add(1).ok_or_else(|| {
+                ChatStreamError::Stream(StreamError::InvalidFraming {
+                    reason: "stream sequence exhausted".to_owned(),
+                })
+            })?;
             let fragment = Fragment::markdown(text.as_bytes().to_vec());
             let chunk = StreamChunk {
                 seq: *seq,
-                total: *seq + 1,
+                total: next_seq,
                 is_final: true,
                 fragment,
             };
-            *seq += 1;
             sink.emit(chunk)?;
+            *seq = next_seq;
         }
         Ok(())
     }

@@ -36,61 +36,80 @@ pub fn escaped(value: &str) -> String {
     out
 }
 
-/// Find the byte offset of the value for `"key":` in `line`, skipping
-/// whitespace between the colon and the value.
+/// Find the byte offset of the value for a top-level `"key":` in `line`,
+/// skipping whitespace between the colon and the value.
 ///
-/// Matches only the key pattern `"key"` followed by optional whitespace and
-/// `:`, so a string *value* containing `"key"` without a trailing colon
-/// cannot match.
+/// Tracks `{}`/`[]` nesting depth and string literals so keys inside nested
+/// objects or arrays (`depth > 1`) and `"key":` substrings inside string
+/// values never shadow top-level JSON object members.
 fn value_offset(line: &str, key: &str) -> Option<usize> {
     let bytes = line.as_bytes();
-    let pattern = format!("\"{key}\"");
-    let pattern_bytes = pattern.as_bytes();
-    let mut search_from = 0;
-    while search_from + pattern_bytes.len() <= bytes.len() {
-        let rest = &bytes[search_from..];
-        let relative = find_subslice(rest, pattern_bytes)?;
-        let mut index = search_from + relative + pattern_bytes.len();
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index < bytes.len() && bytes[index] == b':' {
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+    let mut index = 0_usize;
+    let mut depth = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth += 1;
                 index += 1;
             }
-            if index <= bytes.len() {
-                return Some(index);
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
             }
-            return None;
+            b'"' if depth == 1 => {
+                let (parsed_key, mut after) = parse_json_string(line, index)?;
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if after < bytes.len() && bytes[after] == b':' {
+                    let mut val_start = after + 1;
+                    while val_start < bytes.len() && bytes[val_start].is_ascii_whitespace() {
+                        val_start += 1;
+                    }
+                    if parsed_key == key {
+                        return (val_start <= bytes.len()).then_some(val_start);
+                    }
+                    index = val_start;
+                } else {
+                    index = after;
+                }
+            }
+            b'"' => {
+                index = skip_json_string(bytes, index)?;
+            }
+            _ => {
+                index += 1;
+            }
         }
-        search_from += relative + 1;
     }
     None
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
+fn skip_json_string(bytes: &[u8], quote_offset: usize) -> Option<usize> {
+    if bytes.get(quote_offset) != Some(&b'"') {
         return None;
     }
-    (0..=(haystack.len() - needle.len()))
-        .find(|&index| &haystack[index..index + needle.len()] == needle)
+    let mut index = quote_offset + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
-/// Extract a JSON string field, unescaping it. Returns `None` when the key
-/// is absent or its value is not a string.
-#[must_use]
-pub fn find_string_field(line: &str, key: &str) -> Option<String> {
-    let offset = value_offset(line, key)?;
+fn parse_json_string(line: &str, quote_offset: usize) -> Option<(String, usize)> {
     let bytes = line.as_bytes();
-    if offset >= bytes.len() || bytes[offset] != b'"' {
+    if bytes.get(quote_offset) != Some(&b'"') {
         return None;
     }
     let mut out = String::new();
-    let mut index = offset + 1;
+    let mut index = quote_offset + 1;
     while index < bytes.len() {
         match bytes[index] {
-            b'"' => return Some(out),
+            b'"' => return Some((out, index + 1)),
             b'\\' => {
                 index += 1;
                 if index >= bytes.len() {
@@ -109,17 +128,37 @@ pub fn find_string_field(line: &str, key: &str) -> Option<String> {
                         if index + 4 >= bytes.len() {
                             return None;
                         }
-                        let digits = &line[index + 1..index + 5];
-                        let code = u32::from_str_radix(digits, 16).ok()?;
-                        out.push(char::from_u32(code)?);
-                        index += 4;
+                        let digits = line.get(index + 1..index + 5)?;
+                        let code = u16::from_str_radix(digits, 16).ok()?;
+                        if (0xD800..=0xDBFF).contains(&code) {
+                            if index + 10 >= bytes.len()
+                                || bytes[index + 5] != b'\\'
+                                || bytes[index + 6] != b'u'
+                            {
+                                return None;
+                            }
+                            let low_digits = line.get(index + 7..index + 11)?;
+                            let low = u16::from_str_radix(low_digits, 16).ok()?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return None;
+                            }
+                            let scalar = 0x10000
+                                + (((u32::from(code) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+                            out.push(char::from_u32(scalar)?);
+                            index += 10;
+                        } else if (0xDC00..=0xDFFF).contains(&code) {
+                            return None;
+                        } else {
+                            out.push(char::from_u32(u32::from(code))?);
+                            index += 4;
+                        }
                     }
                     _ => return None,
                 }
                 index += 1;
             }
             _ => {
-                let rest = &line[index..];
+                let rest = line.get(index..)?;
                 let character = rest.chars().next()?;
                 out.push(character);
                 index += character.len_utf8();
@@ -127,6 +166,14 @@ pub fn find_string_field(line: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract a JSON string field, unescaping it. Returns `None` when the key
+/// is absent or its value is not a string.
+#[must_use]
+pub fn find_string_field(line: &str, key: &str) -> Option<String> {
+    let offset = value_offset(line, key)?;
+    parse_json_string(line, offset).map(|(value, _)| value)
 }
 
 /// Extract the raw JSON token for a key: for a string value the inner text
@@ -283,5 +330,34 @@ mod tests {
             Some("a}b".to_owned())
         );
         assert_eq!(find_object_field(line, "id"), None);
+    }
+
+    #[test]
+    fn nested_keys_do_not_shadow_top_level_fields() {
+        let response = r#"{"jsonrpc":"2.0","id":7,"result":{"structuredContent":{"method":"GET","error":{"code":-32000},"id":999}}}"#;
+        assert!(!has_method(response));
+        assert_eq!(find_raw_field(response, "id"), Some("7"));
+        assert_eq!(find_object_field(response, "error"), None);
+
+        let tool_obj = r#"{"inputSchema":{"type":"object","properties":{"name":{"type":"string"}}},"name":"read_file"}"#;
+        assert_eq!(
+            find_string_field(tool_obj, "name"),
+            Some("read_file".to_owned())
+        );
+    }
+
+    #[test]
+    fn string_field_unescapes_utf16_surrogate_pairs_and_rejects_lone_surrogates() {
+        let valid = r#"{"text":"smile \uD83D\uDE00 done"}"#;
+        assert_eq!(
+            find_string_field(valid, "text"),
+            Some("smile 😀 done".to_owned())
+        );
+
+        let lone_high = r#"{"text":"\uD83Dabc"}"#;
+        assert_eq!(find_string_field(lone_high, "text"), None);
+
+        let lone_low = r#"{"text":"\uDE00abc"}"#;
+        assert_eq!(find_string_field(lone_low, "text"), None);
     }
 }

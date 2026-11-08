@@ -131,3 +131,19 @@ fn reject_excessive_tool_call_index_fail_closed() {
         other => panic!("expected JsonParse error, got {other:?}"),
     }
 }
+
+#[test]
+fn pipe_to_sink_leaves_seq_unchanged_when_fragment_rejected() {
+    use bitty_ai_runtime::stream::MAX_FRAGMENT_BYTES;
+
+    let parser = ChatCompletionStreamParser::new();
+    let mut sink = VecSink::new();
+    let mut seq = 3_u32;
+    let oversized = ChatStreamDelta::Content("x".repeat(MAX_FRAGMENT_BYTES + 1));
+    let err = parser
+        .pipe_to_sink(&oversized, &mut sink, &mut seq)
+        .expect_err("oversized delta must fail");
+    assert!(matches!(err, ChatStreamError::Stream(_)));
+    assert_eq!(seq, 3, "failed emit must not advance seq");
+    assert!(sink.is_empty());
+}

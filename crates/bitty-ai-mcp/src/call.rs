@@ -231,40 +231,47 @@ fn collect_text_parts(result: &str) -> CollectedText {
     let Some(array) = find_raw_field(result, "content") else {
         return CollectedText { text, len };
     };
-    let mut rest = array;
-    while let Some(key_at) = rest.find("\"text\"") {
-        let after_key = &rest[key_at + 6..];
-        let Some(colon) = after_key.find(':') else {
-            break;
-        };
-        let value = after_key[colon + 1..].trim_start();
-        if !value.starts_with('"') {
-            rest = &value[1..];
-            continue;
-        }
-        let probe = format!("{{\"text\":{value}");
-        // Reuse the string-field parser on a synthetic object prefix.
-        let part = crate::json::find_string_field(&probe, "text").unwrap_or_default();
-        len += part.len();
-        if len <= MAX_CALL_RESULT_BYTES + 1 {
-            text.push_str(&part);
-        }
-        // Advance past the parsed value: find its closing quote.
-        let bytes = value.as_bytes();
-        let mut index = 1_usize;
-        while index < bytes.len() {
-            match bytes[index] {
-                b'\\' => index += 2,
-                b'"' => {
-                    index += 1;
+    let bytes = array.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => {
+                let Some(end) = crate::json::balanced_end(array, index, b'{', b'}') else {
                     break;
+                };
+                let part_obj = &array[index..=end];
+                index = end + 1;
+                if find_string_field(part_obj, "type")
+                    .as_deref()
+                    .unwrap_or("text")
+                    != "text"
+                {
+                    continue;
                 }
-                _ => index += 1,
+                if let Some(part) = find_string_field(part_obj, "text") {
+                    len += part.len();
+                    if len <= MAX_CALL_RESULT_BYTES + 1 {
+                        text.push_str(&part);
+                    }
+                    if len > MAX_CALL_RESULT_BYTES + 1 {
+                        break;
+                    }
+                }
             }
-        }
-        rest = &value[index.min(value.len())..];
-        if len > MAX_CALL_RESULT_BYTES + 1 {
-            break;
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index += 2,
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            _ => index += 1,
         }
     }
     CollectedText { text, len }
@@ -470,6 +477,17 @@ mod tests {
         let (text, len) = parse_call_result(&line, "mcp_demo_echo").expect("text");
         assert_eq!(text, "ab");
         assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn text_parts_ignore_preceding_fields_and_non_text_items() {
+        let line = answer(
+            1,
+            "{\"content\":[{\"type\":\"text\",\"mimeType\":\"text/plain\",\"text\":\"hello\"},{\"type\":\"image\",\"data\":\"abc\",\"text\":\"ignored\"},{\"type\":\"text\",\"text\":\" world\"}]}",
+        );
+        let (text, len) = parse_call_result(&line, "mcp_demo_echo").expect("text");
+        assert_eq!(text, "hello world");
+        assert_eq!(len, 11);
     }
 
     #[test]

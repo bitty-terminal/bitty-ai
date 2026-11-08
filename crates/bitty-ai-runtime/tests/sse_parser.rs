@@ -186,3 +186,30 @@ fn invalid_retry_integer_fails_closed() {
         other => panic!("expected InvalidRetry, got {other:?}"),
     }
 }
+
+#[test]
+fn exact_max_line_with_split_crlf_and_trailing_cr_at_eof_succeeds() {
+    let mut parser = SseParser::new();
+    let payload_len = MAX_SSE_LINE_BYTES - "data: ".len();
+    let mut chunk1 = Vec::with_capacity(MAX_SSE_LINE_BYTES + 1);
+    chunk1.extend_from_slice(b"data: ");
+    chunk1.resize(MAX_SSE_LINE_BYTES, b'a');
+    chunk1.push(b'\r');
+
+    assert!(
+        parser
+            .feed(&chunk1)
+            .expect("chunk1 with trailing CR")
+            .is_empty()
+    );
+    let events = parser
+        .feed(b"\n\r\n")
+        .expect("chunk2 with LF and blank line");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data.len(), payload_len);
+
+    // Trailing standalone CR at EOF is stripped cleanly by finish().
+    assert!(parser.feed(b"data: eof-cr\r").expect("eof-cr").is_empty());
+    let flushed = parser.finish().expect("finish").expect("flushed event");
+    assert_eq!(flushed.data, "eof-cr");
+}

@@ -115,8 +115,10 @@ impl<R: BufRead> FramedLines<R> {
     pub fn next_line(&mut self) -> Result<Option<String>, McpError> {
         loop {
             let mut raw: Vec<u8> = Vec::new();
-            // Cap-plus-one probe: retain at most this much, then keep
-            // consuming through the newline so the next frame still aligns.
+            // Cap-plus-one probe (plus 2 bytes for optional `\r\n`): retain at
+            // most this much, then keep consuming through the newline so the
+            // next frame still aligns.
+            let max_raw_retain = MAX_FRAME_BYTES + 3;
             let mut retained = 0_usize;
             let mut saw_newline = false;
             let mut eof = false;
@@ -140,8 +142,8 @@ impl<R: BufRead> FramedLines<R> {
                 match take {
                     Some(offset) => {
                         let want = offset + 1;
-                        if retained < MAX_FRAME_BYTES + 1 {
-                            let room = MAX_FRAME_BYTES + 1 - retained;
+                        if retained < max_raw_retain {
+                            let room = max_raw_retain - retained;
                             raw.extend_from_slice(&available[..want.min(room)]);
                         }
                         retained += want;
@@ -149,8 +151,8 @@ impl<R: BufRead> FramedLines<R> {
                         saw_newline = true;
                     }
                     None => {
-                        if retained < MAX_FRAME_BYTES + 1 {
-                            let room = MAX_FRAME_BYTES + 1 - retained;
+                        if retained < max_raw_retain {
+                            let room = max_raw_retain - retained;
                             raw.extend_from_slice(&available[..available.len().min(room)]);
                         }
                         let consumed = available.len();
@@ -169,7 +171,7 @@ impl<R: BufRead> FramedLines<R> {
                     raw.pop();
                 }
             }
-            if retained > MAX_FRAME_BYTES {
+            if raw.len() > MAX_FRAME_BYTES {
                 self.stats.rejected_oversize += 1;
                 return Err(McpError::new(
                     McpStage::Frame,
@@ -277,6 +279,26 @@ mod tests {
             Some("{\"next\":2}".to_owned())
         );
         assert_eq!(frames.stats().rejected_oversize, 1);
+    }
+
+    #[test]
+    fn exact_max_frame_bytes_with_lf_or_crlf_succeeds() {
+        let pad_len = MAX_FRAME_BYTES - "{\"k\":\"\"}".len();
+        let exact_frame = format!("{{\"k\":\"{}\"}}", "a".repeat(pad_len));
+        assert_eq!(exact_frame.len(), MAX_FRAME_BYTES);
+
+        let input = format!("{exact_frame}\n{exact_frame}\r\n");
+        let mut frames = FramedLines::new(BufReader::new(input.as_bytes()));
+        assert_eq!(
+            frames.next_line().expect("lf exact frame"),
+            Some(exact_frame.clone())
+        );
+        assert_eq!(
+            frames.next_line().expect("crlf exact frame"),
+            Some(exact_frame)
+        );
+        assert_eq!(frames.next_line().expect("eof"), None);
+        assert_eq!(frames.stats().rejected_oversize, 0);
     }
 
     #[test]

@@ -147,6 +147,7 @@ impl SseParser {
             let next_line = match find_line_break(&self.buffer) {
                 Some((line_end, advance)) => {
                     if line_end > MAX_SSE_LINE_BYTES {
+                        self.buffer.drain(..advance);
                         return Err(SseError::LineTooLong {
                             max: MAX_SSE_LINE_BYTES,
                             actual: line_end,
@@ -157,11 +158,18 @@ impl SseParser {
                     Some(line_bytes)
                 }
                 None => {
-                    // Check if trailing incomplete line exceeds ceiling
-                    if self.buffer.len() > MAX_SSE_LINE_BYTES {
+                    // A trailing `\r` at the end of the buffer is waiting to see
+                    // if the next chunk starts with `\n`, so exclude it from the
+                    // incomplete payload length check.
+                    let effective_len = self
+                        .buffer
+                        .strip_suffix(b"\r")
+                        .map_or(self.buffer.len(), <[u8]>::len);
+                    if effective_len > MAX_SSE_LINE_BYTES {
+                        self.buffer.clear();
                         return Err(SseError::LineTooLong {
                             max: MAX_SSE_LINE_BYTES,
-                            actual: self.buffer.len(),
+                            actual: effective_len,
                         });
                     }
                     None
@@ -191,7 +199,16 @@ impl SseParser {
     /// Finalize parsing at end of stream, flushing any pending unterminated event.
     pub fn finish(&mut self) -> Result<Option<SseEvent>, SseError> {
         if !self.buffer.is_empty() {
-            let line_bytes = std::mem::take(&mut self.buffer);
+            let mut line_bytes = std::mem::take(&mut self.buffer);
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+            if line_bytes.len() > MAX_SSE_LINE_BYTES {
+                return Err(SseError::LineTooLong {
+                    max: MAX_SSE_LINE_BYTES,
+                    actual: line_bytes.len(),
+                });
+            }
             let line_str = std::str::from_utf8(&line_bytes).map_err(|_| SseError::InvalidUtf8)?;
             if !line_str.starts_with(':') && !line_str.is_empty() {
                 self.process_line(line_str)?;
